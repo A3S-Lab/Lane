@@ -1,0 +1,29 @@
+[package]
+name = "a3s-lane"
+version = "0.1.0"
+edition = "2021"
+authors = ["A3S Lab"]
+license = "MIT"
+description = "Lane-based priority command queue for async task scheduling"
+repository = "https://github.com/a3s-lab/lane"
+keywords = ["queue", "priority", "async", "scheduler", "lane"]
+categories = ["asynchronous", "concurrency"]
+
+[lib]
+name = "a3s_lane"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+async-trait = "0.1"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
