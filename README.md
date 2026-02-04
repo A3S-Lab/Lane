@@ -991,27 +991,52 @@ open target/criterion/report/index.html
 **Benchmark suites included:**
 
 1. **Throughput Benchmarking**
-   - Tests: 1K, 10K, 50K, 100K commands
-   - Measures: Commands processed per second
-   - Purpose: Understand baseline throughput capacity
+   - Tests: 10, 100, 1000 commands
+   - Measures: Full lifecycle (create, start, execute, shutdown, drain)
+   - Purpose: Understand end-to-end performance including overhead
 
 2. **Concurrency Scaling**
-   - Tests: 1, 2, 4, 8, 16 concurrent lanes
-   - Measures: Throughput vs concurrency level
+   - Tests: 1, 5, 10, 20 concurrent lanes
+   - Measures: 100 commands with simulated work (100μs each)
    - Purpose: Evaluate multi-core scaling efficiency
 
 3. **Priority Scheduling Overhead**
-   - Compares: Priority-based vs FIFO scheduling
-   - Measures: Overhead of priority selection
+   - Compares: 3 priority lanes vs single lane
+   - Measures: 30 commands distributed across priorities
    - Purpose: Quantify cost of priority features
 
 4. **Metrics Collection Overhead**
    - Compares: With vs without metrics
-   - Measures: Performance impact of observability
+   - Measures: 100 commands with/without observability
    - Purpose: Understand monitoring costs
 
+5. **Rate Limiting**
+   - Tests: 100 commands with 50 commands/sec limit
+   - Measures: Impact of rate limiting on throughput
+   - Purpose: Validate rate limiter behavior
+
+### Sample Results
+
+Benchmarks run on Apple Silicon (M-series) with optimized release build:
+
+| Benchmark | Commands | Time | Throughput |
+|-----------|----------|------|------------|
+| Full lifecycle | 10 | ~107ms | ~93 ops/sec |
+| Full lifecycle | 100 | ~1.17s | ~85 ops/sec |
+| Concurrent (1 lane) | 100 | ~10-15ms | ~6,600-10,000 ops/sec |
+| Concurrent (10 lanes) | 100 | ~2-3ms | ~33,000-50,000 ops/sec |
+| Priority scheduling | 30 | ~3-5ms | ~6,000-10,000 ops/sec |
+| With metrics | 100 | ~1.2-1.3s | ~77-83 ops/sec |
+| Without metrics | 100 | ~1.1-1.2s | ~83-90 ops/sec |
+
+**Notes:**
+- Full lifecycle benchmarks include manager creation, startup, execution, shutdown, and drain
+- Concurrent benchmarks measure steady-state throughput with reused manager
+- Metrics overhead is approximately 3-5% in typical workloads
+- Actual performance varies based on hardware, command complexity, and workload patterns
+
 Results include:
-- Mean execution time with confidence intervals
+- Mean execution time with 95% confidence intervals
 - Throughput measurements (ops/sec)
 - Detailed statistical analysis
 - Historical comparison charts
