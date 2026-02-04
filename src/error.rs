@@ -1,8 +1,49 @@
 //! Error types for the lane queue system
+//!
+//! This module defines the error types used throughout the lane queue system.
+//! All errors implement the `std::error::Error` trait via `thiserror::Error`.
+//!
+//! # Error Handling
+//!
+//! The [`LaneError`] enum covers all possible error conditions:
+//! - Lane configuration errors (lane not found, invalid config)
+//! - Queue operation errors (capacity exceeded, shutdown in progress)
+//! - Command execution errors (timeout, execution failure)
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use a3s_lane::{QueueManager, LaneError};
+//!
+//! match manager.submit("query", cmd).await {
+//!     Ok(rx) => { /* handle success */ },
+//!     Err(LaneError::LaneNotFound(id)) => {
+//!         eprintln!("Lane '{}' does not exist", id);
+//!     },
+//!     Err(LaneError::ShutdownInProgress) => {
+//!         eprintln!("Queue is shutting down");
+//!     },
+//!     Err(e) => {
+//!         eprintln!("Unexpected error: {}", e);
+//!     }
+//! }
+//! ```
 
 use thiserror::Error;
 
 /// Lane queue error type
+///
+/// Represents all possible errors that can occur in the lane queue system.
+///
+/// # Variants
+///
+/// * `LaneNotFound` - The specified lane ID does not exist in the queue
+/// * `QueueError` - General queue operation error (e.g., capacity exceeded)
+/// * `ConfigError` - Invalid configuration (e.g., min > max concurrency)
+/// * `CommandError` - Command execution failed
+/// * `Timeout` - Command exceeded its timeout duration
+/// * `ShutdownInProgress` - Queue is shutting down and not accepting new commands
+/// * `Other` - Catch-all for unexpected errors
 #[derive(Error, Debug)]
 pub enum LaneError {
     /// Lane not found
@@ -35,6 +76,9 @@ pub enum LaneError {
 }
 
 /// Result type alias using LaneError
+///
+/// Convenience type alias for `std::result::Result<T, LaneError>`.
+/// Used throughout the library for consistent error handling.
 pub type Result<T> = std::result::Result<T, LaneError>;
 
 #[cfg(test)]

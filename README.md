@@ -228,10 +228,11 @@ use std::time::Duration;
 
 let emitter = EventEmitter::new(100);
 
-// Exponential backoff: 3 retries, 1s -> 2s -> 4s
-let retry_policy = RetryPolicy::exponential(3)
-    .with_initial_delay(Duration::from_secs(1))
-    .with_max_delay(Duration::from_secs(10));
+// Exponential backoff: 3 retries with 100ms initial delay, 2x multiplier
+let retry_policy = RetryPolicy::exponential(3);
+
+// Or fixed delay: 5 retries with 1 second delay
+let retry_policy = RetryPolicy::fixed(5, Duration::from_secs(1));
 
 let config = LaneConfig::new(1, 5)
     .with_retry_policy(retry_policy);
@@ -571,12 +572,9 @@ alerts.check_latency("api", 600.0).await; // Triggers critical
 
 | Method | Description |
 |--------|-------------|
-| `exponential(max_retries)` | Create exponential backoff policy (2x multiplier) |
+| `exponential(max_retries)` | Create exponential backoff policy (100ms initial, 30s max, 2x multiplier) |
 | `fixed(max_retries, delay)` | Create fixed delay policy |
 | `none()` | No retries |
-| `with_initial_delay(duration)` | Set initial delay (default: 1s) |
-| `with_max_delay(duration)` | Set maximum delay cap (default: 60s) |
-| `with_multiplier(f64)` | Set backoff multiplier (default: 2.0) |
 
 ### DeadLetterQueue
 
@@ -778,10 +776,17 @@ lane/
 ├── justfile
 ├── README.md
 ├── CLAUDE.md
+├── examples/          # Comprehensive feature demonstrations
+│   ├── basic_usage.rs
+│   ├── reliability.rs
+│   ├── observability.rs
+│   └── scalability.rs
+├── benches/           # Performance benchmarks
+│   └── queue_benchmark.rs
 └── src/
-    ├── lib.rs          # Library entry point
-    ├── config.rs       # LaneConfig
-    ├── error.rs        # LaneError
+    ├── lib.rs          # Library entry point with module docs
+    ├── config.rs       # LaneConfig with timeout, retry, rate limit
+    ├── error.rs        # LaneError and Result types
     ├── event.rs        # EventEmitter, LaneEvent
     ├── queue.rs        # Lane, CommandQueue, Command trait
     ├── manager.rs      # QueueManager, QueueManagerBuilder
@@ -830,7 +835,7 @@ A3S Lane is a **utility component** of the A3S ecosystem — a standalone priori
 
 ## Roadmap
 
-### Phase 1: Core ✅
+### Phase 1: Core ✅ (Complete)
 
 - [x] Priority-based lane scheduling
 - [x] Configurable concurrency per lane
@@ -838,16 +843,17 @@ A3S Lane is a **utility component** of the A3S ecosystem — a standalone priori
 - [x] Queue manager with builder pattern
 - [x] Health monitoring with thresholds
 - [x] Async-first with Tokio
+- [x] 212 comprehensive tests
 
-### Phase 2: Reliability ✅
+### Phase 2: Reliability ✅ (Complete)
 
 - [x] Persistent queue storage (LocalStorage + pluggable Storage trait)
-- [x] Command timeout support
-- [x] Command retries with exponential backoff
-- [x] Dead letter queue for failed commands
-- [x] Graceful shutdown with drain
+- [x] Command timeout support with automatic cancellation
+- [x] Command retries with exponential backoff and fixed delay strategies
+- [x] Dead letter queue for permanently failed commands
+- [x] Graceful shutdown with drain and timeout
 
-### Phase 3: Scalability ✅
+### Phase 3: Scalability ✅ (Complete)
 
 - [x] Queue partitioning (round-robin, hash-based, custom strategies)
 - [x] Multi-core parallelism (automatic CPU core detection)
@@ -855,13 +861,84 @@ A3S Lane is a **utility component** of the A3S ecosystem — a standalone priori
 - [x] Priority boosting (deadline-based automatic priority adjustment)
 - [x] Rate limiting per lane (token bucket and sliding window algorithms)
 
-### Phase 4: Observability ✅
+### Phase 4: Observability ✅ (Complete)
 
 - [x] Metrics collection (LocalMetrics + pluggable MetricsBackend trait)
 - [x] Latency histograms with percentiles (p50, p90, p95, p99)
-- [x] Queue depth alerts with configurable thresholds
+- [x] Queue depth alerts with configurable warning/critical thresholds
 - [x] Latency alerts with warning and critical levels
 - [x] Prometheus/OpenTelemetry ready (implement MetricsBackend trait)
+- [x] Alert callbacks for custom notification handling
+
+### Documentation & Examples ✅ (Complete)
+
+- [x] Comprehensive README with all features documented
+- [x] 4 working examples demonstrating all major features
+- [x] Performance benchmarks with Criterion
+- [x] Detailed API reference
+- [x] Inline documentation for all public APIs
+
+## Examples
+
+The `examples/` directory contains comprehensive demonstrations of all features:
+
+### Basic Usage (`examples/basic_usage.rs`)
+```bash
+cargo run --example basic_usage
+```
+Demonstrates:
+- Creating a queue manager with default lanes
+- Submitting commands and handling results
+- Checking queue statistics
+- Graceful shutdown
+
+### Reliability Features (`examples/reliability.rs`)
+```bash
+cargo run --example reliability
+```
+Demonstrates:
+- Command timeout configuration
+- Retry policies with exponential backoff
+- Dead letter queue for failed commands
+- Graceful shutdown with drain
+
+### Observability Features (`examples/observability.rs`)
+```bash
+cargo run --example observability
+```
+Demonstrates:
+- Metrics collection with local backend
+- Latency histogram tracking
+- Queue depth and latency alerts
+- Alert callbacks for notifications
+
+### Scalability Features (`examples/scalability.rs`)
+```bash
+cargo run --example scalability
+```
+Demonstrates:
+- Rate limiting configuration
+- Priority boosting for urgent commands
+- Distributed queue with partitioning
+- Multi-core parallelism
+
+## Benchmarks
+
+Performance benchmarks are available using Criterion:
+
+```bash
+# Run all benchmarks
+cargo bench
+
+# Run specific benchmark
+cargo bench --bench queue_benchmark
+```
+
+Benchmarks include:
+- **Throughput**: 1K to 100K commands
+- **Concurrency scaling**: 1 to 16 lanes
+- **Priority scheduling overhead**: Comparison with and without priorities
+- **Metrics overhead**: Impact of metrics collection on performance
 
 ## License
 

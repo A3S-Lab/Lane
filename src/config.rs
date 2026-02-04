@@ -1,4 +1,34 @@
 //! Lane configuration types
+//!
+//! This module provides configuration types for lanes, including concurrency limits,
+//! timeouts, retry policies, rate limiting, and priority boosting.
+//!
+//! # Configuration Options
+//!
+//! ## Concurrency Control
+//! - `min_concurrency`: Reserved slots for this lane (guaranteed capacity)
+//! - `max_concurrency`: Maximum concurrent commands allowed
+//!
+//! ## Reliability
+//! - `default_timeout`: Optional timeout for commands in this lane
+//! - `retry_policy`: Retry strategy for failed commands (exponential backoff, fixed delay, none)
+//!
+//! ## Scalability
+//! - `rate_limit`: Optional rate limiting (token bucket or sliding window)
+//! - `priority_boost`: Optional deadline-based priority adjustment
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use a3s_lane::{LaneConfig, RetryPolicy, RateLimitConfig};
+//! use std::time::Duration;
+//!
+//! // Create a lane with timeout, retry, and rate limiting
+//! let config = LaneConfig::new(1, 10)
+//!     .with_timeout(Duration::from_secs(30))
+//!     .with_retry_policy(RetryPolicy::exponential(3))
+//!     .with_rate_limit(RateLimitConfig::per_second(100));
+//! ```
 
 use crate::boost::PriorityBoostConfig;
 use crate::ratelimit::RateLimitConfig;
@@ -7,6 +37,34 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// Lane configuration
+///
+/// Defines the behavior and limits for a single lane in the queue system.
+///
+/// # Fields
+///
+/// * `min_concurrency` - Minimum concurrency (reserved slots). Commands in this lane
+///   are guaranteed at least this many concurrent execution slots.
+/// * `max_concurrency` - Maximum concurrency (capacity limit). No more than this many
+///   commands from this lane can execute concurrently.
+/// * `default_timeout` - Optional timeout for commands. If set, commands that exceed
+///   this duration will be cancelled and return a `Timeout` error.
+/// * `retry_policy` - Retry strategy for failed commands. Defaults to no retries.
+/// * `rate_limit` - Optional rate limiting configuration. If set, commands will be
+///   throttled according to the specified rate limit.
+/// * `priority_boost` - Optional priority boosting configuration. If set, commands
+///   approaching their deadline will have their priority automatically increased.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use a3s_lane::{LaneConfig, RetryPolicy};
+/// use std::time::Duration;
+///
+/// // High-priority lane with timeout and retries
+/// let config = LaneConfig::new(2, 8)
+///     .with_timeout(Duration::from_secs(30))
+///     .with_retry_policy(RetryPolicy::exponential(3));
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LaneConfig {
     /// Minimum concurrency (reserved slots)
@@ -69,6 +127,20 @@ impl Default for LaneConfig {
 
 impl LaneConfig {
     /// Create a new lane configuration
+    ///
+    /// # Arguments
+    ///
+    /// * `min_concurrency` - Minimum concurrent commands (reserved capacity)
+    /// * `max_concurrency` - Maximum concurrent commands (capacity limit)
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use a3s_lane::LaneConfig;
+    ///
+    /// // Lane with 1-10 concurrent commands
+    /// let config = LaneConfig::new(1, 10);
+    /// ```
     pub fn new(min_concurrency: usize, max_concurrency: usize) -> Self {
         Self {
             min_concurrency,
@@ -81,24 +153,73 @@ impl LaneConfig {
     }
 
     /// Set timeout (builder pattern)
+    ///
+    /// Commands in this lane will be cancelled if they exceed the specified duration.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use a3s_lane::LaneConfig;
+    /// use std::time::Duration;
+    ///
+    /// let config = LaneConfig::new(1, 5)
+    ///     .with_timeout(Duration::from_secs(30));
+    /// ```
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.default_timeout = Some(timeout);
         self
     }
 
     /// Set retry policy (builder pattern)
+    ///
+    /// Failed commands will be retried according to the specified policy.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use a3s_lane::{LaneConfig, RetryPolicy};
+    ///
+    /// // Retry up to 3 times with exponential backoff
+    /// let config = LaneConfig::new(1, 5)
+    ///     .with_retry_policy(RetryPolicy::exponential(3));
+    /// ```
     pub fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
         self.retry_policy = retry_policy;
         self
     }
 
     /// Set rate limit (builder pattern)
+    ///
+    /// Commands will be throttled according to the specified rate limit.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use a3s_lane::{LaneConfig, RateLimitConfig};
+    ///
+    /// // Limit to 100 commands per second
+    /// let config = LaneConfig::new(1, 10)
+    ///     .with_rate_limit(RateLimitConfig::per_second(100));
+    /// ```
     pub fn with_rate_limit(mut self, rate_limit: RateLimitConfig) -> Self {
         self.rate_limit = Some(rate_limit);
         self
     }
 
     /// Set priority boost (builder pattern)
+    ///
+    /// Commands approaching their deadline will have their priority automatically increased.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use a3s_lane::{LaneConfig, PriorityBoostConfig};
+    /// use std::time::Duration;
+    ///
+    /// // Boost priority as deadline approaches (5 minute deadline)
+    /// let config = LaneConfig::new(1, 10)
+    ///     .with_priority_boost(PriorityBoostConfig::standard(Duration::from_secs(300)));
+    /// ```
     pub fn with_priority_boost(mut self, priority_boost: PriorityBoostConfig) -> Self {
         self.priority_boost = Some(priority_boost);
         self

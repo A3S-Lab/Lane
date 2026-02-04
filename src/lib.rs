@@ -1,23 +1,66 @@
 //! # A3S Lane
 //!
-//! Lane-based priority command queue for async task scheduling.
+//! A high-performance, priority-based command queue for async task scheduling with comprehensive
+//! reliability, scalability, and observability features.
 //!
-//! This library provides a flexible, priority-based command queue system designed
-//! for managing concurrent async operations with different priority levels.
+//! ## Overview
 //!
-//! ## Features
+//! A3S Lane provides a lane-based priority command queue system designed for managing concurrent
+//! async operations with different priority levels. Commands are organized into lanes, each with
+//! configurable concurrency limits, timeouts, retry policies, and rate limiting.
 //!
-//! - **Priority-based scheduling**: Commands are executed based on lane priority
-//! - **Concurrency control**: Per-lane min/max concurrency limits
+//! ## Core Features
+//!
+//! ### Phase 1: Core Queue System
+//! - **Priority-based scheduling**: Commands execute based on lane priority (lower = higher priority)
+//! - **Concurrency control**: Per-lane min/max concurrency limits with semaphore-based coordination
 //! - **Built-in lanes**: 6 predefined lanes (system, control, query, session, skill, prompt)
-//! - **Event system**: Subscribe to queue events for monitoring
+//! - **Event system**: Subscribe to queue events for real-time monitoring
 //! - **Health monitoring**: Track queue depth and active command counts
-//! - **Builder pattern**: Flexible queue configuration
+//! - **Builder pattern**: Flexible, ergonomic queue configuration
+//!
+//! ### Phase 2: Reliability
+//! - **Command timeout**: Configurable timeout per lane with automatic cancellation
+//! - **Retry policies**: Exponential backoff, fixed delay, or custom retry strategies
+//! - **Dead letter queue**: Capture permanently failed commands for inspection and replay
+//! - **Persistent storage**: Optional pluggable storage backend (LocalStorage included)
+//! - **Graceful shutdown**: Drain pending commands before shutdown with timeout
+//!
+//! ### Phase 3: Scalability
+//! - **Multi-core parallelism**: Automatic CPU core detection and parallel processing
+//! - **Queue partitioning**: Distribute commands across workers (round-robin, hash-based, custom)
+//! - **Rate limiting**: Token bucket and sliding window rate limiters per lane
+//! - **Priority boosting**: Deadline-based automatic priority adjustment
+//! - **Distributed queue**: Pluggable interface for multi-machine processing
+//!
+//! ### Phase 4: Observability
+//! - **Metrics collection**: Local in-memory metrics with pluggable backend support
+//! - **Latency histograms**: Track command execution and wait time with percentiles (p50, p90, p95, p99)
+//! - **Queue depth alerts**: Configurable warning and critical thresholds
+//! - **Latency alerts**: Monitor and alert on command execution latency
+//! - **Prometheus/OpenTelemetry ready**: Implement MetricsBackend trait for external systems
 //!
 //! ## Quick Start
 //!
 //! ```rust,ignore
-//! use a3s_lane::{QueueManagerBuilder, EventEmitter};
+//! use a3s_lane::{QueueManagerBuilder, EventEmitter, Command, Result};
+//! use async_trait::async_trait;
+//!
+//! // Define a command
+//! struct MyCommand {
+//!     data: String,
+//! }
+//!
+//! #[async_trait]
+//! impl Command for MyCommand {
+//!     async fn execute(&self) -> Result<serde_json::Value> {
+//!         Ok(serde_json::json!({"processed": self.data}))
+//!     }
+//!
+//!     fn command_type(&self) -> &str {
+//!         "my_command"
+//!     }
+//! }
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
@@ -33,24 +76,36 @@
 //!     // Start the scheduler
 //!     manager.start().await?;
 //!
-//!     // Get statistics
-//!     let stats = manager.stats().await?;
-//!     println!("Pending: {}, Active: {}", stats.total_pending, stats.total_active);
+//!     // Submit a command
+//!     let cmd = Box::new(MyCommand { data: "hello".to_string() });
+//!     let rx = manager.submit("query", cmd).await?;
+//!
+//!     // Wait for result
+//!     let result = rx.await??;
+//!     println!("Result: {}", result);
 //!
 //!     Ok(())
 //! }
 //! ```
 //!
-//! ## Lane Priorities
+//! ## Lane Priority Model
 //!
-//! | Lane | Priority | Default Max Concurrency |
-//! |------|----------|------------------------|
-//! | system | 0 (highest) | 5 |
-//! | control | 1 | 3 |
-//! | query | 2 | 10 |
-//! | session | 3 | 5 |
-//! | skill | 4 | 3 |
-//! | prompt | 5 (lowest) | 2 |
+//! | Lane | Priority | Default Max Concurrency | Use Case |
+//! |------|----------|------------------------|----------|
+//! | system | 0 (highest) | 5 | System-level operations |
+//! | control | 1 | 3 | Control commands (pause, resume, cancel) |
+//! | query | 2 | 10 | Read-only queries |
+//! | session | 3 | 5 | Session management |
+//! | skill | 4 | 3 | Skill/tool execution |
+//! | prompt | 5 (lowest) | 2 | LLM prompt processing |
+//!
+//! ## Examples
+//!
+//! See the `examples/` directory for comprehensive examples:
+//! - `basic_usage.rs` - Simple command submission and result handling
+//! - `reliability.rs` - Timeout, retry policies, DLQ, graceful shutdown
+//! - `observability.rs` - Metrics collection, latency histograms, alerts
+//! - `scalability.rs` - Rate limiting, priority boosting, partitioning
 
 pub mod alerts;
 pub mod boost;
@@ -98,7 +153,29 @@ pub use storage::{LocalStorage, Storage, StoredCommand, StoredDeadLetter};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Queue statistics
+/// Queue statistics snapshot
+///
+/// Provides a point-in-time view of the queue state across all lanes.
+///
+/// # Fields
+///
+/// * `total_pending` - Total number of commands waiting to be executed across all lanes
+/// * `total_active` - Total number of commands currently executing across all lanes
+/// * `dead_letter_count` - Total number of permanently failed commands in the dead letter queue
+/// * `lanes` - Per-lane status information (pending, active, min/max concurrency)
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let stats = manager.stats().await?;
+/// println!("Queue has {} pending and {} active commands",
+///     stats.total_pending, stats.total_active);
+///
+/// for (lane_id, status) in &stats.lanes {
+///     println!("{}: {} pending, {} active (max: {})",
+///         lane_id, status.pending, status.active, status.max);
+/// }
+/// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QueueStats {
     pub total_pending: usize,
