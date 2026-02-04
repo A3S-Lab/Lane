@@ -1,8 +1,10 @@
 //! Queue manager provides high-level queue management
 
+use crate::alerts::AlertManager;
 use crate::config::LaneConfig;
 use crate::error::Result;
 use crate::event::EventEmitter;
+use crate::metrics::QueueMetrics;
 use crate::queue::{lane_ids, priorities, Command, CommandQueue, Lane};
 use crate::storage::Storage;
 use crate::QueueStats;
@@ -14,14 +16,33 @@ use std::sync::Arc;
 pub struct QueueManager {
     queue: Arc<CommandQueue>,
     scheduler_handle: tokio::sync::Mutex<Option<()>>,
+    metrics: Option<QueueMetrics>,
+    alerts: Option<Arc<AlertManager>>,
 }
 
 impl QueueManager {
     /// Create a new queue manager
+    #[allow(dead_code)]
     pub(crate) fn new(queue: Arc<CommandQueue>) -> Self {
         Self {
             queue,
             scheduler_handle: tokio::sync::Mutex::new(None),
+            metrics: None,
+            alerts: None,
+        }
+    }
+
+    /// Create a new queue manager with metrics and alerts
+    pub(crate) fn with_observability(
+        queue: Arc<CommandQueue>,
+        metrics: Option<QueueMetrics>,
+        alerts: Option<Arc<AlertManager>>,
+    ) -> Self {
+        Self {
+            queue,
+            scheduler_handle: tokio::sync::Mutex::new(None),
+            metrics,
+            alerts,
         }
     }
 
@@ -86,6 +107,16 @@ impl QueueManager {
     pub fn is_shutting_down(&self) -> bool {
         self.queue.is_shutting_down()
     }
+
+    /// Get the metrics collector (if configured)
+    pub fn metrics(&self) -> Option<&QueueMetrics> {
+        self.metrics.as_ref()
+    }
+
+    /// Get the alert manager (if configured)
+    pub fn alerts(&self) -> Option<&Arc<AlertManager>> {
+        self.alerts.as_ref()
+    }
 }
 
 /// Queue manager builder provides a high-level API for managing the command queue
@@ -94,6 +125,8 @@ pub struct QueueManagerBuilder {
     lane_configs: HashMap<String, (LaneConfig, u8)>,
     storage: Option<Arc<dyn Storage>>,
     dlq_size: Option<usize>,
+    metrics: Option<QueueMetrics>,
+    alerts: Option<Arc<AlertManager>>,
 }
 
 impl QueueManagerBuilder {
@@ -104,6 +137,8 @@ impl QueueManagerBuilder {
             lane_configs: HashMap::new(),
             storage: None,
             dlq_size: None,
+            metrics: None,
+            alerts: None,
         }
     }
 
@@ -122,6 +157,18 @@ impl QueueManagerBuilder {
     /// Add dead letter queue with specified size
     pub fn with_dlq(mut self, size: usize) -> Self {
         self.dlq_size = Some(size);
+        self
+    }
+
+    /// Add metrics collection
+    pub fn with_metrics(mut self, metrics: QueueMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Add alert manager
+    pub fn with_alerts(mut self, alerts: Arc<AlertManager>) -> Self {
+        self.alerts = Some(alerts);
         self
     }
 
@@ -184,7 +231,11 @@ impl QueueManagerBuilder {
             queue.register_lane(lane).await;
         }
 
-        Ok(QueueManager::new(queue))
+        Ok(QueueManager::with_observability(
+            queue,
+            self.metrics,
+            self.alerts,
+        ))
     }
 }
 
@@ -671,5 +722,81 @@ mod tests {
         // Verify DLQ has the failed command
         let stats = manager.stats().await.unwrap();
         assert_eq!(stats.dead_letter_count, 1);
+    }
+
+    // ========================================================================
+    // Observability Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_manager_with_metrics() {
+        let emitter = EventEmitter::new(100);
+        let metrics = QueueMetrics::local();
+
+        let manager = QueueManagerBuilder::new(emitter)
+            .with_metrics(metrics.clone())
+            .with_lane(lane_ids::QUERY, LaneConfig::new(1, 10), priorities::QUERY)
+            .build()
+            .await
+            .unwrap();
+
+        assert!(manager.metrics().is_some());
+
+        // Verify metrics are accessible
+        let mgr_metrics = manager.metrics().unwrap();
+        let snapshot = mgr_metrics.snapshot().await;
+        assert!(snapshot.counters.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_manager_with_alerts() {
+        let emitter = EventEmitter::new(100);
+        let alerts = Arc::new(AlertManager::with_queue_depth_alerts(100, 200));
+
+        let manager = QueueManagerBuilder::new(emitter)
+            .with_alerts(alerts.clone())
+            .with_lane(lane_ids::QUERY, LaneConfig::new(1, 10), priorities::QUERY)
+            .build()
+            .await
+            .unwrap();
+
+        assert!(manager.alerts().is_some());
+
+        // Verify alerts are accessible
+        let mgr_alerts = manager.alerts().unwrap();
+        let config = mgr_alerts.queue_depth_config().await;
+        assert_eq!(config.warning_threshold, 100);
+        assert_eq!(config.critical_threshold, 200);
+    }
+
+    #[tokio::test]
+    async fn test_manager_with_metrics_and_alerts() {
+        let emitter = EventEmitter::new(100);
+        let metrics = QueueMetrics::local();
+        let alerts = Arc::new(AlertManager::with_latency_alerts(100.0, 500.0));
+
+        let manager = QueueManagerBuilder::new(emitter)
+            .with_metrics(metrics)
+            .with_alerts(alerts)
+            .with_lane(lane_ids::QUERY, LaneConfig::new(1, 10), priorities::QUERY)
+            .build()
+            .await
+            .unwrap();
+
+        assert!(manager.metrics().is_some());
+        assert!(manager.alerts().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_manager_without_observability() {
+        let emitter = EventEmitter::new(100);
+        let manager = QueueManagerBuilder::new(emitter)
+            .with_lane(lane_ids::QUERY, LaneConfig::new(1, 10), priorities::QUERY)
+            .build()
+            .await
+            .unwrap();
+
+        assert!(manager.metrics().is_none());
+        assert!(manager.alerts().is_none());
     }
 }

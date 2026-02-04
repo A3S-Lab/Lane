@@ -85,6 +85,10 @@ async fn main() -> anyhow::Result<()> {
 - **Rate Limiting**: Token bucket and sliding window rate limiters per lane
 - **Priority Boosting**: Deadline-based automatic priority adjustment
 - **Distributed Queue Support**: Pluggable interface for multi-machine processing
+- **Metrics Collection**: Local in-memory metrics with pluggable backend support
+- **Latency Histograms**: Track command execution and wait time with percentiles (p50, p90, p95, p99)
+- **Queue Depth Alerts**: Configurable warning and critical thresholds
+- **Latency Alerts**: Monitor and alert on command execution latency
 - **Event System**: Subscribe to queue events for monitoring
 - **Health Monitoring**: Track queue depth and active command counts
 - **Builder Pattern**: Flexible queue configuration
@@ -408,6 +412,122 @@ impl Storage for RedisStorage {
 }
 ```
 
+### Observability Features
+
+#### Metrics Collection
+
+```rust
+use a3s_lane::{QueueManagerBuilder, EventEmitter, QueueMetrics, LaneConfig};
+
+let emitter = EventEmitter::new(100);
+
+// Create local metrics collector
+let metrics = QueueMetrics::local();
+
+// Build queue manager with metrics
+let manager = QueueManagerBuilder::new(emitter)
+    .with_metrics(metrics.clone())
+    .with_lane("api", LaneConfig::new(1, 5), 0)
+    .build()
+    .await?;
+
+// Record metrics manually (or integrate into command execution)
+metrics.record_submit("api").await;
+metrics.record_complete("api", 150.0).await; // 150ms latency
+
+// Get metrics snapshot
+let snapshot = metrics.snapshot().await;
+println!("Commands submitted: {:?}", snapshot.counters.get("lane.commands.submitted"));
+
+// Get latency histogram stats
+if let Some(stats) = snapshot.histograms.get("lane.command.latency_ms") {
+    println!("Latency p50: {}ms, p99: {}ms", stats.percentiles.p50, stats.percentiles.p99);
+}
+```
+
+**Custom Metrics Backend (Prometheus/OpenTelemetry):**
+
+```rust
+use a3s_lane::{MetricsBackend, HistogramStats, MetricsSnapshot};
+use async_trait::async_trait;
+
+struct PrometheusMetrics {
+    // Your Prometheus client
+}
+
+#[async_trait]
+impl MetricsBackend for PrometheusMetrics {
+    async fn increment_counter(&self, name: &str, value: u64) {
+        // Push to Prometheus
+    }
+
+    async fn set_gauge(&self, name: &str, value: f64) {
+        // Push to Prometheus
+    }
+
+    async fn record_histogram(&self, name: &str, value: f64) {
+        // Push to Prometheus
+    }
+
+    // Implement other methods...
+}
+```
+
+#### Queue Depth Alerts
+
+```rust
+use a3s_lane::{QueueManagerBuilder, EventEmitter, AlertManager, LaneConfig};
+use std::sync::Arc;
+
+let emitter = EventEmitter::new(100);
+
+// Create alert manager with queue depth thresholds
+let alerts = Arc::new(AlertManager::with_queue_depth_alerts(
+    100,  // Warning threshold
+    200,  // Critical threshold
+));
+
+// Add alert callback
+alerts.add_callback(|alert| {
+    println!("[{}] {}: {}",
+        match alert.level {
+            AlertLevel::Warning => "WARN",
+            AlertLevel::Critical => "CRIT",
+            _ => "INFO",
+        },
+        alert.lane_id,
+        alert.message
+    );
+}).await;
+
+// Build queue manager with alerts
+let manager = QueueManagerBuilder::new(emitter)
+    .with_alerts(alerts.clone())
+    .with_lane("api", LaneConfig::new(1, 5), 0)
+    .build()
+    .await?;
+
+// Check queue depth (triggers alerts if thresholds exceeded)
+alerts.check_queue_depth("api", 150).await; // Triggers warning
+alerts.check_queue_depth("api", 250).await; // Triggers critical
+```
+
+#### Latency Alerts
+
+```rust
+use a3s_lane::{AlertManager, LatencyAlertConfig};
+
+// Create alert manager with latency thresholds
+let alerts = AlertManager::with_latency_alerts(
+    100.0,  // Warning threshold (ms)
+    500.0,  // Critical threshold (ms)
+);
+
+// Check latency after command execution
+alerts.check_latency("api", 250.0).await; // Triggers warning
+alerts.check_latency("api", 600.0).await; // Triggers critical
+```
+
 ## API Reference
 
 ### QueueManagerBuilder
@@ -419,6 +539,8 @@ impl Storage for RedisStorage {
 | `with_default_lanes()` | Add the 6 default lanes |
 | `with_storage(storage)` | Add persistent storage backend |
 | `with_dlq(size)` | Add dead letter queue with max size |
+| `with_metrics(metrics)` | Add metrics collection |
+| `with_alerts(alerts)` | Add alert manager |
 | `build()` | Build the QueueManager |
 
 ### QueueManager
@@ -429,6 +551,8 @@ impl Storage for RedisStorage {
 | `submit(lane_id, command)` | Submit a command to a lane |
 | `stats()` | Get queue statistics |
 | `queue()` | Get underlying CommandQueue |
+| `metrics()` | Get metrics collector (if configured) |
+| `alerts()` | Get alert manager (if configured) |
 | `shutdown()` | Initiate graceful shutdown (stop accepting new commands) |
 | `drain(timeout)` | Wait for pending commands to complete with timeout |
 | `is_shutting_down()` | Check if shutdown is in progress |
@@ -527,6 +651,50 @@ impl Storage for RedisStorage {
 | `auto()` | Create with auto-detected CPU cores |
 | `new(config)` | Create with custom partition config |
 
+### QueueMetrics
+
+| Method | Description |
+|--------|-------------|
+| `local()` | Create with local in-memory backend |
+| `new(backend)` | Create with custom metrics backend |
+| `record_submit(lane_id)` | Record command submission |
+| `record_complete(lane_id, latency_ms)` | Record command completion with latency |
+| `record_failure(lane_id)` | Record command failure |
+| `record_timeout(lane_id)` | Record command timeout |
+| `record_retry(lane_id)` | Record command retry |
+| `record_dead_letter(lane_id)` | Record command sent to DLQ |
+| `set_queue_depth(lane_id, depth)` | Update queue depth gauge |
+| `set_active_commands(lane_id, active)` | Update active commands gauge |
+| `record_wait_time(lane_id, wait_time_ms)` | Record command wait time |
+| `snapshot()` | Get snapshot of all metrics |
+| `reset()` | Reset all metrics |
+
+### MetricsBackend Trait
+
+| Method | Description |
+|--------|-------------|
+| `increment_counter(name, value)` | Increment a counter metric |
+| `set_gauge(name, value)` | Set a gauge metric value |
+| `record_histogram(name, value)` | Record histogram observation |
+| `get_counter(name)` | Get current counter value |
+| `get_gauge(name)` | Get current gauge value |
+| `get_histogram_stats(name)` | Get histogram statistics |
+| `reset()` | Reset all metrics |
+| `snapshot()` | Export all metrics as snapshot |
+
+### AlertManager
+
+| Method | Description |
+|--------|-------------|
+| `new()` | Create with alerts disabled |
+| `with_queue_depth_alerts(warn, crit)` | Create with queue depth alerts |
+| `with_latency_alerts(warn_ms, crit_ms)` | Create with latency alerts |
+| `set_queue_depth_config(config)` | Update queue depth alert config |
+| `set_latency_config(config)` | Update latency alert config |
+| `add_callback(callback)` | Add alert callback function |
+| `check_queue_depth(lane_id, depth)` | Check queue depth and trigger alerts |
+| `check_latency(lane_id, latency_ms)` | Check latency and trigger alerts |
+
 ### QueueMonitor
 
 | Method | Description |
@@ -624,7 +792,9 @@ lane/
     ├── partition.rs    # Partitioning strategies (Phase 3)
     ├── distributed.rs  # Distributed queue support (Phase 3)
     ├── ratelimit.rs    # Rate limiting (Phase 3)
-    └── boost.rs        # Priority boosting (Phase 3)
+    ├── boost.rs        # Priority boosting (Phase 3)
+    ├── metrics.rs      # Metrics collection (Phase 4)
+    └── alerts.rs       # Alert management (Phase 4)
 ```
 
 ## A3S Ecosystem
@@ -685,12 +855,13 @@ A3S Lane is a **utility component** of the A3S ecosystem — a standalone priori
 - [x] Priority boosting (deadline-based automatic priority adjustment)
 - [x] Rate limiting per lane (token bucket and sliding window algorithms)
 
-### Phase 4: Observability 📋
+### Phase 4: Observability ✅
 
-- [ ] Prometheus metrics export
-- [ ] OpenTelemetry integration
-- [ ] Queue depth alerts
-- [ ] Latency histograms
+- [x] Metrics collection (LocalMetrics + pluggable MetricsBackend trait)
+- [x] Latency histograms with percentiles (p50, p90, p95, p99)
+- [x] Queue depth alerts with configurable thresholds
+- [x] Latency alerts with warning and critical levels
+- [x] Prometheus/OpenTelemetry ready (implement MetricsBackend trait)
 
 ## License
 

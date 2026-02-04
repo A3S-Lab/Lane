@@ -52,6 +52,7 @@
 //! | skill | 4 | 3 |
 //! | prompt | 5 (lowest) | 2 |
 
+pub mod alerts;
 pub mod boost;
 pub mod config;
 pub mod distributed;
@@ -59,6 +60,7 @@ pub mod dlq;
 pub mod error;
 pub mod event;
 pub mod manager;
+pub mod metrics;
 pub mod monitor;
 pub mod partition;
 pub mod queue;
@@ -67,6 +69,7 @@ pub mod retry;
 pub mod storage;
 
 // Re-export main types
+pub use alerts::{Alert, AlertLevel, AlertManager, LatencyAlertConfig, QueueDepthAlertConfig};
 pub use boost::{PriorityBoostConfig, PriorityBooster};
 pub use config::LaneConfig;
 pub use distributed::{
@@ -76,6 +79,10 @@ pub use dlq::{DeadLetter, DeadLetterQueue};
 pub use error::{LaneError, Result};
 pub use event::{EventEmitter, EventPayload, EventStream, LaneEvent};
 pub use manager::{QueueManager, QueueManagerBuilder};
+pub use metrics::{
+    metric_names, HistogramPercentiles, HistogramStats, LocalMetrics, MetricsBackend,
+    MetricsSnapshot, QueueMetrics,
+};
 pub use monitor::{MonitorConfig, QueueMonitor};
 pub use partition::{
     CustomPartitioner, HashPartitioner, PartitionConfig, PartitionId, PartitionStrategy,
