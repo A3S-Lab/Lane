@@ -1,5 +1,7 @@
 //! Lane configuration types
 
+use crate::boost::PriorityBoostConfig;
+use crate::ratelimit::RateLimitConfig;
 use crate::retry::RetryPolicy;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -21,6 +23,12 @@ pub struct LaneConfig {
     /// Retry policy for failed commands
     #[serde(default)]
     pub retry_policy: RetryPolicy,
+    /// Rate limit configuration
+    #[serde(skip)]
+    pub rate_limit: Option<RateLimitConfig>,
+    /// Priority boost configuration
+    #[serde(skip)]
+    pub priority_boost: Option<PriorityBoostConfig>,
 }
 
 mod duration_serde {
@@ -53,6 +61,8 @@ impl Default for LaneConfig {
             max_concurrency: 4,
             default_timeout: None,
             retry_policy: RetryPolicy::default(),
+            rate_limit: None,
+            priority_boost: None,
         }
     }
 }
@@ -65,50 +75,33 @@ impl LaneConfig {
             max_concurrency,
             default_timeout: None,
             retry_policy: RetryPolicy::default(),
+            rate_limit: None,
+            priority_boost: None,
         }
     }
 
-    /// Create a new lane configuration with timeout
-    pub fn with_timeout(
-        min_concurrency: usize,
-        max_concurrency: usize,
-        timeout: Duration,
-    ) -> Self {
-        Self {
-            min_concurrency,
-            max_concurrency,
-            default_timeout: Some(timeout),
-            retry_policy: RetryPolicy::default(),
-        }
+    /// Set timeout (builder pattern)
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.default_timeout = Some(timeout);
+        self
     }
 
-    /// Create a new lane configuration with retry policy
-    pub fn with_retry(
-        min_concurrency: usize,
-        max_concurrency: usize,
-        retry_policy: RetryPolicy,
-    ) -> Self {
-        Self {
-            min_concurrency,
-            max_concurrency,
-            default_timeout: None,
-            retry_policy,
-        }
+    /// Set retry policy (builder pattern)
+    pub fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
+        self
     }
 
-    /// Create a new lane configuration with timeout and retry policy
-    pub fn with_timeout_and_retry(
-        min_concurrency: usize,
-        max_concurrency: usize,
-        timeout: Duration,
-        retry_policy: RetryPolicy,
-    ) -> Self {
-        Self {
-            min_concurrency,
-            max_concurrency,
-            default_timeout: Some(timeout),
-            retry_policy,
-        }
+    /// Set rate limit (builder pattern)
+    pub fn with_rate_limit(mut self, rate_limit: RateLimitConfig) -> Self {
+        self.rate_limit = Some(rate_limit);
+        self
+    }
+
+    /// Set priority boost (builder pattern)
+    pub fn with_priority_boost(mut self, priority_boost: PriorityBoostConfig) -> Self {
+        self.priority_boost = Some(priority_boost);
+        self
     }
 }
 
@@ -134,7 +127,7 @@ mod tests {
 
     #[test]
     fn test_lane_config_with_timeout() {
-        let config = LaneConfig::with_timeout(2, 8, Duration::from_secs(30));
+        let config = LaneConfig::new(2, 8).with_timeout(Duration::from_secs(30));
         assert_eq!(config.min_concurrency, 2);
         assert_eq!(config.max_concurrency, 8);
         assert_eq!(config.default_timeout, Some(Duration::from_secs(30)));
@@ -144,7 +137,7 @@ mod tests {
     #[test]
     fn test_lane_config_with_retry() {
         let retry = RetryPolicy::exponential(3);
-        let config = LaneConfig::with_retry(2, 8, retry.clone());
+        let config = LaneConfig::new(2, 8).with_retry_policy(retry.clone());
         assert_eq!(config.min_concurrency, 2);
         assert_eq!(config.max_concurrency, 8);
         assert!(config.default_timeout.is_none());
@@ -154,12 +147,28 @@ mod tests {
     #[test]
     fn test_lane_config_with_timeout_and_retry() {
         let retry = RetryPolicy::fixed(5, Duration::from_secs(1));
-        let config =
-            LaneConfig::with_timeout_and_retry(2, 8, Duration::from_secs(30), retry.clone());
+        let config = LaneConfig::new(2, 8)
+            .with_timeout(Duration::from_secs(30))
+            .with_retry_policy(retry.clone());
         assert_eq!(config.min_concurrency, 2);
         assert_eq!(config.max_concurrency, 8);
         assert_eq!(config.default_timeout, Some(Duration::from_secs(30)));
         assert_eq!(config.retry_policy, retry);
+    }
+
+    #[test]
+    fn test_lane_config_with_rate_limit() {
+        let rate_limit = RateLimitConfig::per_second(100);
+        let config = LaneConfig::new(2, 8).with_rate_limit(rate_limit.clone());
+        assert!(config.rate_limit.is_some());
+        assert_eq!(config.rate_limit.unwrap().max_commands, 100);
+    }
+
+    #[test]
+    fn test_lane_config_with_priority_boost() {
+        let boost = PriorityBoostConfig::standard(Duration::from_secs(60));
+        let config = LaneConfig::new(2, 8).with_priority_boost(boost);
+        assert!(config.priority_boost.is_some());
     }
 
     #[test]

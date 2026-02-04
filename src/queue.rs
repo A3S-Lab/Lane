@@ -867,7 +867,7 @@ mod tests {
         let emitter = EventEmitter::new(100);
         let queue = Arc::new(CommandQueue::new(emitter));
 
-        let config = LaneConfig::with_timeout(1, 4, std::time::Duration::from_millis(50));
+        let config = LaneConfig::new(1, 4).with_timeout(std::time::Duration::from_millis(50));
         let lane = Arc::new(Lane::new("test-lane", config, priorities::QUERY));
         queue.register_lane(lane).await;
 
@@ -929,7 +929,7 @@ mod tests {
         let emitter = EventEmitter::new(100);
         let queue = Arc::new(CommandQueue::new(emitter));
 
-        let config = LaneConfig::with_timeout(1, 4, std::time::Duration::from_secs(5));
+        let config = LaneConfig::new(1, 4).with_timeout(std::time::Duration::from_secs(5));
         let lane = Arc::new(Lane::new("test-lane", config, priorities::QUERY));
         queue.register_lane(lane).await;
 
@@ -981,7 +981,7 @@ mod tests {
         let queue = Arc::new(CommandQueue::new(emitter));
 
         let retry_policy = RetryPolicy::fixed(3, std::time::Duration::from_millis(10));
-        let config = LaneConfig::with_retry(1, 4, retry_policy);
+        let config = LaneConfig::new(1, 4).with_retry_policy(retry_policy);
         let lane = Arc::new(Lane::new("test-lane", config, priorities::QUERY));
         queue.register_lane(lane).await;
 
@@ -1025,7 +1025,7 @@ mod tests {
         let queue = Arc::new(CommandQueue::new(emitter));
 
         let retry_policy = RetryPolicy::fixed(2, std::time::Duration::from_millis(10));
-        let config = LaneConfig::with_retry(1, 4, retry_policy);
+        let config = LaneConfig::new(1, 4).with_retry_policy(retry_policy);
         let lane = Arc::new(Lane::new("test-lane", config, priorities::QUERY));
         queue.register_lane(lane).await;
 
@@ -1072,7 +1072,7 @@ mod tests {
         let queue = Arc::new(CommandQueue::new(emitter));
 
         let retry_policy = RetryPolicy::exponential(3);
-        let config = LaneConfig::with_retry(1, 4, retry_policy);
+        let config = LaneConfig::new(1, 4).with_retry_policy(retry_policy);
         let lane = Arc::new(Lane::new("test-lane", config, priorities::QUERY));
         queue.register_lane(lane).await;
 
@@ -1116,7 +1116,7 @@ mod tests {
         let queue = Arc::new(CommandQueue::with_dlq(emitter, 100));
 
         let retry_policy = RetryPolicy::fixed(2, std::time::Duration::from_millis(10));
-        let config = LaneConfig::with_retry(1, 4, retry_policy);
+        let config = LaneConfig::new(1, 4).with_retry_policy(retry_policy);
         let lane = Arc::new(Lane::new("test-lane", config, priorities::QUERY));
         queue.register_lane(lane).await;
 

@@ -80,6 +80,11 @@ async fn main() -> anyhow::Result<()> {
 - **Dead Letter Queue**: Capture permanently failed commands for inspection
 - **Persistent Storage**: Optional pluggable storage backend (LocalStorage included)
 - **Graceful Shutdown**: Drain pending commands before shutdown
+- **Multi-core Parallelism**: Automatic CPU core detection and parallel processing
+- **Queue Partitioning**: Distribute commands across workers for scalability
+- **Rate Limiting**: Token bucket and sliding window rate limiters per lane
+- **Priority Boosting**: Deadline-based automatic priority adjustment
+- **Distributed Queue Support**: Pluggable interface for multi-machine processing
 - **Event System**: Subscribe to queue events for monitoring
 - **Health Monitoring**: Track queue depth and active command counts
 - **Builder Pattern**: Flexible queue configuration
@@ -266,6 +271,92 @@ manager.drain(Duration::from_secs(30)).await?;
 println!("All commands completed, safe to exit");
 ```
 
+### Scalability Features
+
+#### Multi-core Parallelism
+
+```rust
+use a3s_lane::{PartitionConfig, LocalDistributedQueue};
+
+// Automatically use all CPU cores
+let partition_config = PartitionConfig::auto();
+let distributed_queue = Arc::new(LocalDistributedQueue::auto());
+
+println!("Using {} CPU cores for parallel processing",
+    partition_config.num_partitions);
+```
+
+#### Queue Partitioning
+
+```rust
+use a3s_lane::{PartitionConfig, PartitionStrategy};
+
+// Round-robin partitioning across 8 workers
+let config = PartitionConfig::round_robin(8);
+
+// Hash-based partitioning (same command types go to same partition)
+let config = PartitionConfig::hash(8);
+```
+
+#### Rate Limiting
+
+```rust
+use a3s_lane::{LaneConfig, RateLimitConfig};
+
+// Limit to 100 commands per second
+let rate_limit = RateLimitConfig::per_second(100);
+let config = LaneConfig::new(1, 10)
+    .with_rate_limit(rate_limit);
+
+// Limit to 1000 commands per minute
+let rate_limit = RateLimitConfig::per_minute(1000);
+let config = LaneConfig::new(1, 10)
+    .with_rate_limit(rate_limit);
+```
+
+#### Priority Boosting
+
+```rust
+use a3s_lane::{LaneConfig, PriorityBoostConfig};
+use std::time::Duration;
+
+// Standard boost: priority increases as deadline approaches
+let boost = PriorityBoostConfig::standard(Duration::from_secs(300));
+let config = LaneConfig::new(1, 10)
+    .with_priority_boost(boost);
+
+// Aggressive boost: faster priority escalation
+let boost = PriorityBoostConfig::aggressive(Duration::from_secs(60));
+let config = LaneConfig::new(1, 10)
+    .with_priority_boost(boost);
+```
+
+#### Custom Distributed Queue
+
+```rust
+use a3s_lane::{DistributedQueue, CommandEnvelope, CommandResult};
+use async_trait::async_trait;
+
+struct RedisDistributedQueue {
+    // Your Redis client
+}
+
+#[async_trait]
+impl DistributedQueue for RedisDistributedQueue {
+    async fn enqueue(&self, envelope: CommandEnvelope) -> Result<()> {
+        // Enqueue to Redis
+        Ok(())
+    }
+
+    async fn dequeue(&self, partition_id: PartitionId) -> Result<Option<CommandEnvelope>> {
+        // Dequeue from Redis
+        Ok(None)
+    }
+
+    // Implement other methods...
+}
+```
+
 #### Persistent Storage
 
 ```rust
@@ -349,6 +440,8 @@ impl Storage for RedisStorage {
 | `new(min, max)` | Create config with min/max concurrency |
 | `with_timeout(duration)` | Set command timeout for this lane |
 | `with_retry_policy(policy)` | Set retry policy for this lane |
+| `with_rate_limit(config)` | Set rate limiting for this lane |
+| `with_priority_boost(config)` | Set priority boosting for this lane |
 
 ### RetryPolicy
 
@@ -389,6 +482,50 @@ impl Storage for RedisStorage {
 | Method | Description |
 |--------|-------------|
 | `new(path)` | Create local filesystem storage at path |
+
+### PartitionConfig
+
+| Method | Description |
+|--------|-------------|
+| `auto()` | Auto-detect CPU cores for optimal parallelism |
+| `round_robin(n)` | Round-robin distribution across n partitions |
+| `hash(n)` | Hash-based distribution across n partitions |
+| `none()` | No partitioning (single partition) |
+
+### RateLimitConfig
+
+| Method | Description |
+|--------|-------------|
+| `per_second(n)` | Limit to n commands per second |
+| `per_minute(n)` | Limit to n commands per minute |
+| `per_hour(n)` | Limit to n commands per hour |
+| `unlimited()` | No rate limiting |
+
+### PriorityBoostConfig
+
+| Method | Description |
+|--------|-------------|
+| `standard(deadline)` | Standard boost intervals (25%, 50%, 75%) |
+| `aggressive(deadline)` | Aggressive boost intervals |
+| `disabled()` | No priority boosting |
+| `with_boost(time, boost)` | Add custom boost interval |
+
+### DistributedQueue Trait
+
+| Method | Description |
+|--------|-------------|
+| `enqueue(envelope)` | Enqueue command for processing |
+| `dequeue(partition_id)` | Dequeue command from partition |
+| `complete(result)` | Report command completion |
+| `num_partitions()` | Get number of partitions |
+| `worker_id()` | Get worker identifier |
+
+### LocalDistributedQueue
+
+| Method | Description |
+|--------|-------------|
+| `auto()` | Create with auto-detected CPU cores |
+| `new(config)` | Create with custom partition config |
 
 ### QueueMonitor
 
@@ -483,7 +620,11 @@ lane/
     ├── monitor.rs      # QueueMonitor, MonitorConfig
     ├── retry.rs        # RetryPolicy (Phase 2)
     ├── dlq.rs          # DeadLetterQueue (Phase 2)
-    └── storage.rs      # Storage trait, LocalStorage (Phase 2)
+    ├── storage.rs      # Storage trait, LocalStorage (Phase 2)
+    ├── partition.rs    # Partitioning strategies (Phase 3)
+    ├── distributed.rs  # Distributed queue support (Phase 3)
+    ├── ratelimit.rs    # Rate limiting (Phase 3)
+    └── boost.rs        # Priority boosting (Phase 3)
 ```
 
 ## A3S Ecosystem
@@ -536,12 +677,13 @@ A3S Lane is a **utility component** of the A3S ecosystem — a standalone priori
 - [x] Dead letter queue for failed commands
 - [x] Graceful shutdown with drain
 
-### Phase 3: Scalability 📋
+### Phase 3: Scalability ✅
 
-- [ ] Distributed queue support
-- [ ] Priority boosting (deadline-based)
-- [ ] Rate limiting per lane
-- [ ] Queue partitioning
+- [x] Queue partitioning (round-robin, hash-based, custom strategies)
+- [x] Multi-core parallelism (automatic CPU core detection)
+- [x] Distributed queue support (pluggable DistributedQueue trait)
+- [x] Priority boosting (deadline-based automatic priority adjustment)
+- [x] Rate limiting per lane (token bucket and sliding window algorithms)
 
 ### Phase 4: Observability 📋
 

@@ -52,26 +52,39 @@
 //! | skill | 4 | 3 |
 //! | prompt | 5 (lowest) | 2 |
 
+pub mod boost;
 pub mod config;
+pub mod distributed;
 pub mod dlq;
 pub mod error;
 pub mod event;
 pub mod manager;
 pub mod monitor;
+pub mod partition;
 pub mod queue;
+pub mod ratelimit;
 pub mod retry;
 pub mod storage;
 
 // Re-export main types
+pub use boost::{PriorityBoostConfig, PriorityBooster};
 pub use config::LaneConfig;
+pub use distributed::{
+    CommandEnvelope, CommandResult, DistributedQueue, LocalDistributedQueue, WorkerPool, WorkerId,
+};
 pub use dlq::{DeadLetter, DeadLetterQueue};
 pub use error::{LaneError, Result};
 pub use event::{EventEmitter, EventPayload, EventStream, LaneEvent};
 pub use manager::{QueueManager, QueueManagerBuilder};
 pub use monitor::{MonitorConfig, QueueMonitor};
+pub use partition::{
+    CustomPartitioner, HashPartitioner, PartitionConfig, PartitionId, PartitionStrategy,
+    Partitioner, RoundRobinPartitioner,
+};
 pub use queue::{
     lane_ids, priorities, Command, CommandId, CommandQueue, Lane, LaneId, LaneStatus, Priority,
 };
+pub use ratelimit::{RateLimitConfig, RateLimiter, SlidingWindowLimiter, TokenBucketLimiter};
 pub use retry::RetryPolicy;
 pub use storage::{LocalStorage, Storage, StoredCommand, StoredDeadLetter};
 
