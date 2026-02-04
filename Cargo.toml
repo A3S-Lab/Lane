@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2021"
 authors = ["A3S Lab"]
 license = "MIT"
-description = "Lane-based priority command queue for async task scheduling"
-repository = "https://github.com/a3s-lab/lane"
-keywords = ["queue", "priority", "async", "scheduler", "lane"]
+description = "Lane-based priority command queue for async task scheduling with reliability, scalability, and observability features"
+repository = "https://github.com/a3s-lab/a3s"
+documentation = "https://docs.rs/a3s-lane"
+readme = "README.md"
+keywords = ["queue", "priority", "async", "scheduler", "concurrency"]
 categories = ["asynchronous", "concurrency"]
 
 [lib]
