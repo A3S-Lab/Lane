@@ -1,11 +1,16 @@
 //! Core queue implementation with lanes and priority scheduling
 
 use crate::config::LaneConfig;
+use crate::dlq::{DeadLetter, DeadLetterQueue};
 use crate::error::{LaneError, Result};
 use crate::event::EventEmitter;
+use crate::retry::RetryPolicy;
+use crate::storage::{Storage, StoredCommand};
 use async_trait::async_trait;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 use uuid::Uuid;
@@ -45,8 +50,13 @@ pub trait Command: Send + Sync {
 #[allow(dead_code)]
 struct CommandWrapper {
     id: CommandId,
-    command: Box<dyn Command>,
-    result_tx: tokio::sync::oneshot::Sender<Result<serde_json::Value>>,
+    command: Arc<dyn Command>,
+    result_tx: Option<tokio::sync::oneshot::Sender<Result<serde_json::Value>>>,
+    timeout: Option<std::time::Duration>,
+    retry_policy: RetryPolicy,
+    attempt: u32,
+    lane_id: LaneId,
+    command_type: String,
 }
 
 /// Lane state
@@ -93,6 +103,7 @@ impl LaneState {
 pub struct Lane {
     id: LaneId,
     state: Arc<Mutex<LaneState>>,
+    storage: Option<Arc<dyn Storage>>,
 }
 
 impl Lane {
@@ -101,6 +112,21 @@ impl Lane {
         Self {
             id: id.into(),
             state: Arc::new(Mutex::new(LaneState::new(config, priority))),
+            storage: None,
+        }
+    }
+
+    /// Create a new lane with storage
+    pub fn with_storage(
+        id: impl Into<String>,
+        config: LaneConfig,
+        priority: Priority,
+        storage: Arc<dyn Storage>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            state: Arc::new(Mutex::new(LaneState::new(config, priority))),
+            storage: Some(storage),
         }
     }
 
@@ -120,16 +146,56 @@ impl Lane {
         command: Box<dyn Command>,
     ) -> tokio::sync::oneshot::Receiver<Result<serde_json::Value>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let state = self.state.lock().await;
+        let timeout = state.config.default_timeout;
+        let retry_policy = state.config.retry_policy.clone();
+        drop(state);
+
+        let command_id = Uuid::new_v4().to_string();
+        let command_type = command.command_type().to_string();
         let wrapper = CommandWrapper {
-            id: Uuid::new_v4().to_string(),
-            command,
-            result_tx: tx,
+            id: command_id.clone(),
+            command: Arc::from(command),
+            result_tx: Some(tx),
+            timeout,
+            retry_policy,
+            attempt: 0,
+            lane_id: self.id.clone(),
+            command_type: command_type.clone(),
         };
+
+        // Persist to storage if available
+        if let Some(storage) = &self.storage {
+            let stored_cmd = StoredCommand {
+                id: command_id,
+                command_type,
+                lane_id: self.id.clone(),
+                payload: serde_json::json!({}), // Empty payload for now
+                retry_count: 0,
+                created_at: Utc::now(),
+                last_attempt_at: None,
+            };
+            // Ignore storage errors to not block command execution
+            let _ = storage.save_command(stored_cmd).await;
+        }
 
         let mut state = self.state.lock().await;
         state.pending.push_back(wrapper);
 
         rx
+    }
+
+    /// Re-enqueue a command for retry (internal use)
+    async fn retry_command(&self, mut wrapper: CommandWrapper, delay: std::time::Duration) {
+        wrapper.attempt += 1;
+
+        // Spawn a task to re-enqueue after delay
+        let state_clone = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let mut state = state_clone.lock().await;
+            state.pending.push_back(wrapper);
+        });
     }
 
     /// Try to dequeue a command for execution
@@ -175,6 +241,10 @@ pub struct LaneStatus {
 pub struct CommandQueue {
     lanes: Arc<Mutex<HashMap<LaneId, Arc<Lane>>>>,
     event_emitter: EventEmitter,
+    dlq: Option<DeadLetterQueue>,
+    storage: Option<Arc<dyn Storage>>,
+    is_shutting_down: Arc<AtomicBool>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
 }
 
 impl CommandQueue {
@@ -183,6 +253,102 @@ impl CommandQueue {
         Self {
             lanes: Arc::new(Mutex::new(HashMap::new())),
             event_emitter,
+            dlq: None,
+            storage: None,
+            is_shutting_down: Arc::new(AtomicBool::new(false)),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Create a new command queue with a dead letter queue
+    pub fn with_dlq(event_emitter: EventEmitter, dlq_size: usize) -> Self {
+        Self {
+            lanes: Arc::new(Mutex::new(HashMap::new())),
+            event_emitter,
+            dlq: Some(DeadLetterQueue::new(dlq_size)),
+            storage: None,
+            is_shutting_down: Arc::new(AtomicBool::new(false)),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Create a new command queue with storage
+    pub fn with_storage(event_emitter: EventEmitter, storage: Arc<dyn Storage>) -> Self {
+        Self {
+            lanes: Arc::new(Mutex::new(HashMap::new())),
+            event_emitter,
+            dlq: None,
+            storage: Some(storage),
+            is_shutting_down: Arc::new(AtomicBool::new(false)),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Create a new command queue with both DLQ and storage
+    pub fn with_dlq_and_storage(
+        event_emitter: EventEmitter,
+        dlq_size: usize,
+        storage: Arc<dyn Storage>,
+    ) -> Self {
+        Self {
+            lanes: Arc::new(Mutex::new(HashMap::new())),
+            event_emitter,
+            dlq: Some(DeadLetterQueue::new(dlq_size)),
+            storage: Some(storage),
+            is_shutting_down: Arc::new(AtomicBool::new(false)),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Get the storage backend
+    pub fn storage(&self) -> Option<&Arc<dyn Storage>> {
+        self.storage.as_ref()
+    }
+
+    /// Get the dead letter queue
+    pub fn dlq(&self) -> Option<&DeadLetterQueue> {
+        self.dlq.as_ref()
+    }
+
+    /// Check if shutdown is in progress
+    pub fn is_shutting_down(&self) -> bool {
+        self.is_shutting_down.load(Ordering::SeqCst)
+    }
+
+    /// Initiate graceful shutdown - stop accepting new commands
+    pub async fn shutdown(&self) {
+        self.is_shutting_down.store(true, Ordering::SeqCst);
+    }
+
+    /// Wait for all pending commands to complete (with timeout)
+    pub async fn drain(&self, timeout: std::time::Duration) -> Result<()> {
+        let start = std::time::Instant::now();
+
+        loop {
+            // Check if all lanes are empty and idle
+            let lanes = self.lanes.lock().await;
+            let mut all_idle = true;
+
+            for lane in lanes.values() {
+                let status = lane.status().await;
+                if status.pending > 0 || status.active > 0 {
+                    all_idle = false;
+                    break;
+                }
+            }
+            drop(lanes);
+
+            if all_idle {
+                return Ok(());
+            }
+
+            // Check timeout
+            if start.elapsed() >= timeout {
+                return Err(LaneError::Timeout(timeout));
+            }
+
+            // Wait a bit before checking again
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
 
@@ -198,6 +364,11 @@ impl CommandQueue {
         lane_id: &str,
         command: Box<dyn Command>,
     ) -> Result<tokio::sync::oneshot::Receiver<Result<serde_json::Value>>> {
+        // Reject new commands during shutdown
+        if self.is_shutting_down() {
+            return Err(LaneError::ShutdownInProgress);
+        }
+
         let lanes = self.lanes.lock().await;
         let lane = lanes
             .get(lane_id)
@@ -232,12 +403,75 @@ impl CommandQueue {
         lane_priorities.sort_by_key(|(priority, _)| *priority);
 
         for (_, lane) in lane_priorities {
-            if let Some(wrapper) = lane.try_dequeue().await {
+            if let Some(mut wrapper) = lane.try_dequeue().await {
                 let lane_clone = Arc::clone(&lane);
+                let timeout = wrapper.timeout;
+                let retry_policy = wrapper.retry_policy.clone();
+                let attempt = wrapper.attempt;
+                let dlq = self.dlq.clone();
+                let command_id = wrapper.id.clone();
+                let command_type = wrapper.command_type.clone();
+                let lane_id = wrapper.lane_id.clone();
+                let storage = lane.storage.clone();
+
                 tokio::spawn(async move {
-                    let result = wrapper.command.execute().await;
-                    let _ = wrapper.result_tx.send(result);
-                    lane_clone.mark_completed().await;
+                    let result = match timeout {
+                        Some(dur) => {
+                            match tokio::time::timeout(dur, wrapper.command.execute()).await {
+                                Ok(r) => r,
+                                Err(_) => Err(LaneError::Timeout(dur)),
+                            }
+                        }
+                        None => wrapper.command.execute().await,
+                    };
+
+                    match result {
+                        Ok(value) => {
+                            // Success - remove from storage
+                            if let Some(storage) = &storage {
+                                let _ = storage.remove_command(&command_id).await;
+                            }
+
+                            // Send result if channel is still open
+                            if let Some(tx) = wrapper.result_tx.take() {
+                                let _ = tx.send(Ok(value));
+                            }
+                            lane_clone.mark_completed().await;
+                        }
+                        Err(err) => {
+                            // Check if we should retry
+                            if retry_policy.should_retry(attempt) {
+                                let delay = retry_policy.delay_for_attempt(attempt + 1);
+                                // Re-enqueue for retry
+                                lane_clone.retry_command(wrapper, delay).await;
+                                lane_clone.mark_completed().await;
+                            } else {
+                                // No more retries - remove from storage
+                                if let Some(storage) = &storage {
+                                    let _ = storage.remove_command(&command_id).await;
+                                }
+
+                                // Send to DLQ if available
+                                if let Some(dlq) = dlq {
+                                    let dead_letter = DeadLetter {
+                                        command_id,
+                                        command_type,
+                                        lane_id,
+                                        error: err.to_string(),
+                                        attempts: attempt + 1,
+                                        failed_at: Utc::now(),
+                                    };
+                                    dlq.push(dead_letter).await;
+                                }
+
+                                // Send error to caller
+                                if let Some(tx) = wrapper.result_tx.take() {
+                                    let _ = tx.send(Err(err));
+                                }
+                                lane_clone.mark_completed().await;
+                            }
+                        }
+                    }
                 });
                 break;
             }
@@ -355,10 +589,7 @@ mod tests {
 
     #[test]
     fn test_lane_new() {
-        let config = LaneConfig {
-            min_concurrency: 1,
-            max_concurrency: 4,
-        };
+        let config = LaneConfig::new(1, 4);
         let lane = Lane::new("test-lane", config, priorities::QUERY);
 
         assert_eq!(lane.id(), "test-lane");
@@ -366,10 +597,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_lane_priority() {
-        let config = LaneConfig {
-            min_concurrency: 1,
-            max_concurrency: 4,
-        };
+        let config = LaneConfig::new(1, 4);
         let lane = Lane::new("test", config, priorities::SESSION);
 
         assert_eq!(lane.priority().await, priorities::SESSION);
@@ -377,10 +605,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_lane_status_initial() {
-        let config = LaneConfig {
-            min_concurrency: 2,
-            max_concurrency: 8,
-        };
+        let config = LaneConfig::new(2, 8);
         let lane = Lane::new("test", config, priorities::QUERY);
 
         let status = lane.status().await;
@@ -392,10 +617,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_lane_enqueue() {
-        let config = LaneConfig {
-            min_concurrency: 1,
-            max_concurrency: 4,
-        };
+        let config = LaneConfig::new(1, 4);
         let lane = Lane::new("test", config, priorities::QUERY);
 
         let cmd = Box::new(TestCommand::new(serde_json::json!({"result": "ok"})));
@@ -439,10 +661,7 @@ mod tests {
         let emitter = EventEmitter::new(100);
         let queue = CommandQueue::new(emitter);
 
-        let config = LaneConfig {
-            min_concurrency: 1,
-            max_concurrency: 4,
-        };
+        let config = LaneConfig::new(1, 4);
         let lane = Arc::new(Lane::new("test-lane", config, priorities::QUERY));
 
         queue.register_lane(lane).await;
@@ -456,10 +675,7 @@ mod tests {
         let emitter = EventEmitter::new(100);
         let queue = CommandQueue::new(emitter);
 
-        let config = LaneConfig {
-            min_concurrency: 1,
-            max_concurrency: 4,
-        };
+        let config = LaneConfig::new(1, 4);
         let lane = Arc::new(Lane::new("test-lane", config, priorities::QUERY));
         queue.register_lane(lane).await;
 
@@ -498,10 +714,7 @@ mod tests {
         ];
 
         for (id, priority, max) in configs {
-            let config = LaneConfig {
-                min_concurrency: 1,
-                max_concurrency: max,
-            };
+            let config = LaneConfig::new(1, max);
             let lane = Arc::new(Lane::new(id, config, priority));
             queue.register_lane(lane).await;
         }
@@ -518,10 +731,7 @@ mod tests {
         let emitter = EventEmitter::new(100);
         let queue = CommandQueue::new(emitter);
 
-        let config = LaneConfig {
-            min_concurrency: 2,
-            max_concurrency: 16,
-        };
+        let config = LaneConfig::new(2, 16);
         let lane = Arc::new(Lane::new("query", config, priorities::QUERY));
         queue.register_lane(lane).await;
 
@@ -536,10 +746,7 @@ mod tests {
 
     #[test]
     fn test_lane_state_has_capacity() {
-        let config = LaneConfig {
-            min_concurrency: 1,
-            max_concurrency: 2,
-        };
+        let config = LaneConfig::new(1, 2);
         let mut state = LaneState::new(config, priorities::QUERY);
 
         assert!(state.has_capacity());
@@ -551,10 +758,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_lane_state_has_pending() {
-        let config = LaneConfig {
-            min_concurrency: 1,
-            max_concurrency: 4,
-        };
+        let config = LaneConfig::new(1, 4);
         let state = LaneState::new(config, priorities::QUERY);
 
         assert!(!state.has_pending());
@@ -656,5 +860,398 @@ mod tests {
     fn test_command_id_type() {
         let id: CommandId = "cmd-123".to_string();
         assert_eq!(id, "cmd-123");
+    }
+
+    #[tokio::test]
+    async fn test_command_timeout() {
+        let emitter = EventEmitter::new(100);
+        let queue = Arc::new(CommandQueue::new(emitter));
+
+        let config = LaneConfig::with_timeout(1, 4, std::time::Duration::from_millis(50));
+        let lane = Arc::new(Lane::new("test-lane", config, priorities::QUERY));
+        queue.register_lane(lane).await;
+
+        // Start scheduler
+        Arc::clone(&queue).start_scheduler().await;
+
+        // Submit a command that takes longer than timeout
+        let cmd = Box::new(TestCommand::with_delay(
+            serde_json::json!({"result": "ok"}),
+            200,
+        ));
+        let rx = queue.submit("test-lane", cmd).await.unwrap();
+
+        // Wait for result
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+            .await
+            .expect("Timeout waiting for result")
+            .expect("Channel closed");
+
+        // Should be a timeout error
+        assert!(result.is_err());
+        if let Err(LaneError::Timeout(dur)) = result {
+            assert_eq!(dur, std::time::Duration::from_millis(50));
+        } else {
+            panic!("Expected Timeout error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_command_no_timeout() {
+        let emitter = EventEmitter::new(100);
+        let queue = Arc::new(CommandQueue::new(emitter));
+
+        let config = LaneConfig::new(1, 4);
+        let lane = Arc::new(Lane::new("test-lane", config, priorities::QUERY));
+        queue.register_lane(lane).await;
+
+        Arc::clone(&queue).start_scheduler().await;
+
+        // Submit a command with delay but no timeout configured
+        let cmd = Box::new(TestCommand::with_delay(
+            serde_json::json!({"result": "ok"}),
+            50,
+        ));
+        let rx = queue.submit("test-lane", cmd).await.unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+            .await
+            .expect("Timeout waiting for result")
+            .expect("Channel closed");
+
+        // Should succeed
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap()["result"], "ok");
+    }
+
+    #[tokio::test]
+    async fn test_command_completes_before_timeout() {
+        let emitter = EventEmitter::new(100);
+        let queue = Arc::new(CommandQueue::new(emitter));
+
+        let config = LaneConfig::with_timeout(1, 4, std::time::Duration::from_secs(5));
+        let lane = Arc::new(Lane::new("test-lane", config, priorities::QUERY));
+        queue.register_lane(lane).await;
+
+        Arc::clone(&queue).start_scheduler().await;
+
+        // Submit a fast command with long timeout
+        let cmd = Box::new(TestCommand::with_delay(
+            serde_json::json!({"result": "fast"}),
+            10,
+        ));
+        let rx = queue.submit("test-lane", cmd).await.unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+            .await
+            .expect("Timeout waiting for result")
+            .expect("Channel closed");
+
+        // Should succeed
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap()["result"], "fast");
+    }
+
+    #[tokio::test]
+    async fn test_command_retry_on_failure() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        // Command that fails first 2 times, then succeeds
+        struct RetryableCommand {
+            attempts: Arc<AtomicU32>,
+        }
+
+        #[async_trait]
+        impl Command for RetryableCommand {
+            async fn execute(&self) -> Result<serde_json::Value> {
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt < 2 {
+                    Err(LaneError::Other(format!("Attempt {} failed", attempt)))
+                } else {
+                    Ok(serde_json::json!({"success": true, "attempts": attempt + 1}))
+                }
+            }
+
+            fn command_type(&self) -> &str {
+                "retryable"
+            }
+        }
+
+        let emitter = EventEmitter::new(100);
+        let queue = Arc::new(CommandQueue::new(emitter));
+
+        let retry_policy = RetryPolicy::fixed(3, std::time::Duration::from_millis(10));
+        let config = LaneConfig::with_retry(1, 4, retry_policy);
+        let lane = Arc::new(Lane::new("test-lane", config, priorities::QUERY));
+        queue.register_lane(lane).await;
+
+        Arc::clone(&queue).start_scheduler().await;
+
+        let attempts = Arc::new(AtomicU32::new(0));
+        let cmd = Box::new(RetryableCommand {
+            attempts: Arc::clone(&attempts),
+        });
+        let rx = queue.submit("test-lane", cmd).await.unwrap();
+
+        // Wait for result (should succeed after retries)
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .expect("Timeout waiting for result")
+            .expect("Channel closed");
+
+        assert!(result.is_ok());
+        let value = result.unwrap();
+        assert_eq!(value["success"], true);
+        assert_eq!(value["attempts"], 3); // Failed twice, succeeded on 3rd attempt
+    }
+
+    #[tokio::test]
+    async fn test_command_retry_exhausted() {
+        // Command that always fails
+        struct AlwaysFailCommand;
+
+        #[async_trait]
+        impl Command for AlwaysFailCommand {
+            async fn execute(&self) -> Result<serde_json::Value> {
+                Err(LaneError::Other("Always fails".to_string()))
+            }
+
+            fn command_type(&self) -> &str {
+                "always_fail"
+            }
+        }
+
+        let emitter = EventEmitter::new(100);
+        let queue = Arc::new(CommandQueue::new(emitter));
+
+        let retry_policy = RetryPolicy::fixed(2, std::time::Duration::from_millis(10));
+        let config = LaneConfig::with_retry(1, 4, retry_policy);
+        let lane = Arc::new(Lane::new("test-lane", config, priorities::QUERY));
+        queue.register_lane(lane).await;
+
+        Arc::clone(&queue).start_scheduler().await;
+
+        let cmd = Box::new(AlwaysFailCommand);
+        let rx = queue.submit("test-lane", cmd).await.unwrap();
+
+        // Wait for result (should fail after exhausting retries)
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .expect("Timeout waiting for result")
+            .expect("Channel closed");
+
+        assert!(result.is_err());
+        if let Err(LaneError::Other(msg)) = result {
+            assert_eq!(msg, "Always fails");
+        } else {
+            panic!("Expected Other error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_command_no_retry_on_success() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct CountingCommand {
+            counter: Arc<AtomicU32>,
+        }
+
+        #[async_trait]
+        impl Command for CountingCommand {
+            async fn execute(&self) -> Result<serde_json::Value> {
+                let count = self.counter.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({"count": count + 1}))
+            }
+
+            fn command_type(&self) -> &str {
+                "counting"
+            }
+        }
+
+        let emitter = EventEmitter::new(100);
+        let queue = Arc::new(CommandQueue::new(emitter));
+
+        let retry_policy = RetryPolicy::exponential(3);
+        let config = LaneConfig::with_retry(1, 4, retry_policy);
+        let lane = Arc::new(Lane::new("test-lane", config, priorities::QUERY));
+        queue.register_lane(lane).await;
+
+        Arc::clone(&queue).start_scheduler().await;
+
+        let counter = Arc::new(AtomicU32::new(0));
+        let cmd = Box::new(CountingCommand {
+            counter: Arc::clone(&counter),
+        });
+        let rx = queue.submit("test-lane", cmd).await.unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+            .await
+            .expect("Timeout waiting for result")
+            .expect("Channel closed");
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap()["count"], 1);
+
+        // Verify command was only executed once (no retries on success)
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_dlq_integration() {
+        // Command that always fails
+        struct FailCommand;
+
+        #[async_trait]
+        impl Command for FailCommand {
+            async fn execute(&self) -> Result<serde_json::Value> {
+                Err(LaneError::Other("Permanent failure".to_string()))
+            }
+
+            fn command_type(&self) -> &str {
+                "fail_command"
+            }
+        }
+
+        let emitter = EventEmitter::new(100);
+        let queue = Arc::new(CommandQueue::with_dlq(emitter, 100));
+
+        let retry_policy = RetryPolicy::fixed(2, std::time::Duration::from_millis(10));
+        let config = LaneConfig::with_retry(1, 4, retry_policy);
+        let lane = Arc::new(Lane::new("test-lane", config, priorities::QUERY));
+        queue.register_lane(lane).await;
+
+        Arc::clone(&queue).start_scheduler().await;
+
+        // Submit a failing command
+        let cmd = Box::new(FailCommand);
+        let rx = queue.submit("test-lane", cmd).await.unwrap();
+
+        // Wait for result
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .expect("Timeout waiting for result")
+            .expect("Channel closed");
+
+        assert!(result.is_err());
+
+        // Check DLQ
+        let dlq = queue.dlq().expect("DLQ should exist");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await; // Give time for DLQ push
+
+        assert_eq!(dlq.len().await, 1);
+
+        let letters = dlq.list().await;
+        assert_eq!(letters[0].command_type, "fail_command");
+        assert_eq!(letters[0].lane_id, "test-lane");
+        assert_eq!(letters[0].attempts, 3); // Initial + 2 retries
+        assert!(letters[0].error.contains("Permanent failure"));
+    }
+
+    #[tokio::test]
+    async fn test_no_dlq_without_configuration() {
+        let emitter = EventEmitter::new(100);
+        let queue = Arc::new(CommandQueue::new(emitter));
+
+        assert!(queue.dlq().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_rejects_new_commands() {
+        let emitter = EventEmitter::new(100);
+        let queue = Arc::new(CommandQueue::new(emitter));
+
+        let config = LaneConfig::new(1, 4);
+        let lane = Arc::new(Lane::new("test-lane", config, priorities::QUERY));
+        queue.register_lane(lane).await;
+
+        // Initiate shutdown
+        queue.shutdown().await;
+        assert!(queue.is_shutting_down());
+
+        // Try to submit a command - should be rejected
+        let cmd = Box::new(TestCommand::new(serde_json::json!({"test": "data"})));
+        let result = queue.submit("test-lane", cmd).await;
+
+        assert!(result.is_err());
+        if let Err(LaneError::ShutdownInProgress) = result {
+            // Expected
+        } else {
+            panic!("Expected ShutdownInProgress error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_drain_waits_for_completion() {
+        let emitter = EventEmitter::new(100);
+        let queue = Arc::new(CommandQueue::new(emitter));
+
+        let config = LaneConfig::new(1, 4);
+        let lane = Arc::new(Lane::new("test-lane", config, priorities::QUERY));
+        queue.register_lane(lane).await;
+
+        Arc::clone(&queue).start_scheduler().await;
+
+        // Submit a slow command
+        let cmd = Box::new(TestCommand::with_delay(
+            serde_json::json!({"result": "ok"}),
+            100,
+        ));
+        let rx = queue.submit("test-lane", cmd).await.unwrap();
+
+        // Initiate shutdown
+        queue.shutdown().await;
+
+        // Drain should wait for the command to complete
+        let drain_result = queue.drain(std::time::Duration::from_secs(2)).await;
+        assert!(drain_result.is_ok());
+
+        // Command should have completed
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx)
+            .await
+            .expect("Timeout")
+            .expect("Channel closed");
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_drain_timeout() {
+        let emitter = EventEmitter::new(100);
+        let queue = Arc::new(CommandQueue::new(emitter));
+
+        let config = LaneConfig::new(1, 4);
+        let lane = Arc::new(Lane::new("test-lane", config, priorities::QUERY));
+        queue.register_lane(lane).await;
+
+        Arc::clone(&queue).start_scheduler().await;
+
+        // Submit a very slow command
+        let cmd = Box::new(TestCommand::with_delay(
+            serde_json::json!({"result": "ok"}),
+            5000,
+        ));
+        let _rx = queue.submit("test-lane", cmd).await.unwrap();
+
+        // Initiate shutdown
+        queue.shutdown().await;
+
+        // Drain with short timeout should fail
+        let drain_result = queue.drain(std::time::Duration::from_millis(50)).await;
+        assert!(drain_result.is_err());
+        if let Err(LaneError::Timeout(_)) = drain_result {
+            // Expected
+        } else {
+            panic!("Expected Timeout error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_is_shutting_down() {
+        let emitter = EventEmitter::new(100);
+        let queue = Arc::new(CommandQueue::new(emitter));
+
+        assert!(!queue.is_shutting_down());
+
+        queue.shutdown().await;
+        assert!(queue.is_shutting_down());
     }
 }

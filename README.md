@@ -75,6 +75,11 @@ async fn main() -> anyhow::Result<()> {
 - **Priority-based Scheduling**: Commands execute based on lane priority (lower = higher priority)
 - **Concurrency Control**: Per-lane min/max concurrency limits
 - **6 Built-in Lanes**: system, control, query, session, skill, prompt
+- **Command Timeout**: Configurable timeout per lane with automatic cancellation
+- **Retry Policies**: Exponential backoff, fixed delay, or custom retry strategies
+- **Dead Letter Queue**: Capture permanently failed commands for inspection
+- **Persistent Storage**: Optional pluggable storage backend (LocalStorage included)
+- **Graceful Shutdown**: Drain pending commands before shutdown
 - **Event System**: Subscribe to queue events for monitoring
 - **Health Monitoring**: Track queue depth and active command counts
 - **Builder Pattern**: Flexible queue configuration
@@ -186,6 +191,132 @@ tokio::spawn(async move {
 });
 ```
 
+### Reliability Features
+
+#### Command Timeout
+
+```rust
+use a3s_lane::{LaneConfig, QueueManagerBuilder, EventEmitter};
+use std::time::Duration;
+
+let emitter = EventEmitter::new(100);
+
+// Configure lane with 30-second timeout
+let config = LaneConfig::new(1, 5)
+    .with_timeout(Duration::from_secs(30));
+
+let manager = QueueManagerBuilder::new(emitter)
+    .with_lane("api", config, 0)
+    .build()
+    .await?;
+```
+
+#### Retry Policies
+
+```rust
+use a3s_lane::{LaneConfig, RetryPolicy, QueueManagerBuilder, EventEmitter};
+use std::time::Duration;
+
+let emitter = EventEmitter::new(100);
+
+// Exponential backoff: 3 retries, 1s -> 2s -> 4s
+let retry_policy = RetryPolicy::exponential(3)
+    .with_initial_delay(Duration::from_secs(1))
+    .with_max_delay(Duration::from_secs(10));
+
+let config = LaneConfig::new(1, 5)
+    .with_retry_policy(retry_policy);
+
+let manager = QueueManagerBuilder::new(emitter)
+    .with_lane("external-api", config, 0)
+    .build()
+    .await?;
+```
+
+#### Dead Letter Queue
+
+```rust
+use a3s_lane::{CommandQueue, EventEmitter, DeadLetterQueue};
+
+let emitter = EventEmitter::new(100);
+let dlq = DeadLetterQueue::new(1000); // Max 1000 dead letters
+
+// Create queue with DLQ
+let queue = CommandQueue::with_dlq(emitter, dlq.clone());
+
+// Later: inspect failed commands
+let dead_letters = dlq.list().await;
+for letter in dead_letters {
+    println!("Failed: {} - {}", letter.command_type, letter.error);
+}
+```
+
+#### Graceful Shutdown
+
+```rust
+use a3s_lane::QueueManager;
+use std::time::Duration;
+
+// Initiate shutdown (stop accepting new commands)
+manager.shutdown().await;
+
+// Wait for pending commands to complete (with 30s timeout)
+manager.drain(Duration::from_secs(30)).await?;
+
+println!("All commands completed, safe to exit");
+```
+
+#### Persistent Storage
+
+```rust
+use a3s_lane::{QueueManagerBuilder, EventEmitter, LocalStorage, LaneConfig};
+use std::path::PathBuf;
+
+let emitter = EventEmitter::new(100);
+let storage_dir = PathBuf::from("./queue_data");
+let storage = Arc::new(LocalStorage::new(storage_dir).await?);
+
+// Create queue with persistent storage
+let manager = QueueManagerBuilder::new(emitter)
+    .with_storage(storage.clone())
+    .with_lane("api", LaneConfig::new(1, 5), 0)
+    .build()
+    .await?;
+
+// Commands are automatically persisted to disk
+// On restart, you can inspect stored commands:
+let stored_commands = storage.load_commands().await?;
+for cmd in stored_commands {
+    println!("Pending: {} ({})", cmd.command_type, cmd.id);
+}
+```
+
+**Custom Storage Backend:**
+
+```rust
+use a3s_lane::{Storage, StoredCommand, StoredDeadLetter};
+use async_trait::async_trait;
+
+struct RedisStorage {
+    // Your Redis client
+}
+
+#[async_trait]
+impl Storage for RedisStorage {
+    async fn save_command(&self, command: StoredCommand) -> Result<()> {
+        // Store in Redis
+        Ok(())
+    }
+
+    async fn load_commands(&self) -> Result<Vec<StoredCommand>> {
+        // Load from Redis
+        Ok(vec![])
+    }
+
+    // Implement other methods...
+}
+```
+
 ## API Reference
 
 ### QueueManagerBuilder
@@ -195,6 +326,8 @@ tokio::spawn(async move {
 | `new(emitter)` | Create a new builder |
 | `with_lane(id, config, priority)` | Add a custom lane |
 | `with_default_lanes()` | Add the 6 default lanes |
+| `with_storage(storage)` | Add persistent storage backend |
+| `with_dlq(size)` | Add dead letter queue with max size |
 | `build()` | Build the QueueManager |
 
 ### QueueManager
@@ -205,6 +338,57 @@ tokio::spawn(async move {
 | `submit(lane_id, command)` | Submit a command to a lane |
 | `stats()` | Get queue statistics |
 | `queue()` | Get underlying CommandQueue |
+| `shutdown()` | Initiate graceful shutdown (stop accepting new commands) |
+| `drain(timeout)` | Wait for pending commands to complete with timeout |
+| `is_shutting_down()` | Check if shutdown is in progress |
+
+### LaneConfig
+
+| Method | Description |
+|--------|-------------|
+| `new(min, max)` | Create config with min/max concurrency |
+| `with_timeout(duration)` | Set command timeout for this lane |
+| `with_retry_policy(policy)` | Set retry policy for this lane |
+
+### RetryPolicy
+
+| Method | Description |
+|--------|-------------|
+| `exponential(max_retries)` | Create exponential backoff policy (2x multiplier) |
+| `fixed(max_retries, delay)` | Create fixed delay policy |
+| `none()` | No retries |
+| `with_initial_delay(duration)` | Set initial delay (default: 1s) |
+| `with_max_delay(duration)` | Set maximum delay cap (default: 60s) |
+| `with_multiplier(f64)` | Set backoff multiplier (default: 2.0) |
+
+### DeadLetterQueue
+
+| Method | Description |
+|--------|-------------|
+| `new(max_size)` | Create DLQ with maximum size |
+| `push(letter)` | Add a dead letter |
+| `pop()` | Remove and return oldest dead letter |
+| `list()` | Get all dead letters |
+| `clear()` | Remove all dead letters |
+| `len()` | Get current count |
+
+### Storage Trait
+
+| Method | Description |
+|--------|-------------|
+| `save_command(cmd)` | Persist a command to storage |
+| `load_commands()` | Load all pending commands |
+| `remove_command(id)` | Remove a completed command |
+| `save_dead_letter(letter)` | Persist a dead letter |
+| `load_dead_letters()` | Load all dead letters |
+| `clear_dead_letters()` | Clear all dead letters |
+| `clear_all()` | Clear all storage |
+
+### LocalStorage
+
+| Method | Description |
+|--------|-------------|
+| `new(path)` | Create local filesystem storage at path |
 
 ### QueueMonitor
 
@@ -296,7 +480,10 @@ lane/
     ├── event.rs        # EventEmitter, LaneEvent
     ├── queue.rs        # Lane, CommandQueue, Command trait
     ├── manager.rs      # QueueManager, QueueManagerBuilder
-    └── monitor.rs      # QueueMonitor, MonitorConfig
+    ├── monitor.rs      # QueueMonitor, MonitorConfig
+    ├── retry.rs        # RetryPolicy (Phase 2)
+    ├── dlq.rs          # DeadLetterQueue (Phase 2)
+    └── storage.rs      # Storage trait, LocalStorage (Phase 2)
 ```
 
 ## A3S Ecosystem
@@ -341,12 +528,13 @@ A3S Lane is a **utility component** of the A3S ecosystem — a standalone priori
 - [x] Health monitoring with thresholds
 - [x] Async-first with Tokio
 
-### Phase 2: Reliability 🚧
+### Phase 2: Reliability ✅
 
-- [ ] Persistent queue storage
-- [ ] Command retries with exponential backoff
-- [ ] Dead letter queue for failed commands
-- [ ] Graceful shutdown with drain
+- [x] Persistent queue storage (LocalStorage + pluggable Storage trait)
+- [x] Command timeout support
+- [x] Command retries with exponential backoff
+- [x] Dead letter queue for failed commands
+- [x] Graceful shutdown with drain
 
 ### Phase 3: Scalability 📋
 

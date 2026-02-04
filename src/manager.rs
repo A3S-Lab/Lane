@@ -4,6 +4,7 @@ use crate::config::LaneConfig;
 use crate::error::Result;
 use crate::event::EventEmitter;
 use crate::queue::{lane_ids, priorities, Command, CommandQueue, Lane};
+use crate::storage::Storage;
 use crate::QueueStats;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -53,9 +54,15 @@ impl QueueManager {
             total_active += status.active;
         }
 
+        let dead_letter_count = match self.queue.dlq() {
+            Some(dlq) => dlq.len().await,
+            None => 0,
+        };
+
         Ok(QueueStats {
             total_pending,
             total_active,
+            dead_letter_count,
             lanes: lane_status,
         })
     }
@@ -64,12 +71,29 @@ impl QueueManager {
     pub fn queue(&self) -> Arc<CommandQueue> {
         Arc::clone(&self.queue)
     }
+
+    /// Initiate graceful shutdown - stop accepting new commands
+    pub async fn shutdown(&self) {
+        self.queue.shutdown().await;
+    }
+
+    /// Wait for all pending commands to complete (with timeout)
+    pub async fn drain(&self, timeout: std::time::Duration) -> Result<()> {
+        self.queue.drain(timeout).await
+    }
+
+    /// Check if shutdown is in progress
+    pub fn is_shutting_down(&self) -> bool {
+        self.queue.is_shutting_down()
+    }
 }
 
 /// Queue manager builder provides a high-level API for managing the command queue
 pub struct QueueManagerBuilder {
     event_emitter: EventEmitter,
     lane_configs: HashMap<String, (LaneConfig, u8)>,
+    storage: Option<Arc<dyn Storage>>,
+    dlq_size: Option<usize>,
 }
 
 impl QueueManagerBuilder {
@@ -78,6 +102,8 @@ impl QueueManagerBuilder {
         Self {
             event_emitter,
             lane_configs: HashMap::new(),
+            storage: None,
+            dlq_size: None,
         }
     }
 
@@ -87,78 +113,74 @@ impl QueueManagerBuilder {
         self
     }
 
+    /// Add storage backend for persistence
+    pub fn with_storage(mut self, storage: Arc<dyn Storage>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    /// Add dead letter queue with specified size
+    pub fn with_dlq(mut self, size: usize) -> Self {
+        self.dlq_size = Some(size);
+        self
+    }
+
     /// Add default lanes (system, control, query, session, skill, prompt)
     pub fn with_default_lanes(mut self) -> Self {
         self.lane_configs.insert(
             lane_ids::SYSTEM.to_string(),
-            (
-                LaneConfig {
-                    min_concurrency: 1,
-                    max_concurrency: 5,
-                },
-                priorities::SYSTEM,
-            ),
+            (LaneConfig::new(1, 5), priorities::SYSTEM),
         );
         self.lane_configs.insert(
             lane_ids::CONTROL.to_string(),
-            (
-                LaneConfig {
-                    min_concurrency: 1,
-                    max_concurrency: 3,
-                },
-                priorities::CONTROL,
-            ),
+            (LaneConfig::new(1, 3), priorities::CONTROL),
         );
         self.lane_configs.insert(
             lane_ids::QUERY.to_string(),
-            (
-                LaneConfig {
-                    min_concurrency: 1,
-                    max_concurrency: 10,
-                },
-                priorities::QUERY,
-            ),
+            (LaneConfig::new(1, 10), priorities::QUERY),
         );
         self.lane_configs.insert(
             lane_ids::SESSION.to_string(),
-            (
-                LaneConfig {
-                    min_concurrency: 1,
-                    max_concurrency: 5,
-                },
-                priorities::SESSION,
-            ),
+            (LaneConfig::new(1, 5), priorities::SESSION),
         );
         self.lane_configs.insert(
             lane_ids::SKILL.to_string(),
-            (
-                LaneConfig {
-                    min_concurrency: 1,
-                    max_concurrency: 3,
-                },
-                priorities::SKILL,
-            ),
+            (LaneConfig::new(1, 3), priorities::SKILL),
         );
         self.lane_configs.insert(
             lane_ids::PROMPT.to_string(),
-            (
-                LaneConfig {
-                    min_concurrency: 1,
-                    max_concurrency: 2,
-                },
-                priorities::PROMPT,
-            ),
+            (LaneConfig::new(1, 2), priorities::PROMPT),
         );
         self
     }
 
     /// Build the queue manager
     pub async fn build(self) -> anyhow::Result<QueueManager> {
-        let queue = Arc::new(CommandQueue::new(self.event_emitter));
+        // Create queue with appropriate configuration
+        let queue = match (self.dlq_size, self.storage.clone()) {
+            (Some(dlq_size), Some(storage)) => {
+                Arc::new(CommandQueue::with_dlq_and_storage(
+                    self.event_emitter,
+                    dlq_size,
+                    storage.clone(),
+                ))
+            }
+            (Some(dlq_size), None) => {
+                Arc::new(CommandQueue::with_dlq(self.event_emitter, dlq_size))
+            }
+            (None, Some(storage)) => {
+                Arc::new(CommandQueue::with_storage(self.event_emitter, storage.clone()))
+            }
+            (None, None) => Arc::new(CommandQueue::new(self.event_emitter)),
+        };
 
         // Register all lanes
         for (id, (config, priority)) in self.lane_configs {
-            let lane = Arc::new(Lane::new(id, config, priority));
+            let lane = if let Some(storage) = &self.storage {
+                Arc::new(Lane::with_storage(id, config, priority, storage.clone()))
+            } else {
+                Arc::new(Lane::new(id, config, priority))
+            };
             queue.register_lane(lane).await;
         }
 
@@ -213,10 +235,7 @@ mod tests {
         ];
 
         for (id, priority, max) in lanes {
-            let config = LaneConfig {
-                min_concurrency: 1,
-                max_concurrency: max,
-            };
+            let config = LaneConfig::new(1, max);
             queue
                 .register_lane(Arc::new(Lane::new(id, config, priority)))
                 .await;
@@ -523,5 +542,134 @@ mod tests {
             .expect("Channel closed");
         assert!(result.is_ok());
         assert_eq!(result.unwrap()["direct"], true);
+    }
+
+    // ========================================================================
+    // Shutdown Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_manager_shutdown() {
+        let manager = make_manager().await;
+
+        assert!(!manager.is_shutting_down());
+
+        manager.shutdown().await;
+        assert!(manager.is_shutting_down());
+    }
+
+    #[tokio::test]
+    async fn test_manager_shutdown_rejects_commands() {
+        let manager = make_manager().await;
+
+        manager.shutdown().await;
+
+        let cmd = Box::new(TestCommand {
+            result: serde_json::json!({}),
+        });
+        let result = manager.submit(lane_ids::QUERY, cmd).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_manager_drain() {
+        let manager = make_manager().await;
+        manager.start().await.unwrap();
+
+        // Submit a command
+        let cmd = Box::new(TestCommand {
+            result: serde_json::json!({"test": "data"}),
+        });
+        let _rx = manager.submit(lane_ids::QUERY, cmd).await.unwrap();
+
+        // Shutdown and drain
+        manager.shutdown().await;
+        let drain_result = manager.drain(std::time::Duration::from_secs(2)).await;
+
+        assert!(drain_result.is_ok());
+    }
+
+    // ========================================================================
+    // Storage Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_manager_with_storage() {
+        use crate::storage::LocalStorage;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let storage = Arc::new(LocalStorage::new(temp_dir.path().to_path_buf()).await.unwrap());
+
+        let emitter = EventEmitter::new(100);
+        let manager = QueueManagerBuilder::new(emitter)
+            .with_storage(storage.clone())
+            .with_lane(lane_ids::QUERY, LaneConfig::new(1, 10), priorities::QUERY)
+            .build()
+            .await
+            .unwrap();
+
+        manager.start().await.unwrap();
+
+        // Submit a command
+        let cmd = Box::new(TestCommand {
+            result: serde_json::json!({"stored": true}),
+        });
+        let rx = manager.submit(lane_ids::QUERY, cmd).await.unwrap();
+
+        // Wait for command to complete
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+            .await
+            .expect("Timeout")
+            .expect("Channel closed");
+        assert!(result.is_ok());
+
+        // Verify command was removed from storage after completion
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let stored_commands = storage.load_commands().await.unwrap();
+        assert_eq!(stored_commands.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_manager_with_storage_and_dlq() {
+        use crate::storage::LocalStorage;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let storage = Arc::new(LocalStorage::new(temp_dir.path().to_path_buf()).await.unwrap());
+
+        let emitter = EventEmitter::new(100);
+        let manager = QueueManagerBuilder::new(emitter)
+            .with_storage(storage.clone())
+            .with_dlq(100)
+            .with_lane(lane_ids::QUERY, LaneConfig::new(1, 10), priorities::QUERY)
+            .build()
+            .await
+            .unwrap();
+
+        manager.start().await.unwrap();
+
+        // Submit a failing command
+        let cmd = Box::new(FailingCommand {
+            message: "test error".to_string(),
+        });
+        let rx = manager.submit(lane_ids::QUERY, cmd).await.unwrap();
+
+        // Wait for command to fail
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+            .await
+            .expect("Timeout")
+            .expect("Channel closed");
+        assert!(result.is_err());
+
+        // Verify command was removed from storage after failure
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let stored_commands = storage.load_commands().await.unwrap();
+        assert_eq!(stored_commands.len(), 0);
+
+        // Verify DLQ has the failed command
+        let stats = manager.stats().await.unwrap();
+        assert_eq!(stats.dead_letter_count, 1);
     }
 }

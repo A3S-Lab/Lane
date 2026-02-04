@@ -124,6 +124,11 @@ pub mod events {
     pub const QUEUE_COMMAND_STARTED: &str = "queue.command.started";
     pub const QUEUE_COMMAND_COMPLETED: &str = "queue.command.completed";
     pub const QUEUE_COMMAND_FAILED: &str = "queue.command.failed";
+    pub const QUEUE_COMMAND_TIMEOUT: &str = "queue.command.timeout";
+    pub const QUEUE_COMMAND_RETRY: &str = "queue.command.retry";
+    pub const QUEUE_COMMAND_DEAD_LETTERED: &str = "queue.command.dead_lettered";
+    pub const QUEUE_SHUTDOWN_STARTED: &str = "queue.shutdown.started";
+    pub const QUEUE_SHUTDOWN_COMPLETE: &str = "queue.shutdown.complete";
 }
 
 #[cfg(test)]
@@ -291,5 +296,13 @@ mod tests {
         assert_eq!(events::QUEUE_COMMAND_STARTED, "queue.command.started");
         assert_eq!(events::QUEUE_COMMAND_COMPLETED, "queue.command.completed");
         assert_eq!(events::QUEUE_COMMAND_FAILED, "queue.command.failed");
+        assert_eq!(events::QUEUE_COMMAND_TIMEOUT, "queue.command.timeout");
+        assert_eq!(events::QUEUE_COMMAND_RETRY, "queue.command.retry");
+        assert_eq!(
+            events::QUEUE_COMMAND_DEAD_LETTERED,
+            "queue.command.dead_lettered"
+        );
+        assert_eq!(events::QUEUE_SHUTDOWN_STARTED, "queue.shutdown.started");
+        assert_eq!(events::QUEUE_SHUTDOWN_COMPLETE, "queue.shutdown.complete");
     }
 }

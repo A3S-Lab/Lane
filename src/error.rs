@@ -21,6 +21,14 @@ pub enum LaneError {
     #[error("Command execution error: {0}")]
     CommandError(String),
 
+    /// Command timeout
+    #[error("Command timed out after {0:?}")]
+    Timeout(std::time::Duration),
+
+    /// Shutdown in progress
+    #[error("Queue is shutting down, not accepting new commands")]
+    ShutdownInProgress,
+
     /// Other error
     #[error("{0}")]
     Other(String),
@@ -55,6 +63,21 @@ mod tests {
     fn test_command_error() {
         let error = LaneError::CommandError("execution failed".to_string());
         assert_eq!(error.to_string(), "Command execution error: execution failed");
+    }
+
+    #[test]
+    fn test_timeout_error() {
+        let error = LaneError::Timeout(std::time::Duration::from_secs(5));
+        assert_eq!(error.to_string(), "Command timed out after 5s");
+    }
+
+    #[test]
+    fn test_shutdown_in_progress_error() {
+        let error = LaneError::ShutdownInProgress;
+        assert_eq!(
+            error.to_string(),
+            "Queue is shutting down, not accepting new commands"
+        );
     }
 
     #[test]

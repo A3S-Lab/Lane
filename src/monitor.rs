@@ -106,9 +106,15 @@ impl QueueMonitor {
             total_active += status.active;
         }
 
+        let dead_letter_count = match self.queue.dlq() {
+            Some(dlq) => dlq.len().await,
+            None => 0,
+        };
+
         QueueStats {
             total_pending,
             total_active,
+            dead_letter_count,
             lanes: lane_status,
         }
     }
@@ -136,10 +142,7 @@ mod tests {
         ];
 
         for (id, priority, max) in lanes {
-            let config = LaneConfig {
-                min_concurrency: 1,
-                max_concurrency: max,
-            };
+            let config = LaneConfig::new(1, max);
             queue
                 .register_lane(Arc::new(Lane::new(id, config, priority)))
                 .await;
@@ -467,6 +470,7 @@ mod tests {
         let stats = QueueStats {
             total_pending: 5,
             total_active: 2,
+            dead_letter_count: 0,
             lanes,
         };
 
@@ -483,6 +487,7 @@ mod tests {
         let stats = QueueStats {
             total_pending: 10,
             total_active: 3,
+            dead_letter_count: 0,
             lanes: std::collections::HashMap::new(),
         };
         let cloned = stats.clone();

@@ -14,7 +14,7 @@ name = "a3s_lane"
 path = "src/lib.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+tokio = { version = "1", features = ["sync", "time", "rt", "macros", "fs"] }
 async-trait = "0.1"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
@@ -27,3 +27,4 @@ chrono = { version = "0.4", features = ["serde"] }
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3"

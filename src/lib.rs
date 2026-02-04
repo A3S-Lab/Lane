@@ -53,14 +53,18 @@
 //! | prompt | 5 (lowest) | 2 |
 
 pub mod config;
+pub mod dlq;
 pub mod error;
 pub mod event;
 pub mod manager;
 pub mod monitor;
 pub mod queue;
+pub mod retry;
+pub mod storage;
 
 // Re-export main types
 pub use config::LaneConfig;
+pub use dlq::{DeadLetter, DeadLetterQueue};
 pub use error::{LaneError, Result};
 pub use event::{EventEmitter, EventPayload, EventStream, LaneEvent};
 pub use manager::{QueueManager, QueueManagerBuilder};
@@ -68,6 +72,8 @@ pub use monitor::{MonitorConfig, QueueMonitor};
 pub use queue::{
     lane_ids, priorities, Command, CommandId, CommandQueue, Lane, LaneId, LaneStatus, Priority,
 };
+pub use retry::RetryPolicy;
+pub use storage::{LocalStorage, Storage, StoredCommand, StoredDeadLetter};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -77,6 +83,7 @@ use std::collections::HashMap;
 pub struct QueueStats {
     pub total_pending: usize,
     pub total_active: usize,
+    pub dead_letter_count: usize,
     pub lanes: HashMap<String, LaneStatus>,
 }
 
@@ -121,6 +128,7 @@ mod tests {
         let stats = QueueStats {
             total_pending: 5,
             total_active: 2,
+            dead_letter_count: 0,
             lanes,
         };
 
