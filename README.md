@@ -94,6 +94,57 @@ async fn main() -> anyhow::Result<()> {
 - **Builder Pattern**: Flexible queue configuration
 - **Async-first**: Built on Tokio for high-performance async operations
 
+## Quality Metrics
+
+### Test Coverage
+
+**212 comprehensive unit tests** with **96.48% line coverage**:
+
+| Module | Lines | Coverage | Functions | Coverage |
+|--------|-------|----------|-----------|----------|
+| dlq.rs | 157 | 100.00% | 34 | 100.00% |
+| error.rs | 34 | 100.00% | 8 | 100.00% |
+| lib.rs | 39 | 100.00% | 4 | 100.00% |
+| retry.rs | 111 | 100.00% | 16 | 100.00% |
+| manager.rs | 572 | 99.65% | 81 | 100.00% |
+| queue.rs | 822 | 98.91% | 120 | 99.17% |
+| monitor.rs | 325 | 98.46% | 45 | 97.78% |
+| event.rs | 169 | 97.63% | 29 | 100.00% |
+| metrics.rs | 453 | 96.69% | 82 | 93.90% |
+| alerts.rs | 432 | 96.53% | 79 | 93.67% |
+| boost.rs | 184 | 95.11% | 26 | 88.46% |
+| storage.rs | 193 | 94.82% | 30 | 83.33% |
+| distributed.rs | 227 | 92.07% | 34 | 82.35% |
+| config.rs | 118 | 88.98% | 18 | 88.89% |
+| ratelimit.rs | 257 | 88.33% | 53 | 86.79% |
+| partition.rs | 143 | 86.71% | 28 | 82.14% |
+| **TOTAL** | **4236** | **96.48%** | **687** | **94.18%** |
+
+Run coverage report:
+```bash
+cargo llvm-cov --lib --summary-only
+```
+
+### Performance Benchmarks
+
+Criterion-based benchmarks measure throughput, concurrency scaling, and overhead:
+
+```bash
+# Run all benchmarks
+cargo bench
+
+# Run specific benchmark
+cargo bench --bench queue_benchmark
+```
+
+**Benchmark suites:**
+- **Throughput**: Measures commands/second for 1K, 10K, 50K, and 100K command batches
+- **Concurrency scaling**: Tests performance with 1, 2, 4, 8, and 16 concurrent lanes
+- **Priority scheduling**: Compares overhead of priority-based vs FIFO scheduling
+- **Metrics overhead**: Measures performance impact of metrics collection
+
+Results are saved to `target/criterion/` with detailed HTML reports.
+
 ## Architecture
 
 ### Lane Priority Model
@@ -932,13 +983,38 @@ cargo bench
 
 # Run specific benchmark
 cargo bench --bench queue_benchmark
+
+# View HTML reports
+open target/criterion/report/index.html
 ```
 
-Benchmarks include:
-- **Throughput**: 1K to 100K commands
-- **Concurrency scaling**: 1 to 16 lanes
-- **Priority scheduling overhead**: Comparison with and without priorities
-- **Metrics overhead**: Impact of metrics collection on performance
+**Benchmark suites included:**
+
+1. **Throughput Benchmarking**
+   - Tests: 1K, 10K, 50K, 100K commands
+   - Measures: Commands processed per second
+   - Purpose: Understand baseline throughput capacity
+
+2. **Concurrency Scaling**
+   - Tests: 1, 2, 4, 8, 16 concurrent lanes
+   - Measures: Throughput vs concurrency level
+   - Purpose: Evaluate multi-core scaling efficiency
+
+3. **Priority Scheduling Overhead**
+   - Compares: Priority-based vs FIFO scheduling
+   - Measures: Overhead of priority selection
+   - Purpose: Quantify cost of priority features
+
+4. **Metrics Collection Overhead**
+   - Compares: With vs without metrics
+   - Measures: Performance impact of observability
+   - Purpose: Understand monitoring costs
+
+Results include:
+- Mean execution time with confidence intervals
+- Throughput measurements (ops/sec)
+- Detailed statistical analysis
+- Historical comparison charts
 
 ## License
 
