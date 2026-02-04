@@ -1,11 +1,11 @@
 # A3S Lane
 
 <p align="center">
-  <strong>Lane-based Priority Command Queue for Async Task Scheduling</strong>
+  <strong>Priority-Based Command Queue</strong>
 </p>
 
 <p align="center">
-  <em>Flexible, priority-based command queue system for managing concurrent async operations</em>
+  <em>Utility layer — lane-based async task scheduling with configurable concurrency</em>
 </p>
 
 <p align="center">
