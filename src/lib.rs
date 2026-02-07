@@ -128,7 +128,7 @@ pub use alerts::{Alert, AlertLevel, AlertManager, LatencyAlertConfig, QueueDepth
 pub use boost::{PriorityBoostConfig, PriorityBooster};
 pub use config::LaneConfig;
 pub use distributed::{
-    CommandEnvelope, CommandResult, DistributedQueue, LocalDistributedQueue, WorkerPool, WorkerId,
+    CommandEnvelope, CommandResult, DistributedQueue, LocalDistributedQueue, WorkerId, WorkerPool,
 };
 pub use dlq::{DeadLetter, DeadLetterQueue};
 pub use error::{LaneError, Result};

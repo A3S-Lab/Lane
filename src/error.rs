@@ -100,13 +100,19 @@ mod tests {
     #[test]
     fn test_config_error() {
         let error = LaneError::ConfigError("invalid concurrency".to_string());
-        assert_eq!(error.to_string(), "Configuration error: invalid concurrency");
+        assert_eq!(
+            error.to_string(),
+            "Configuration error: invalid concurrency"
+        );
     }
 
     #[test]
     fn test_command_error() {
         let error = LaneError::CommandError("execution failed".to_string());
-        assert_eq!(error.to_string(), "Command execution error: execution failed");
+        assert_eq!(
+            error.to_string(),
+            "Command execution error: execution failed"
+        );
     }
 
     #[test]

@@ -7,8 +7,8 @@
 //! - Latency alerts
 
 use a3s_lane::{
-    AlertLevel, AlertManager, Command, EventEmitter, LaneConfig, QueueManagerBuilder,
-    QueueMetrics, Result,
+    AlertLevel, AlertManager, Command, EventEmitter, LaneConfig, QueueManagerBuilder, QueueMetrics,
+    Result,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -49,8 +49,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Create alert manager with thresholds
     let alerts = Arc::new(AlertManager::with_queue_depth_alerts(
-        10,  // Warning at 10 pending
-        20,  // Critical at 20 pending
+        10, // Warning at 10 pending
+        20, // Critical at 20 pending
     ));
 
     // Add latency alerts
@@ -69,10 +69,7 @@ async fn main() -> anyhow::Result<()> {
                 AlertLevel::Warning => "WARN",
                 AlertLevel::Critical => "CRIT",
             };
-            println!(
-                "  🚨 [{}] {} - {}",
-                level_str, alert.lane_id, alert.message
-            );
+            println!("  🚨 [{}] {} - {}", level_str, alert.lane_id, alert.message);
         })
         .await;
 
@@ -181,17 +178,11 @@ async fn main() -> anyhow::Result<()> {
     // Example 3: Per-lane metrics
     println!("=== Example 3: Per-Lane Metrics ===");
 
-    if let Some(submitted) = snapshot
-        .counters
-        .get("lane.commands.submitted.api")
-    {
+    if let Some(submitted) = snapshot.counters.get("lane.commands.submitted.api") {
         println!("API lane - Commands submitted: {}", submitted);
     }
 
-    if let Some(stats) = snapshot
-        .histograms
-        .get("lane.command.latency_ms.api")
-    {
+    if let Some(stats) = snapshot.histograms.get("lane.command.latency_ms.api") {
         println!("API lane - Mean latency: {:.2}ms", stats.mean);
     }
 

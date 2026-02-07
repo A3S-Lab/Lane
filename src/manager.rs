@@ -205,19 +205,18 @@ impl QueueManagerBuilder {
     pub async fn build(self) -> anyhow::Result<QueueManager> {
         // Create queue with appropriate configuration
         let queue = match (self.dlq_size, self.storage.clone()) {
-            (Some(dlq_size), Some(storage)) => {
-                Arc::new(CommandQueue::with_dlq_and_storage(
-                    self.event_emitter,
-                    dlq_size,
-                    storage.clone(),
-                ))
-            }
+            (Some(dlq_size), Some(storage)) => Arc::new(CommandQueue::with_dlq_and_storage(
+                self.event_emitter,
+                dlq_size,
+                storage.clone(),
+            )),
             (Some(dlq_size), None) => {
                 Arc::new(CommandQueue::with_dlq(self.event_emitter, dlq_size))
             }
-            (None, Some(storage)) => {
-                Arc::new(CommandQueue::with_storage(self.event_emitter, storage.clone()))
-            }
+            (None, Some(storage)) => Arc::new(CommandQueue::with_storage(
+                self.event_emitter,
+                storage.clone(),
+            )),
             (None, None) => Arc::new(CommandQueue::new(self.event_emitter)),
         };
 
@@ -651,7 +650,11 @@ mod tests {
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
-        let storage = Arc::new(LocalStorage::new(temp_dir.path().to_path_buf()).await.unwrap());
+        let storage = Arc::new(
+            LocalStorage::new(temp_dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
 
         let emitter = EventEmitter::new(100);
         let manager = QueueManagerBuilder::new(emitter)
@@ -688,7 +691,11 @@ mod tests {
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
-        let storage = Arc::new(LocalStorage::new(temp_dir.path().to_path_buf()).await.unwrap());
+        let storage = Arc::new(
+            LocalStorage::new(temp_dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
 
         let emitter = EventEmitter::new(100);
         let manager = QueueManagerBuilder::new(emitter)

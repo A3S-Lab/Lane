@@ -97,9 +97,7 @@ async fn main() -> anyhow::Result<()> {
     // Graceful shutdown
     println!("\n=== Shutting Down ===");
     manager.shutdown().await;
-    manager
-        .drain(tokio::time::Duration::from_secs(5))
-        .await?;
+    manager.drain(tokio::time::Duration::from_secs(5)).await?;
     println!("✓ Shutdown complete");
 
     Ok(())

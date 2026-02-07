@@ -166,11 +166,7 @@ async fn test_basic_priority_ordering() -> anyhow::Result<()> {
         );
 
         // Verify that execution order matches priority order
-        assert_eq!(
-            order, i as u64,
-            "Execution order mismatch for {}",
-            lane
-        );
+        assert_eq!(order, i as u64, "Execution order mismatch for {}", lane);
     }
 
     println!("✓ Test 1 PASSED: Commands executed in priority order\n");
@@ -195,11 +191,7 @@ async fn test_concurrency_limit_behavior() -> anyhow::Result<()> {
         LaneConfig::new(1, 1), // max_concurrency = 1
         0,
     );
-    builder = builder.with_lane(
-        "query",
-        LaneConfig::new(1, 10),
-        2,
-    );
+    builder = builder.with_lane("query", LaneConfig::new(1, 10), 2);
 
     let manager = builder.build().await?;
     manager.start().await?;
@@ -265,10 +257,15 @@ async fn test_concurrency_limit_behavior() -> anyhow::Result<()> {
     // Verify that query command executed while system lane was blocked
     // query-cmd should execute after system-cmd-1 starts but before system-cmd-2
     assert_eq!(order1, 0, "system-cmd-1 should execute first");
-    assert_eq!(order3, 1, "query-cmd should execute second (while system lane is blocked)");
+    assert_eq!(
+        order3, 1,
+        "query-cmd should execute second (while system lane is blocked)"
+    );
     assert_eq!(order2, 2, "system-cmd-2 should execute last");
 
-    println!("✓ Test 2 PASSED: Lower priority lane executed when higher priority lane was at capacity\n");
+    println!(
+        "✓ Test 2 PASSED: Lower priority lane executed when higher priority lane was at capacity\n"
+    );
 
     manager.shutdown().await;
     manager.drain(Duration::from_secs(5)).await?;
@@ -287,14 +284,9 @@ async fn test_mixed_priority_workload() -> anyhow::Result<()> {
         .build()
         .await?;
 
-    manager.start().await?;
-
-    // Give scheduler time to start
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
     let execution_order = Arc::new(AtomicU32::new(0));
 
-    // Submit a mix of commands
+    // Submit all commands BEFORE starting scheduler to ensure fair priority comparison
     let mut receivers = Vec::new();
 
     // Simulate a burst of low-priority prompt commands
@@ -306,14 +298,14 @@ async fn test_mixed_priority_workload() -> anyhow::Result<()> {
             duration_ms: 100,
             execution_order: Arc::clone(&execution_order),
         });
-        receivers.push((format!("prompt-{}", i), manager.submit("prompt", cmd).await?));
+        receivers.push((
+            format!("prompt-{}", i),
+            manager.submit("prompt", cmd).await?,
+        ));
     }
     println!("Submitted 3 prompt commands (priority 5)");
 
-    // Wait a bit
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
-    // Submit a critical system command - should jump to front
+    // Submit a critical system command - should execute first
     let cmd = Box::new(TrackedCommand {
         id: "system-critical".to_string(),
         lane: "system".to_string(),
@@ -321,7 +313,10 @@ async fn test_mixed_priority_workload() -> anyhow::Result<()> {
         duration_ms: 50,
         execution_order: Arc::clone(&execution_order),
     });
-    receivers.push(("system-critical".to_string(), manager.submit("system", cmd).await?));
+    receivers.push((
+        "system-critical".to_string(),
+        manager.submit("system", cmd).await?,
+    ));
     println!("Submitted critical system command (priority 0)");
 
     // Submit some medium-priority query commands
@@ -336,6 +331,10 @@ async fn test_mixed_priority_workload() -> anyhow::Result<()> {
         receivers.push((format!("query-{}", i), manager.submit("query", cmd).await?));
     }
     println!("Submitted 2 query commands (priority 2)");
+
+    // NOW start the scheduler with all commands queued
+    println!("Starting scheduler with all commands queued...");
+    manager.start().await?;
 
     println!("\nWaiting for execution...\n");
 
@@ -365,20 +364,23 @@ async fn test_mixed_priority_workload() -> anyhow::Result<()> {
         );
     }
 
-    // Verify that system command executed early despite being submitted later
-    let system_result = results.iter().find(|(id, _)| id == "system-critical").unwrap();
+    // Verify that system command executed first
+    let system_result = results
+        .iter()
+        .find(|(id, _)| id == "system-critical")
+        .unwrap();
     let system_order = system_result.1["execution_order"].as_u64().unwrap();
 
     println!("\n--- Verification ---");
     println!("System command execution order: {}", system_order);
-    println!("Expected: System command should execute early (order 0 or 1)");
+    println!("Expected: System command should execute first (order 0)");
 
-    assert!(
-        system_order <= 1,
-        "System command should execute early despite being submitted later"
+    assert_eq!(
+        system_order, 0,
+        "System command should execute first when all commands are queued before scheduler starts"
     );
 
-    println!("✓ Test 3 PASSED: Critical commands preempted lower priority commands\n");
+    println!("✓ Test 3 PASSED: Critical commands executed first in priority order\n");
 
     manager.shutdown().await;
     manager.drain(Duration::from_secs(5)).await?;

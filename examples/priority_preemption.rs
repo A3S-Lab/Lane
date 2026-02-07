@@ -117,7 +117,9 @@ async fn scenario_1_high_priority_empty() -> anyhow::Result<()> {
     println!("\n--- Verification ---");
     println!("Result 1: {}", result1);
     println!("Result 2: {}", result2);
-    println!("✓ Scenario 1 PASSED: Low priority commands executed when high priority queue was empty\n");
+    println!(
+        "✓ Scenario 1 PASSED: Low priority commands executed when high priority queue was empty\n"
+    );
 
     manager.shutdown().await;
     manager.drain(Duration::from_secs(5)).await?;

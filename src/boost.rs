@@ -44,8 +44,7 @@ impl PriorityBoostConfig {
     pub fn with_boost(mut self, time_before_deadline: Duration, boost: u8) -> Self {
         self.boost_intervals.push((time_before_deadline, boost));
         // Sort by time (descending) so we check largest intervals first
-        self.boost_intervals
-            .sort_by(|a, b| b.0.cmp(&a.0));
+        self.boost_intervals.sort_by(|a, b| b.0.cmp(&a.0));
         self
     }
 

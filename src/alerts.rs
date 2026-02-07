@@ -127,10 +127,7 @@ impl AlertManager {
     }
 
     /// Create a new alert manager with queue depth alerts enabled
-    pub fn with_queue_depth_alerts(
-        warning_threshold: usize,
-        critical_threshold: usize,
-    ) -> Self {
+    pub fn with_queue_depth_alerts(warning_threshold: usize, critical_threshold: usize) -> Self {
         Self {
             queue_depth_config: RwLock::new(QueueDepthAlertConfig::new(
                 warning_threshold,
@@ -142,10 +139,7 @@ impl AlertManager {
     }
 
     /// Create a new alert manager with latency alerts enabled
-    pub fn with_latency_alerts(
-        warning_threshold_ms: f64,
-        critical_threshold_ms: f64,
-    ) -> Self {
+    pub fn with_latency_alerts(warning_threshold_ms: f64, critical_threshold_ms: f64) -> Self {
         Self {
             queue_depth_config: RwLock::new(QueueDepthAlertConfig::default()),
             latency_config: RwLock::new(LatencyAlertConfig::new(

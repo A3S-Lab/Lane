@@ -248,13 +248,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_custom_partitioner() {
-        let partitioner = CustomPartitioner::new(|cmd_type: &str| {
-            if cmd_type.starts_with("high") {
-                0
-            } else {
-                1
-            }
-        });
+        let partitioner = CustomPartitioner::new(
+            |cmd_type: &str| {
+                if cmd_type.starts_with("high") {
+                    0
+                } else {
+                    1
+                }
+            },
+        );
 
         let cmd_high = TestCommand {
             cmd_type: "high_priority".to_string(),

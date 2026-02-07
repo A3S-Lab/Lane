@@ -45,7 +45,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Token bucket: 5 commands per second
     let rate_limit = RateLimitConfig::per_second(5);
-    println!("Rate limit: {} commands per second", rate_limit.max_commands);
+    println!(
+        "Rate limit: {} commands per second",
+        rate_limit.max_commands
+    );
 
     let config = LaneConfig::new(1, 10).with_rate_limit(rate_limit);
 
@@ -176,10 +179,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let elapsed = start.elapsed();
-    println!(
-        "✓ Completed 50 commands in {:.2}s",
-        elapsed.as_secs_f64()
-    );
+    println!("✓ Completed 50 commands in {:.2}s", elapsed.as_secs_f64());
     println!(
         "  Throughput: {:.1} commands/second",
         50.0 / elapsed.as_secs_f64()

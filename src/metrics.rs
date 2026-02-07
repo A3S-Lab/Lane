@@ -284,7 +284,10 @@ impl QueueMetrics {
             .increment_counter(metric_names::COMMANDS_SUBMITTED, 1)
             .await;
         self.backend
-            .increment_counter(&format!("{}.{}", metric_names::COMMANDS_SUBMITTED, lane_id), 1)
+            .increment_counter(
+                &format!("{}.{}", metric_names::COMMANDS_SUBMITTED, lane_id),
+                1,
+            )
             .await;
     }
 
@@ -294,7 +297,10 @@ impl QueueMetrics {
             .increment_counter(metric_names::COMMANDS_COMPLETED, 1)
             .await;
         self.backend
-            .increment_counter(&format!("{}.{}", metric_names::COMMANDS_COMPLETED, lane_id), 1)
+            .increment_counter(
+                &format!("{}.{}", metric_names::COMMANDS_COMPLETED, lane_id),
+                1,
+            )
             .await;
         self.backend
             .record_histogram(metric_names::COMMAND_LATENCY, latency_ms)
@@ -323,7 +329,10 @@ impl QueueMetrics {
             .increment_counter(metric_names::COMMANDS_TIMEOUT, 1)
             .await;
         self.backend
-            .increment_counter(&format!("{}.{}", metric_names::COMMANDS_TIMEOUT, lane_id), 1)
+            .increment_counter(
+                &format!("{}.{}", metric_names::COMMANDS_TIMEOUT, lane_id),
+                1,
+            )
             .await;
     }
 
@@ -333,7 +342,10 @@ impl QueueMetrics {
             .increment_counter(metric_names::COMMANDS_RETRIED, 1)
             .await;
         self.backend
-            .increment_counter(&format!("{}.{}", metric_names::COMMANDS_RETRIED, lane_id), 1)
+            .increment_counter(
+                &format!("{}.{}", metric_names::COMMANDS_RETRIED, lane_id),
+                1,
+            )
             .await;
     }
 
@@ -436,16 +448,16 @@ mod tests {
     async fn test_local_metrics_histogram() {
         let metrics = LocalMetrics::new();
 
-        assert!(metrics.get_histogram_stats("test.histogram").await.is_none());
+        assert!(metrics
+            .get_histogram_stats("test.histogram")
+            .await
+            .is_none());
 
         metrics.record_histogram("test.histogram", 10.0).await;
         metrics.record_histogram("test.histogram", 20.0).await;
         metrics.record_histogram("test.histogram", 30.0).await;
 
-        let stats = metrics
-            .get_histogram_stats("test.histogram")
-            .await
-            .unwrap();
+        let stats = metrics.get_histogram_stats("test.histogram").await.unwrap();
         assert_eq!(stats.count, 3);
         assert_eq!(stats.sum, 60.0);
         assert_eq!(stats.min, 10.0);
@@ -462,10 +474,7 @@ mod tests {
             metrics.record_histogram("test.histogram", i as f64).await;
         }
 
-        let stats = metrics
-            .get_histogram_stats("test.histogram")
-            .await
-            .unwrap();
+        let stats = metrics.get_histogram_stats("test.histogram").await.unwrap();
         assert_eq!(stats.count, 100);
         assert_eq!(stats.min, 1.0);
         assert_eq!(stats.max, 100.0);
@@ -489,7 +498,10 @@ mod tests {
 
         assert_eq!(metrics.get_counter("test.counter").await, None);
         assert_eq!(metrics.get_gauge("test.gauge").await, None);
-        assert!(metrics.get_histogram_stats("test.histogram").await.is_none());
+        assert!(metrics
+            .get_histogram_stats("test.histogram")
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -549,7 +561,10 @@ mod tests {
             Some(&2)
         );
 
-        let latency_stats = snapshot.histograms.get(metric_names::COMMAND_LATENCY).unwrap();
+        let latency_stats = snapshot
+            .histograms
+            .get(metric_names::COMMAND_LATENCY)
+            .unwrap();
         assert_eq!(latency_stats.count, 2);
         assert_eq!(latency_stats.mean, 75.0);
     }

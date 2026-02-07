@@ -301,8 +301,7 @@ impl WorkerPool {
 
     /// Check if workers are running
     pub fn is_running(&self) -> bool {
-        !self.worker_handles.is_empty()
-            && !self.shutdown.load(std::sync::atomic::Ordering::Relaxed)
+        !self.worker_handles.is_empty() && !self.shutdown.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -385,9 +384,7 @@ mod tests {
         let mut pool = WorkerPool::new(queue.clone());
 
         // Start workers with a simple executor
-        pool.start(|envelope| async move {
-            Ok(serde_json::json!({"processed": envelope.id}))
-        });
+        pool.start(|envelope| async move { Ok(serde_json::json!({"processed": envelope.id})) });
 
         assert!(pool.is_running());
 

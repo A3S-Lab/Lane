@@ -238,8 +238,8 @@ fn bench_rate_limiting(c: &mut Criterion) {
     c.bench_function("rate_limiting", |b| {
         b.to_async(&rt).iter(|| async {
             let emitter = EventEmitter::new(1000);
-            let config = LaneConfig::new(1, 10)
-                .with_rate_limit(a3s_lane::RateLimitConfig::per_second(50));
+            let config =
+                LaneConfig::new(1, 10).with_rate_limit(a3s_lane::RateLimitConfig::per_second(50));
 
             let manager = QueueManagerBuilder::new(emitter)
                 .with_lane("bench", config, 0)
