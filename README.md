@@ -929,6 +929,24 @@ A3S Lane is a **utility component** of the A3S ecosystem — a standalone priori
 - [x] Detailed API reference
 - [x] Inline documentation for all public APIs
 
+### Phase 5: OpenTelemetry Integration 📋
+
+Export metrics and traces to external observability backends:
+
+- [ ] **OTLP Metrics Export**: Implement `MetricsBackend` for OpenTelemetry
+  - Latency histograms (p50/p90/p95/p99) → OTLP Histogram
+  - Queue depth gauges → OTLP Gauge
+  - Command throughput counters → OTLP Counter
+- [ ] **Distributed Tracing**: Propagate trace context through command lifecycle
+  - Span: `a3s.lane.enqueue` → `a3s.lane.execute` → `a3s.lane.complete`
+  - Attributes: lane_name, priority, wait_time_ms, execution_time_ms
+- [ ] **Prometheus Exporter**: Direct Prometheus scrape endpoint
+  - `a3s_lane_queue_depth{lane="query"}` gauge
+  - `a3s_lane_command_duration_seconds{lane="query"}` histogram
+  - `a3s_lane_dlq_size{lane="query"}` gauge
+- [ ] **Alert Integration**: Forward alerts to external systems (PagerDuty, Slack, webhook)
+- [ ] **SigNoz Dashboard Template**: Pre-built dashboard for A3S Lane metrics
+
 ## Examples
 
 The `examples/` directory contains comprehensive demonstrations of all features:
