@@ -60,6 +60,13 @@ impl QueueManager {
         lane_id: &str,
         command: Box<dyn Command>,
     ) -> Result<tokio::sync::oneshot::Receiver<Result<serde_json::Value>>> {
+        let _span = tracing::info_span!(
+            "a3s.lane.submit",
+            a3s.lane.lane_name = %lane_id,
+            a3s.lane.command_type = %command.command_type(),
+        )
+        .entered();
+        crate::telemetry::record_submit(lane_id);
         self.queue.submit(lane_id, command).await
     }
 

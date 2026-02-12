@@ -122,6 +122,7 @@ pub mod queue;
 pub mod ratelimit;
 pub mod retry;
 pub mod storage;
+pub mod telemetry;
 
 // Re-export main types
 pub use alerts::{Alert, AlertLevel, AlertManager, LatencyAlertConfig, QueueDepthAlertConfig};
@@ -149,6 +150,7 @@ pub use queue::{
 pub use ratelimit::{RateLimitConfig, RateLimiter, SlidingWindowLimiter, TokenBucketLimiter};
 pub use retry::RetryPolicy;
 pub use storage::{LocalStorage, Storage, StoredCommand, StoredDeadLetter};
+pub use telemetry::OtelMetricsBackend;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
