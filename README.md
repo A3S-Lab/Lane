@@ -1,11 +1,11 @@
 # A3S Lane
 
 <p align="center">
-  <strong>Priority-Based Command Queue</strong>
+  <strong>Per-Session Priority Queue</strong>
 </p>
 
 <p align="center">
-  <em>Utility layer — lane-based async task scheduling with configurable concurrency</em>
+  <em>Scheduling layer — each a3s-code agent session gets its own a3s-lane instance for priority-based command scheduling</em>
 </p>
 
 <p align="center">
@@ -20,7 +20,7 @@
 
 ## Overview
 
-**A3S Lane** provides a lane-based priority command queue designed for managing concurrent async operations with different priority levels. Commands are organized into lanes, each with configurable concurrency limits and priority.
+**A3S Lane** provides a lane-based priority command queue designed for managing concurrent async operations with different priority levels. In the A3S ecosystem, each a3s-code agent session gets its own a3s-lane instance — ensuring control commands (pause/cancel) always preempt LLM generation tasks. Commands are organized into lanes, each with configurable concurrency limits and priority.
 
 ### Basic Usage
 
@@ -855,30 +855,32 @@ lane/
 
 ## A3S Ecosystem
 
-A3S Lane is a **utility component** of the A3S ecosystem — a standalone priority queue that can be used by any async Rust application.
+A3S Lane is the **per-session scheduling layer** of the A3S Agent OS. Each a3s-code agent session gets its own a3s-lane instance, ensuring control commands always preempt LLM generation tasks.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│                    A3S Ecosystem                         │
-│                                                          │
-│  Infrastructure:  a3s-box     (MicroVM sandbox runtime)  │
-│                      │                                   │
-│  Application:     a3s-code    (AI coding agent)          │
-│                    /   \                                 │
-│  Utilities:   a3s-lane  a3s-context                     │
-│                  ▲      (memory/knowledge)               │
-│                  │                                       │
-│            You are here                                  │
+│                    A3S Agent OS                            │
+│                                                            │
+│  External:     a3s-gateway  (OS external gateway)          │
+│                      │                                     │
+│  Sandbox:      a3s-box      (MicroVM isolation)            │
+│                      │                                     │
+│  Application:  SafeClaw     (OS main app, multi-agent)     │
+│                      │                                     │
+│  Execution:    a3s-code     (AI agent instances)           │
+│                      │                                     │
+│  Scheduling:   a3s-lane     (per-session priority queue)   │
+│                  ▲                                         │
+│                  │ You are here                             │
 └──────────────────────────────────────────────────────────┘
 ```
 
 | Project | Package | Relationship |
 |---------|---------|--------------|
-| **box** | `a3s-box-*` | Can use `lane` for internal task scheduling |
-| **code** | `a3s-code` | Uses `lane` for command priority and concurrency control |
-| **context** | `a3s-context` | Independent utility (no direct relationship) |
+| **code** | `a3s-code` | Each a3s-code session creates its own `SessionLaneQueue` wrapping a3s-lane |
+| **SafeClaw** | `safeclaw` | Coordinates multiple a3s-code sessions, each with independent a3s-lane instances |
 
-**Standalone Usage**: `a3s-lane` works independently for any priority-based async task scheduling:
+**Standalone Usage**: a3s-lane also works independently for any priority-based async task scheduling:
 - Web servers with request prioritization
 - Background job processors
 - Rate-limited API clients
