@@ -1,5 +1,5 @@
 {
-  "name": "@a3s/lane",
+  "name": "@a3s-lab/lane",
   "version": "0.2.0",
   "description": "Node.js bindings for a3s-lane priority command queue",
   "main": "index.js",
