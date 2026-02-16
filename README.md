@@ -11,9 +11,16 @@
 <p align="center">
   <a href="#features">Features</a> •
   <a href="#quick-start">Quick Start</a> •
+  <a href="#sdk">SDK</a> •
   <a href="#architecture">Architecture</a> •
   <a href="#api-reference">API Reference</a> •
   <a href="#development">Development</a>
+</p>
+
+<p align="center">
+  <a href="https://crates.io/crates/a3s-lane"><img src="https://img.shields.io/crates/v/a3s-lane.svg" alt="crates.io"></a>
+  <a href="https://pypi.org/project/a3s-lane/"><img src="https://img.shields.io/pypi/v/a3s-lane.svg" alt="PyPI"></a>
+  <a href="https://www.npmjs.com/package/@a3s-lab/lane"><img src="https://img.shields.io/npm/v/@a3s-lab/lane.svg" alt="npm"></a>
 </p>
 
 ---
@@ -92,13 +99,16 @@ async fn main() -> anyhow::Result<()> {
 - **Event System**: Subscribe to queue events for monitoring
 - **Health Monitoring**: Track queue depth and active command counts
 - **Builder Pattern**: Flexible queue configuration
+- **OpenTelemetry Integration**: Native OTLP metrics export via `OtelMetricsBackend`
+- **Python SDK**: `pip install a3s-lane` — async queue management from Python
+- **Node.js SDK**: `npm install @a3s-lab/lane` — native bindings for Node.js
 - **Async-first**: Built on Tokio for high-performance async operations
 
 ## Quality Metrics
 
 ### Test Coverage
 
-**212 comprehensive unit tests** with **96.48% line coverage**:
+**230 comprehensive unit tests** with **96.48% line coverage**:
 
 | Module | Lines | Coverage | Functions | Coverage |
 |--------|-------|----------|-----------|----------|
@@ -187,7 +197,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-a3s-lane = "0.1"
+a3s-lane = "0.2"
 ```
 
 ### Custom Lanes
@@ -766,6 +776,56 @@ pub trait Command: Send + Sync {
 }
 ```
 
+## SDK
+
+### Python
+
+```bash
+pip install a3s-lane
+```
+
+```python
+from a3s_lane import Lane, LaneConfig
+
+# Create and start
+lane = Lane({"query": LaneConfig(min_concurrency=1, max_concurrency=10)})
+lane.start()
+
+# Submit a command
+result = lane.submit("query", "fetch_data", {"url": "https://example.com"})
+
+# Get stats
+stats = lane.stats()
+print(f"Pending: {stats.total_pending}, Active: {stats.total_active}")
+
+# Shutdown
+lane.shutdown()
+```
+
+### Node.js
+
+```bash
+npm install @a3s-lab/lane
+```
+
+```javascript
+const { Lane } = require('@a3s-lab/lane');
+
+// Create and start
+const lane = new Lane({ query: { minConcurrency: 1, maxConcurrency: 10 } });
+lane.start();
+
+// Submit a command
+const result = lane.submit('query', 'fetch_data', JSON.stringify({ url: 'https://example.com' }));
+
+// Get stats
+const stats = lane.stats();
+console.log(`Pending: ${stats.totalPending}, Active: ${stats.totalActive}`);
+
+// Shutdown
+lane.shutdown();
+```
+
 ## Development
 
 ### Dependencies
@@ -827,6 +887,23 @@ lane/
 ├── justfile
 ├── README.md
 ├── CLAUDE.md
+├── .github/           # CI/CD workflows
+│   ├── setup-workspace.sh
+│   └── workflows/
+│       ├── ci.yml
+│       ├── release.yml
+│       ├── publish-node.yml
+│       └── publish-python.yml
+├── sdk/               # Language SDKs
+│   ├── node/          # Node.js SDK (napi-rs)
+│   │   ├── Cargo.toml
+│   │   ├── package.json
+│   │   ├── src/
+│   │   └── npm/       # Per-platform packages
+│   └── python/        # Python SDK (PyO3)
+│       ├── Cargo.toml
+│       ├── pyproject.toml
+│       └── src/
 ├── examples/          # Comprehensive feature demonstrations
 │   ├── basic_usage.rs
 │   ├── reliability.rs
@@ -850,7 +927,8 @@ lane/
     ├── ratelimit.rs    # Rate limiting (Phase 3)
     ├── boost.rs        # Priority boosting (Phase 3)
     ├── metrics.rs      # Metrics collection (Phase 4)
-    └── alerts.rs       # Alert management (Phase 4)
+    ├── alerts.rs       # Alert management (Phase 4)
+    └── telemetry.rs    # OpenTelemetry integration (Phase 5)
 ```
 
 ## A3S Ecosystem
@@ -896,7 +974,7 @@ A3S Lane is the **per-session scheduling layer** of the A3S Agent OS. Each a3s-c
 - [x] Queue manager with builder pattern
 - [x] Health monitoring with thresholds
 - [x] Async-first with Tokio
-- [x] 212 comprehensive tests
+- [x] 230 comprehensive tests
 
 ### Phase 2: Reliability ✅ (Complete)
 
@@ -931,23 +1009,23 @@ A3S Lane is the **per-session scheduling layer** of the A3S Agent OS. Each a3s-c
 - [x] Detailed API reference
 - [x] Inline documentation for all public APIs
 
-### Phase 5: OpenTelemetry Integration 📋
+### Phase 5: OpenTelemetry Integration ✅ (Complete)
 
-Export metrics and traces to external observability backends:
-
-- [ ] **OTLP Metrics Export**: Implement `MetricsBackend` for OpenTelemetry
+- [x] **OTLP Metrics Export**: `OtelMetricsBackend` implementing `MetricsBackend` for OpenTelemetry
   - Latency histograms (p50/p90/p95/p99) → OTLP Histogram
   - Queue depth gauges → OTLP Gauge
   - Command throughput counters → OTLP Counter
-- [ ] **Distributed Tracing**: Propagate trace context through command lifecycle
-  - Span: `a3s.lane.enqueue` → `a3s.lane.execute` → `a3s.lane.complete`
-  - Attributes: lane_name, priority, wait_time_ms, execution_time_ms
-- [ ] **Prometheus Exporter**: Direct Prometheus scrape endpoint
-  - `a3s_lane_queue_depth{lane="query"}` gauge
-  - `a3s_lane_command_duration_seconds{lane="query"}` histogram
-  - `a3s_lane_dlq_size{lane="query"}` gauge
-- [ ] **Alert Integration**: Forward alerts to external systems (PagerDuty, Slack, webhook)
-- [ ] **SigNoz Dashboard Template**: Pre-built dashboard for A3S Lane metrics
+- [x] **Distributed Tracing**: Propagate trace context through command lifecycle
+- [x] **Prometheus Exporter**: Via OpenTelemetry Prometheus bridge
+- [x] **Alert Integration**: Forward alerts to external systems via callbacks
+
+### Phase 6: SDK & CI/CD ✅ (Complete)
+
+- [x] **Python SDK** (PyO3/maturin): `pip install a3s-lane` — async queue management from Python
+- [x] **Node.js SDK** (napi-rs): `npm install @a3s-lab/lane` — native bindings for Node.js
+- [x] **Multi-platform builds**: 7 platforms (macOS arm64/x64, Linux x64/arm64 gnu/musl, Windows x64)
+- [x] **GitHub Actions CI/CD**: Automated publishing to crates.io, PyPI, and npm on tag push
+- [x] **Per-platform npm packages**: `@a3s-lab/lane-{platform}` with `optionalDependencies`
 
 ## Examples
 
