@@ -8,7 +8,6 @@ use crate::retry::RetryPolicy;
 use crate::storage::{Storage, StoredCommand};
 use crate::telemetry;
 use async_trait::async_trait;
-use tracing::Instrument;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -16,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, Semaphore};
+use tracing::Instrument;
 use uuid::Uuid;
 
 /// Lane identifier
@@ -47,6 +47,36 @@ pub trait Command: Send + Sync {
 
     /// Get command type (for logging/debugging)
     fn command_type(&self) -> &str;
+}
+
+/// A simple JSON-based command for SDK usage.
+///
+/// Returns the payload as-is when executed. Useful for language bindings
+/// (Python, Node.js) where commands are represented as JSON data.
+pub struct JsonCommand {
+    command_type: String,
+    payload: serde_json::Value,
+}
+
+impl JsonCommand {
+    /// Create a new JSON command.
+    pub fn new(command_type: impl Into<String>, payload: serde_json::Value) -> Self {
+        Self {
+            command_type: command_type.into(),
+            payload,
+        }
+    }
+}
+
+#[async_trait]
+impl Command for JsonCommand {
+    async fn execute(&self) -> Result<serde_json::Value> {
+        Ok(self.payload.clone())
+    }
+
+    fn command_type(&self) -> &str {
+        &self.command_type
+    }
 }
 
 /// Command wrapper
@@ -425,85 +455,86 @@ impl CommandQueue {
                     a3s.lane.success = tracing::field::Empty,
                 );
 
-                tokio::spawn(async move {
-                    let exec_start = Instant::now();
+                tokio::spawn(
+                    async move {
+                        let exec_start = Instant::now();
 
-                    let result = match timeout {
-                        Some(dur) => {
-                            match tokio::time::timeout(dur, wrapper.command.execute()).await {
-                                Ok(r) => r,
-                                Err(_) => Err(LaneError::Timeout(dur)),
+                        let result = match timeout {
+                            Some(dur) => {
+                                match tokio::time::timeout(dur, wrapper.command.execute()).await {
+                                    Ok(r) => r,
+                                    Err(_) => Err(LaneError::Timeout(dur)),
+                                }
                             }
-                        }
-                        None => wrapper.command.execute().await,
-                    };
+                            None => wrapper.command.execute().await,
+                        };
 
-                    match result {
-                        Ok(value) => {
-                            // Success - remove from storage
-                            if let Some(storage) = &storage {
-                                let _ = storage.remove_command(&command_id).await;
-                            }
-
-                            tracing::Span::current()
-                                .record(telemetry::ATTR_SUCCESS, true);
-                            telemetry::record_complete(
-                                &lane_id,
-                                exec_start.elapsed().as_secs_f64(),
-                            );
-
-                            // Send result if channel is still open
-                            if let Some(tx) = wrapper.result_tx.take() {
-                                let _ = tx.send(Ok(value));
-                            }
-                            lane_clone.mark_completed().await;
-                        }
-                        Err(err) => {
-                            // Check if we should retry
-                            if retry_policy.should_retry(attempt) {
-                                let delay = retry_policy.delay_for_attempt(attempt + 1);
-
-                                tracing::info!(
-                                    command_id = %command_id,
-                                    retry_attempt = attempt + 1,
-                                    "a3s.lane.retry: retrying command"
-                                );
-
-                                // Re-enqueue for retry
-                                lane_clone.retry_command(wrapper, delay).await;
-                                lane_clone.mark_completed().await;
-                            } else {
-                                tracing::Span::current()
-                                    .record(telemetry::ATTR_SUCCESS, false);
-                                telemetry::record_failure(&lane_id);
-
-                                // No more retries - remove from storage
+                        match result {
+                            Ok(value) => {
+                                // Success - remove from storage
                                 if let Some(storage) = &storage {
                                     let _ = storage.remove_command(&command_id).await;
                                 }
 
-                                // Send to DLQ if available
-                                if let Some(dlq) = dlq {
-                                    let dead_letter = DeadLetter {
-                                        command_id,
-                                        command_type,
-                                        lane_id,
-                                        error: err.to_string(),
-                                        attempts: attempt + 1,
-                                        failed_at: Utc::now(),
-                                    };
-                                    dlq.push(dead_letter).await;
-                                }
+                                tracing::Span::current().record(telemetry::ATTR_SUCCESS, true);
+                                telemetry::record_complete(
+                                    &lane_id,
+                                    exec_start.elapsed().as_secs_f64(),
+                                );
 
-                                // Send error to caller
+                                // Send result if channel is still open
                                 if let Some(tx) = wrapper.result_tx.take() {
-                                    let _ = tx.send(Err(err));
+                                    let _ = tx.send(Ok(value));
                                 }
                                 lane_clone.mark_completed().await;
                             }
+                            Err(err) => {
+                                // Check if we should retry
+                                if retry_policy.should_retry(attempt) {
+                                    let delay = retry_policy.delay_for_attempt(attempt + 1);
+
+                                    tracing::info!(
+                                        command_id = %command_id,
+                                        retry_attempt = attempt + 1,
+                                        "a3s.lane.retry: retrying command"
+                                    );
+
+                                    // Re-enqueue for retry
+                                    lane_clone.retry_command(wrapper, delay).await;
+                                    lane_clone.mark_completed().await;
+                                } else {
+                                    tracing::Span::current().record(telemetry::ATTR_SUCCESS, false);
+                                    telemetry::record_failure(&lane_id);
+
+                                    // No more retries - remove from storage
+                                    if let Some(storage) = &storage {
+                                        let _ = storage.remove_command(&command_id).await;
+                                    }
+
+                                    // Send to DLQ if available
+                                    if let Some(dlq) = dlq {
+                                        let dead_letter = DeadLetter {
+                                            command_id,
+                                            command_type,
+                                            lane_id,
+                                            error: err.to_string(),
+                                            attempts: attempt + 1,
+                                            failed_at: Utc::now(),
+                                        };
+                                        dlq.push(dead_letter).await;
+                                    }
+
+                                    // Send error to caller
+                                    if let Some(tx) = wrapper.result_tx.take() {
+                                        let _ = tx.send(Err(err));
+                                    }
+                                    lane_clone.mark_completed().await;
+                                }
+                            }
                         }
                     }
-                }.instrument(exec_span));
+                    .instrument(exec_span),
+                );
                 break;
             }
         }

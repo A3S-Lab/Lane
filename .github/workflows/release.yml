@@ -1,0 +1,110 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  # ───────────────────────────────────────────────
+  # Gate: CI checks must pass before any publishing
+  # ───────────────────────────────────────────────
+  ci:
+    name: CI Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup workspace context
+        run: bash .github/setup-workspace.sh
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format check
+        run: cargo fmt -p a3s-lane -- --check
+
+      - name: Clippy
+        run: cargo clippy -p a3s-lane -- -D warnings
+
+      - name: Tests
+        run: cargo test -p a3s-lane --lib
+
+  # ───────────────────────────────────────────────
+  # Publish core crate to crates.io
+  # ───────────────────────────────────────────────
+  publish-crate:
+    name: Publish to crates.io
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup workspace context
+        run: bash .github/setup-workspace.sh
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish
+        working-directory: crates/lane
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
+        run: cargo publish --allow-dirty
+
+  # ───────────────────────────────────────────────
+  # Create GitHub Release
+  # ───────────────────────────────────────────────
+  github-release:
+    name: GitHub Release
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate release notes
+        run: |
+          PREV_TAG=$(git tag --sort=-v:refname | grep '^v' | head -2 | tail -1)
+          if [ -z "$PREV_TAG" ]; then
+            NOTES="Initial release"
+          else
+            NOTES=$(git log "${PREV_TAG}..HEAD" --oneline --no-merges --pretty=format:"- %s" | head -50)
+          fi
+          echo "$NOTES" > /tmp/release-notes.md
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" &>/dev/null; then
+            echo "Release already exists"
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file /tmp/release-notes.md
+          fi
+
+  # ───────────────────────────────────────────────
+  # Build and publish Node SDK to npm
+  # ───────────────────────────────────────────────
+  publish-node:
+    name: Node SDK
+    needs: ci
+    uses: ./.github/workflows/publish-node.yml
+    secrets: inherit
+
+  # ───────────────────────────────────────────────
+  # Build and publish Python SDK to PyPI
+  # ───────────────────────────────────────────────
+  publish-python:
+    name: Python SDK
+    needs: ci
+    uses: ./.github/workflows/publish-python.yml
+    secrets: inherit

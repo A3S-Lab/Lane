@@ -249,7 +249,11 @@ mod tests {
             SPAN_LANE_HEALTH_CHECK,
         ];
         for span in &spans {
-            assert!(span.starts_with("a3s."), "Span {} should start with a3s.", span);
+            assert!(
+                span.starts_with("a3s."),
+                "Span {} should start with a3s.",
+                span
+            );
         }
     }
 

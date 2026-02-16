@@ -145,7 +145,8 @@ pub use partition::{
     Partitioner, RoundRobinPartitioner,
 };
 pub use queue::{
-    lane_ids, priorities, Command, CommandId, CommandQueue, Lane, LaneId, LaneStatus, Priority,
+    lane_ids, priorities, Command, CommandId, CommandQueue, JsonCommand, Lane, LaneId, LaneStatus,
+    Priority,
 };
 pub use ratelimit::{RateLimitConfig, RateLimiter, SlidingWindowLimiter, TokenBucketLimiter};
 pub use retry::RetryPolicy;

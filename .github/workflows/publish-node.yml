@@ -1,0 +1,134 @@
+name: Publish Node SDK
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - host: macos-latest
+            target: aarch64-apple-darwin
+          - host: macos-latest
+            target: x86_64-apple-darwin
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            zig: true
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            zig: true
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            zig: true
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    name: Build ${{ matrix.settings.target }}
+    runs-on: ${{ matrix.settings.host }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup workspace context
+        shell: bash
+        run: bash .github/setup-workspace.sh
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.settings.target }}
+
+      - name: Install Zig
+        if: matrix.settings.zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install dependencies
+        working-directory: crates/lane/sdk/node
+        run: npm install
+
+      - name: Build native module
+        working-directory: crates/lane/sdk/node
+        shell: bash
+        run: |
+          if [ "${{ matrix.settings.zig }}" = "true" ]; then
+            npx napi build --platform --release --target ${{ matrix.settings.target }} --zig
+          else
+            npx napi build --platform --release --target ${{ matrix.settings.target }}
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.settings.target }}
+          path: crates/lane/sdk/node/*.node
+          if-no-files-found: error
+
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        working-directory: sdk/node
+        run: npm install
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: sdk/node/artifacts
+
+      - name: Move artifacts
+        working-directory: sdk/node
+        run: |
+          for artifact_dir in artifacts/bindings-*/; do
+            for node_file in "$artifact_dir"*.node; do
+              filename="$(basename "$node_file")"
+              platform="${filename#a3s-lane.}"
+              platform="${platform%.node}"
+              target_dir="npm/$platform"
+              if [ -d "$target_dir" ]; then
+                cp "$node_file" "$target_dir/"
+                echo "Copied $filename -> $target_dir/"
+              else
+                echo "Warning: no npm dir for $platform, skipping $filename"
+              fi
+            done
+          done
+
+      - name: Publish platform packages
+        working-directory: sdk/node
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for dir in npm/*/; do
+            if [ -f "$dir/package.json" ] && ls "$dir"/*.node 1>/dev/null 2>&1; then
+              echo "Publishing $(basename $dir)..."
+              (cd "$dir" && npm publish --access public) || true
+            fi
+          done
+
+      - name: Publish main package
+        working-directory: sdk/node
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --ignore-scripts

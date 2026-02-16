@@ -4,6 +4,10 @@
 *.pdb
 Cargo.lock
 
+# SDK build artifacts
+sdk/*/target/
+sdk/*/node_modules/
+
 # Coverage
 *.lcov
 lcov.info

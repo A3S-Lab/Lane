@@ -1,0 +1,30 @@
+{
+  "name": "@a3s/lane",
+  "version": "0.1.0",
+  "description": "Node.js bindings for a3s-lane priority command queue",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/A3S-Lab/Lane"
+  },
+  "napi": {
+    "name": "a3s-lane",
+    "triples": {
+      "defaults": true,
+      "additional": [
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-unknown-linux-musl"
+      ]
+    }
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0"
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "prepublishOnly": "napi prepublish -t npm"
+  }
+}
