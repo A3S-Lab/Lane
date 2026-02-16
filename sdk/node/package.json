@@ -1,6 +1,6 @@
 {
   "name": "@a3s-lab/lane",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Node.js bindings for a3s-lane priority command queue",
   "main": "index.js",
   "types": "index.d.ts",
