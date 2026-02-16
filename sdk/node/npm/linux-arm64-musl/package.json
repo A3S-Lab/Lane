@@ -1,0 +1,16 @@
+{
+  "name": "@a3s-lab/lane-linux-arm64-musl",
+  "version": "0.2.2",
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "libc": ["musl"],
+  "main": "a3s-lane.linux-arm64-musl.node",
+  "files": ["a3s-lane.linux-arm64-musl.node"],
+  "description": "Native binding for @a3s-lab/lane (linux-arm64-musl)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/A3S-Lab/Lane",
+    "directory": "sdk/node"
+  }
+}

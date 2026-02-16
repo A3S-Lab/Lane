@@ -1,6 +1,6 @@
 [package]
 name = "a3s-lane"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 authors = ["A3S Lab"]
 license = "MIT"

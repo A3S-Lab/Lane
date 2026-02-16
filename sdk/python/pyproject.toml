@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "a3s-lane"
-version = "0.2.1"
+version = "0.2.2"
 description = "Python bindings for a3s-lane priority command queue"
 license = "MIT"
 requires-python = ">=3.9"
