@@ -257,7 +257,79 @@ pip install a3s-lane        # Python (PyO3/maturin)
 npm install @a3s-lab/lane   # Node.js (napi-rs)
 ```
 
-See `sdk/python/` and `sdk/node/` for full examples and type definitions.
+Both SDKs expose the full v0.4 API: default lanes, custom lanes, submit, subscribe, drain.
+
+### Python
+
+```python
+from a3s_lane import Lane, LaneConfig
+
+# Default lanes
+lane = Lane()
+lane.start()
+
+# Custom lanes
+lane = Lane.with_lanes([
+    LaneConfig("high", priority=0, min_concurrency=1, max_concurrency=4),
+    LaneConfig("low",  priority=1, min_concurrency=1, max_concurrency=2),
+])
+lane.start()
+
+# Submit — blocks until the command completes
+result = lane.submit("high", "my_command", {"key": "value"})
+
+# Subscribe — blocks until the next event (optional timeout)
+stream = lane.subscribe()
+event = stream.recv(timeout_ms=5000)   # returns None on timeout
+if event:
+    print(event.key, event.payload)
+
+# Filtered subscription — exact key match
+failures = lane.subscribe_filtered([
+    "queue.command.failed",
+    "queue.command.timeout",
+])
+
+# Graceful shutdown
+lane.shutdown()
+lane.drain(timeout_secs=30.0)
+```
+
+### Node.js
+
+```js
+const { Lane } = require('@a3s-lab/lane');
+
+// Default lanes
+const lane = new Lane();
+lane.start();
+
+// Custom lanes
+const lane = Lane.withLanes([
+  { laneId: 'high', priority: 0, minConcurrency: 1, maxConcurrency: 4 },
+  { laneId: 'low',  priority: 1, minConcurrency: 1, maxConcurrency: 2 },
+]);
+lane.start();
+
+// Submit — returns JSON string
+const result = JSON.parse(lane.submit('high', 'my_command', JSON.stringify({ key: 'value' })));
+
+// Subscribe — callback receives (err, event) for every event
+lane.subscribe((err, event) => {
+  if (err) throw err;
+  console.log(event.key, JSON.parse(event.payload));
+});
+
+// Filtered subscription — exact key match
+lane.subscribeFiltered(
+  ['queue.command.failed', 'queue.command.timeout'],
+  (err, event) => { console.error('failure:', event.key); }
+);
+
+// Graceful shutdown
+lane.shutdown();
+lane.drain(30_000);  // timeout in ms
+```
 
 ## Development
 
