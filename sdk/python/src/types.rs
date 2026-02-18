@@ -2,28 +2,71 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use serde_json::Value;
 
-/// Lane configuration.
+/// Lane configuration for custom queue setup.
 #[pyclass]
 #[derive(Clone)]
 pub struct PyLaneConfig {
+    #[pyo3(get, set)]
+    pub lane_id: String,
+    #[pyo3(get, set)]
+    pub priority: u32,
     #[pyo3(get, set)]
     pub min_concurrency: usize,
     #[pyo3(get, set)]
     pub max_concurrency: usize,
     #[pyo3(get, set)]
     pub timeout_secs: Option<u64>,
+    #[pyo3(get, set)]
+    pub pressure_threshold: Option<usize>,
 }
 
 #[pymethods]
 impl PyLaneConfig {
     #[new]
-    #[pyo3(signature = (min_concurrency=1, max_concurrency=10, timeout_secs=None))]
-    fn new(min_concurrency: usize, max_concurrency: usize, timeout_secs: Option<u64>) -> Self {
+    #[pyo3(signature = (lane_id, priority, min_concurrency=1, max_concurrency=10, timeout_secs=None, pressure_threshold=None))]
+    fn new(
+        lane_id: String,
+        priority: u32,
+        min_concurrency: usize,
+        max_concurrency: usize,
+        timeout_secs: Option<u64>,
+        pressure_threshold: Option<usize>,
+    ) -> Self {
         Self {
+            lane_id,
+            priority,
             min_concurrency,
             max_concurrency,
             timeout_secs,
+            pressure_threshold,
         }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "LaneConfig(lane_id='{}', priority={}, min={}, max={})",
+            self.lane_id, self.priority, self.min_concurrency, self.max_concurrency
+        )
+    }
+}
+
+/// A queue lifecycle event.
+#[pyclass]
+pub struct PyLaneEvent {
+    #[pyo3(get)]
+    pub key: String,
+    /// Event payload — `None` for empty, a string, or a dict.
+    #[pyo3(get)]
+    pub payload: PyObject,
+    /// RFC3339 timestamp.
+    #[pyo3(get)]
+    pub timestamp: String,
+}
+
+#[pymethods]
+impl PyLaneEvent {
+    fn __repr__(&self) -> String {
+        format!("LaneEvent(key='{}')", self.key)
     }
 }
 
@@ -70,9 +113,7 @@ impl PyQueueStats {
     fn __repr__(&self) -> String {
         format!(
             "QueueStats(pending={}, active={}, lanes={})",
-            self.total_pending,
-            self.total_active,
-            self.lanes.len()
+            self.total_pending, self.total_active, self.lanes.len()
         )
     }
 }
