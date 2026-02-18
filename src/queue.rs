@@ -3,11 +3,15 @@
 use crate::config::LaneConfig;
 use crate::dlq::{DeadLetter, DeadLetterQueue};
 use crate::error::{LaneError, Result};
-use crate::event::EventEmitter;
+use crate::event::{events, EventEmitter, LaneEvent};
 use crate::retry::RetryPolicy;
 use crate::storage::{Storage, StoredCommand};
 #[cfg(feature = "telemetry")]
 use crate::telemetry;
+#[cfg(feature = "distributed")]
+use crate::boost::PriorityBooster;
+#[cfg(feature = "distributed")]
+use crate::ratelimit::RateLimiter;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -81,7 +85,6 @@ impl Command for JsonCommand {
 }
 
 /// Command wrapper
-#[allow(dead_code)]
 struct CommandWrapper {
     id: CommandId,
     command: Arc<dyn Command>,
@@ -91,6 +94,9 @@ struct CommandWrapper {
     attempt: u32,
     lane_id: LaneId,
     command_type: String,
+    /// Submission time used by the priority booster to calculate deadline proximity
+    #[cfg(feature = "distributed")]
+    enqueue_time: chrono::DateTime<chrono::Utc>,
 }
 
 /// Lane state
@@ -138,15 +144,36 @@ pub struct Lane {
     id: LaneId,
     state: Arc<Mutex<LaneState>>,
     storage: Option<Arc<dyn Storage>>,
+    /// Rate limiter instantiated from LaneConfig.rate_limit (None = unlimited)
+    #[cfg(feature = "distributed")]
+    rate_limiter: RateLimiter,
+    /// Priority booster instantiated from LaneConfig.priority_boost
+    #[cfg(feature = "distributed")]
+    booster: Option<PriorityBooster>,
 }
 
 impl Lane {
     /// Create a new lane
     pub fn new(id: impl Into<String>, config: LaneConfig, priority: Priority) -> Self {
+        #[cfg(feature = "distributed")]
+        let rate_limiter = config
+            .rate_limit
+            .as_ref()
+            .map(RateLimiter::token_bucket)
+            .unwrap_or_default();
+        #[cfg(feature = "distributed")]
+        let booster = config
+            .priority_boost
+            .as_ref()
+            .map(|pb| PriorityBooster::new(pb.clone()));
         Self {
             id: id.into(),
             state: Arc::new(Mutex::new(LaneState::new(config, priority))),
             storage: None,
+            #[cfg(feature = "distributed")]
+            rate_limiter,
+            #[cfg(feature = "distributed")]
+            booster,
         }
     }
 
@@ -157,10 +184,25 @@ impl Lane {
         priority: Priority,
         storage: Arc<dyn Storage>,
     ) -> Self {
+        #[cfg(feature = "distributed")]
+        let rate_limiter = config
+            .rate_limit
+            .as_ref()
+            .map(RateLimiter::token_bucket)
+            .unwrap_or_default();
+        #[cfg(feature = "distributed")]
+        let booster = config
+            .priority_boost
+            .as_ref()
+            .map(|pb| PriorityBooster::new(pb.clone()));
         Self {
             id: id.into(),
             state: Arc::new(Mutex::new(LaneState::new(config, priority))),
             storage: Some(storage),
+            #[cfg(feature = "distributed")]
+            rate_limiter,
+            #[cfg(feature = "distributed")]
+            booster,
         }
     }
 
@@ -172,6 +214,19 @@ impl Lane {
     /// Get lane priority
     pub async fn priority(&self) -> Priority {
         self.state.lock().await.priority
+    }
+
+    /// Get effective priority, applying boost based on the front command's age
+    pub async fn effective_priority(&self) -> Priority {
+        let state = self.state.lock().await;
+        let base = state.priority;
+        #[cfg(feature = "distributed")]
+        if let Some(booster) = &self.booster {
+            if let Some(front) = state.pending.front() {
+                return booster.calculate_priority(base, front.enqueue_time);
+            }
+        }
+        base
     }
 
     /// Enqueue a command
@@ -196,6 +251,8 @@ impl Lane {
             attempt: 0,
             lane_id: self.id.clone(),
             command_type: command_type.clone(),
+            #[cfg(feature = "distributed")]
+            enqueue_time: Utc::now(),
         };
 
         // Persist to storage if available
@@ -234,6 +291,11 @@ impl Lane {
 
     /// Try to dequeue a command for execution
     async fn try_dequeue(&self) -> Option<CommandWrapper> {
+        // Check rate limiter before acquiring the state lock
+        #[cfg(feature = "distributed")]
+        if !self.rate_limiter.try_acquire().await {
+            return None;
+        }
         let mut state = self.state.lock().await;
         if state.has_capacity() && state.has_pending() {
             state.active += 1;
@@ -352,6 +414,7 @@ impl CommandQueue {
     /// Initiate graceful shutdown - stop accepting new commands
     pub async fn shutdown(&self) {
         self.is_shutting_down.store(true, Ordering::SeqCst);
+        self.event_emitter.emit(LaneEvent::empty(events::QUEUE_SHUTDOWN_STARTED));
     }
 
     /// Wait for all pending commands to complete (with timeout)
@@ -407,8 +470,14 @@ impl CommandQueue {
         let lane = lanes
             .get(lane_id)
             .ok_or_else(|| LaneError::LaneNotFound(lane_id.to_string()))?;
+        let rx = lane.enqueue(command).await;
 
-        Ok(lane.enqueue(command).await)
+        self.event_emitter.emit(LaneEvent::with_map(
+            events::QUEUE_COMMAND_SUBMITTED,
+            HashMap::from([("lane_id".to_string(), serde_json::json!(lane_id))]),
+        ));
+
+        Ok(rx)
     }
 
     /// Start the scheduler
@@ -423,13 +492,13 @@ impl CommandQueue {
 
     /// Schedule the next command
     async fn schedule_next(&self) {
-        // Find the highest-priority lane with pending commands
+        // Find the highest-priority lane with pending commands.
+        // effective_priority applies any deadline-based boost configured on the lane.
         let lanes = self.lanes.lock().await;
 
-        // Collect lanes with their priorities
         let mut lane_priorities = Vec::new();
         for lane in lanes.values() {
-            let priority = lane.priority().await;
+            let priority = lane.effective_priority().await;
             lane_priorities.push((priority, Arc::clone(lane)));
         }
 
@@ -447,6 +516,16 @@ impl CommandQueue {
                 let command_type = wrapper.command_type.clone();
                 let lane_id = wrapper.lane_id.clone();
                 let storage = lane.storage.clone();
+                let event_emitter = self.event_emitter.clone();
+
+                event_emitter.emit(LaneEvent::with_map(
+                    events::QUEUE_COMMAND_STARTED,
+                    HashMap::from([
+                        ("lane_id".to_string(), serde_json::json!(lane_id)),
+                        ("command_id".to_string(), serde_json::json!(command_id)),
+                        ("command_type".to_string(), serde_json::json!(command_type)),
+                    ]),
+                ));
 
                 tokio::spawn(async move {
                     #[cfg(feature = "telemetry")]
@@ -474,6 +553,14 @@ impl CommandQueue {
                                 exec_start.elapsed().as_secs_f64(),
                             );
 
+                            event_emitter.emit(LaneEvent::with_map(
+                                events::QUEUE_COMMAND_COMPLETED,
+                                HashMap::from([
+                                    ("lane_id".to_string(), serde_json::json!(lane_id)),
+                                    ("command_id".to_string(), serde_json::json!(command_id)),
+                                ]),
+                            ));
+
                             if let Some(tx) = wrapper.result_tx.take() {
                                 let _ = tx.send(Ok(value));
                             }
@@ -489,6 +576,15 @@ impl CommandQueue {
                                     "a3s.lane.retry: retrying command"
                                 );
 
+                                event_emitter.emit(LaneEvent::with_map(
+                                    events::QUEUE_COMMAND_RETRY,
+                                    HashMap::from([
+                                        ("lane_id".to_string(), serde_json::json!(lane_id)),
+                                        ("command_id".to_string(), serde_json::json!(command_id)),
+                                        ("attempt".to_string(), serde_json::json!(attempt + 1)),
+                                    ]),
+                                ));
+
                                 lane_clone.retry_command(wrapper, delay).await;
                                 lane_clone.mark_completed().await;
                             } else {
@@ -499,17 +595,48 @@ impl CommandQueue {
                                     let _ = storage.remove_command(&command_id).await;
                                 }
 
+                                let error_msg = err.to_string();
+                                let is_timeout = matches!(err, LaneError::Timeout(_));
+
                                 if let Some(dlq) = dlq {
                                     let dead_letter = DeadLetter {
-                                        command_id,
-                                        command_type,
-                                        lane_id,
-                                        error: err.to_string(),
+                                        command_id: command_id.clone(),
+                                        command_type: command_type.clone(),
+                                        lane_id: lane_id.clone(),
+                                        error: error_msg.clone(),
                                         attempts: attempt + 1,
                                         failed_at: Utc::now(),
                                     };
                                     dlq.push(dead_letter).await;
+
+                                    event_emitter.emit(LaneEvent::with_map(
+                                        events::QUEUE_COMMAND_DEAD_LETTERED,
+                                        HashMap::from([
+                                            ("lane_id".to_string(), serde_json::json!(lane_id)),
+                                            (
+                                                "command_id".to_string(),
+                                                serde_json::json!(command_id),
+                                            ),
+                                            (
+                                                "command_type".to_string(),
+                                                serde_json::json!(command_type),
+                                            ),
+                                        ]),
+                                    ));
                                 }
+
+                                event_emitter.emit(LaneEvent::with_map(
+                                    if is_timeout {
+                                        events::QUEUE_COMMAND_TIMEOUT
+                                    } else {
+                                        events::QUEUE_COMMAND_FAILED
+                                    },
+                                    HashMap::from([
+                                        ("lane_id".to_string(), serde_json::json!(lane_id)),
+                                        ("command_id".to_string(), serde_json::json!(command_id)),
+                                        ("error".to_string(), serde_json::json!(error_msg)),
+                                    ]),
+                                ));
 
                                 if let Some(tx) = wrapper.result_tx.take() {
                                     let _ = tx.send(Err(err));
@@ -1299,5 +1426,146 @@ mod tests {
 
         queue.shutdown().await;
         assert!(queue.is_shutting_down());
+    }
+
+    // ── Bug-fix tests ──────────────────────────────────────────────────────────
+
+    /// Bug fix: EventEmitter.emit() is now called on submit, start, complete, retry,
+    /// dead-letter, fail, and shutdown.
+    #[tokio::test]
+    async fn test_event_emitted_on_submit() {
+        use crate::event::events;
+
+        let emitter = EventEmitter::new(100);
+        let mut rx = emitter.subscribe();
+        let queue = CommandQueue::new(emitter);
+
+        let config = LaneConfig::new(1, 4);
+        let lane = Arc::new(Lane::new("test-lane", config, priorities::QUERY));
+        queue.register_lane(lane).await;
+
+        let cmd = Box::new(TestCommand::new(serde_json::json!({"result": "ok"})));
+        let _ = queue.submit("test-lane", cmd).await.unwrap();
+
+        let event = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            async { rx.recv().await.unwrap() },
+        )
+        .await
+        .expect("QUEUE_COMMAND_SUBMITTED event not received");
+
+        assert_eq!(event.key, events::QUEUE_COMMAND_SUBMITTED);
+    }
+
+    #[tokio::test]
+    async fn test_event_emitted_on_complete() {
+        use crate::event::{events, EventStream};
+
+        let emitter = EventEmitter::new(100);
+        let queue = Arc::new(CommandQueue::new(emitter.clone()));
+
+        let config = LaneConfig::new(1, 4);
+        let lane = Arc::new(Lane::new("test-lane", config, priorities::QUERY));
+        queue.register_lane(lane).await;
+        Arc::clone(&queue).start_scheduler().await;
+
+        let mut stream: EventStream =
+            emitter.subscribe_filtered(|e| e.key == events::QUEUE_COMMAND_COMPLETED);
+
+        let cmd = Box::new(TestCommand::new(serde_json::json!({"result": "ok"})));
+        let rx = queue.submit("test-lane", cmd).await.unwrap();
+
+        // Wait for command to complete
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), rx).await;
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(200), stream.recv())
+            .await
+            .expect("QUEUE_COMMAND_COMPLETED event not received")
+            .expect("stream closed");
+
+        assert_eq!(event.key, events::QUEUE_COMMAND_COMPLETED);
+    }
+
+    #[tokio::test]
+    async fn test_event_emitted_on_shutdown() {
+        use crate::event::events;
+
+        let emitter = EventEmitter::new(100);
+        let mut rx = emitter.subscribe();
+        let queue = CommandQueue::new(emitter);
+
+        queue.shutdown().await;
+
+        let event = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            async { rx.recv().await.unwrap() },
+        )
+        .await
+        .expect("QUEUE_SHUTDOWN_STARTED event not received");
+
+        assert_eq!(event.key, events::QUEUE_SHUTDOWN_STARTED);
+    }
+
+    #[cfg(feature = "distributed")]
+    #[tokio::test]
+    async fn test_rate_limit_blocks_dequeue() {
+        use crate::ratelimit::RateLimitConfig;
+
+        // Token bucket starts full (1 token for per_second(1))
+        let config = LaneConfig::new(1, 10).with_rate_limit(RateLimitConfig::per_second(1));
+        let lane = Lane::new("test", config, priorities::QUERY);
+
+        let _rx1 = lane.enqueue(Box::new(TestCommand::new(serde_json::json!(1)))).await;
+        let _rx2 = lane.enqueue(Box::new(TestCommand::new(serde_json::json!(2)))).await;
+
+        // First dequeue consumes the single available token
+        let first = lane.try_dequeue().await;
+        assert!(first.is_some(), "first dequeue should succeed");
+        // Return the slot so capacity isn't the limiting factor
+        lane.mark_completed().await;
+
+        // No tokens left — rate limiter should block the second dequeue
+        let second = lane.try_dequeue().await;
+        assert!(second.is_none(), "second dequeue should be rate-limited");
+    }
+
+    #[cfg(feature = "distributed")]
+    #[tokio::test]
+    async fn test_effective_priority_no_boost_when_fresh() {
+        use crate::boost::PriorityBoostConfig;
+
+        // Boost activates with 9 s remaining on a 10 s deadline.
+        // A freshly-enqueued command has ~10 s left, so no boost yet.
+        let config = LaneConfig::new(1, 4).with_priority_boost(
+            PriorityBoostConfig::new(std::time::Duration::from_secs(10))
+                .with_boost(std::time::Duration::from_secs(9), 2),
+        );
+        let lane = Lane::new("test", config, priorities::QUERY);
+
+        // Without any pending command the lane returns its base priority
+        assert_eq!(lane.effective_priority().await, priorities::QUERY);
+
+        // A just-enqueued command has ~10 s left — no boost
+        let _rx = lane.enqueue(Box::new(TestCommand::new(serde_json::json!(1)))).await;
+        assert_eq!(lane.effective_priority().await, priorities::QUERY);
+    }
+
+    #[cfg(feature = "distributed")]
+    #[tokio::test]
+    async fn test_effective_priority_boosted_when_past_deadline() {
+        use crate::boost::PriorityBoostConfig;
+
+        // Deadline already passed — effective priority should reach 0 (maximum)
+        let config = LaneConfig::new(1, 4).with_priority_boost(PriorityBoostConfig::standard(
+            std::time::Duration::from_millis(1), // 1 ms deadline
+        ));
+        let lane = Lane::new("test", config, priorities::PROMPT); // base = 5
+
+        let _rx = lane.enqueue(Box::new(TestCommand::new(serde_json::json!(1)))).await;
+
+        // Sleep past the deadline so the booster gives priority 0
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        assert_eq!(lane.effective_priority().await, 0);
     }
 }
