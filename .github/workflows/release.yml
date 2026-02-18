@@ -26,14 +26,16 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - uses: Swatinem/rust-cache@v2
+
       - name: Format check
         run: cargo fmt -p a3s-lane -- --check
 
       - name: Clippy
-        run: cargo clippy -p a3s-lane -- -D warnings
+        run: cargo clippy -p a3s-lane --all-features -- -D warnings
 
       - name: Tests
-        run: cargo test -p a3s-lane --lib
+        run: cargo test -p a3s-lane --all-features --lib
 
   # ───────────────────────────────────────────────
   # Publish core crate to crates.io

@@ -62,7 +62,7 @@ name = "scalability"
 required-features = ["distributed"]
 
 [profile.release]
-opt-level = "z"
-lto = true
-codegen-units = 1
+opt-level = 3         # throughput over size; this is a queue library, not a CLI
+lto = "thin"          # comparable perf to fat LTO, compiles 2-4x faster
+codegen-units = 1     # single codegen unit — required for lto = "thin" to matter
 strip = true

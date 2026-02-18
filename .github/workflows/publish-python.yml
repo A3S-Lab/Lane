@@ -54,6 +54,10 @@ jobs:
         with:
           targets: ${{ matrix.settings.target }}
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.settings.target }}
+
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:

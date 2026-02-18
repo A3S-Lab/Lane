@@ -1,6 +1,6 @@
 {
   "name": "@a3s-lab/lane-linux-x64-musl",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "os": ["linux"],
   "cpu": ["x64"],
   "libc": ["musl"],

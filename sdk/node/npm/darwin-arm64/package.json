@@ -1,6 +1,6 @@
 {
   "name": "@a3s-lab/lane-darwin-arm64",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "os": ["darwin"],
   "cpu": ["arm64"],
   "main": "a3s-lane.darwin-arm64.node",

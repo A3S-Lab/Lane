@@ -48,6 +48,10 @@ jobs:
         with:
           targets: ${{ matrix.settings.target }}
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.settings.target }}
+
       - name: Install Zig
         if: matrix.settings.zig
         uses: goto-bus-stop/setup-zig@v2
