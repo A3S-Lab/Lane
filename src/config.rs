@@ -30,11 +30,11 @@
 //!     .with_rate_limit(RateLimitConfig::per_second(100));
 //! ```
 
-use crate::retry::RetryPolicy;
 #[cfg(feature = "distributed")]
 use crate::boost::PriorityBoostConfig;
 #[cfg(feature = "distributed")]
 use crate::ratelimit::RateLimitConfig;
+use crate::retry::RetryPolicy;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 

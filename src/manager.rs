@@ -347,13 +347,10 @@ mod tests {
         let _ = manager.submit(lane_ids::QUERY, cmd).await.unwrap();
 
         // The first event emitted is QUEUE_COMMAND_SUBMITTED
-        let event = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            stream.next(),
-        )
-        .await
-        .expect("No event received via manager.subscribe()")
-        .expect("Stream ended");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("No event received via manager.subscribe()")
+            .expect("Stream ended");
 
         assert_eq!(event.key, events::QUEUE_COMMAND_SUBMITTED);
     }
@@ -365,8 +362,7 @@ mod tests {
 
         let manager = make_manager().await;
         // Only capture completed events; submitted/started events are filtered out
-        let mut stream =
-            manager.subscribe_filtered(|e| e.key == events::QUEUE_COMMAND_COMPLETED);
+        let mut stream = manager.subscribe_filtered(|e| e.key == events::QUEUE_COMMAND_COMPLETED);
 
         manager.start().await.unwrap();
 
@@ -378,13 +374,10 @@ mod tests {
         // Wait for command to finish
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), rx).await;
 
-        let event = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            stream.next(),
-        )
-        .await
-        .expect("No completed event received via manager.subscribe_filtered()")
-        .expect("Stream ended");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("No completed event received via manager.subscribe_filtered()")
+            .expect("Stream ended");
 
         assert_eq!(event.key, events::QUEUE_COMMAND_COMPLETED);
     }

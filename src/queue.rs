@@ -1,17 +1,17 @@
 //! Core queue implementation with lanes and priority scheduling
 
+#[cfg(feature = "distributed")]
+use crate::boost::PriorityBooster;
 use crate::config::LaneConfig;
 use crate::dlq::{DeadLetter, DeadLetterQueue};
 use crate::error::{LaneError, Result};
 use crate::event::{events, EventEmitter, EventStream, LaneEvent};
+#[cfg(feature = "distributed")]
+use crate::ratelimit::RateLimiter;
 use crate::retry::RetryPolicy;
 use crate::storage::{Storage, StoredCommand};
 #[cfg(feature = "telemetry")]
 use crate::telemetry;
-#[cfg(feature = "distributed")]
-use crate::boost::PriorityBooster;
-#[cfg(feature = "distributed")]
-use crate::ratelimit::RateLimiter;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -442,7 +442,8 @@ impl CommandQueue {
     /// Initiate graceful shutdown - stop accepting new commands
     pub async fn shutdown(&self) {
         self.is_shutting_down.store(true, Ordering::SeqCst);
-        self.event_emitter.emit(LaneEvent::empty(events::QUEUE_SHUTDOWN_STARTED));
+        self.event_emitter
+            .emit(LaneEvent::empty(events::QUEUE_SHUTDOWN_STARTED));
     }
 
     /// Wait for all pending commands to complete (with timeout)
@@ -1504,13 +1505,10 @@ mod tests {
         // Start scheduler — first tick calls check_pressure → pending=2 >= 2 → emit PRESSURE
         Arc::clone(&queue).start_scheduler().await;
 
-        let event = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            stream.recv(),
-        )
-        .await
-        .expect("No pressure event received within timeout")
-        .expect("Stream ended");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv())
+            .await
+            .expect("No pressure event received within timeout")
+            .expect("Stream ended");
 
         assert_eq!(event.key, events::QUEUE_LANE_PRESSURE);
     }
@@ -1539,23 +1537,17 @@ mod tests {
         Arc::clone(&queue).start_scheduler().await;
 
         // First event must be pressure
-        let pressure = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            stream.recv(),
-        )
-        .await
-        .expect("No pressure event")
-        .expect("Stream ended");
+        let pressure = tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv())
+            .await
+            .expect("No pressure event")
+            .expect("Stream ended");
         assert_eq!(pressure.key, events::QUEUE_LANE_PRESSURE);
 
         // After dequeue, pending=0 → idle event on the next scheduler tick
-        let idle = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            stream.recv(),
-        )
-        .await
-        .expect("No idle event")
-        .expect("Stream ended");
+        let idle = tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv())
+            .await
+            .expect("No idle event")
+            .expect("Stream ended");
         assert_eq!(idle.key, events::QUEUE_LANE_IDLE);
     }
 
@@ -1587,13 +1579,13 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         // No pressure/idle events should have been emitted
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            stream.recv(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), stream.recv()).await;
 
-        assert!(result.is_err(), "Should not receive pressure/idle events without threshold");
+        assert!(
+            result.is_err(),
+            "Should not receive pressure/idle events without threshold"
+        );
     }
 
     // ── Bug-fix tests ──────────────────────────────────────────────────────────
@@ -1615,10 +1607,9 @@ mod tests {
         let cmd = Box::new(TestCommand::new(serde_json::json!({"result": "ok"})));
         let _ = queue.submit("test-lane", cmd).await.unwrap();
 
-        let event = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            async { rx.recv().await.unwrap() },
-        )
+        let event = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            rx.recv().await.unwrap()
+        })
         .await
         .expect("QUEUE_COMMAND_SUBMITTED event not received");
 
@@ -1664,10 +1655,9 @@ mod tests {
 
         queue.shutdown().await;
 
-        let event = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            async { rx.recv().await.unwrap() },
-        )
+        let event = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            rx.recv().await.unwrap()
+        })
         .await
         .expect("QUEUE_SHUTDOWN_STARTED event not received");
 
@@ -1683,8 +1673,12 @@ mod tests {
         let config = LaneConfig::new(1, 10).with_rate_limit(RateLimitConfig::per_second(1));
         let lane = Lane::new("test", config, priorities::QUERY);
 
-        let _rx1 = lane.enqueue(Box::new(TestCommand::new(serde_json::json!(1)))).await;
-        let _rx2 = lane.enqueue(Box::new(TestCommand::new(serde_json::json!(2)))).await;
+        let _rx1 = lane
+            .enqueue(Box::new(TestCommand::new(serde_json::json!(1))))
+            .await;
+        let _rx2 = lane
+            .enqueue(Box::new(TestCommand::new(serde_json::json!(2))))
+            .await;
 
         // First dequeue consumes the single available token
         let first = lane.try_dequeue().await;
@@ -1714,7 +1708,9 @@ mod tests {
         assert_eq!(lane.effective_priority().await, priorities::QUERY);
 
         // A just-enqueued command has ~10 s left — no boost
-        let _rx = lane.enqueue(Box::new(TestCommand::new(serde_json::json!(1)))).await;
+        let _rx = lane
+            .enqueue(Box::new(TestCommand::new(serde_json::json!(1))))
+            .await;
         assert_eq!(lane.effective_priority().await, priorities::QUERY);
     }
 
@@ -1729,7 +1725,9 @@ mod tests {
         ));
         let lane = Lane::new("test", config, priorities::PROMPT); // base = 5
 
-        let _rx = lane.enqueue(Box::new(TestCommand::new(serde_json::json!(1)))).await;
+        let _rx = lane
+            .enqueue(Box::new(TestCommand::new(serde_json::json!(1))))
+            .await;
 
         // Sleep past the deadline so the booster gives priority 0
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;

@@ -63,22 +63,22 @@ pub mod retry;
 pub mod storage;
 
 // Feature-gated modules
+#[cfg(feature = "monitoring")]
+pub mod alerts;
+#[cfg(feature = "distributed")]
+pub mod boost;
+#[cfg(feature = "distributed")]
+pub mod distributed;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 #[cfg(feature = "monitoring")]
-pub mod alerts;
-#[cfg(feature = "monitoring")]
 pub mod monitor;
-#[cfg(feature = "telemetry")]
-pub mod telemetry;
-#[cfg(feature = "distributed")]
-pub mod boost;
 #[cfg(feature = "distributed")]
 pub mod partition;
 #[cfg(feature = "distributed")]
 pub mod ratelimit;
-#[cfg(feature = "distributed")]
-pub mod distributed;
+#[cfg(feature = "telemetry")]
+pub mod telemetry;
 
 // Core re-exports
 pub use config::LaneConfig;
@@ -94,23 +94,21 @@ pub use retry::RetryPolicy;
 pub use storage::{LocalStorage, Storage, StoredCommand, StoredDeadLetter};
 
 // Feature-gated re-exports
-#[cfg(feature = "metrics")]
-pub use metrics::{
-    metric_names, HistogramPercentiles, HistogramStats, LocalMetrics, MetricsBackend,
-    MetricsSnapshot, QueueMetrics,
-};
 #[cfg(feature = "monitoring")]
 pub use alerts::{Alert, AlertLevel, AlertManager, LatencyAlertConfig, QueueDepthAlertConfig};
-#[cfg(feature = "monitoring")]
-pub use monitor::{MonitorConfig, QueueMonitor};
-#[cfg(feature = "telemetry")]
-pub use telemetry::OtelMetricsBackend;
 #[cfg(feature = "distributed")]
 pub use boost::{PriorityBoostConfig, PriorityBooster};
 #[cfg(feature = "distributed")]
 pub use distributed::{
     CommandEnvelope, CommandResult, DistributedQueue, LocalDistributedQueue, WorkerId, WorkerPool,
 };
+#[cfg(feature = "metrics")]
+pub use metrics::{
+    metric_names, HistogramPercentiles, HistogramStats, LocalMetrics, MetricsBackend,
+    MetricsSnapshot, QueueMetrics,
+};
+#[cfg(feature = "monitoring")]
+pub use monitor::{MonitorConfig, QueueMonitor};
 #[cfg(feature = "distributed")]
 pub use partition::{
     CustomPartitioner, HashPartitioner, PartitionConfig, PartitionId, PartitionStrategy,
@@ -118,6 +116,8 @@ pub use partition::{
 };
 #[cfg(feature = "distributed")]
 pub use ratelimit::{RateLimitConfig, RateLimiter, SlidingWindowLimiter, TokenBucketLimiter};
+#[cfg(feature = "telemetry")]
+pub use telemetry::OtelMetricsBackend;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

@@ -312,13 +312,10 @@ mod tests {
 
         emitter.emit(LaneEvent::empty("test.stream.event"));
 
-        let event = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            stream.next(),
-        )
-        .await
-        .expect("Timeout waiting for event via Stream::next")
-        .expect("Stream ended unexpectedly");
+        let event = tokio::time::timeout(std::time::Duration::from_millis(200), stream.next())
+            .await
+            .expect("Timeout waiting for event via Stream::next")
+            .expect("Stream ended unexpectedly");
 
         assert_eq!(event.key, "test.stream.event");
     }
@@ -335,13 +332,10 @@ mod tests {
         emitter.emit(LaneEvent::empty("stream.3"));
 
         for expected in ["stream.1", "stream.2", "stream.3"] {
-            let event = tokio::time::timeout(
-                std::time::Duration::from_millis(200),
-                stream.next(),
-            )
-            .await
-            .expect("Timeout")
-            .expect("Stream ended");
+            let event = tokio::time::timeout(std::time::Duration::from_millis(200), stream.next())
+                .await
+                .expect("Timeout")
+                .expect("Stream ended");
             assert_eq!(event.key, expected);
         }
     }
@@ -354,13 +348,10 @@ mod tests {
         emitter.emit(LaneEvent::empty("skip.this"));
         emitter.emit(LaneEvent::empty("ok.recv.event"));
 
-        let event = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            stream.recv(),
-        )
-        .await
-        .expect("Timeout waiting for event via recv()")
-        .expect("Stream ended");
+        let event = tokio::time::timeout(std::time::Duration::from_millis(200), stream.recv())
+            .await
+            .expect("Timeout waiting for event via recv()")
+            .expect("Stream ended");
 
         assert_eq!(event.key, "ok.recv.event");
     }
