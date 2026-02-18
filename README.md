@@ -52,7 +52,7 @@ impl Command for MyCommand {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create event emitter
     let emitter = EventEmitter::new(100);
 
@@ -79,60 +79,50 @@ async fn main() -> anyhow::Result<()> {
 
 ## Features
 
+### Core (always compiled)
 - **Priority-based Scheduling**: Commands execute based on lane priority (lower = higher priority)
 - **Concurrency Control**: Per-lane min/max concurrency limits
 - **6 Built-in Lanes**: system, control, query, session, skill, prompt
 - **Command Timeout**: Configurable timeout per lane with automatic cancellation
-- **Retry Policies**: Exponential backoff, fixed delay, or custom retry strategies
+- **Retry Policies**: Exponential backoff, fixed delay, or no-retry strategies
 - **Dead Letter Queue**: Capture permanently failed commands for inspection
-- **Persistent Storage**: Optional pluggable storage backend (LocalStorage included)
+- **Persistent Storage**: Optional pluggable storage backend (`LocalStorage` included)
 - **Graceful Shutdown**: Drain pending commands before shutdown
-- **Multi-core Parallelism**: Automatic CPU core detection and parallel processing
-- **Queue Partitioning**: Distribute commands across workers for scalability
-- **Rate Limiting**: Token bucket and sliding window rate limiters per lane
-- **Priority Boosting**: Deadline-based automatic priority adjustment
-- **Distributed Queue Support**: Pluggable interface for multi-machine processing
-- **Metrics Collection**: Local in-memory metrics with pluggable backend support
-- **Latency Histograms**: Track command execution and wait time with percentiles (p50, p90, p95, p99)
+- **Event System**: 11 lifecycle events emitted automatically (submit, start, complete, retry, DLQ, fail, timeout, shutdown)
+- **Builder Pattern**: Flexible queue configuration via `QueueManagerBuilder`
+- **Async-first**: Built on Tokio for high-performance async operations
+
+### `distributed` feature (default)
+- **Rate Limiting**: Token bucket and sliding window rate limiters, enforced per-lane at dequeue time
+- **Priority Boosting**: Deadline-based priority boost applied to the front command on each scheduling tick
+- **Queue Partitioning**: Round-robin, hash-based, and custom partitioning strategies
+- **Multi-core Parallelism**: Automatic CPU core detection via `PartitionConfig::auto()`
+- **Distributed Queue**: Pluggable `DistributedQueue` trait for multi-machine processing
+
+### `metrics` feature (default)
+- **Metrics Collection**: Local in-memory metrics with pluggable `MetricsBackend` trait
+- **Latency Histograms**: Command execution and wait time with percentiles (p50, p90, p95, p99)
+
+### `monitoring` feature (default, requires `metrics`)
 - **Queue Depth Alerts**: Configurable warning and critical thresholds
 - **Latency Alerts**: Monitor and alert on command execution latency
-- **Event System**: Subscribe to queue events for monitoring
-- **Health Monitoring**: Track queue depth and active command counts
-- **Builder Pattern**: Flexible queue configuration
+- **Health Monitoring**: Background `QueueMonitor` tracking depth and active counts
+
+### `telemetry` feature (default, requires `metrics`)
 - **OpenTelemetry Integration**: Native OTLP metrics export via `OtelMetricsBackend`
+
+### SDKs
 - **Python SDK**: `pip install a3s-lane` — async queue management from Python
 - **Node.js SDK**: `npm install @a3s-lab/lane` — native bindings for Node.js
-- **Async-first**: Built on Tokio for high-performance async operations
 
 ## Quality Metrics
 
 ### Test Coverage
 
-**230 comprehensive unit tests** with **96.48% line coverage**:
+**236 unit tests** across all modules (`--all-features`). Run the live coverage report:
 
-| Module | Lines | Coverage | Functions | Coverage |
-|--------|-------|----------|-----------|----------|
-| dlq.rs | 157 | 100.00% | 34 | 100.00% |
-| error.rs | 34 | 100.00% | 8 | 100.00% |
-| lib.rs | 39 | 100.00% | 4 | 100.00% |
-| retry.rs | 111 | 100.00% | 16 | 100.00% |
-| manager.rs | 572 | 99.65% | 81 | 100.00% |
-| queue.rs | 822 | 98.91% | 120 | 99.17% |
-| monitor.rs | 325 | 98.46% | 45 | 97.78% |
-| event.rs | 169 | 97.63% | 29 | 100.00% |
-| metrics.rs | 453 | 96.69% | 82 | 93.90% |
-| alerts.rs | 432 | 96.53% | 79 | 93.67% |
-| boost.rs | 184 | 95.11% | 26 | 88.46% |
-| storage.rs | 193 | 94.82% | 30 | 83.33% |
-| distributed.rs | 227 | 92.07% | 34 | 82.35% |
-| config.rs | 118 | 88.98% | 18 | 88.89% |
-| ratelimit.rs | 257 | 88.33% | 53 | 86.79% |
-| partition.rs | 143 | 86.71% | 28 | 82.14% |
-| **TOTAL** | **4236** | **96.48%** | **687** | **94.18%** |
-
-Run coverage report:
 ```bash
-cargo llvm-cov --lib --summary-only
+cargo llvm-cov --lib --summary-only --all-features
 ```
 
 ### Performance Benchmarks
@@ -193,11 +183,23 @@ Results are saved to `target/criterion/` with detailed HTML reports.
 
 ### Installation
 
-Add to your `Cargo.toml`:
+```toml
+[dependencies]
+a3s-lane = "0.3"
+```
+
+All four features (`metrics`, `monitoring`, `telemetry`, `distributed`) are on by default. To use only the core queue without optional deps:
 
 ```toml
 [dependencies]
-a3s-lane = "0.2"
+a3s-lane = { version = "0.3", default-features = false }
+```
+
+Enable individual features selectively:
+
+```toml
+[dependencies]
+a3s-lane = { version = "0.3", default-features = false, features = ["metrics", "distributed"] }
 ```
 
 ### Custom Lanes
@@ -242,6 +244,8 @@ println!("Pending: {}, Active: {}", stats.total_pending, stats.total_active);
 
 ### Event Subscription
 
+The queue emits lifecycle events automatically. Subscribe before starting the scheduler:
+
 ```rust
 use a3s_lane::EventEmitter;
 
@@ -251,15 +255,30 @@ let emitter = EventEmitter::new(100);
 let mut receiver = emitter.subscribe();
 
 // Subscribe with filter
-let mut filtered = emitter.subscribe_filtered(|e| e.key.starts_with("queue."));
+let mut started = emitter.subscribe_filtered(|e| e.key == "queue.command.started");
 
-// In another task
+// Consume events in a background task
 tokio::spawn(async move {
     while let Ok(event) = receiver.recv().await {
-        println!("Event: {} at {}", event.key, event.timestamp);
+        println!("[{}] {}", event.timestamp, event.key);
     }
 });
 ```
+
+**Lifecycle events emitted automatically:**
+
+| Event key | When emitted | Payload fields |
+|-----------|-------------|----------------|
+| `queue.command.submitted` | `submit()` accepted | `lane_id` |
+| `queue.command.started` | Scheduler dispatched a command | `lane_id`, `command_id`, `command_type` |
+| `queue.command.completed` | Command returned `Ok` | `lane_id`, `command_id` |
+| `queue.command.retry` | Command failed, will be retried | `lane_id`, `command_id`, `attempt` |
+| `queue.command.dead_lettered` | Command moved to DLQ | `lane_id`, `command_id`, `command_type` |
+| `queue.command.failed` | Terminal failure (non-timeout) | `lane_id`, `command_id`, `error` |
+| `queue.command.timeout` | Terminal failure (timeout) | `lane_id`, `command_id`, `error` |
+| `queue.shutdown.started` | `shutdown()` called | *(empty)* |
+| `queue.lane.pressure` | *(emitted by AlertManager)* | — |
+| `queue.lane.idle` | *(emitted by AlertManager)* | — |
 
 ### Reliability Features
 
@@ -366,35 +385,35 @@ let config = PartitionConfig::hash(8);
 
 #### Rate Limiting
 
+Token bucket rate limiting is enforced at dequeue time — commands that exceed the configured rate are held in the queue until a token is available.
+
 ```rust
 use a3s_lane::{LaneConfig, RateLimitConfig};
 
-// Limit to 100 commands per second
-let rate_limit = RateLimitConfig::per_second(100);
+// Limit to 100 commands per second (token bucket)
 let config = LaneConfig::new(1, 10)
-    .with_rate_limit(rate_limit);
+    .with_rate_limit(RateLimitConfig::per_second(100));
 
 // Limit to 1000 commands per minute
-let rate_limit = RateLimitConfig::per_minute(1000);
 let config = LaneConfig::new(1, 10)
-    .with_rate_limit(rate_limit);
+    .with_rate_limit(RateLimitConfig::per_minute(1000));
 ```
 
 #### Priority Boosting
+
+Priority boost is applied on every scheduling tick: the scheduler calls `effective_priority()` on each lane, which reads the front command's submission timestamp and applies the configured boost intervals. A command past its deadline gets priority 0 (highest).
 
 ```rust
 use a3s_lane::{LaneConfig, PriorityBoostConfig};
 use std::time::Duration;
 
-// Standard boost: priority increases as deadline approaches
-let boost = PriorityBoostConfig::standard(Duration::from_secs(300));
+// At 75%/50%/25%/10% of deadline remaining: boost by 1/2/3/4
 let config = LaneConfig::new(1, 10)
-    .with_priority_boost(boost);
+    .with_priority_boost(PriorityBoostConfig::standard(Duration::from_secs(300)));
 
-// Aggressive boost: faster priority escalation
-let boost = PriorityBoostConfig::aggressive(Duration::from_secs(60));
+// Faster escalation: boost by 2/4/6/8 at 80%/60%/40%/20%
 let config = LaneConfig::new(1, 10)
-    .with_priority_boost(boost);
+    .with_priority_boost(PriorityBoostConfig::aggressive(Duration::from_secs(60)));
 ```
 
 #### Custom Distributed Queue
@@ -619,6 +638,17 @@ alerts.check_latency("api", 600.0).await; // Triggers critical
 | `drain(timeout)` | Wait for pending commands to complete with timeout |
 | `is_shutting_down()` | Check if shutdown is in progress |
 
+### Lane
+
+| Method | Description |
+|--------|-------------|
+| `new(id, config, priority)` | Create a new lane |
+| `with_storage(id, config, priority, storage)` | Create a lane with persistent storage |
+| `id()` | Get lane identifier |
+| `priority()` | Get the static base priority |
+| `effective_priority()` | Get runtime priority after applying deadline boost (requires `distributed`) |
+| `status()` | Get pending / active / min / max counts |
+
 ### LaneConfig
 
 | Method | Description |
@@ -626,8 +656,8 @@ alerts.check_latency("api", 600.0).await; // Triggers critical
 | `new(min, max)` | Create config with min/max concurrency |
 | `with_timeout(duration)` | Set command timeout for this lane |
 | `with_retry_policy(policy)` | Set retry policy for this lane |
-| `with_rate_limit(config)` | Set rate limiting for this lane |
-| `with_priority_boost(config)` | Set priority boosting for this lane |
+| `with_rate_limit(config)` | Set rate limiting for this lane (requires `distributed`) |
+| `with_priority_boost(config)` | Set priority boosting for this lane (requires `distributed`) |
 
 ### RetryPolicy
 
@@ -966,66 +996,32 @@ A3S Lane is the **per-session scheduling layer** of the A3S Agent OS. Each a3s-c
 
 ## Roadmap
 
-### Phase 1: Core ✅ (Complete)
+### Shipped ✅
 
-- [x] Priority-based lane scheduling
-- [x] Configurable concurrency per lane
-- [x] Event system for monitoring
-- [x] Queue manager with builder pattern
-- [x] Health monitoring with thresholds
-- [x] Async-first with Tokio
-- [x] 230 comprehensive tests
-
-### Phase 2: Reliability ✅ (Complete)
-
-- [x] Persistent queue storage (LocalStorage + pluggable Storage trait)
-- [x] Command timeout support with automatic cancellation
-- [x] Command retries with exponential backoff and fixed delay strategies
-- [x] Dead letter queue for permanently failed commands
-- [x] Graceful shutdown with drain and timeout
-
-### Phase 3: Scalability ✅ (Complete)
-
+- [x] Priority-based lane scheduling with 6 built-in lanes
+- [x] Configurable concurrency, timeout, retry (exponential backoff / fixed delay)
+- [x] Dead letter queue, persistent storage (`LocalStorage` + pluggable `Storage` trait)
+- [x] Graceful shutdown with configurable drain timeout
+- [x] Event system — 11 lifecycle events emitted automatically at every queue stage
+- [x] Rate limiting enforced at dequeue time (token bucket, sliding window)
+- [x] Priority boosting applied per scheduling tick via `effective_priority()`
 - [x] Queue partitioning (round-robin, hash-based, custom strategies)
-- [x] Multi-core parallelism (automatic CPU core detection)
-- [x] Distributed queue support (pluggable DistributedQueue trait)
-- [x] Priority boosting (deadline-based automatic priority adjustment)
-- [x] Rate limiting per lane (token bucket and sliding window algorithms)
+- [x] Distributed queue support (pluggable `DistributedQueue` trait)
+- [x] Metrics collection (`LocalMetrics` + pluggable `MetricsBackend` trait)
+- [x] Latency histograms with p50/p90/p95/p99 percentiles
+- [x] Queue depth and latency alerts with warning/critical thresholds
+- [x] OpenTelemetry OTLP metrics export (`OtelMetricsBackend`)
+- [x] Optional feature gates — zero cost for unused subsystems
+- [x] Python SDK (PyO3/maturin) — `pip install a3s-lane`
+- [x] Node.js SDK (napi-rs) — `npm install @a3s-lab/lane`
+- [x] Multi-platform CI/CD — 7 platforms, automated publishing to crates.io / PyPI / npm
+- [x] 236 unit tests
 
-### Phase 4: Observability ✅ (Complete)
+### Up Next
 
-- [x] Metrics collection (LocalMetrics + pluggable MetricsBackend trait)
-- [x] Latency histograms with percentiles (p50, p90, p95, p99)
-- [x] Queue depth alerts with configurable warning/critical thresholds
-- [x] Latency alerts with warning and critical levels
-- [x] Prometheus/OpenTelemetry ready (implement MetricsBackend trait)
-- [x] Alert callbacks for custom notification handling
-
-### Documentation & Examples ✅ (Complete)
-
-- [x] Comprehensive README with all features documented
-- [x] 4 working examples demonstrating all major features
-- [x] Performance benchmarks with Criterion
-- [x] Detailed API reference
-- [x] Inline documentation for all public APIs
-
-### Phase 5: OpenTelemetry Integration ✅ (Complete)
-
-- [x] **OTLP Metrics Export**: `OtelMetricsBackend` implementing `MetricsBackend` for OpenTelemetry
-  - Latency histograms (p50/p90/p95/p99) → OTLP Histogram
-  - Queue depth gauges → OTLP Gauge
-  - Command throughput counters → OTLP Counter
-- [x] **Distributed Tracing**: Propagate trace context through command lifecycle
-- [x] **Prometheus Exporter**: Via OpenTelemetry Prometheus bridge
-- [x] **Alert Integration**: Forward alerts to external systems via callbacks
-
-### Phase 6: SDK & CI/CD ✅ (Complete)
-
-- [x] **Python SDK** (PyO3/maturin): `pip install a3s-lane` — async queue management from Python
-- [x] **Node.js SDK** (napi-rs): `npm install @a3s-lab/lane` — native bindings for Node.js
-- [x] **Multi-platform builds**: 7 platforms (macOS arm64/x64, Linux x64/arm64 gnu/musl, Windows x64)
-- [x] **GitHub Actions CI/CD**: Automated publishing to crates.io, PyPI, and npm on tag push
-- [x] **Per-platform npm packages**: `@a3s-lab/lane-{platform}` with `optionalDependencies`
+- [ ] Async `EventStream` adapter (futures `Stream` impl, no manual recv loop needed)
+- [ ] `QueueManager::subscribe()` shortcut (avoid threading `EventEmitter` manually)
+- [ ] Priority lane pressure event (auto-emit `queue.lane.pressure` when depth threshold crossed)
 
 ## Examples
 
