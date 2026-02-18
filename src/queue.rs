@@ -3,7 +3,7 @@
 use crate::config::LaneConfig;
 use crate::dlq::{DeadLetter, DeadLetterQueue};
 use crate::error::{LaneError, Result};
-use crate::event::{events, EventEmitter, LaneEvent};
+use crate::event::{events, EventEmitter, EventStream, LaneEvent};
 use crate::retry::RetryPolicy;
 use crate::storage::{Storage, StoredCommand};
 #[cfg(feature = "telemetry")]
@@ -116,6 +116,9 @@ struct LaneState {
 
     /// Semaphore for concurrency control
     semaphore: Arc<Semaphore>,
+
+    /// True when the lane is currently considered under pressure
+    is_pressured: bool,
 }
 
 impl LaneState {
@@ -127,6 +130,7 @@ impl LaneState {
             pending: VecDeque::new(),
             active: 0,
             semaphore,
+            is_pressured: false,
         }
     }
 
@@ -321,6 +325,30 @@ impl Lane {
             max: state.config.max_concurrency,
         }
     }
+
+    /// Check for pressure state transitions.
+    ///
+    /// Returns the event key to emit if a transition occurred, or `None` if no change.
+    /// - Transitions to pressured when `pending >= threshold` and was not already pressured.
+    /// - Transitions to idle when `pending == 0` and was previously pressured.
+    async fn check_pressure(&self) -> Option<&'static str> {
+        let mut state = self.state.lock().await;
+        let threshold = match state.config.pressure_threshold {
+            Some(t) => t,
+            None => return None,
+        };
+        let pending = state.pending.len();
+        let was_pressured = state.is_pressured;
+        if pending >= threshold && !was_pressured {
+            state.is_pressured = true;
+            Some(events::QUEUE_LANE_PRESSURE)
+        } else if pending == 0 && was_pressured {
+            state.is_pressured = false;
+            Some(events::QUEUE_LANE_IDLE)
+        } else {
+            None
+        }
+    }
 }
 
 /// Lane status
@@ -496,6 +524,16 @@ impl CommandQueue {
         // effective_priority applies any deadline-based boost configured on the lane.
         let lanes = self.lanes.lock().await;
 
+        // Check pressure transitions for all lanes and emit events
+        for (lane_id, lane) in lanes.iter() {
+            if let Some(event_key) = lane.check_pressure().await {
+                self.event_emitter.emit(LaneEvent::with_map(
+                    event_key,
+                    HashMap::from([("lane_id".to_string(), serde_json::json!(lane_id))]),
+                ));
+            }
+        }
+
         let mut lane_priorities = Vec::new();
         for lane in lanes.values() {
             let priority = lane.effective_priority().await;
@@ -649,6 +687,19 @@ impl CommandQueue {
                 break;
             }
         }
+    }
+
+    /// Subscribe to all queue lifecycle events as an `EventStream` (implements `Stream`)
+    pub fn subscribe_stream(&self) -> EventStream {
+        self.event_emitter.subscribe_stream()
+    }
+
+    /// Subscribe to filtered queue lifecycle events as an `EventStream`
+    pub fn subscribe_filtered(
+        &self,
+        filter: impl Fn(&LaneEvent) -> bool + Send + Sync + 'static,
+    ) -> EventStream {
+        self.event_emitter.subscribe_filtered(filter)
     }
 
     /// Get queue status for all lanes
@@ -1426,6 +1477,123 @@ mod tests {
 
         queue.shutdown().await;
         assert!(queue.is_shutting_down());
+    }
+
+    // ── Pressure event tests ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_lane_pressure_emits_on_threshold() {
+        use crate::event::events;
+
+        let emitter = EventEmitter::new(100);
+        let queue = Arc::new(CommandQueue::new(emitter.clone()));
+
+        let config = LaneConfig::new(1, 4).with_pressure_threshold(2);
+        let lane = Arc::new(Lane::new("test-lane", config, priorities::QUERY));
+        queue.register_lane(lane).await;
+
+        // Subscribe before enqueuing to capture all events
+        let mut stream = emitter.subscribe_filtered(|e| e.key == events::QUEUE_LANE_PRESSURE);
+
+        // Enqueue 2 commands (meets threshold=2)
+        for _ in 0..2 {
+            let cmd = Box::new(TestCommand::new(serde_json::json!({})));
+            let _ = queue.submit("test-lane", cmd).await.unwrap();
+        }
+
+        // Start scheduler — first tick calls check_pressure → pending=2 >= 2 → emit PRESSURE
+        Arc::clone(&queue).start_scheduler().await;
+
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            stream.recv(),
+        )
+        .await
+        .expect("No pressure event received within timeout")
+        .expect("Stream ended");
+
+        assert_eq!(event.key, events::QUEUE_LANE_PRESSURE);
+    }
+
+    #[tokio::test]
+    async fn test_lane_idle_emits_when_drained() {
+        use crate::event::events;
+
+        let emitter = EventEmitter::new(100);
+        let queue = Arc::new(CommandQueue::new(emitter.clone()));
+
+        let config = LaneConfig::new(1, 4).with_pressure_threshold(1);
+        let lane = Arc::new(Lane::new("test-lane", config, priorities::QUERY));
+        queue.register_lane(lane).await;
+
+        // Subscribe to both pressure and idle events
+        let mut stream = emitter.subscribe_filtered(|e| {
+            e.key == events::QUEUE_LANE_PRESSURE || e.key == events::QUEUE_LANE_IDLE
+        });
+
+        // Enqueue 1 command (meets threshold=1)
+        let cmd = Box::new(TestCommand::new(serde_json::json!({})));
+        let _ = queue.submit("test-lane", cmd).await.unwrap();
+
+        // Start scheduler
+        Arc::clone(&queue).start_scheduler().await;
+
+        // First event must be pressure
+        let pressure = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            stream.recv(),
+        )
+        .await
+        .expect("No pressure event")
+        .expect("Stream ended");
+        assert_eq!(pressure.key, events::QUEUE_LANE_PRESSURE);
+
+        // After dequeue, pending=0 → idle event on the next scheduler tick
+        let idle = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            stream.recv(),
+        )
+        .await
+        .expect("No idle event")
+        .expect("Stream ended");
+        assert_eq!(idle.key, events::QUEUE_LANE_IDLE);
+    }
+
+    #[tokio::test]
+    async fn test_lane_no_pressure_without_threshold() {
+        use crate::event::events;
+
+        let emitter = EventEmitter::new(100);
+        let queue = Arc::new(CommandQueue::new(emitter.clone()));
+
+        // No pressure threshold
+        let config = LaneConfig::new(1, 4);
+        let lane = Arc::new(Lane::new("test-lane", config, priorities::QUERY));
+        queue.register_lane(lane).await;
+
+        let mut stream = emitter.subscribe_filtered(|e| {
+            e.key == events::QUEUE_LANE_PRESSURE || e.key == events::QUEUE_LANE_IDLE
+        });
+
+        // Enqueue several commands
+        for _ in 0..5 {
+            let cmd = Box::new(TestCommand::new(serde_json::json!({})));
+            let _ = queue.submit("test-lane", cmd).await.unwrap();
+        }
+
+        Arc::clone(&queue).start_scheduler().await;
+
+        // Allow time for scheduler ticks to run
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // No pressure/idle events should have been emitted
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            stream.recv(),
+        )
+        .await;
+
+        assert!(result.is_err(), "Should not receive pressure/idle events without threshold");
     }
 
     // ── Bug-fix tests ──────────────────────────────────────────────────────────

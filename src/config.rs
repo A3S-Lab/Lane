@@ -91,6 +91,11 @@ pub struct LaneConfig {
     #[cfg(feature = "distributed")]
     #[serde(skip)]
     pub priority_boost: Option<PriorityBoostConfig>,
+    /// Pressure threshold: emit `queue.lane.pressure` when `pending >= threshold`.
+    /// Emit `queue.lane.idle` when pending returns to 0 after being pressured.
+    /// `None` disables pressure tracking for this lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pressure_threshold: Option<usize>,
 }
 
 mod duration_serde {
@@ -127,6 +132,7 @@ impl Default for LaneConfig {
             rate_limit: None,
             #[cfg(feature = "distributed")]
             priority_boost: None,
+            pressure_threshold: None,
         }
     }
 }
@@ -157,6 +163,7 @@ impl LaneConfig {
             rate_limit: None,
             #[cfg(feature = "distributed")]
             priority_boost: None,
+            pressure_threshold: None,
         }
     }
 
@@ -232,6 +239,25 @@ impl LaneConfig {
     #[cfg(feature = "distributed")]
     pub fn with_priority_boost(mut self, priority_boost: PriorityBoostConfig) -> Self {
         self.priority_boost = Some(priority_boost);
+        self
+    }
+
+    /// Set pressure threshold (builder pattern)
+    ///
+    /// When the number of pending commands reaches this threshold, a `queue.lane.pressure`
+    /// event is emitted. When pending drops back to 0, a `queue.lane.idle` event is emitted.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use a3s_lane::LaneConfig;
+    ///
+    /// // Emit pressure event when 50+ commands are queued
+    /// let config = LaneConfig::new(1, 10)
+    ///     .with_pressure_threshold(50);
+    /// ```
+    pub fn with_pressure_threshold(mut self, threshold: usize) -> Self {
+        self.pressure_threshold = Some(threshold);
         self
     }
 }
@@ -321,6 +347,21 @@ mod tests {
 
         let parsed: LaneConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, config);
+    }
+
+    #[test]
+    fn test_pressure_threshold_config() {
+        let config = LaneConfig::new(1, 5).with_pressure_threshold(10);
+        assert_eq!(config.pressure_threshold, Some(10));
+    }
+
+    #[test]
+    fn test_pressure_threshold_default_is_none() {
+        let config = LaneConfig::new(1, 5);
+        assert!(config.pressure_threshold.is_none());
+
+        let config = LaneConfig::default();
+        assert!(config.pressure_threshold.is_none());
     }
 
     #[test]

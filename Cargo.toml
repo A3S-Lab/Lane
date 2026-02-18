@@ -24,6 +24,8 @@ distributed = ["dep:num_cpus"]
 
 [dependencies]
 tokio = { version = "1", features = ["sync", "time", "rt", "macros", "fs"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-core = { version = "0.3" }
 async-trait = "0.1"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }

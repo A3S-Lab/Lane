@@ -1,8 +1,11 @@
 //! Event system for queue notifications
 
+use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use tokio::sync::broadcast;
 
 /// Event key type
@@ -81,37 +84,49 @@ impl EventEmitter {
         self.sender.subscribe()
     }
 
-    /// Subscribe to events with a filter
+    /// Subscribe to filtered events as an `EventStream` (implements `Stream`)
     pub fn subscribe_filtered(
         &self,
         filter: impl Fn(&LaneEvent) -> bool + Send + Sync + 'static,
     ) -> EventStream {
+        use tokio_stream::wrappers::BroadcastStream;
+        use tokio_stream::StreamExt as TokioStreamExt;
+        let stream = BroadcastStream::new(self.sender.subscribe())
+            .filter_map(|r: Result<LaneEvent, _>| r.ok())
+            .filter(move |e| filter(e));
         EventStream {
-            receiver: self.sender.subscribe(),
-            filter: Arc::new(filter),
+            inner: Box::pin(stream),
         }
+    }
+
+    /// Subscribe to all events as an `EventStream` (implements `Stream`)
+    pub fn subscribe_stream(&self) -> EventStream {
+        self.subscribe_filtered(|_| true)
     }
 }
 
-/// Event stream with filtering
+/// Event stream — implements `futures_core::Stream<Item = LaneEvent>`.
+///
+/// Returned by [`EventEmitter::subscribe_filtered`] and [`EventEmitter::subscribe_stream`].
+/// Use `.next().await` via `StreamExt` from `tokio_stream` or `futures`, or call the
+/// convenience [`EventStream::recv`] method directly.
 pub struct EventStream {
-    receiver: broadcast::Receiver<LaneEvent>,
-    filter: Arc<dyn Fn(&LaneEvent) -> bool + Send + Sync>,
+    inner: Pin<Box<dyn Stream<Item = LaneEvent> + Send>>,
+}
+
+impl Stream for EventStream {
+    type Item = LaneEvent;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
 }
 
 impl EventStream {
-    /// Receive the next matching event
+    /// Receive the next matching event (convenience wrapper around `Stream::poll_next`)
     pub async fn recv(&mut self) -> Option<LaneEvent> {
-        loop {
-            match self.receiver.recv().await {
-                Ok(event) => {
-                    if (self.filter)(&event) {
-                        return Some(event);
-                    }
-                }
-                Err(_) => return None,
-            }
-        }
+        use tokio_stream::StreamExt;
+        self.next().await
     }
 }
 
@@ -286,6 +301,68 @@ mod tests {
 
         let parsed: LaneEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.key, "test.event");
+    }
+
+    #[tokio::test]
+    async fn test_event_stream_implements_stream() {
+        use tokio_stream::StreamExt;
+
+        let emitter = EventEmitter::new(100);
+        let mut stream = emitter.subscribe_stream();
+
+        emitter.emit(LaneEvent::empty("test.stream.event"));
+
+        let event = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            stream.next(),
+        )
+        .await
+        .expect("Timeout waiting for event via Stream::next")
+        .expect("Stream ended unexpectedly");
+
+        assert_eq!(event.key, "test.stream.event");
+    }
+
+    #[tokio::test]
+    async fn test_event_stream_subscribe_stream() {
+        use tokio_stream::StreamExt;
+
+        let emitter = EventEmitter::new(100);
+        let mut stream = emitter.subscribe_stream();
+
+        emitter.emit(LaneEvent::empty("stream.1"));
+        emitter.emit(LaneEvent::empty("stream.2"));
+        emitter.emit(LaneEvent::empty("stream.3"));
+
+        for expected in ["stream.1", "stream.2", "stream.3"] {
+            let event = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                stream.next(),
+            )
+            .await
+            .expect("Timeout")
+            .expect("Stream ended");
+            assert_eq!(event.key, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_event_stream_recv_still_works() {
+        let emitter = EventEmitter::new(100);
+        let mut stream = emitter.subscribe_filtered(|e| e.key.starts_with("ok."));
+
+        emitter.emit(LaneEvent::empty("skip.this"));
+        emitter.emit(LaneEvent::empty("ok.recv.event"));
+
+        let event = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            stream.recv(),
+        )
+        .await
+        .expect("Timeout waiting for event via recv()")
+        .expect("Stream ended");
+
+        assert_eq!(event.key, "ok.recv.event");
     }
 
     #[test]

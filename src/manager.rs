@@ -4,7 +4,7 @@
 use crate::alerts::AlertManager;
 use crate::config::LaneConfig;
 use crate::error::Result;
-use crate::event::EventEmitter;
+use crate::event::{EventEmitter, EventStream, LaneEvent};
 #[cfg(feature = "metrics")]
 use crate::metrics::QueueMetrics;
 use crate::queue::{lane_ids, priorities, Command, CommandQueue, Lane};
@@ -101,6 +101,19 @@ impl QueueManager {
     /// Get the underlying command queue
     pub fn queue(&self) -> Arc<CommandQueue> {
         Arc::clone(&self.queue)
+    }
+
+    /// Subscribe to all queue lifecycle events as an `EventStream` (implements `Stream`)
+    pub fn subscribe(&self) -> EventStream {
+        self.queue.subscribe_stream()
+    }
+
+    /// Subscribe to filtered queue lifecycle events as an `EventStream`
+    pub fn subscribe_filtered(
+        &self,
+        filter: impl Fn(&LaneEvent) -> bool + Send + Sync + 'static,
+    ) -> EventStream {
+        self.queue.subscribe_filtered(filter)
     }
 
     /// Initiate graceful shutdown - stop accepting new commands
@@ -312,6 +325,68 @@ mod tests {
         }
 
         QueueManager::new(queue)
+    }
+
+    // ========================================================================
+    // subscribe() Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_manager_subscribe_yields_events() {
+        use crate::event::events;
+        use tokio_stream::StreamExt;
+
+        let manager = make_manager().await;
+        let mut stream = manager.subscribe();
+
+        manager.start().await.unwrap();
+
+        let cmd = Box::new(TestCommand {
+            result: serde_json::json!({}),
+        });
+        let _ = manager.submit(lane_ids::QUERY, cmd).await.unwrap();
+
+        // The first event emitted is QUEUE_COMMAND_SUBMITTED
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            stream.next(),
+        )
+        .await
+        .expect("No event received via manager.subscribe()")
+        .expect("Stream ended");
+
+        assert_eq!(event.key, events::QUEUE_COMMAND_SUBMITTED);
+    }
+
+    #[tokio::test]
+    async fn test_manager_subscribe_filtered() {
+        use crate::event::events;
+        use tokio_stream::StreamExt;
+
+        let manager = make_manager().await;
+        // Only capture completed events; submitted/started events are filtered out
+        let mut stream =
+            manager.subscribe_filtered(|e| e.key == events::QUEUE_COMMAND_COMPLETED);
+
+        manager.start().await.unwrap();
+
+        let cmd = Box::new(TestCommand {
+            result: serde_json::json!({"done": true}),
+        });
+        let rx = manager.submit(lane_ids::QUERY, cmd).await.unwrap();
+
+        // Wait for command to finish
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), rx).await;
+
+        let event = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            stream.next(),
+        )
+        .await
+        .expect("No completed event received via manager.subscribe_filtered()")
+        .expect("Stream ended");
+
+        assert_eq!(event.key, events::QUEUE_COMMAND_COMPLETED);
     }
 
     // ========================================================================
