@@ -6,6 +6,7 @@ use crate::error::{LaneError, Result};
 use crate::event::EventEmitter;
 use crate::retry::RetryPolicy;
 use crate::storage::{Storage, StoredCommand};
+#[cfg(feature = "telemetry")]
 use crate::telemetry;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -13,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+#[cfg(feature = "telemetry")]
 use std::time::Instant;
 use tokio::sync::{Mutex, Semaphore};
 use uuid::Uuid;
@@ -447,6 +449,7 @@ impl CommandQueue {
                 let storage = lane.storage.clone();
 
                 tokio::spawn(async move {
+                    #[cfg(feature = "telemetry")]
                     let exec_start = Instant::now();
 
                     let result = match timeout {
@@ -465,6 +468,7 @@ impl CommandQueue {
                                 let _ = storage.remove_command(&command_id).await;
                             }
 
+                            #[cfg(feature = "telemetry")]
                             telemetry::record_complete(
                                 &lane_id,
                                 exec_start.elapsed().as_secs_f64(),
@@ -488,6 +492,7 @@ impl CommandQueue {
                                 lane_clone.retry_command(wrapper, delay).await;
                                 lane_clone.mark_completed().await;
                             } else {
+                                #[cfg(feature = "telemetry")]
                                 telemetry::record_failure(&lane_id);
 
                                 if let Some(storage) = &storage {

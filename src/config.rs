@@ -30,9 +30,11 @@
 //!     .with_rate_limit(RateLimitConfig::per_second(100));
 //! ```
 
-use crate::boost::PriorityBoostConfig;
-use crate::ratelimit::RateLimitConfig;
 use crate::retry::RetryPolicy;
+#[cfg(feature = "distributed")]
+use crate::boost::PriorityBoostConfig;
+#[cfg(feature = "distributed")]
+use crate::ratelimit::RateLimitConfig;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -82,9 +84,11 @@ pub struct LaneConfig {
     #[serde(default)]
     pub retry_policy: RetryPolicy,
     /// Rate limit configuration
+    #[cfg(feature = "distributed")]
     #[serde(skip)]
     pub rate_limit: Option<RateLimitConfig>,
     /// Priority boost configuration
+    #[cfg(feature = "distributed")]
     #[serde(skip)]
     pub priority_boost: Option<PriorityBoostConfig>,
 }
@@ -119,7 +123,9 @@ impl Default for LaneConfig {
             max_concurrency: 4,
             default_timeout: None,
             retry_policy: RetryPolicy::default(),
+            #[cfg(feature = "distributed")]
             rate_limit: None,
+            #[cfg(feature = "distributed")]
             priority_boost: None,
         }
     }
@@ -147,7 +153,9 @@ impl LaneConfig {
             max_concurrency,
             default_timeout: None,
             retry_policy: RetryPolicy::default(),
+            #[cfg(feature = "distributed")]
             rate_limit: None,
+            #[cfg(feature = "distributed")]
             priority_boost: None,
         }
     }
@@ -201,6 +209,7 @@ impl LaneConfig {
     /// let config = LaneConfig::new(1, 10)
     ///     .with_rate_limit(RateLimitConfig::per_second(100));
     /// ```
+    #[cfg(feature = "distributed")]
     pub fn with_rate_limit(mut self, rate_limit: RateLimitConfig) -> Self {
         self.rate_limit = Some(rate_limit);
         self
@@ -220,6 +229,7 @@ impl LaneConfig {
     /// let config = LaneConfig::new(1, 10)
     ///     .with_priority_boost(PriorityBoostConfig::standard(Duration::from_secs(300)));
     /// ```
+    #[cfg(feature = "distributed")]
     pub fn with_priority_boost(mut self, priority_boost: PriorityBoostConfig) -> Self {
         self.priority_boost = Some(priority_boost);
         self
@@ -277,6 +287,7 @@ mod tests {
         assert_eq!(config.retry_policy, retry);
     }
 
+    #[cfg(feature = "distributed")]
     #[test]
     fn test_lane_config_with_rate_limit() {
         let rate_limit = RateLimitConfig::per_second(100);
@@ -285,6 +296,7 @@ mod tests {
         assert_eq!(config.rate_limit.unwrap().max_commands, 100);
     }
 
+    #[cfg(feature = "distributed")]
     #[test]
     fn test_lane_config_with_priority_boost() {
         let boost = PriorityBoostConfig::standard(Duration::from_secs(60));

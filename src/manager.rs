@@ -1,9 +1,11 @@
 //! Queue manager provides high-level queue management
 
+#[cfg(feature = "monitoring")]
 use crate::alerts::AlertManager;
 use crate::config::LaneConfig;
 use crate::error::Result;
 use crate::event::EventEmitter;
+#[cfg(feature = "metrics")]
 use crate::metrics::QueueMetrics;
 use crate::queue::{lane_ids, priorities, Command, CommandQueue, Lane};
 use crate::storage::Storage;
@@ -16,7 +18,9 @@ use std::sync::Arc;
 pub struct QueueManager {
     queue: Arc<CommandQueue>,
     scheduler_handle: tokio::sync::Mutex<Option<()>>,
+    #[cfg(feature = "metrics")]
     metrics: Option<QueueMetrics>,
+    #[cfg(feature = "monitoring")]
     alerts: Option<Arc<AlertManager>>,
 }
 
@@ -27,7 +31,9 @@ impl QueueManager {
         Self {
             queue,
             scheduler_handle: tokio::sync::Mutex::new(None),
+            #[cfg(feature = "metrics")]
             metrics: None,
+            #[cfg(feature = "monitoring")]
             alerts: None,
         }
     }
@@ -35,19 +41,21 @@ impl QueueManager {
     /// Create a new queue manager with metrics and alerts
     pub(crate) fn with_observability(
         queue: Arc<CommandQueue>,
-        metrics: Option<QueueMetrics>,
-        alerts: Option<Arc<AlertManager>>,
+        #[cfg(feature = "metrics")] metrics: Option<QueueMetrics>,
+        #[cfg(feature = "monitoring")] alerts: Option<Arc<AlertManager>>,
     ) -> Self {
         Self {
             queue,
             scheduler_handle: tokio::sync::Mutex::new(None),
+            #[cfg(feature = "metrics")]
             metrics,
+            #[cfg(feature = "monitoring")]
             alerts,
         }
     }
 
     /// Start the queue scheduler
-    pub async fn start(&self) -> anyhow::Result<()> {
+    pub async fn start(&self) -> Result<()> {
         tracing::info!("Starting queue scheduler");
         let queue = Arc::clone(&self.queue);
         queue.start_scheduler().await;
@@ -60,12 +68,13 @@ impl QueueManager {
         lane_id: &str,
         command: Box<dyn Command>,
     ) -> Result<tokio::sync::oneshot::Receiver<Result<serde_json::Value>>> {
+        #[cfg(feature = "telemetry")]
         crate::telemetry::record_submit(lane_id);
         self.queue.submit(lane_id, command).await
     }
 
     /// Get queue statistics
-    pub async fn stats(&self) -> anyhow::Result<QueueStats> {
+    pub async fn stats(&self) -> Result<QueueStats> {
         let lane_status = self.queue.status().await;
 
         let mut total_pending = 0;
@@ -110,11 +119,13 @@ impl QueueManager {
     }
 
     /// Get the metrics collector (if configured)
+    #[cfg(feature = "metrics")]
     pub fn metrics(&self) -> Option<&QueueMetrics> {
         self.metrics.as_ref()
     }
 
     /// Get the alert manager (if configured)
+    #[cfg(feature = "monitoring")]
     pub fn alerts(&self) -> Option<&Arc<AlertManager>> {
         self.alerts.as_ref()
     }
@@ -126,7 +137,9 @@ pub struct QueueManagerBuilder {
     lane_configs: HashMap<String, (LaneConfig, u8)>,
     storage: Option<Arc<dyn Storage>>,
     dlq_size: Option<usize>,
+    #[cfg(feature = "metrics")]
     metrics: Option<QueueMetrics>,
+    #[cfg(feature = "monitoring")]
     alerts: Option<Arc<AlertManager>>,
 }
 
@@ -138,7 +151,9 @@ impl QueueManagerBuilder {
             lane_configs: HashMap::new(),
             storage: None,
             dlq_size: None,
+            #[cfg(feature = "metrics")]
             metrics: None,
+            #[cfg(feature = "monitoring")]
             alerts: None,
         }
     }
@@ -162,12 +177,14 @@ impl QueueManagerBuilder {
     }
 
     /// Add metrics collection
+    #[cfg(feature = "metrics")]
     pub fn with_metrics(mut self, metrics: QueueMetrics) -> Self {
         self.metrics = Some(metrics);
         self
     }
 
     /// Add alert manager
+    #[cfg(feature = "monitoring")]
     pub fn with_alerts(mut self, alerts: Arc<AlertManager>) -> Self {
         self.alerts = Some(alerts);
         self
@@ -203,7 +220,7 @@ impl QueueManagerBuilder {
     }
 
     /// Build the queue manager
-    pub async fn build(self) -> anyhow::Result<QueueManager> {
+    pub async fn build(self) -> Result<QueueManager> {
         // Create queue with appropriate configuration
         let queue = match (self.dlq_size, self.storage.clone()) {
             (Some(dlq_size), Some(storage)) => Arc::new(CommandQueue::with_dlq_and_storage(
@@ -233,7 +250,9 @@ impl QueueManagerBuilder {
 
         Ok(QueueManager::with_observability(
             queue,
+            #[cfg(feature = "metrics")]
             self.metrics,
+            #[cfg(feature = "monitoring")]
             self.alerts,
         ))
     }
@@ -736,6 +755,7 @@ mod tests {
     // Observability Tests
     // ========================================================================
 
+    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn test_manager_with_metrics() {
         let emitter = EventEmitter::new(100);
@@ -756,6 +776,7 @@ mod tests {
         assert!(snapshot.counters.is_empty());
     }
 
+    #[cfg(feature = "monitoring")]
     #[tokio::test]
     async fn test_manager_with_alerts() {
         let emitter = EventEmitter::new(100);
@@ -777,6 +798,7 @@ mod tests {
         assert_eq!(config.critical_threshold, 200);
     }
 
+    #[cfg(all(feature = "metrics", feature = "monitoring"))]
     #[tokio::test]
     async fn test_manager_with_metrics_and_alerts() {
         let emitter = EventEmitter::new(100);
@@ -795,6 +817,7 @@ mod tests {
         assert!(manager.alerts().is_some());
     }
 
+    #[cfg(all(feature = "metrics", feature = "monitoring"))]
     #[tokio::test]
     async fn test_manager_without_observability() {
         let emitter = EventEmitter::new(100);

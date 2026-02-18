@@ -1,6 +1,6 @@
 [package]
 name = "a3s-lane"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
 authors = ["A3S Lab"]
 license = "MIT"
@@ -15,27 +15,52 @@ categories = ["asynchronous", "concurrency"]
 name = "a3s_lane"
 path = "src/lib.rs"
 
+[features]
+default = ["metrics", "monitoring", "telemetry", "distributed"]
+metrics = []
+monitoring = ["metrics"]
+telemetry = ["metrics", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:dashmap"]
+distributed = ["dep:num_cpus"]
+
 [dependencies]
 tokio = { version = "1", features = ["sync", "time", "rt", "macros", "fs"] }
 async-trait = "0.1"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-anyhow = "1"
 thiserror = "1"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
-num_cpus = "1"
-opentelemetry = { version = "0.21", features = ["metrics"] }
-opentelemetry_sdk = { version = "0.21", features = ["rt-tokio", "metrics"] }
-dashmap = "6.0"
+
+# Optional: distributed
+num_cpus = { version = "1", optional = true }
+
+# Optional: telemetry
+opentelemetry = { version = "0.21", features = ["metrics"], optional = true }
+opentelemetry_sdk = { version = "0.21", features = ["rt-tokio", "metrics"], optional = true }
+dashmap = { version = "6.0", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 criterion = { version = "0.5", features = ["async_tokio"] }
+anyhow = "1"
 
 [[bench]]
 name = "queue_benchmark"
 harness = false
+
+[[example]]
+name = "observability"
+required-features = ["monitoring", "telemetry"]
+
+[[example]]
+name = "scalability"
+required-features = ["distributed"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
