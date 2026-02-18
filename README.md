@@ -12,15 +12,15 @@ Used in the A3S ecosystem to guarantee control commands (pause/cancel) always pr
 
 ```toml
 [dependencies]
-a3s-lane = "0.3"
+a3s-lane = "0.4"
 ```
 
 All four features (`distributed`, `metrics`, `monitoring`, `telemetry`) are on by default. Core queue only:
 
 ```toml
-a3s-lane = { version = "0.3", default-features = false }
+a3s-lane = { version = "0.4", default-features = false }
 # or pick selectively:
-a3s-lane = { version = "0.3", default-features = false, features = ["metrics", "distributed"] }
+a3s-lane = { version = "0.4", default-features = false, features = ["metrics", "distributed"] }
 ```
 
 ## Usage

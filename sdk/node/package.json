@@ -1,6 +1,6 @@
 {
   "name": "@a3s-lab/lane",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Node.js bindings for a3s-lane priority command queue",
   "main": "index.js",
   "types": "index.d.ts",
@@ -22,13 +22,13 @@
     }
   },
   "optionalDependencies": {
-    "@a3s-lab/lane-win32-x64-msvc": "0.3.0",
-    "@a3s-lab/lane-darwin-x64": "0.3.0",
-    "@a3s-lab/lane-darwin-arm64": "0.3.0",
-    "@a3s-lab/lane-linux-x64-gnu": "0.3.0",
-    "@a3s-lab/lane-linux-x64-musl": "0.3.0",
-    "@a3s-lab/lane-linux-arm64-gnu": "0.3.0",
-    "@a3s-lab/lane-linux-arm64-musl": "0.3.0"
+    "@a3s-lab/lane-win32-x64-msvc": "0.4.0",
+    "@a3s-lab/lane-darwin-x64": "0.4.0",
+    "@a3s-lab/lane-darwin-arm64": "0.4.0",
+    "@a3s-lab/lane-linux-x64-gnu": "0.4.0",
+    "@a3s-lab/lane-linux-x64-musl": "0.4.0",
+    "@a3s-lab/lane-linux-arm64-gnu": "0.4.0",
+    "@a3s-lab/lane-linux-arm64-musl": "0.4.0"
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.0"
