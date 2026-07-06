@@ -116,7 +116,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             serde_json::json!({}),
             JobOptions::new()
                 .with_priority(1)
-                .with_delay(Duration::from_millis(10)),
+                .with_delay(Duration::from_millis(200)),
         )
         .await
         .expect("delayed job should be added");
@@ -127,7 +127,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("early delayed claim should return")
         .is_none());
 
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(
         producer
             .promote_due_jobs(Utc::now())
