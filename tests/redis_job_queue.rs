@@ -1010,11 +1010,60 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .hget(format!("{namespace}:jobs:jobs"), &removable.id)
         .await?;
     assert!(removed_hash.is_none());
+    let missing_job_id = "missing-job";
+    for state in [
+        "waiting",
+        "delayed",
+        "active",
+        "waiting_children",
+        "completed",
+        "failed",
+    ] {
+        let _: usize = remove_index_conn
+            .zadd(format!("{namespace}:jobs:{state}"), missing_job_id, 0.0)
+            .await?;
+    }
+    let _: () = remove_index_conn
+        .set(
+            format!("{namespace}:jobs:locks:{missing_job_id}"),
+            "stale-lock",
+        )
+        .await?;
+    let _: usize = remove_index_conn
+        .sadd(
+            format!("{namespace}:jobs:dependencies:{missing_job_id}"),
+            "stale-child",
+        )
+        .await?;
     assert!(producer
-        .remove_job("missing-job")
+        .remove_job(missing_job_id)
         .await
         .expect("missing job remove should return")
         .is_none());
+    for state in [
+        "waiting",
+        "delayed",
+        "active",
+        "waiting_children",
+        "completed",
+        "failed",
+    ] {
+        let orphan_score: Option<f64> = remove_index_conn
+            .zscore(format!("{namespace}:jobs:{state}"), missing_job_id)
+            .await?;
+        assert!(
+            orphan_score.is_none(),
+            "orphaned {state} index should be pruned for missing remove"
+        );
+    }
+    let missing_lock_exists: usize = remove_index_conn
+        .exists(format!("{namespace}:jobs:locks:{missing_job_id}"))
+        .await?;
+    assert_eq!(missing_lock_exists, 0);
+    let missing_dependencies_exist: usize = remove_index_conn
+        .exists(format!("{namespace}:jobs:dependencies:{missing_job_id}"))
+        .await?;
+    assert_eq!(missing_dependencies_exist, 0);
 
     let locked_stalled = producer
         .add_job(

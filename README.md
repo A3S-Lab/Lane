@@ -709,9 +709,10 @@ treating it as recoverable work.
 
 `remove_job()` uses a Redis script to reject active jobs and remove the job
 hash, lock key, all state indexes, and any child dependency set in one Redis
-turn. If the removed job is a flow child, the same script updates the parent's
-dependency set and atomically moves the parent from `waiting_children` to
-`waiting`, `delayed`, or `failed` as appropriate.
+turn. A remove request for a missing job still prunes orphaned indexes, locks,
+and dependency sets for that id. If the removed job is a flow child, the same
+script updates the parent's dependency set and atomically moves the parent from
+`waiting_children` to `waiting`, `delayed`, or `failed` as appropriate.
 
 Run the Redis integration test against any reachable Redis server:
 

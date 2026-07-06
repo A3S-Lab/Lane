@@ -754,6 +754,11 @@ end
 
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
+  redis.call('DEL', KEYS[2])
+  for index = 3, 8 do
+    redis.call('ZREM', KEYS[index], ARGV[1])
+  end
+  redis.call('DEL', ARGV[5] .. ARGV[1])
   return {'missing'}
 end
 
