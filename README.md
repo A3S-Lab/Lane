@@ -370,7 +370,7 @@ A3S stack and language SDKs.
 | --- | --- | --- |
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
 | Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, debounce TTL extension, delayed-owner replace, and keep-last-if-active requeue, repeat-key ownership, explicit job states, priority ordering, delayed jobs, token-owned worker leases, active-to-delayed movement, completion/failure snapshots, retry backoff, Redis-shared rate-limit and active-concurrency controls, stalled-job recovery, pause/resume. |
-| Job management API | In progress | Add/get/get-state/get-job-counts/get-job-count/count-pending/remove/remove-repeat/remove-deduplication-key/get-deduplication-job-id/list-repeats/get-flow-dependencies/promote/reschedule/delay-active/retry/update-priority/pause/resume/is-paused/drain/clean/obliterate APIs, pagination, waiting priority counts, add-log/get-logs, progress updates, lease renewal. |
+| Job management API | In progress | Add/get/get-state/get-job-counts/get-job-count/count-pending/remove/remove-repeat/remove-deduplication-key/get-deduplication-job-id/list-repeats/get-flow-dependencies/promote/reschedule/delay-active/retry/update-priority/update-data/pause/resume/is-paused/drain/clean/obliterate APIs, pagination, waiting priority counts, add-log/get-logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, and stalled recovery loops. |
 | Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership/listing/removal, flow submission, flow dependency inspection, delayed promotion and rescheduling, active-to-delayed movement, single-job promote, state-index queries, job count snapshots, manual retry, priority update, progress update, log append, list/stat snapshots, drain, clean, obliterate, claim, Redis-shared rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, dependency inspection, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
@@ -422,6 +422,9 @@ if let Some(claimed) = claimed {
         .as_deref()
         .expect("claimed jobs include a lock token");
     queue
+        .update_data(&claimed.id, serde_json::json!({ "to": "ops@example.com", "normalized": true }))
+        .await?;
+    queue
         .update_progress(&claimed.id, serde_json::json!({ "percent": 50 }))
         .await?;
     queue
@@ -464,7 +467,8 @@ queue and removes all queue data only when no active jobs exist,
 returns per-state counts, `get_job_count()` returns aggregate counts for
 selected states, `count_pending_jobs()` returns waiting, delayed, and
 waiting-children work, `get_counts_per_priority()` returns waiting-job counts
-for selected priorities, `add_log()` appends retained job logs, and
+for selected priorities, `update_data()` replaces a retained job payload,
+`add_log()` appends retained job logs, and
 `get_job_logs()` returns a `JobLogPage` with Redis/BullMQ-style range semantics.
 `pause()`, `resume()`, and `is_paused()` provide queue-level dispatch control.
 Cleanup paths can unblock flow parents when a pending child is removed.
@@ -978,15 +982,18 @@ members while preserving the stored non-terminal state. This is intentionally
 aligned with BullMQ's mechanism of moving job state through Redis scripts instead
 of coordinating several client-side Redis commands.
 
-Redis job management mutations are script-backed too. `update_progress()` checks
-the current state and writes the progress value in one Redis turn. `add_log()`
-follows BullMQ's `addLog` shape at the key level: the script verifies that the
-job exists, `RPUSH`es a structured JSON entry into `logs:<jobId>`, applies
-`LTRIM` when a retention count is provided, and mirrors the retained entries into
-the job JSON snapshot for Lane compatibility. `clean_jobs()` filters retained
-records by the parsed millisecond reference time, removes their lock keys, hash
-entries, state indexes, dependency sets, and log lists atomically, updates flow
-parents for removed child jobs, and returns the removed snapshots.
+Redis job management mutations are script-backed too. `update_data()` follows
+BullMQ's `updateData` existence check and write shape, adapted to Lane's Redis
+hash layout by decoding the stored job JSON, replacing `payload`, and writing the
+job snapshot back in one Lua turn. `update_progress()` checks the current state
+and writes the progress value in one Redis turn. `add_log()` follows BullMQ's
+`addLog` shape at the key level: the script verifies that the job exists,
+`RPUSH`es a structured JSON entry into `logs:<jobId>`, applies `LTRIM` when a
+retention count is provided, and mirrors the retained entries into the job JSON
+snapshot for Lane compatibility. `clean_jobs()` filters retained records by the
+parsed millisecond reference time, removes their lock keys, hash entries, state
+indexes, dependency sets, and log lists atomically, updates flow parents for
+removed child jobs, and returns the removed snapshots.
 
 Queue draining follows the same rule. `drain_jobs(false)` removes waiting jobs
 and `drain_jobs(true)` also removes ordinary delayed jobs in one Redis turn,
@@ -1092,6 +1099,7 @@ backend
 
 let send_processor: Arc<dyn JobProcessor> = Arc::new(job_processor_fn(|job, context| async move {
     context.ensure_lease()?;
+    context.update_data(serde_json::json!({ "to": job.payload["to"], "normalized": true })).await?;
     context.update_progress(serde_json::json!({ "phase": "sending" })).await?;
     context.add_log("provider accepted message").await?;
     Ok(serde_json::json!({ "sent": job.payload["to"] }))

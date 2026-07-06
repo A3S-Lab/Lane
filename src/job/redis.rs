@@ -3051,6 +3051,20 @@ end
 return result
 "#;
 
+const UPDATE_DATA_SCRIPT: &str = r#"
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not raw then
+  return {'missing'}
+end
+
+local job = cjson.decode(raw)
+job["payload"] = cjson.decode(ARGV[2])
+local updated = cjson.encode(job)
+redis.call('HSET', KEYS[1], ARGV[1], updated)
+
+return {'ok', updated}
+"#;
+
 const UPDATE_PROGRESS_SCRIPT: &str = r#"
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
@@ -4349,6 +4363,22 @@ impl JobQueueBackend for RedisJobQueue {
 
         let result: Vec<i64> = command.query_async(&mut conn).await.map_err(redis_error)?;
         decode_priority_counts(&priorities, &result)
+    }
+
+    async fn update_data(&self, job_id: &str, payload: Value) -> Result<Job> {
+        let mut conn = self.connection().await?;
+        let payload = serde_json::to_string(&payload)
+            .map_err(|error| LaneError::Other(format!("failed to encode job payload: {error}")))?;
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(UPDATE_DATA_SCRIPT)
+            .arg(1)
+            .arg(self.jobs_key())
+            .arg(job_id)
+            .arg(payload)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_transition_result(&result, job_id, "update data")
     }
 
     async fn update_progress(&self, job_id: &str, progress: Value) -> Result<Job> {

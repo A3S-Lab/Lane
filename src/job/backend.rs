@@ -139,6 +139,8 @@ pub trait JobQueueBackend: Send + Sync {
         priorities: &[JobPriority],
     ) -> Result<Vec<JobPriorityCount>>;
 
+    async fn update_data(&self, job_id: &str, payload: Value) -> Result<Job>;
+
     async fn update_progress(&self, job_id: &str, progress: Value) -> Result<Job>;
 
     async fn add_log(

@@ -181,6 +181,12 @@ impl JobContext {
         }
     }
 
+    /// Replace the payload for the current job.
+    pub async fn update_data(&self, payload: Value) -> Result<Job> {
+        self.ensure_lease()?;
+        self.backend.update_data(&self.job_id, payload).await
+    }
+
     /// Store a progress value for the current job.
     pub async fn update_progress(&self, progress: Value) -> Result<Job> {
         self.ensure_lease()?;

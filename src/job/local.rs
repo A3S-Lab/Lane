@@ -357,6 +357,12 @@ impl JobQueueBackend for LocalJobQueue {
         self.inner.get_counts_per_priority(priorities).await
     }
 
+    async fn update_data(&self, job_id: &str, payload: Value) -> Result<Job> {
+        let job = self.inner.update_data(job_id, payload).await?;
+        self.persist().await?;
+        Ok(job)
+    }
+
     async fn update_progress(&self, job_id: &str, progress: Value) -> Result<Job> {
         let job = self.inner.update_progress(job_id, progress).await?;
         self.persist().await?;

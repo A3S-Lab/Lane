@@ -2497,6 +2497,27 @@ async fn management_api_lists_progress_logs_retries_and_cleans_jobs() {
         .unwrap();
     assert_eq!(second_page.jobs[0].id, slower.id);
 
+    let updated_data = queue
+        .update_data(
+            &slower.id,
+            serde_json::json!({ "stage": "normalized", "attempt": 1 }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        updated_data.payload,
+        serde_json::json!({ "stage": "normalized", "attempt": 1 })
+    );
+    assert_eq!(
+        queue.get_job(&slower.id).await.unwrap().unwrap().payload,
+        serde_json::json!({ "stage": "normalized", "attempt": 1 })
+    );
+    let missing_data_update = queue
+        .update_data("missing-data-job", serde_json::json!({}))
+        .await
+        .unwrap_err();
+    assert!(matches!(missing_data_update, LaneError::JobNotFound(_)));
+
     let progress = queue
         .update_progress(&slower.id, serde_json::json!({ "percent": 50 }))
         .await
@@ -2571,6 +2592,17 @@ async fn management_api_lists_progress_logs_retries_and_cleans_jobs() {
         )
         .await
         .unwrap();
+    let terminal_data = queue
+        .update_data(
+            &faster.id,
+            serde_json::json!({ "stage": "archived", "terminal": true }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        terminal_data.payload,
+        serde_json::json!({ "stage": "archived", "terminal": true })
+    );
 
     let cleaned = queue
         .clean_jobs(
@@ -3391,6 +3423,12 @@ async fn worker_completes_claimed_job_and_preserves_context_updates() {
     let processor = Arc::new(job_processor_fn(
         |job: Job, context: JobContext| async move {
             context
+                .update_data(serde_json::json!({
+                    "to": job.payload["to"].clone(),
+                    "normalized": true
+                }))
+                .await?;
+            context
                 .update_progress(serde_json::json!({ "percent": 50 }))
                 .await?;
             context.add_log("accepted by provider").await?;
@@ -3416,6 +3454,10 @@ async fn worker_completes_claimed_job_and_preserves_context_updates() {
 
     let stored = backend.get_job(&job.id).await.unwrap().unwrap();
     assert_eq!(stored.state, JobState::Completed);
+    assert_eq!(
+        stored.payload,
+        serde_json::json!({ "to": "ops@example.com", "normalized": true })
+    );
     assert_eq!(stored.progress, Some(serde_json::json!({ "percent": 50 })));
     assert_eq!(stored.logs.len(), 1);
     assert_eq!(stored.logs[0].line, "accepted by provider");

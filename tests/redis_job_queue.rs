@@ -2525,6 +2525,17 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .update_progress(&first.id, serde_json::json!({ "percent": 50 }))
         .await
         .expect("progress update should succeed");
+    let updated_data = worker
+        .update_data(
+            &first.id,
+            serde_json::json!({ "n": 1, "stage": "normalized" }),
+        )
+        .await
+        .expect("data update should succeed");
+    assert_eq!(
+        updated_data.payload,
+        serde_json::json!({ "n": 1, "stage": "normalized" })
+    );
     worker
         .add_log(&first.id, "accepted".to_string(), 10, Utc::now())
         .await
@@ -2552,6 +2563,17 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect_err("terminal completed jobs must reject progress updates");
     assert!(matches!(terminal_progress, LaneError::JobStateConflict(_)));
+    let terminal_data = worker
+        .update_data(
+            &first.id,
+            serde_json::json!({ "n": 1, "stage": "archived" }),
+        )
+        .await
+        .expect("terminal retained jobs should allow data updates");
+    assert_eq!(
+        terminal_data.payload,
+        serde_json::json!({ "n": 1, "stage": "archived" })
+    );
 
     let second = worker
         .claim_next("worker-b".to_string(), Duration::from_secs(30), Utc::now())
@@ -3259,6 +3281,10 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("stored high job should load")
         .expect("stored high job should exist");
     assert_eq!(
+        stored_high.payload,
+        serde_json::json!({ "n": 1, "stage": "archived" })
+    );
+    assert_eq!(
         stored_high.progress,
         Some(serde_json::json!({ "percent": 50 }))
     );
@@ -3288,6 +3314,14 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     let mut logs_conn = redis::Client::open(redis_url.as_str())?
         .get_connection_manager()
         .await?;
+    let raw_high: String = logs_conn
+        .hget(format!("{namespace}:jobs:jobs"), &high.id)
+        .await?;
+    let decoded_high: Job = serde_json::from_str(&raw_high).expect("raw high job should decode");
+    assert_eq!(
+        decoded_high.payload,
+        serde_json::json!({ "n": 1, "stage": "archived" })
+    );
     let high_logs_len: usize = logs_conn.llen(&high_logs_key).await?;
     assert_eq!(high_logs_len, 2);
     let high_raw_logs: Vec<String> = logs_conn.lrange(&high_logs_key, 0, -1).await?;

@@ -791,6 +791,17 @@ impl InMemoryJobQueue {
     }
 
     /// Update progress for a non-terminal job.
+    pub async fn set_data(&self, job_id: &str, payload: Value) -> Result<Job> {
+        let mut inner = self.inner.lock().await;
+        let job = inner
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
+        job.payload = payload;
+        Ok(job.clone())
+    }
+
+    /// Update progress for a non-terminal job.
     pub async fn set_progress(&self, job_id: &str, progress: Value) -> Result<Job> {
         let mut inner = self.inner.lock().await;
         let job = inner
@@ -1253,6 +1264,10 @@ impl JobQueueBackend for InMemoryJobQueue {
         priorities: &[JobPriority],
     ) -> Result<Vec<JobPriorityCount>> {
         self.counts_per_priority(priorities).await
+    }
+
+    async fn update_data(&self, job_id: &str, payload: Value) -> Result<Job> {
+        self.set_data(job_id, payload).await
     }
 
     async fn update_progress(&self, job_id: &str, progress: Value) -> Result<Job> {
