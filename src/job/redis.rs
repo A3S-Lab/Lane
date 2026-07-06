@@ -15,6 +15,35 @@ use uuid::Uuid;
 
 const WAITING_SCORE_BUCKET: f64 = 1_000_000_000_000.0;
 
+const ADD_JOB_SCRIPT: &str = r#"
+local existing = redis.call('HGET', KEYS[1], ARGV[1])
+if existing then
+  return {'existing', existing}
+end
+
+local inserted = redis.call('HSETNX', KEYS[1], ARGV[1], ARGV[2])
+if inserted == 0 then
+  local current = redis.call('HGET', KEYS[1], ARGV[1])
+  if current then
+    return {'existing', current}
+  end
+  return {'missing'}
+end
+
+local state = ARGV[3]
+if state == 'waiting' then
+  local sequence = redis.call('INCR', KEYS[5])
+  local waiting_score = (tonumber(ARGV[5]) * tonumber(ARGV[6])) + sequence
+  redis.call('ZADD', KEYS[2], waiting_score, ARGV[1])
+elseif state == 'delayed' then
+  redis.call('ZADD', KEYS[3], ARGV[4], ARGV[1])
+elseif state == 'waiting_children' then
+  redis.call('ZADD', KEYS[4], ARGV[4], ARGV[1])
+end
+
+return {'inserted', ARGV[2]}
+"#;
+
 const CLAIM_SCRIPT: &str = r#"
 local due_ids = redis.call('ZRANGEBYSCORE', KEYS[6], '-inf', ARGV[10], 'LIMIT', 0, ARGV[12])
 for _, due_id in ipairs(due_ids) do
@@ -318,17 +347,7 @@ impl RedisJobQueue {
         let mut conn = self.connection().await?;
         let mut added = Vec::with_capacity(created.len());
         for job in created {
-            if self.store_new_job(&mut conn, &job).await? {
-                self.index_new_job(&mut conn, &job).await?;
-                added.push(job);
-                continue;
-            }
-
-            let existing = self
-                .load_job(&mut conn, &job.id)
-                .await?
-                .ok_or_else(|| LaneError::JobNotFound(job.id.clone()))?;
-            added.push(existing);
+            added.push(self.add_new_job(&mut conn, &job).await?);
         }
 
         Ok(added)
@@ -464,16 +483,26 @@ impl RedisJobQueue {
             .map_err(redis_error)
     }
 
-    async fn store_new_job(&self, conn: &mut ConnectionManager, job: &Job) -> Result<bool> {
+    async fn add_new_job(&self, conn: &mut ConnectionManager, job: &Job) -> Result<Job> {
         let encoded = encode_job(job)?;
-        let inserted: usize = redis::cmd("HSETNX")
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(ADD_JOB_SCRIPT)
+            .arg(5)
             .arg(self.jobs_key())
+            .arg(self.state_key(JobState::Waiting))
+            .arg(self.state_key(JobState::Delayed))
+            .arg(self.state_key(JobState::WaitingChildren))
+            .arg(self.sequence_key())
             .arg(&job.id)
             .arg(encoded)
+            .arg(job_state_name(job.state))
+            .arg(millis(job.scheduled_at))
+            .arg(job.priority)
+            .arg(WAITING_SCORE_BUCKET)
             .query_async(conn)
             .await
             .map_err(redis_error)?;
-        Ok(inserted == 1)
+        decode_add_job_result(&result, &job.id)
     }
 
     async fn index_new_job(&self, conn: &mut ConnectionManager, job: &Job) -> Result<()> {
@@ -682,14 +711,7 @@ impl JobQueueBackend for RedisJobQueue {
         let now = Utc::now();
         let job = Job::new(self.queue.clone(), name, payload, options, now);
         let mut conn = self.connection().await?;
-        if self.store_new_job(&mut conn, &job).await? {
-            self.index_new_job(&mut conn, &job).await?;
-            return Ok(job);
-        }
-
-        self.load_job(&mut conn, &job.id)
-            .await?
-            .ok_or_else(|| LaneError::JobNotFound(job.id.clone()))
+        self.add_new_job(&mut conn, &job).await
     }
 
     async fn add_jobs(&self, jobs: Vec<JobSpec>, now: DateTime<Utc>) -> Result<Vec<Job>> {
@@ -1310,6 +1332,26 @@ fn decode_job(raw: &str) -> Result<Job> {
         .map_err(|error| LaneError::Other(format!("failed to decode Redis job: {error}")))
 }
 
+fn decode_add_job_result(result: &[String], job_id: &str) -> Result<Job> {
+    match result.first().map(String::as_str) {
+        Some("inserted" | "existing") => {
+            let raw = result.get(1).ok_or_else(|| {
+                LaneError::Other(format!(
+                    "Redis add job script returned no payload for {job_id}"
+                ))
+            })?;
+            decode_job(raw)
+        }
+        Some("missing") => Err(LaneError::JobNotFound(job_id.to_string())),
+        Some(other) => Err(LaneError::Other(format!(
+            "unexpected Redis add job script status `{other}` for {job_id}"
+        ))),
+        None => Err(LaneError::Other(format!(
+            "Redis add job script returned no status for {job_id}"
+        ))),
+    }
+}
+
 fn decode_transition_result(result: &[String], job_id: &str, action: &str) -> Result<Job> {
     match result.first().map(String::as_str) {
         Some("ok") => {
@@ -1375,6 +1417,17 @@ fn subtract_duration(at: DateTime<Utc>, duration: Duration) -> DateTime<Utc> {
 
 fn waiting_score(priority: JobPriority, sequence: u64) -> f64 {
     (priority as f64 * WAITING_SCORE_BUCKET) + sequence as f64
+}
+
+fn job_state_name(state: JobState) -> &'static str {
+    match state {
+        JobState::Waiting => "waiting",
+        JobState::Delayed => "delayed",
+        JobState::Active => "active",
+        JobState::WaitingChildren => "waiting_children",
+        JobState::Completed => "completed",
+        JobState::Failed => "failed",
+    }
 }
 
 fn lock_duration_millis(duration: Duration) -> u64 {

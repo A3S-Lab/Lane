@@ -158,7 +158,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             serde_json::json!({}),
             JobOptions::new()
                 .with_priority(7)
-                .with_delay(Duration::from_millis(80)),
+                .with_delay(Duration::from_millis(500)),
         )
         .await
         .expect("claim-promoted delayed job should be added");
@@ -171,7 +171,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect("early claim-promote claim should return")
         .is_none());
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    tokio::time::sleep(Duration::from_millis(560)).await;
     let claim_promoted_claim = claim_promote_queue
         .claim_next(
             "worker-claim-promote".to_string(),
@@ -203,11 +203,11 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .add_job(
             "paused-promoted".to_string(),
             serde_json::json!({}),
-            JobOptions::new().with_delay(Duration::from_millis(80)),
+            JobOptions::new().with_delay(Duration::from_millis(500)),
         )
         .await
         .expect("paused-promoted delayed job should be added");
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    tokio::time::sleep(Duration::from_millis(560)).await;
     assert!(paused_promote_queue
         .claim_next(
             "worker-paused-promote".to_string(),
@@ -931,6 +931,84 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             .count(),
         2
     );
+
+    let atomic_add_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "atomic-add")
+        .expect("valid Redis URL should build the atomic-add queue");
+    let atomic_add_id = format!("{namespace}:atomic:add");
+    let atomic_first = atomic_add_queue
+        .add_job(
+            "atomic-add".to_string(),
+            serde_json::json!({ "attempt": 1 }),
+            JobOptions::new()
+                .with_job_id(atomic_add_id.clone())
+                .with_priority(3),
+        )
+        .await
+        .expect("atomic-add job should be added");
+    let atomic_duplicate = atomic_add_queue
+        .add_job(
+            "atomic-add-duplicate".to_string(),
+            serde_json::json!({ "attempt": 2 }),
+            JobOptions::new()
+                .with_job_id(atomic_add_id.clone())
+                .with_priority(1),
+        )
+        .await
+        .expect("duplicate atomic-add job should return existing");
+    assert_eq!(atomic_duplicate, atomic_first);
+    let mut atomic_add_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let atomic_sequence: Option<u64> = atomic_add_conn
+        .get(format!("{namespace}:atomic-add:sequence"))
+        .await?;
+    assert_eq!(atomic_sequence, Some(1));
+    let atomic_waiting_count: usize = atomic_add_conn
+        .zcard(format!("{namespace}:atomic-add:waiting"))
+        .await?;
+    assert_eq!(atomic_waiting_count, 1);
+    let atomic_waiting_score: Option<f64> = atomic_add_conn
+        .zscore(format!("{namespace}:atomic-add:waiting"), &atomic_add_id)
+        .await?;
+    assert!(atomic_waiting_score.is_some());
+
+    let atomic_delayed_id = format!("{namespace}:atomic:delayed");
+    let atomic_delayed = atomic_add_queue
+        .add_job(
+            "atomic-delayed".to_string(),
+            serde_json::json!({ "attempt": 1 }),
+            JobOptions::new()
+                .with_job_id(atomic_delayed_id.clone())
+                .with_delay(Duration::from_secs(60)),
+        )
+        .await
+        .expect("atomic delayed job should be added");
+    let atomic_delayed_duplicate = atomic_add_queue
+        .add_job(
+            "atomic-delayed-duplicate".to_string(),
+            serde_json::json!({ "attempt": 2 }),
+            JobOptions::new()
+                .with_job_id(atomic_delayed_id.clone())
+                .with_delay(Duration::from_secs(30)),
+        )
+        .await
+        .expect("duplicate atomic delayed job should return existing");
+    assert_eq!(atomic_delayed_duplicate, atomic_delayed);
+    let atomic_sequence_after_delayed: Option<u64> = atomic_add_conn
+        .get(format!("{namespace}:atomic-add:sequence"))
+        .await?;
+    assert_eq!(atomic_sequence_after_delayed, Some(1));
+    let atomic_delayed_count: usize = atomic_add_conn
+        .zcard(format!("{namespace}:atomic-add:delayed"))
+        .await?;
+    assert_eq!(atomic_delayed_count, 1);
+    let atomic_delayed_score: Option<f64> = atomic_add_conn
+        .zscore(
+            format!("{namespace}:atomic-add:delayed"),
+            &atomic_delayed_id,
+        )
+        .await?;
+    assert!(atomic_delayed_score.is_some());
 
     cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())
