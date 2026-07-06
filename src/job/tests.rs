@@ -4596,3 +4596,95 @@ async fn worker_run_until_idle_processes_ready_jobs() {
     assert_eq!(stats.completed, 2);
     assert_eq!(stats.waiting, 0);
 }
+
+#[tokio::test]
+async fn job_event_stream_records_core_lifecycle() {
+    let queue = InMemoryJobQueue::new("events");
+    let now = ts(1_000);
+    let job = queue
+        .add_at("task", serde_json::json!({}), JobOptions::new(), now)
+        .await
+        .unwrap();
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .update_progress(&job.id, serde_json::json!({ "percent": 50 }))
+        .await
+        .unwrap();
+    queue
+        .complete_job(
+            &job.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            now,
+        )
+        .await
+        .unwrap();
+
+    let events = queue.read_events("-", "+", 20).await.unwrap();
+    let names = events
+        .iter()
+        .map(|event| event.event.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec!["added", "waiting", "active", "progress", "completed"]
+    );
+    assert_eq!(events[0].job_id.as_deref(), Some(job.id.as_str()));
+    assert_eq!(
+        events[0].fields.get("name"),
+        Some(&Value::String("task".to_string()))
+    );
+    assert_eq!(events[2].prev, Some(JobState::Waiting));
+    assert_eq!(
+        events[3].fields.get("data"),
+        Some(&serde_json::json!({ "percent": 50 }))
+    );
+    assert_eq!(events[4].prev, Some(JobState::Active));
+    assert_eq!(
+        events[4].fields.get("returnvalue"),
+        Some(&serde_json::json!({ "ok": true }))
+    );
+
+    assert_eq!(queue.trim_events(2).await.unwrap(), 3);
+    let trimmed = queue.read_events("-", "+", 20).await.unwrap();
+    let names = trimmed
+        .iter()
+        .map(|event| event.event.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["progress", "completed"]);
+}
+
+#[tokio::test]
+async fn local_job_queue_persists_event_stream() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("jobs").join("events.json");
+    let queue = LocalJobQueue::open("durable-events", &snapshot_path)
+        .await
+        .unwrap();
+    let job = queue
+        .add_at("task", serde_json::json!({}), JobOptions::new(), ts(1_000))
+        .await
+        .unwrap();
+    queue
+        .update_progress(&job.id, serde_json::json!({ "percent": 25 }))
+        .await
+        .unwrap();
+
+    let reopened = LocalJobQueue::open("durable-events", &snapshot_path)
+        .await
+        .unwrap();
+    let events = reopened.read_events("-", "+", 10).await.unwrap();
+    let names = events
+        .iter()
+        .map(|event| event.event.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["added", "waiting", "progress"]);
+    assert_eq!(
+        events[2].fields.get("data"),
+        Some(&serde_json::json!({ "percent": 25 }))
+    );
+}

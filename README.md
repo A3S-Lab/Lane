@@ -369,10 +369,10 @@ A3S stack and language SDKs.
 | Phase | Status | Scope |
 | --- | --- | --- |
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
-| Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, debounce TTL extension, delayed-owner replace, and keep-last-if-active requeue, repeat-key ownership, explicit job states, priority plus FIFO/LIFO same-priority ordering, delayed jobs, token-owned worker leases, active-to-wait/delayed movement, completion/failure snapshots, retry backoff, Redis-shared rate-limit and active-concurrency controls, stalled-job recovery, pause/resume. |
-| Job management API | In progress | Add/get/get-state/get-job-counts/get-job-count/count-pending/remove/remove-repeat/remove-deduplication-key/get-deduplication-job-id/list-repeats/get-flow-dependencies/get-flow-dependency-counts/remove-unprocessed-children/remove-child-dependency/promote/reschedule/delay-active/release-active/retry/update-priority/update-priority-with-lifo/update-data/pause/resume/is-paused/drain/clean/obliterate APIs, multi-state pagination, ascending/descending listing, waiting priority counts, add-log/get-logs/clear-job-logs, progress updates, lease renewal. |
+| Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, debounce TTL extension, delayed-owner replace, and keep-last-if-active requeue, repeat-key ownership, explicit job states, priority plus FIFO/LIFO same-priority ordering, retained queue event streams, delayed jobs, token-owned worker leases, active-to-wait/delayed movement, completion/failure snapshots, retry backoff, Redis-shared rate-limit and active-concurrency controls, stalled-job recovery, pause/resume. |
+| Job management API | In progress | Add/get/get-state/get-job-counts/get-job-count/count-pending/remove/remove-repeat/remove-deduplication-key/get-deduplication-job-id/list-repeats/get-flow-dependencies/get-flow-dependency-counts/remove-unprocessed-children/remove-child-dependency/promote/reschedule/delay-active/release-active/retry/update-priority/update-priority-with-lifo/update-data/pause/resume/is-paused/drain/clean/obliterate APIs, multi-state pagination, ascending/descending listing, waiting priority counts, add-log/get-logs/clear-job-logs, read-events/trim-events, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, and stalled recovery loops. |
-| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, FIFO/LIFO waiting score ordering, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership/listing/removal, flow submission, flow dependency inspection, delayed promotion and rescheduling, active-to-wait/delayed movement, single-job promote, state-index queries, job count snapshots, manual retry, priority update, progress update, log append, list/stat snapshots, drain, clean, obliterate, claim, Redis-shared rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
+| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, FIFO/LIFO waiting score ordering, Redis stream queue events, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership/listing/removal, flow submission, flow dependency inspection, delayed promotion and rescheduling, active-to-wait/delayed movement, single-job promote, state-index queries, job count snapshots, manual retry, priority update, progress update, log append, list/stat snapshots, drain, clean, obliterate, claim, Redis-shared rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, dependency inspection, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, end timestamps, and repeat-key removal are available across in-memory, local durable, and Redis backends. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
@@ -491,7 +491,9 @@ for selected priorities, `update_data()` replaces a retained job payload,
 `add_log()` appends retained job logs, and
 `get_job_logs()` returns a `JobLogPage` with Redis/BullMQ-style range semantics.
 `clear_job_logs(job_id, 0)` clears retained logs for a job, while positive
-values keep the newest entries.
+values keep the newest entries. `read_events("-", "+", limit)` reads retained
+queue events in Redis stream id order, and `trim_events(max_len)` trims the
+queue event stream using the backend's retained-event mechanism.
 `pause()`, `resume()`, and `is_paused()` provide queue-level dispatch control.
 Cleanup paths can unblock flow parents when a pending child is removed.
 Set `JobOptions::with_job_id()` when producers need idempotent submission:
@@ -500,6 +502,23 @@ duplicate.
 `JobOptions::with_lifo(true)` changes the ready-job insertion semantics for
 jobs with the same priority: newer ready jobs are claimed before older ready
 jobs, while lower priority values still run first.
+
+```rust
+# use a3s_lane::{InMemoryJobQueue, JobOptions, JobQueueBackend};
+# async fn events_example() -> a3s_lane::Result<()> {
+let queue = InMemoryJobQueue::new("email");
+let job = queue
+    .add_job("send".to_string(), serde_json::json!({ "to": "ops@example.com" }), JobOptions::new())
+    .await?;
+
+let events = queue.read_events("-", "+", 100).await?;
+assert_eq!(events[0].event, "added");
+assert_eq!(events[0].job_id.as_deref(), Some(job.id.as_str()));
+
+queue.trim_events(10_000).await?;
+# Ok(())
+# }
+```
 
 Every claimed job carries an opaque `lock_token`. Workers must pass that token
 to `complete_job()`, `fail_job()`, `fail_job_discarding_retry()`, and
@@ -960,6 +979,22 @@ claiming priority-first, newest LIFO before older LIFO, LIFO before FIFO at the
 same priority, and oldest FIFO before newer FIFO, while preserving
 `get_counts_per_priority()` as a `ZCOUNT` over the same priority bucket.
 
+Queue events follow BullMQ's Redis stream mechanism. BullMQ's Lua scripts write
+global queue events with `XADD <queue>:events`, commonly using
+`MAXLEN ~ maxEvents` with a default of 10,000 retained entries; `QueueEvents`
+then reads from that stream by event id. Lane mirrors that storage shape for the
+Redis backend with an `events` stream per queue. Lua state transitions write the
+event in the same Redis turn as the job mutation: add writes `added` followed by
+`waiting`, `delayed`, or `waiting-children`; claim writes `active prev=waiting`;
+completion writes `completed prev=active` with `returnvalue`; failure writes
+`failed` or retry `delayed` with `failedReason`; progress writes
+`progress data=<json>`; pause/resume write queue-level events. `read_events()`
+uses `XRANGE` over stream ids, and `trim_events()` uses BullMQ-style
+`XTRIM MAXLEN ~`. The in-memory and local durable backends keep the same
+retained event entries in their snapshots so tests and embedded runtimes expose
+the same contract without Redis. Like BullMQ's `addLog` script, Lane job logs
+remain a retained log list and do not emit queue events; progress updates do.
+
 Completion, terminal failure, remove, clean, and stalled terminal failure scripts
 release deduplication keys only when they still point at the job being finalized
 or removed.
@@ -1097,14 +1132,15 @@ Redis job management mutations are script-backed too. `update_data()` follows
 BullMQ's `updateData` existence check and write shape, adapted to Lane's Redis
 hash layout by decoding the stored job JSON, replacing `payload`, and writing the
 job snapshot back in one Lua turn. `update_progress()` checks the current state
-and writes the progress value in one Redis turn. `add_log()` follows BullMQ's
-`addLog` shape at the key level: the script verifies that the job exists,
-`RPUSH`es a structured JSON entry into `logs:<jobId>`, applies `LTRIM` when a
-retention count is provided, and mirrors the retained entries into the job JSON
-snapshot for Lane compatibility. `clean_jobs()` filters retained records by the
-parsed millisecond reference time, removes their lock keys, hash entries, state
-indexes, dependency sets, and log lists atomically, updates flow parents for
-removed child jobs, and returns the removed snapshots.
+and writes the progress value plus an `XADD event=progress` entry in one Redis
+turn. `add_log()` follows BullMQ's `addLog` shape at the key level: the script
+verifies that the job exists, `RPUSH`es a structured JSON entry into
+`logs:<jobId>`, applies `LTRIM` when a retention count is provided, and mirrors
+the retained entries into the job JSON snapshot for Lane compatibility without
+emitting a queue event. `clean_jobs()` filters retained records by the parsed
+millisecond reference time, removes their lock keys, hash entries, state indexes,
+dependency sets, and log lists atomically, updates flow parents for removed
+child jobs, and returns the removed snapshots.
 
 Queue draining follows the same rule. `drain_jobs(false)` removes waiting jobs
 and `drain_jobs(true)` also removes ordinary delayed jobs in one Redis turn,

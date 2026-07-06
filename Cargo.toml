@@ -40,7 +40,7 @@ cron = { version = "0.17.0", features = ["serde"] }
 num_cpus = { version = "1", optional = true }
 
 # Optional: Redis-backed generic job queue
-redis = { version = "0.32.7", default-features = false, features = ["tokio-comp", "connection-manager", "script"], optional = true }
+redis = { version = "0.32.7", default-features = false, features = ["tokio-comp", "connection-manager", "script", "streams"], optional = true }
 
 # Optional: telemetry
 opentelemetry = { version = "0.21", features = ["metrics"], optional = true }

@@ -1,17 +1,18 @@
 use super::backend::JobQueueBackend;
 use super::types::{
-    add_duration, deduplication_expiration, Job, JobFlow, JobFlowDependencies,
+    add_duration, deduplication_expiration, Job, JobEvent, JobFlow, JobFlowDependencies,
     JobFlowDependencyCounts, JobId, JobListOptions, JobListPage, JobLogEntry, JobLogPage,
     JobOptions, JobPriority, JobPriorityCount, JobQueueStats, JobRateLimit, JobRepeatEntry,
-    JobSpec, JobState, JobStateCount, JobWorkerId, QueueName,
+    JobSpec, JobState, JobStateCount, JobWorkerId, QueueName, DEFAULT_JOB_EVENT_RETENTION,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use redis::aio::ConnectionManager;
+use redis::streams::{StreamMaxlen, StreamRangeReply};
 use redis::AsyncCommands;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -275,6 +276,14 @@ if ARGV[9] ~= '' then
   redis.call('SET', ARGV[10] .. ARGV[9], ARGV[1])
 end
 
+local event_job = cjson.decode(inserted_raw)
+redis.call('XADD', KEYS[7], 'MAXLEN', '~', ARGV[13], '*', 'event', 'added', 'jobId', ARGV[1], 'name', event_job["name"] or '')
+local event_state = state
+if event_state == 'waiting_children' then
+  event_state = 'waiting-children'
+end
+redis.call('XADD', KEYS[7], 'MAXLEN', '~', ARGV[13], '*', 'event', event_state, 'jobId', ARGV[1])
+
 return {'inserted', inserted_raw}
 "#;
 
@@ -484,6 +493,7 @@ local deduplication_prefix = ARGV[3 + count * per_job_args]
 local repeat_prefix = ARGV[4 + count * per_job_args]
 local deduplication_next_prefix = ARGV[5 + count * per_job_args]
 local logs_prefix = ARGV[6 + count * per_job_args]
+local max_events = ARGV[7 + count * per_job_args]
 local added = {}
 
 for index = 1, count do
@@ -556,6 +566,13 @@ for index = 1, count do
         if repeat_key ~= '' then
           redis.call('SET', repeat_prefix .. repeat_key, id)
         end
+        local event_job = cjson.decode(inserted_raw)
+        redis.call('XADD', KEYS[7], 'MAXLEN', '~', max_events, '*', 'event', 'added', 'jobId', id, 'name', event_job["name"] or '')
+        local event_state = state
+        if event_state == 'waiting_children' then
+          event_state = 'waiting-children'
+        end
+        redis.call('XADD', KEYS[7], 'MAXLEN', '~', max_events, '*', 'event', event_state, 'jobId', id)
         added[index] = inserted_raw
       end
     end
@@ -687,6 +704,7 @@ local waiting_score_bucket = tonumber(ARGV[2 + count * per_job_args])
 local dependency_prefix = ARGV[3 + count * per_job_args]
 local deduplication_prefix = ARGV[4 + count * per_job_args]
 local repeat_prefix = ARGV[5 + count * per_job_args]
+local max_events = ARGV[6 + count * per_job_args]
 local staged_deduplication_ids = {}
 local staged_repeat_keys = {}
 
@@ -744,6 +762,13 @@ for index = 1, count do
   if repeat_key ~= '' then
     redis.call('SET', repeat_prefix .. repeat_key, id)
   end
+  local event_job = cjson.decode(raw)
+  redis.call('XADD', KEYS[6], 'MAXLEN', '~', max_events, '*', 'event', 'added', 'jobId', id, 'name', event_job["name"] or '')
+  local event_state = state
+  if event_state == 'waiting_children' then
+    event_state = 'waiting-children'
+  end
+  redis.call('XADD', KEYS[6], 'MAXLEN', '~', max_events, '*', 'event', event_state, 'jobId', id)
 
   offset = offset + per_job_args
 end
@@ -794,6 +819,7 @@ for _, due_id in ipairs(due_ids) do
       delayed_job["state"] = "waiting"
       local priority = tonumber(delayed_job["priority"] or '1000') or 1000
       enqueue_waiting_job(KEYS[3], KEYS[1], KEYS[7], delayed_job, due_id, priority, ARGV[11])
+      redis.call('XADD', KEYS[8], 'MAXLEN', '~', ARGV[14], '*', 'event', 'waiting', 'jobId', due_id, 'prev', 'delayed')
     end
   end
 end
@@ -864,6 +890,7 @@ for _, id in ipairs(ids) do
       redis.call('ZREM', KEYS[1], id)
       redis.call('ZADD', KEYS[2], ARGV[1], id)
       redis.call('HSET', KEYS[3], id, updated)
+      redis.call('XADD', KEYS[8], 'MAXLEN', '~', ARGV[14], '*', 'event', 'active', 'jobId', id, 'prev', 'waiting')
       return updated
     end
   end
@@ -1327,6 +1354,8 @@ if not enqueued_deduplicated_next and repeat_next_id and repeat_next_id ~= '' th
 end
 release_repeat_key(job, ARGV[1], ARGV[15])
 
+redis.call('XADD', KEYS[10], 'MAXLEN', '~', ARGV[18], '*', 'event', 'completed', 'jobId', ARGV[1], 'returnvalue', ARGV[4], 'prev', 'active')
+
 return {'ok', updated}
 "#;
 
@@ -1608,6 +1637,7 @@ if ARGV[5] == '1' then
   local updated = cjson.encode(job)
   redis.call('HSET', KEYS[1], ARGV[1], updated)
   redis.call('ZADD', KEYS[3], ARGV[7], ARGV[1])
+  redis.call('XADD', KEYS[9], 'MAXLEN', '~', ARGV[16], '*', 'event', 'delayed', 'jobId', ARGV[1], 'failedReason', ARGV[4], 'prev', 'active')
   return {'ok', updated}
 end
 
@@ -1651,6 +1681,8 @@ if parent_id and parent_id ~= cjson.null then
     end
   end
 end
+
+redis.call('XADD', KEYS[9], 'MAXLEN', '~', ARGV[16], '*', 'event', 'failed', 'jobId', ARGV[1], 'failedReason', ARGV[4], 'prev', 'active')
 
 return {'ok', updated}
 "#;
@@ -1726,6 +1758,7 @@ job["options"]["delay"] = cjson.decode(ARGV[5])
 local updated = cjson.encode(job)
 redis.call('HSET', KEYS[1], ARGV[1], updated)
 redis.call('ZADD', KEYS[3], ARGV[4], ARGV[1])
+redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[6], '*', 'event', 'delayed', 'jobId', ARGV[1], 'prev', 'active')
 
 return {'ok', updated}
 "#;
@@ -1789,6 +1822,7 @@ job["failed_reason"] = cjson.null
 
 local priority = tonumber(job["priority"] or '1000') or 1000
 local updated = enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[4], job, ARGV[1], priority, ARGV[5])
+redis.call('XADD', KEYS[6], 'MAXLEN', '~', ARGV[6], '*', 'event', 'waiting', 'jobId', ARGV[1], 'prev', 'active')
 
 return {'ok', updated}
 "#;
@@ -2165,6 +2199,7 @@ job["state"] = "waiting"
 job["scheduled_at"] = ARGV[2]
 local priority = tonumber(job["priority"] or '1000') or 1000
 local updated = enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[4], job, ARGV[1], priority, ARGV[3])
+redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[4], '*', 'event', 'waiting', 'jobId', ARGV[1], 'prev', 'delayed')
 
 return {'ok', updated}
 "#;
@@ -2343,6 +2378,7 @@ end
 
 local priority = tonumber(job["priority"] or '1000') or 1000
 local updated = enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[4], job, ARGV[1], priority, ARGV[3])
+redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[8], '*', 'event', 'waiting', 'jobId', ARGV[1], 'prev', 'failed')
 if retry_deduplication_id then
   if ARGV[7] ~= '' then
     redis.call('SET', ARGV[4] .. retry_deduplication_id, ARGV[1], 'PX', ARGV[7])
@@ -2411,6 +2447,7 @@ end
 
 local updated = cjson.encode(job)
 redis.call('HSET', KEYS[1], ARGV[1], updated)
+redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[3], '*', 'event', 'progress', 'jobId', ARGV[1], 'data', ARGV[2])
 
 return {'ok', updated}
 "#;
@@ -2448,6 +2485,7 @@ for _, id in ipairs(ids) do
       job["state"] = "waiting"
       local priority = tonumber(job["priority"] or '1000') or 1000
       enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[4], job, id, priority, ARGV[2])
+      redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[4], '*', 'event', 'waiting', 'jobId', id, 'prev', 'delayed')
       promoted = promoted + 1
     end
   end
@@ -4346,13 +4384,14 @@ impl RedisJobQueue {
         let mut command = redis::cmd("EVAL");
         command
             .arg(ADD_JOBS_SCRIPT)
-            .arg(6)
+            .arg(7)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Waiting))
             .arg(self.state_key(JobState::Delayed))
             .arg(self.state_key(JobState::WaitingChildren))
             .arg(self.sequence_key())
             .arg(self.state_key(JobState::Active))
+            .arg(self.events_key())
             .arg(created.len());
         for job in &created {
             command
@@ -4369,7 +4408,8 @@ impl RedisJobQueue {
             .arg(self.deduplication_key_prefix())
             .arg(self.repeat_key_prefix())
             .arg(self.deduplication_next_key_prefix())
-            .arg(self.logs_key_prefix());
+            .arg(self.logs_key_prefix())
+            .arg(DEFAULT_JOB_EVENT_RETENTION);
 
         let result: Vec<String> = command.query_async(&mut conn).await.map_err(redis_error)?;
         let added = decode_add_jobs_result(&result, created.len())?;
@@ -4559,6 +4599,10 @@ impl RedisJobQueue {
         self.key("sequence")
     }
 
+    fn events_key(&self) -> String {
+        self.key("events")
+    }
+
     fn claim_rate_limit_key(&self) -> String {
         self.key("claim_rate_limit")
     }
@@ -4622,13 +4666,14 @@ impl RedisJobQueue {
         let encoded = encode_job(job)?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(ADD_JOB_SCRIPT)
-            .arg(6)
+            .arg(7)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Waiting))
             .arg(self.state_key(JobState::Delayed))
             .arg(self.state_key(JobState::WaitingChildren))
             .arg(self.sequence_key())
             .arg(self.state_key(JobState::Active))
+            .arg(self.events_key())
             .arg(&job.id)
             .arg(encoded)
             .arg(job_state_name(job.state))
@@ -4641,6 +4686,7 @@ impl RedisJobQueue {
             .arg(self.repeat_key_prefix())
             .arg(self.deduplication_next_key_prefix())
             .arg(self.logs_key_prefix())
+            .arg(DEFAULT_JOB_EVENT_RETENTION)
             .query_async(conn)
             .await
             .map_err(redis_error)?;
@@ -4657,12 +4703,13 @@ impl RedisJobQueue {
         let mut command = redis::cmd("EVAL");
         command
             .arg(ADD_FLOW_SCRIPT)
-            .arg(5)
+            .arg(6)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Waiting))
             .arg(self.state_key(JobState::Delayed))
             .arg(self.state_key(JobState::WaitingChildren))
             .arg(self.sequence_key())
+            .arg(self.events_key())
             .arg(job_count);
 
         for job in std::iter::once(parent).chain(children.iter()) {
@@ -4679,7 +4726,8 @@ impl RedisJobQueue {
             .arg(WAITING_SCORE_BUCKET)
             .arg(self.dependencies_key_prefix())
             .arg(self.deduplication_key_prefix())
-            .arg(self.repeat_key_prefix());
+            .arg(self.repeat_key_prefix())
+            .arg(DEFAULT_JOB_EVENT_RETENTION);
 
         let result: Vec<String> = command.query_async(conn).await.map_err(redis_error)?;
         decode_add_flow_result(&result)
@@ -4794,7 +4842,7 @@ impl RedisJobQueue {
         let scheduled_at = retry_at.unwrap_or(now);
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(FAIL_SCRIPT)
-            .arg(8)
+            .arg(9)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.state_key(JobState::Delayed))
@@ -4803,6 +4851,7 @@ impl RedisJobQueue {
             .arg(self.state_key(JobState::WaitingChildren))
             .arg(self.state_key(JobState::Waiting))
             .arg(self.sequence_key())
+            .arg(self.events_key())
             .arg(job_id)
             .arg(lock_token)
             .arg(now.to_rfc3339())
@@ -4818,6 +4867,7 @@ impl RedisJobQueue {
             .arg(WAITING_SCORE_BUCKET)
             .arg(self.deduplication_next_key_prefix())
             .arg(self.logs_key_prefix())
+            .arg(DEFAULT_JOB_EVENT_RETENTION)
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -4888,7 +4938,7 @@ impl JobQueueBackend for RedisJobQueue {
             .unwrap_or((0, 0));
         let raw: Option<String> = redis::cmd("EVAL")
             .arg(CLAIM_SCRIPT)
-            .arg(7)
+            .arg(8)
             .arg(self.state_key(JobState::Waiting))
             .arg(self.state_key(JobState::Active))
             .arg(self.jobs_key())
@@ -4896,6 +4946,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.meta_key())
             .arg(self.state_key(JobState::Delayed))
             .arg(self.sequence_key())
+            .arg(self.events_key())
             .arg(millis(lease_expires_at))
             .arg(now.to_rfc3339())
             .arg(worker_id)
@@ -4909,6 +4960,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(WAITING_SCORE_BUCKET)
             .arg(1_000_u16)
             .arg(1_000_u16)
+            .arg(DEFAULT_JOB_EVENT_RETENTION)
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -4934,7 +4986,7 @@ impl JobQueueBackend for RedisJobQueue {
         let next_repeat = next_repeat_job(&active_job, now)?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(COMPLETE_SCRIPT)
-            .arg(9)
+            .arg(10)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.state_key(JobState::Completed))
@@ -4944,6 +4996,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.sequence_key())
             .arg(self.state_key(JobState::Failed))
             .arg(self.state_key(JobState::Delayed))
+            .arg(self.events_key())
             .arg(job_id)
             .arg(lock_token)
             .arg(now.to_rfc3339())
@@ -4991,6 +5044,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.repeat_key_prefix())
             .arg(self.deduplication_next_key_prefix())
             .arg(self.logs_key_prefix())
+            .arg(DEFAULT_JOB_EVENT_RETENTION)
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -5058,11 +5112,12 @@ impl JobQueueBackend for RedisJobQueue {
         let scheduled_at = add_duration(now, delay);
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(DELAY_ACTIVE_JOB_SCRIPT)
-            .arg(4)
+            .arg(5)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.state_key(JobState::Delayed))
             .arg(self.lock_key(job_id))
+            .arg(self.events_key())
             .arg(job_id)
             .arg(lock_token)
             .arg(scheduled_at.to_rfc3339())
@@ -5070,6 +5125,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(serde_json::to_string(&delay).map_err(|error| {
                 LaneError::Other(format!("failed to encode Redis job delay: {error}"))
             })?)
+            .arg(DEFAULT_JOB_EVENT_RETENTION)
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -5085,17 +5141,19 @@ impl JobQueueBackend for RedisJobQueue {
         let mut conn = self.connection().await?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(RELEASE_ACTIVE_JOB_SCRIPT)
-            .arg(5)
+            .arg(6)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.state_key(JobState::Waiting))
             .arg(self.sequence_key())
             .arg(self.lock_key(job_id))
+            .arg(self.events_key())
             .arg(job_id)
             .arg(lock_token)
             .arg(now.to_rfc3339())
             .arg(millis(now))
             .arg(WAITING_SCORE_BUCKET)
+            .arg(DEFAULT_JOB_EVENT_RETENTION)
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -5106,14 +5164,16 @@ impl JobQueueBackend for RedisJobQueue {
         let mut conn = self.connection().await?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(PROMOTE_JOB_SCRIPT)
-            .arg(4)
+            .arg(5)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Waiting))
             .arg(self.state_key(JobState::Delayed))
             .arg(self.sequence_key())
+            .arg(self.events_key())
             .arg(job_id)
             .arg(now.to_rfc3339())
             .arg(WAITING_SCORE_BUCKET)
+            .arg(DEFAULT_JOB_EVENT_RETENTION)
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -5166,11 +5226,12 @@ impl JobQueueBackend for RedisJobQueue {
             .unwrap_or_default();
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(RETRY_JOB_SCRIPT)
-            .arg(4)
+            .arg(5)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Failed))
             .arg(self.state_key(JobState::Waiting))
             .arg(self.sequence_key())
+            .arg(self.events_key())
             .arg(job_id)
             .arg(now.to_rfc3339())
             .arg(WAITING_SCORE_BUCKET)
@@ -5178,6 +5239,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.repeat_key_prefix())
             .arg(deduplication_expires_at)
             .arg(deduplication_ttl_millis)
+            .arg(DEFAULT_JOB_EVENT_RETENTION)
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -5446,10 +5508,12 @@ impl JobQueueBackend for RedisJobQueue {
             .map_err(|error| LaneError::Other(format!("failed to encode job progress: {error}")))?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(UPDATE_PROGRESS_SCRIPT)
-            .arg(1)
+            .arg(2)
             .arg(self.jobs_key())
+            .arg(self.events_key())
             .arg(job_id)
             .arg(progress)
+            .arg(DEFAULT_JOB_EVENT_RETENTION)
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -5532,20 +5596,51 @@ impl JobQueueBackend for RedisJobQueue {
         decode_clear_logs_result(&result, job_id)
     }
 
+    async fn read_events(&self, start: &str, end: &str, limit: usize) -> Result<Vec<JobEvent>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut conn = self.connection().await?;
+        let reply: StreamRangeReply = redis::cmd("XRANGE")
+            .arg(self.events_key())
+            .arg(start)
+            .arg(end)
+            .arg("COUNT")
+            .arg(limit)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_event_stream(reply)
+    }
+
+    async fn trim_events(&self, max_len: usize) -> Result<usize> {
+        let mut conn = self.connection().await?;
+        redis::cmd("XTRIM")
+            .arg(self.events_key())
+            .arg("MAXLEN")
+            .arg(StreamMaxlen::Approx(max_len))
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)
+    }
+
     async fn promote_due_jobs(&self, now: DateTime<Utc>) -> Result<usize> {
         let mut conn = self.connection().await?;
         let mut total = 0;
         loop {
             let promoted: usize = redis::cmd("EVAL")
                 .arg(PROMOTE_DUE_JOBS_SCRIPT)
-                .arg(4)
+                .arg(5)
                 .arg(self.jobs_key())
                 .arg(self.state_key(JobState::Delayed))
                 .arg(self.state_key(JobState::Waiting))
                 .arg(self.sequence_key())
+                .arg(self.events_key())
                 .arg(millis(now))
                 .arg(WAITING_SCORE_BUCKET)
                 .arg(1_000_u16)
+                .arg(DEFAULT_JOB_EVENT_RETENTION)
                 .query_async(&mut conn)
                 .await
                 .map_err(redis_error)?;
@@ -5586,16 +5681,40 @@ impl JobQueueBackend for RedisJobQueue {
 
     async fn pause(&self) -> Result<()> {
         let mut conn = self.connection().await?;
-        conn.hset(self.meta_key(), "paused", 1_u8)
+        let _: i64 = redis::cmd("EVAL")
+            .arg(
+                "redis.call('HSET', KEYS[1], 'paused', 1); \
+                 redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[2], '*', 'event', ARGV[1]); \
+                 return 1",
+            )
+            .arg(2)
+            .arg(self.meta_key())
+            .arg(self.events_key())
+            .arg("paused")
+            .arg(DEFAULT_JOB_EVENT_RETENTION)
+            .query_async(&mut conn)
             .await
-            .map_err(redis_error)
+            .map_err(redis_error)?;
+        Ok(())
     }
 
     async fn resume(&self) -> Result<()> {
         let mut conn = self.connection().await?;
-        conn.hdel(self.meta_key(), "paused")
+        let _: i64 = redis::cmd("EVAL")
+            .arg(
+                "redis.call('HDEL', KEYS[1], 'paused'); \
+                 redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[2], '*', 'event', ARGV[1]); \
+                 return 1",
+            )
+            .arg(2)
+            .arg(self.meta_key())
+            .arg(self.events_key())
+            .arg("resumed")
+            .arg(DEFAULT_JOB_EVENT_RETENTION)
+            .query_async(&mut conn)
             .await
-            .map_err(redis_error)
+            .map_err(redis_error)?;
+        Ok(())
     }
 
     async fn is_paused(&self) -> Result<bool> {
@@ -5958,6 +6077,82 @@ fn decode_log_entries(raw_logs: Vec<String>) -> Result<Vec<JobLogEntry>> {
             })
         })
         .collect()
+}
+
+fn decode_event_stream(reply: StreamRangeReply) -> Result<Vec<JobEvent>> {
+    reply
+        .ids
+        .into_iter()
+        .map(|entry| {
+            let event = stream_string_field(&entry.map, "event").ok_or_else(|| {
+                LaneError::Other(format!(
+                    "Redis event stream entry {} has no event",
+                    entry.id
+                ))
+            })?;
+            let timestamp = stream_id_timestamp(&entry.id);
+            let job_id = stream_string_field(&entry.map, "jobId");
+            let prev = stream_string_field(&entry.map, "prev")
+                .as_deref()
+                .map(decode_event_prev_state)
+                .transpose()?;
+            let mut fields = BTreeMap::new();
+            for (key, value) in entry.map {
+                if matches!(key.as_str(), "event" | "jobId" | "prev") {
+                    continue;
+                }
+                fields.insert(key, stream_field_value(&value));
+            }
+            Ok(JobEvent {
+                id: entry.id,
+                event,
+                timestamp,
+                job_id,
+                prev,
+                fields,
+            })
+        })
+        .collect()
+}
+
+fn stream_string_field(
+    map: &std::collections::HashMap<String, redis::Value>,
+    key: &str,
+) -> Option<String> {
+    map.get(key)
+        .and_then(|value| redis::from_redis_value::<String>(value).ok())
+}
+
+fn stream_field_value(value: &redis::Value) -> Value {
+    if let Ok(raw) = redis::from_redis_value::<String>(value) {
+        serde_json::from_str(&raw).unwrap_or(Value::String(raw))
+    } else if let Ok(number) = redis::from_redis_value::<i64>(value) {
+        Value::from(number)
+    } else {
+        Value::Null
+    }
+}
+
+fn stream_id_timestamp(id: &str) -> DateTime<Utc> {
+    let millis = id
+        .split_once('-')
+        .and_then(|(millis, _)| millis.parse::<i64>().ok())
+        .unwrap_or_default();
+    DateTime::<Utc>::from_timestamp_millis(millis).unwrap_or_else(Utc::now)
+}
+
+fn decode_event_prev_state(state: &str) -> Result<JobState> {
+    match state {
+        "waiting" => Ok(JobState::Waiting),
+        "delayed" => Ok(JobState::Delayed),
+        "active" => Ok(JobState::Active),
+        "waiting_children" | "waiting-children" => Ok(JobState::WaitingChildren),
+        "completed" => Ok(JobState::Completed),
+        "failed" => Ok(JobState::Failed),
+        other => Err(LaneError::Other(format!(
+            "unexpected Redis event prev state `{other}`"
+        ))),
+    }
 }
 
 fn decode_clear_logs_result(result: &[String], job_id: &str) -> Result<JobLogPage> {

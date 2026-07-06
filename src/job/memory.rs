@@ -1,16 +1,16 @@
 use super::backend::JobQueueBackend;
 use super::types::{
-    deduplication_expiration, Job, JobFlow, JobFlowDependencies, JobFlowDependencyCounts, JobId,
-    JobListOptions, JobListPage, JobLogEntry, JobLogPage, JobOptions, JobPriority,
+    deduplication_expiration, Job, JobEvent, JobFlow, JobFlowDependencies, JobFlowDependencyCounts,
+    JobId, JobListOptions, JobListPage, JobLogEntry, JobLogPage, JobOptions, JobPriority,
     JobPriorityCount, JobQueueSnapshot, JobQueueStats, JobRepeatEntry, JobSpec, JobState,
-    JobStateCount, JobWorkerId, QueueName,
+    JobStateCount, JobWorkerId, QueueName, DEFAULT_JOB_EVENT_RETENTION,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -20,6 +20,8 @@ use uuid::Uuid;
 struct InMemoryJobQueueState {
     paused: bool,
     sequence: u64,
+    event_sequence: u64,
+    events: Vec<JobEvent>,
     jobs: HashMap<JobId, Job>,
     deduplication_next: HashMap<String, Job>,
     released_deduplication_owners: HashSet<(String, JobId)>,
@@ -58,6 +60,8 @@ impl InMemoryJobQueue {
             queue: snapshot.queue,
             inner: Arc::new(Mutex::new(InMemoryJobQueueState {
                 paused: snapshot.paused,
+                event_sequence: snapshot.event_sequence,
+                events: snapshot.events,
                 sequence,
                 jobs: snapshot
                     .jobs
@@ -99,12 +103,32 @@ impl InMemoryJobQueue {
         JobQueueSnapshot {
             queue: self.queue.clone(),
             paused: inner.paused,
+            events: inner.events.clone(),
+            event_sequence: inner.event_sequence,
             jobs,
             deduplication_next_jobs,
             released_deduplication_owners: sorted_released_deduplication_owners(
                 &inner.released_deduplication_owners,
             ),
         }
+    }
+
+    fn emit_job_created_events_locked(
+        inner: &mut InMemoryJobQueueState,
+        job: &Job,
+        now: DateTime<Utc>,
+    ) {
+        let mut fields = BTreeMap::new();
+        fields.insert("name".to_string(), Value::String(job.name.clone()));
+        emit_event_locked(inner, "added", Some(job), None, now, fields);
+        emit_event_locked(
+            inner,
+            job_event_for_state(job.state),
+            Some(job),
+            None,
+            now,
+            BTreeMap::new(),
+        );
     }
 
     async fn fail_active_job(
@@ -162,6 +186,18 @@ impl InMemoryJobQueue {
                 );
             }
         }
+        let mut fields = BTreeMap::new();
+        if let Some(reason) = &failed.failed_reason {
+            fields.insert("failedReason".to_string(), Value::String(reason.clone()));
+        }
+        emit_event_locked(
+            &mut inner,
+            job_event_for_state(failed.state),
+            Some(&failed),
+            Some(JobState::Active),
+            now,
+            fields,
+        );
         Ok(failed)
     }
 
@@ -218,6 +254,7 @@ impl InMemoryJobQueue {
         Self::forget_released_deduplication_owner_locked(&mut inner, &job);
         assign_waiting_order(&mut inner.sequence, &mut job);
         inner.jobs.insert(job.id.clone(), job.clone());
+        Self::emit_job_created_events_locked(&mut inner, &job, now);
         Ok(job)
     }
 
@@ -311,7 +348,8 @@ impl InMemoryJobQueue {
 
         for (job_id, job) in staged {
             Self::forget_released_deduplication_owner_locked(&mut inner, &job);
-            inner.jobs.insert(job_id, job);
+            inner.jobs.insert(job_id, job.clone());
+            Self::emit_job_created_events_locked(&mut inner, &job, now);
         }
         Ok(added)
     }
@@ -402,10 +440,12 @@ impl InMemoryJobQueue {
         assign_waiting_order(&mut inner.sequence, &mut parent_job);
         Self::forget_released_deduplication_owner_locked(&mut inner, &parent_job);
         inner.jobs.insert(parent_job.id.clone(), parent_job.clone());
+        Self::emit_job_created_events_locked(&mut inner, &parent_job, now);
         for child in &mut child_jobs {
             assign_waiting_order(&mut inner.sequence, child);
             Self::forget_released_deduplication_owner_locked(&mut inner, child);
             inner.jobs.insert(child.id.clone(), child.clone());
+            Self::emit_job_created_events_locked(&mut inner, child, now);
         }
 
         Ok(JobFlow {
@@ -622,7 +662,18 @@ impl InMemoryJobQueue {
             job.scheduled_at = now;
             job.enqueued_seq = enqueued_seq.expect("promoted jobs get a waiting sequence");
         }
-        Ok(job.clone())
+        let job = job.clone();
+        if should_promote {
+            emit_event_locked(
+                &mut inner,
+                "waiting",
+                Some(&job),
+                Some(JobState::Delayed),
+                now,
+                BTreeMap::new(),
+            );
+        }
+        Ok(job)
     }
 
     /// Reschedule a delayed job relative to `now`.
@@ -718,7 +769,16 @@ impl InMemoryJobQueue {
         job.lease_expires_at = None;
         job.failed_reason = None;
         job.enqueued_seq = enqueued_seq;
-        Ok(job.clone())
+        let job = job.clone();
+        emit_event_locked(
+            &mut inner,
+            "waiting",
+            Some(&job),
+            Some(JobState::Failed),
+            now,
+            BTreeMap::new(),
+        );
+        Ok(job)
     }
 
     /// Renew the active worker lease for a job.
@@ -763,7 +823,16 @@ impl InMemoryJobQueue {
         job.lock_token = None;
         job.lease_expires_at = None;
         job.failed_reason = None;
-        Ok(job.clone())
+        let job = job.clone();
+        emit_event_locked(
+            &mut inner,
+            "delayed",
+            Some(&job),
+            Some(JobState::Active),
+            now,
+            BTreeMap::new(),
+        );
+        Ok(job)
     }
 
     /// Release an active leased job back to waiting state.
@@ -795,7 +864,16 @@ impl InMemoryJobQueue {
         job.lease_expires_at = None;
         job.failed_reason = None;
         job.enqueued_seq = enqueued_seq;
-        Ok(job.clone())
+        let job = job.clone();
+        emit_event_locked(
+            &mut inner,
+            "waiting",
+            Some(&job),
+            Some(JobState::Active),
+            now,
+            BTreeMap::new(),
+        );
+        Ok(job)
     }
 
     /// Update a non-terminal job priority.
@@ -1030,8 +1108,12 @@ impl InMemoryJobQueue {
                 job.id
             )));
         }
-        job.progress = Some(progress);
-        Ok(job.clone())
+        job.progress = Some(progress.clone());
+        let job = job.clone();
+        let mut fields = BTreeMap::new();
+        fields.insert("data".to_string(), progress);
+        emit_event_locked(&mut inner, "progress", Some(&job), None, Utc::now(), fields);
+        Ok(job)
     }
 
     /// Append a log line. `keep == 0` retains all log lines.
@@ -1113,10 +1195,23 @@ impl InMemoryJobQueue {
         });
         for due_job in due_jobs {
             let enqueued_seq = next_waiting_sequence(&mut inner.sequence);
-            if let Some(job) = inner.jobs.get_mut(&due_job.id) {
+            let promoted_job = if let Some(job) = inner.jobs.get_mut(&due_job.id) {
                 job.state = JobState::Waiting;
                 job.enqueued_seq = enqueued_seq;
                 promoted += 1;
+                Some(job.clone())
+            } else {
+                None
+            };
+            if let Some(job) = promoted_job {
+                emit_event_locked(
+                    inner,
+                    "waiting",
+                    Some(&job),
+                    Some(JobState::Delayed),
+                    now,
+                    BTreeMap::new(),
+                );
             }
         }
         promoted
@@ -1175,6 +1270,7 @@ impl InMemoryJobQueue {
         Self::forget_released_deduplication_owner_locked(inner, &next);
         assign_waiting_order(&mut inner.sequence, &mut next);
         inner.jobs.insert(next.id.clone(), next.clone());
+        Self::emit_job_created_events_locked(inner, &next, now);
         Some(next)
     }
 
@@ -1245,7 +1341,16 @@ impl InMemoryJobQueue {
         if let Some(enqueued_seq) = enqueued_seq {
             parent.enqueued_seq = enqueued_seq;
         }
-        Some(parent.clone())
+        let parent = parent.clone();
+        emit_event_locked(
+            inner,
+            job_event_for_state(parent.state),
+            Some(&parent),
+            Some(JobState::WaitingChildren),
+            now,
+            BTreeMap::new(),
+        );
+        Some(parent)
     }
 
     fn fail_waiting_parent_locked(
@@ -1269,6 +1374,18 @@ impl InMemoryJobQueue {
         if failed.options.remove_on_fail {
             Self::remove_job_record_locked(inner, parent_id);
         }
+        let mut fields = BTreeMap::new();
+        if let Some(reason) = &failed.failed_reason {
+            fields.insert("failedReason".to_string(), Value::String(reason.clone()));
+        }
+        emit_event_locked(
+            inner,
+            "failed",
+            Some(&failed),
+            Some(JobState::WaitingChildren),
+            now,
+            fields,
+        );
         Some(failed)
     }
 }
@@ -1337,18 +1454,29 @@ impl JobQueueBackend for InMemoryJobQueue {
             return Ok(None);
         };
 
-        let job = inner
-            .jobs
-            .get_mut(&job_id)
-            .expect("selected job must still exist");
-        job.state = JobState::Active;
-        job.attempts_made = job.attempts_made.saturating_add(1);
-        job.processed_at = Some(now);
-        job.worker_id = Some(worker_id);
-        job.lock_token = Some(Uuid::new_v4().to_string());
-        job.lease_expires_at = Some(add_duration(now, lease_for));
-        job.failed_reason = None;
-        Ok(Some(job.clone()))
+        let claimed = {
+            let job = inner
+                .jobs
+                .get_mut(&job_id)
+                .expect("selected job must still exist");
+            job.state = JobState::Active;
+            job.attempts_made = job.attempts_made.saturating_add(1);
+            job.processed_at = Some(now);
+            job.worker_id = Some(worker_id);
+            job.lock_token = Some(Uuid::new_v4().to_string());
+            job.lease_expires_at = Some(add_duration(now, lease_for));
+            job.failed_reason = None;
+            job.clone()
+        };
+        emit_event_locked(
+            &mut inner,
+            "active",
+            Some(&claimed),
+            Some(JobState::Waiting),
+            now,
+            BTreeMap::new(),
+        );
+        Ok(Some(claimed))
     }
 
     async fn complete_job(
@@ -1385,12 +1513,25 @@ impl JobQueueBackend for InMemoryJobQueue {
                 let mut next_job = next_job;
                 Self::forget_released_deduplication_owner_locked(&mut inner, &next_job);
                 assign_waiting_order(&mut inner.sequence, &mut next_job);
-                inner.jobs.insert(next_job.id.clone(), next_job);
+                inner.jobs.insert(next_job.id.clone(), next_job.clone());
+                Self::emit_job_created_events_locked(&mut inner, &next_job, now);
             }
         }
         if let Some(parent_id) = &completed.parent_id {
             Self::release_parent_if_ready_locked(&mut inner, parent_id, now);
         }
+        let mut fields = BTreeMap::new();
+        if let Some(value) = &completed.return_value {
+            fields.insert("returnvalue".to_string(), value.clone());
+        }
+        emit_event_locked(
+            &mut inner,
+            "completed",
+            Some(&completed),
+            Some(JobState::Active),
+            now,
+            fields,
+        );
         Ok(completed)
     }
 
@@ -1560,6 +1701,25 @@ impl JobQueueBackend for InMemoryJobQueue {
         self.clear_logs(job_id, keep).await
     }
 
+    async fn read_events(&self, start: &str, end: &str, limit: usize) -> Result<Vec<JobEvent>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let inner = self.inner.lock().await;
+        Ok(inner
+            .events
+            .iter()
+            .filter(|event| event_in_range(event, start, end))
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    async fn trim_events(&self, max_len: usize) -> Result<usize> {
+        let mut inner = self.inner.lock().await;
+        Ok(trim_events_locked(&mut inner, max_len))
+    }
+
     async fn promote_due_jobs(&self, now: DateTime<Utc>) -> Result<usize> {
         let mut inner = self.inner.lock().await;
         Ok(Self::promote_due_locked(&mut inner, now))
@@ -1571,6 +1731,7 @@ impl JobQueueBackend for InMemoryJobQueue {
         let mut remove_ids = Vec::new();
         let mut failed_children = Vec::new();
         let mut terminal_failures = Vec::new();
+        let mut recovered_events = Vec::new();
 
         let mut stalled_jobs = inner
             .jobs
@@ -1607,7 +1768,9 @@ impl JobQueueBackend for InMemoryJobQueue {
                             job.failed_reason.clone(),
                         ));
                     }
-                    terminal_failures.push(job.clone());
+                    let failed = job.clone();
+                    terminal_failures.push(failed.clone());
+                    recovered_events.push(failed);
                     if job.options.remove_on_fail {
                         remove_ids.push(job.id.clone());
                     }
@@ -1621,6 +1784,7 @@ impl JobQueueBackend for InMemoryJobQueue {
                 let enqueued_seq = next_waiting_sequence(&mut inner.sequence);
                 if let Some(job) = inner.jobs.get_mut(&id) {
                     job.enqueued_seq = enqueued_seq;
+                    recovered_events.push(job.clone());
                 }
             }
             recovered += 1;
@@ -1644,18 +1808,56 @@ impl JobQueueBackend for InMemoryJobQueue {
                 now,
             );
         }
+        for job in recovered_events {
+            let mut fields = BTreeMap::new();
+            if let Some(reason) = &job.failed_reason {
+                fields.insert("failedReason".to_string(), Value::String(reason.clone()));
+            }
+            emit_event_locked(
+                &mut inner,
+                "stalled",
+                Some(&job),
+                Some(JobState::Active),
+                now,
+                fields.clone(),
+            );
+            emit_event_locked(
+                &mut inner,
+                job_event_for_state(job.state),
+                Some(&job),
+                Some(JobState::Active),
+                now,
+                fields,
+            );
+        }
         Ok(recovered)
     }
 
     async fn pause(&self) -> Result<()> {
         let mut inner = self.inner.lock().await;
         inner.paused = true;
+        emit_event_locked(
+            &mut inner,
+            "paused",
+            None,
+            None,
+            Utc::now(),
+            BTreeMap::new(),
+        );
         Ok(())
     }
 
     async fn resume(&self) -> Result<()> {
         let mut inner = self.inner.lock().await;
         inner.paused = false;
+        emit_event_locked(
+            &mut inner,
+            "resumed",
+            None,
+            None,
+            Utc::now(),
+            BTreeMap::new(),
+        );
         Ok(())
     }
 
@@ -1700,6 +1902,72 @@ fn compare_claim_order(a: &&Job, b: &&Job) -> Ordering {
         .then_with(|| a.scheduled_at.cmp(&b.scheduled_at))
         .then_with(|| a.created_at.cmp(&b.created_at))
         .then_with(|| a.id.cmp(&b.id))
+}
+
+fn emit_event_locked(
+    inner: &mut InMemoryJobQueueState,
+    event: impl Into<String>,
+    job: Option<&Job>,
+    prev: Option<JobState>,
+    timestamp: DateTime<Utc>,
+    fields: BTreeMap<String, Value>,
+) {
+    inner.event_sequence = inner.event_sequence.saturating_add(1);
+    inner.events.push(JobEvent {
+        id: format!("{}-0", inner.event_sequence),
+        event: event.into(),
+        timestamp,
+        job_id: job.map(|job| job.id.clone()),
+        prev,
+        fields,
+    });
+    trim_events_locked(inner, DEFAULT_JOB_EVENT_RETENTION);
+}
+
+fn trim_events_locked(inner: &mut InMemoryJobQueueState, max_len: usize) -> usize {
+    if inner.events.len() <= max_len {
+        return 0;
+    }
+    let remove_count = inner.events.len() - max_len;
+    inner.events.drain(0..remove_count);
+    remove_count
+}
+
+fn event_in_range(event: &JobEvent, start: &str, end: &str) -> bool {
+    let Some(event_id) = parse_stream_id(&event.id) else {
+        return false;
+    };
+    let after_start = match start {
+        "-" => true,
+        other => match parse_stream_id(other) {
+            Some(start_id) => event_id >= start_id,
+            None => true,
+        },
+    };
+    let before_end = match end {
+        "+" => true,
+        other => match parse_stream_id(other) {
+            Some(end_id) => event_id <= end_id,
+            None => true,
+        },
+    };
+    after_start && before_end
+}
+
+fn parse_stream_id(id: &str) -> Option<(i64, u64)> {
+    let (millis, sequence) = id.split_once('-')?;
+    Some((millis.parse().ok()?, sequence.parse().ok()?))
+}
+
+fn job_event_for_state(state: JobState) -> &'static str {
+    match state {
+        JobState::Waiting => "waiting",
+        JobState::Delayed => "delayed",
+        JobState::Active => "active",
+        JobState::WaitingChildren => "waiting-children",
+        JobState::Completed => "completed",
+        JobState::Failed => "failed",
+    }
 }
 
 fn assign_waiting_order(sequence: &mut u64, job: &mut Job) {

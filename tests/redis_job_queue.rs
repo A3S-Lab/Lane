@@ -105,6 +105,97 @@ async fn redis_backend_orders_lifo_waiting_jobs_against_real_server() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn redis_backend_records_queue_events_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    tokio::time::timeout(Duration::from_secs(120), run_queue_events(redis_url))
+        .await
+        .expect("Redis queue-events integration test timed out")
+        .unwrap();
+}
+
+async fn run_queue_events(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "events")
+        .expect("valid Redis URL should build the events queue");
+    let job = queue
+        .add_job(
+            "task".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_job_id("events:task"),
+        )
+        .await
+        .expect("event test job should add");
+    let claimed = queue
+        .claim_next(
+            "worker-events".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("event test claim should succeed")
+        .expect("event test job should be claimable");
+    queue
+        .update_progress(&job.id, serde_json::json!({ "percent": 50 }))
+        .await
+        .expect("progress should update");
+    queue
+        .complete_job(
+            &job.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("event test job should complete");
+    queue.pause().await.expect("queue should pause");
+    queue.resume().await.expect("queue should resume");
+
+    let events = queue
+        .read_events("-", "+", 20)
+        .await
+        .expect("events should read");
+    let names = events
+        .iter()
+        .map(|event| event.event.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "added",
+            "waiting",
+            "active",
+            "progress",
+            "completed",
+            "paused",
+            "resumed"
+        ]
+    );
+    assert_eq!(events[0].job_id.as_deref(), Some(job.id.as_str()));
+    assert_eq!(
+        events[0].fields.get("name"),
+        Some(&serde_json::Value::String("task".to_string()))
+    );
+    assert_eq!(events[2].prev, Some(JobState::Waiting));
+    assert_eq!(
+        events[3].fields.get("data"),
+        Some(&serde_json::json!({ "percent": 50 }))
+    );
+    assert_eq!(events[4].prev, Some(JobState::Active));
+    assert_eq!(
+        events[4].fields.get("returnvalue"),
+        Some(&serde_json::json!({ "ok": true }))
+    );
+
+    cleanup_namespace(&redis_url, &namespace).await?;
+    Ok(())
+}
+
 async fn run_lifo_waiting_order(redis_url: String) -> redis::RedisResult<()> {
     let namespace = unique_namespace();
     cleanup_namespace(&redis_url, &namespace).await?;

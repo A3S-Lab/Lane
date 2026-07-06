@@ -1,7 +1,7 @@
 use super::types::{
-    Job, JobFlow, JobFlowDependencies, JobFlowDependencyCounts, JobId, JobListOptions, JobListPage,
-    JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueStats, JobRepeatEntry, JobSpec,
-    JobState, JobStateCount, JobWorkerId,
+    Job, JobEvent, JobFlow, JobFlowDependencies, JobFlowDependencyCounts, JobId, JobListOptions,
+    JobListPage, JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueStats,
+    JobRepeatEntry, JobSpec, JobState, JobStateCount, JobWorkerId,
 };
 use crate::error::Result;
 use async_trait::async_trait;
@@ -212,6 +212,20 @@ pub trait JobQueueBackend: Send + Sync {
     /// removes the log list, while positive values keep the newest `keep`
     /// entries.
     async fn clear_job_logs(&self, job_id: &str, keep: usize) -> Result<JobLogPage>;
+
+    /// Read retained queue events in stream-id order.
+    ///
+    /// `start` and `end` follow Redis stream range semantics for the supported
+    /// forms: `-`, `+`, or concrete `<milliseconds>-<sequence>` ids. `limit ==
+    /// 0` returns no events.
+    async fn read_events(&self, _start: &str, _end: &str, _limit: usize) -> Result<Vec<JobEvent>> {
+        Ok(Vec::new())
+    }
+
+    /// Trim retained queue events to approximately `max_len` entries.
+    async fn trim_events(&self, _max_len: usize) -> Result<usize> {
+        Ok(0)
+    }
 
     async fn promote_due_jobs(&self, now: DateTime<Utc>) -> Result<usize>;
 

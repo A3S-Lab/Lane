@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use cron::Schedule;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::time::Duration;
 use uuid::Uuid;
@@ -26,11 +27,37 @@ pub type JobPriority = u32;
 /// Default priority for jobs that do not specify one.
 pub const DEFAULT_JOB_PRIORITY: JobPriority = 1000;
 
+/// Default retained queue event count, matching BullMQ's default stream length.
+pub const DEFAULT_JOB_EVENT_RETENTION: usize = 10_000;
+
 /// Waiting-job count for a priority value.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JobPriorityCount {
     pub priority: JobPriority,
     pub count: usize,
+}
+
+/// Retained job queue event.
+///
+/// Redis-backed queues store these entries in a Redis stream, while memory and
+/// local queues keep the same stream-id shape in their snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobEvent {
+    /// Redis-stream-style event id: `<milliseconds>-<sequence>`.
+    pub id: String,
+    /// Event name, for example `added`, `waiting`, `active`, or `completed`.
+    pub event: String,
+    /// Event timestamp.
+    pub timestamp: DateTime<Utc>,
+    /// Job associated with this event, when the event is job-scoped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<JobId>,
+    /// Previous lifecycle state for state-transition events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev: Option<JobState>,
+    /// Additional event fields such as job name, progress data, or failure reason.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fields: BTreeMap<String, Value>,
 }
 
 /// Queue-level rate limit for claiming generic jobs.
@@ -796,6 +823,10 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 pub(crate) fn deduplication_expiration(
     options: &JobOptions,
     now: DateTime<Utc>,
@@ -848,6 +879,10 @@ pub struct JobQueueStats {
 pub struct JobQueueSnapshot {
     pub queue: QueueName,
     pub paused: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<JobEvent>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub event_sequence: u64,
     pub jobs: Vec<Job>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deduplication_next_jobs: Vec<Job>,

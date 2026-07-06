@@ -1,9 +1,9 @@
 use super::backend::JobQueueBackend;
 use super::memory::InMemoryJobQueue;
 use super::types::{
-    Job, JobFlow, JobFlowDependencies, JobFlowDependencyCounts, JobId, JobListOptions, JobListPage,
-    JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueSnapshot, JobQueueStats,
-    JobRepeatEntry, JobSpec, JobState, JobStateCount, JobWorkerId,
+    Job, JobEvent, JobFlow, JobFlowDependencies, JobFlowDependencyCounts, JobId, JobListOptions,
+    JobListPage, JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueSnapshot,
+    JobQueueStats, JobRepeatEntry, JobSpec, JobState, JobStateCount, JobWorkerId,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -495,6 +495,16 @@ impl JobQueueBackend for LocalJobQueue {
 
     async fn clear_job_logs(&self, job_id: &str, keep: usize) -> Result<JobLogPage> {
         self.clear_logs(job_id, keep).await
+    }
+
+    async fn read_events(&self, start: &str, end: &str, limit: usize) -> Result<Vec<JobEvent>> {
+        self.inner.read_events(start, end, limit).await
+    }
+
+    async fn trim_events(&self, max_len: usize) -> Result<usize> {
+        let removed = self.inner.trim_events(max_len).await?;
+        self.persist().await?;
+        Ok(removed)
     }
 
     async fn promote_due_jobs(&self, now: DateTime<Utc>) -> Result<usize> {
