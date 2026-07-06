@@ -565,7 +565,9 @@ assert_eq!(duplicate.id, first.id);
 The current deduplication mode intentionally covers BullMQ's simple mode: a
 deduplication id blocks duplicate adds until the owning job completes, fails
 terminally, is removed, or is cleaned. TTL, replace/debounce, and
-keep-last-if-active behavior remain planned.
+keep-last-if-active behavior remain planned. Retrying a failed deduplicated job
+reclaims the deduplication id while the job is waiting or active again; retry is
+rejected if another non-terminal job already owns that id.
 
 Use `LocalJobQueue` when a process-local runtime needs durable restart
 recovery:
@@ -690,7 +692,9 @@ For simple deduplication, the same add scripts use an independent
 `deduplication:<id>` key, equivalent to BullMQ's `de:<id>` role, to return the
 currently active job before writing a duplicate. Completion, terminal failure,
 remove, clean, and stalled terminal failure scripts release that key only when it
-still points at the job being finalized or removed.
+still points at the job being finalized or removed. Manual retry reclaims the key
+inside the retry script and refuses to move the failed job back to waiting if a
+newer non-terminal job already owns the same deduplication id.
 
 Redis flow submission is all-or-nothing: the flow add script first checks every
 parent and child job id, then writes the parent, children, and all state indexes
@@ -718,7 +722,9 @@ waiting inside one script, treats the delayed zset as the Redis movement gate,
 and prunes orphaned or stale delayed members when a job is missing or already in
 another state. `retry_job()` clears terminal failure metadata, treats the failed
 zset as the Redis movement gate, prunes orphaned or stale failed members, and
-moves valid failed jobs back to waiting inside one script. `update_priority()`
+moves valid failed jobs back to waiting inside one script. For deduplicated jobs,
+that same script reclaims the deduplication key before returning the job to
+waiting. `update_priority()`
 rewrites the job hash and, for waiting jobs, replaces the waiting zset score in
 the same script; for jobs that are no longer waiting, it prunes stale waiting
 members while preserving the stored non-terminal state. This is intentionally

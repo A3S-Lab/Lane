@@ -138,6 +138,93 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .get(format!("{namespace}:dedup:deduplication:tenant:fail"))
         .await?;
     assert!(failed_dedup_owner.is_none());
+    let retried_dedup = dedup_queue
+        .retry_job(&fail_dedup.id, Utc::now())
+        .await
+        .expect("dedup retry should move failed job back to waiting");
+    assert_eq!(retried_dedup.id, fail_dedup.id);
+    let retry_dedup_owner: Option<String> = dedup_conn
+        .get(format!("{namespace}:dedup:deduplication:tenant:fail"))
+        .await?;
+    assert_eq!(retry_dedup_owner.as_deref(), Some(fail_dedup.id.as_str()));
+    let retry_duplicate = dedup_queue
+        .add_job(
+            "dedup-fail-duplicate".to_string(),
+            serde_json::json!({ "version": 5 }),
+            JobOptions::new().with_deduplication_id("tenant:fail"),
+        )
+        .await
+        .expect("duplicate add after dedup retry should return retried job");
+    assert_eq!(retry_duplicate.id, fail_dedup.id);
+    dedup_queue
+        .remove_job(&fail_dedup.id)
+        .await
+        .expect("retried dedup job should remove")
+        .expect("retried dedup job should be returned");
+    let removed_retry_dedup_owner: Option<String> = dedup_conn
+        .get(format!("{namespace}:dedup:deduplication:tenant:fail"))
+        .await?;
+    assert!(removed_retry_dedup_owner.is_none());
+
+    let retry_conflict_a = dedup_queue
+        .add_job(
+            "dedup-retry-conflict-a".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_deduplication_id("tenant:retry-conflict"),
+        )
+        .await
+        .expect("retry conflict first job should be added");
+    let retry_conflict_claim = dedup_queue
+        .claim_next(
+            "worker-dedup-retry-conflict".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("retry conflict claim should return")
+        .expect("retry conflict job should be claimable");
+    assert_eq!(retry_conflict_claim.id, retry_conflict_a.id);
+    dedup_queue
+        .fail_job(
+            &retry_conflict_claim.id,
+            lock_token(&retry_conflict_claim),
+            "terminal conflict".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("retry conflict first job should fail");
+    let retry_conflict_b = dedup_queue
+        .add_job(
+            "dedup-retry-conflict-b".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_deduplication_id("tenant:retry-conflict"),
+        )
+        .await
+        .expect("retry conflict second job should be added");
+    assert_ne!(retry_conflict_b.id, retry_conflict_a.id);
+    let retry_conflict = dedup_queue
+        .retry_job(&retry_conflict_a.id, Utc::now())
+        .await
+        .expect_err("retry should reject a dedup id owned by another non-terminal job");
+    assert!(matches!(retry_conflict, LaneError::JobStateConflict(_)));
+    let retry_conflict_failed_score: Option<f64> = dedup_conn
+        .zscore(format!("{namespace}:dedup:failed"), &retry_conflict_a.id)
+        .await?;
+    assert!(retry_conflict_failed_score.is_some());
+    let retry_conflict_owner: Option<String> = dedup_conn
+        .get(format!(
+            "{namespace}:dedup:deduplication:tenant:retry-conflict"
+        ))
+        .await?;
+    assert_eq!(
+        retry_conflict_owner.as_deref(),
+        Some(retry_conflict_b.id.as_str())
+    );
+    dedup_queue
+        .remove_job(&retry_conflict_b.id)
+        .await
+        .expect("retry conflict second job should remove")
+        .expect("retry conflict second job should be returned");
 
     let clean_dedup = dedup_queue
         .add_job(

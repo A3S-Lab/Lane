@@ -821,19 +821,67 @@ return {'ok', updated}
 "#;
 
 const RETRY_JOB_SCRIPT: &str = r#"
+local function deduplication_id(job)
+  if not job["options"] or job["options"] == cjson.null then
+    return nil
+  end
+  local deduplication = job["options"]["deduplication"]
+  if not deduplication or deduplication == cjson.null then
+    return nil
+  end
+  local id = deduplication["id"]
+  if not id or id == cjson.null or id == '' then
+    return nil
+  end
+  return id
+end
+
+local function active_deduplication_owner(jobs_key, deduplication_prefix, deduplication_id, job_id)
+  if not deduplication_id then
+    return nil
+  end
+
+  local deduplication_key = deduplication_prefix .. deduplication_id
+  local existing_id = redis.call('GET', deduplication_key)
+  if not existing_id or existing_id == job_id then
+    return nil
+  end
+
+  local existing_raw = redis.call('HGET', jobs_key, existing_id)
+  if not existing_raw then
+    redis.call('DEL', deduplication_key)
+    return nil
+  end
+
+  local existing_job = cjson.decode(existing_raw)
+  if existing_job["state"] == "completed" or existing_job["state"] == "failed" then
+    redis.call('DEL', deduplication_key)
+    return nil
+  end
+
+  return existing_id
+end
+
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
   redis.call('ZREM', KEYS[2], ARGV[1])
   return {'missing'}
 end
 
-local removed_from_failed = redis.call('ZREM', KEYS[2], ARGV[1])
-
 local job = cjson.decode(raw)
 if job["state"] ~= "failed" then
+  redis.call('ZREM', KEYS[2], ARGV[1])
   return {'state', job["state"] or ''}
 end
 
+local retry_deduplication_id = deduplication_id(job)
+local deduplication_owner =
+  active_deduplication_owner(KEYS[1], ARGV[4], retry_deduplication_id, ARGV[1])
+if deduplication_owner then
+  return {'deduplicated', deduplication_owner}
+end
+
+local removed_from_failed = redis.call('ZREM', KEYS[2], ARGV[1])
 if removed_from_failed == 0 then
   return {'state', 'failed_index_missing'}
 end
@@ -854,6 +902,9 @@ local updated = cjson.encode(job)
 
 redis.call('ZADD', KEYS[3], waiting_score, ARGV[1])
 redis.call('HSET', KEYS[1], ARGV[1], updated)
+if retry_deduplication_id then
+  redis.call('SET', ARGV[4] .. retry_deduplication_id, ARGV[1])
+end
 
 return {'ok', updated}
 "#;
@@ -2088,6 +2139,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(job_id)
             .arg(now.to_rfc3339())
             .arg(WAITING_SCORE_BUCKET)
+            .arg(self.deduplication_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -2453,6 +2505,10 @@ fn decode_transition_result(result: &[String], job_id: &str, action: &str) -> Re
         ))),
         Some("lock_mismatch") => Err(LaneError::JobLeaseConflict(format!(
             "lock token does not own job {job_id}"
+        ))),
+        Some("deduplicated") => Err(LaneError::JobStateConflict(format!(
+            "cannot {action} job {job_id}; deduplication id is active on job {}",
+            result.get(1).map(String::as_str).unwrap_or("unknown")
         ))),
         Some(other) => Err(LaneError::Other(format!(
             "unexpected Redis job {action} script status `{other}`"

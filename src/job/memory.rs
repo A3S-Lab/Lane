@@ -258,16 +258,36 @@ impl InMemoryJobQueue {
     /// Manually retry a failed job by moving it back to the waiting state.
     pub async fn retry(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {
         let mut inner = self.inner.lock().await;
+        let current = inner
+            .jobs
+            .get(job_id)
+            .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
+        if current.state != JobState::Failed {
+            return Err(LaneError::JobStateConflict(format!(
+                "cannot retry job {} from state {:?}",
+                current.id, current.state
+            )));
+        }
+        if let Some(deduplication_id) = current
+            .options
+            .deduplication
+            .as_ref()
+            .map(|value| &value.id)
+        {
+            if let Some(existing) =
+                find_active_deduplication_id_except(&inner.jobs, deduplication_id, job_id)
+            {
+                return Err(LaneError::JobStateConflict(format!(
+                    "cannot retry job {job_id}; deduplication id `{deduplication_id}` is active on job {}",
+                    existing.id
+                )));
+            }
+        }
+
         let job = inner
             .jobs
             .get_mut(job_id)
             .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
-        if job.state != JobState::Failed {
-            return Err(LaneError::JobStateConflict(format!(
-                "cannot retry job {} from state {:?}",
-                job.id, job.state
-            )));
-        }
         job.state = JobState::Waiting;
         job.scheduled_at = now;
         job.processed_at = None;
@@ -865,6 +885,16 @@ fn find_active_deduplication_id<'a>(
 ) -> Option<&'a Job> {
     jobs.values()
         .find(|job| active_deduplication_id(job) == Some(deduplication_id))
+}
+
+fn find_active_deduplication_id_except<'a>(
+    jobs: &'a HashMap<JobId, Job>,
+    deduplication_id: &str,
+    excluded_job_id: &str,
+) -> Option<&'a Job> {
+    jobs.values().find(|job| {
+        job.id != excluded_job_id && active_deduplication_id(job) == Some(deduplication_id)
+    })
 }
 
 fn state_after_dependencies(scheduled_at: DateTime<Utc>, now: DateTime<Utc>) -> JobState {

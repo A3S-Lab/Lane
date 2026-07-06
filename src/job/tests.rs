@@ -181,6 +181,91 @@ async fn simple_deduplication_coalesces_non_terminal_jobs() {
 }
 
 #[tokio::test]
+async fn retry_reclaims_simple_deduplication() {
+    let queue = InMemoryJobQueue::new("dedup-retry");
+    let now = ts(1_000);
+    let first = queue
+        .add_at(
+            "sync",
+            serde_json::json!({}),
+            JobOptions::new().with_deduplication_id("account:retry"),
+            now,
+        )
+        .await
+        .unwrap();
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(1_100))
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .fail_job(
+            &claimed.id,
+            lock_token(&claimed),
+            "boom".to_string(),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+
+    let retried = queue.retry_job(&first.id, ts(1_300)).await.unwrap();
+    assert_eq!(retried.state, JobState::Waiting);
+    let duplicate = queue
+        .add_at(
+            "sync-duplicate",
+            serde_json::json!({}),
+            JobOptions::new().with_deduplication_id("account:retry"),
+            ts(1_400),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(duplicate.id, first.id);
+    assert_eq!(queue.stats().await.unwrap().waiting, 1);
+}
+
+#[tokio::test]
+async fn retry_rejects_active_deduplication_owner() {
+    let queue = InMemoryJobQueue::new("dedup-retry-conflict");
+    let first = queue
+        .add_at(
+            "sync",
+            serde_json::json!({}),
+            JobOptions::new().with_deduplication_id("account:retry-conflict"),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(1_100))
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .fail_job(
+            &claimed.id,
+            lock_token(&claimed),
+            "boom".to_string(),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+    let second = queue
+        .add_at(
+            "sync-after-fail",
+            serde_json::json!({}),
+            JobOptions::new().with_deduplication_id("account:retry-conflict"),
+            ts(1_300),
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(second.id, first.id);
+    let error = queue.retry_job(&first.id, ts(1_400)).await.unwrap_err();
+    assert!(matches!(error, LaneError::JobStateConflict(_)));
+}
+
+#[tokio::test]
 async fn add_many_preserves_order_and_idempotent_custom_ids() {
     let queue = InMemoryJobQueue::new("bulk");
     let now = ts(1_000);
