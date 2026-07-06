@@ -11,6 +11,7 @@ use redis::AsyncCommands;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::time::Duration;
+use uuid::Uuid;
 
 const WAITING_SCORE_BUCKET: f64 = 1_000_000_000_000.0;
 
@@ -27,6 +28,9 @@ if not raw then
   return nil
 end
 
+local lock_key = ARGV[7] .. id
+redis.call('SET', lock_key, ARGV[5], 'PX', ARGV[6])
+
 local job = cjson.decode(raw)
 job["state"] = "active"
 job["attempts_made"] = (job["attempts_made"] or 0) + 1
@@ -40,6 +44,121 @@ redis.call('ZREM', KEYS[1], id)
 redis.call('ZADD', KEYS[2], ARGV[1], id)
 redis.call('HSET', KEYS[3], id, updated)
 return updated
+"#;
+
+const COMPLETE_SCRIPT: &str = r#"
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not raw then
+  return {'missing'}
+end
+
+local job = cjson.decode(raw)
+if job["state"] ~= "active" then
+  return {'state', job["state"] or ''}
+end
+
+local lock_token = redis.call('GET', KEYS[4])
+if not lock_token then
+  return {'lock_missing'}
+end
+if lock_token ~= ARGV[2] then
+  return {'lock_mismatch'}
+end
+
+redis.call('DEL', KEYS[4])
+redis.call('ZREM', KEYS[2], ARGV[1])
+
+job["state"] = "completed"
+job["finished_at"] = ARGV[3]
+job["worker_id"] = cjson.null
+job["lease_expires_at"] = cjson.null
+job["return_value"] = cjson.decode(ARGV[4])
+
+local updated = cjson.encode(job)
+if ARGV[6] == '1' then
+  redis.call('HDEL', KEYS[1], ARGV[1])
+else
+  redis.call('HSET', KEYS[1], ARGV[1], updated)
+  redis.call('ZADD', KEYS[3], ARGV[5], ARGV[1])
+end
+
+return {'ok', updated}
+"#;
+
+const FAIL_SCRIPT: &str = r#"
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not raw then
+  return {'missing'}
+end
+
+local job = cjson.decode(raw)
+if job["state"] ~= "active" then
+  return {'state', job["state"] or ''}
+end
+
+local lock_token = redis.call('GET', KEYS[5])
+if not lock_token then
+  return {'lock_missing'}
+end
+if lock_token ~= ARGV[2] then
+  return {'lock_mismatch'}
+end
+
+redis.call('DEL', KEYS[5])
+redis.call('ZREM', KEYS[2], ARGV[1])
+
+job["worker_id"] = cjson.null
+job["lease_expires_at"] = cjson.null
+job["failed_reason"] = ARGV[4]
+
+if ARGV[5] == '1' then
+  job["state"] = "delayed"
+  job["scheduled_at"] = ARGV[6]
+  job["finished_at"] = cjson.null
+  local updated = cjson.encode(job)
+  redis.call('HSET', KEYS[1], ARGV[1], updated)
+  redis.call('ZADD', KEYS[3], ARGV[7], ARGV[1])
+  return {'ok', updated}
+end
+
+job["state"] = "failed"
+job["finished_at"] = ARGV[3]
+local updated = cjson.encode(job)
+if ARGV[9] == '1' then
+  redis.call('HDEL', KEYS[1], ARGV[1])
+else
+  redis.call('HSET', KEYS[1], ARGV[1], updated)
+  redis.call('ZADD', KEYS[4], ARGV[8], ARGV[1])
+end
+
+return {'ok', updated}
+"#;
+
+const RENEW_LEASE_SCRIPT: &str = r#"
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not raw then
+  return {'missing'}
+end
+
+local job = cjson.decode(raw)
+if job["state"] ~= "active" then
+  return {'state', job["state"] or ''}
+end
+
+local lock_token = redis.call('GET', KEYS[3])
+if not lock_token then
+  return {'lock_missing'}
+end
+if lock_token ~= ARGV[2] then
+  return {'lock_mismatch'}
+end
+
+redis.call('SET', KEYS[3], ARGV[2], 'PX', ARGV[5])
+job["lease_expires_at"] = ARGV[3]
+local updated = cjson.encode(job)
+redis.call('HSET', KEYS[1], ARGV[1], updated)
+redis.call('ZADD', KEYS[2], ARGV[4], ARGV[1])
+return {'ok', updated}
 "#;
 
 /// Redis-backed generic job queue.
@@ -215,6 +334,14 @@ impl RedisJobQueue {
         self.key("sequence")
     }
 
+    fn lock_key(&self, job_id: &str) -> String {
+        format!("{}:{}:locks:{}", self.namespace, self.queue, job_id)
+    }
+
+    fn lock_key_prefix(&self) -> String {
+        format!("{}:{}:locks:", self.namespace, self.queue)
+    }
+
     fn state_key(&self, state: JobState) -> String {
         self.key(match state {
             JobState::Waiting => "waiting",
@@ -341,6 +468,7 @@ impl RedisJobQueue {
     ) -> Result<Option<Job>> {
         let job = self.load_job(conn, job_id).await?;
         self.remove_from_state_sets(conn, job_id).await?;
+        let _: usize = conn.del(self.lock_key(job_id)).await.map_err(redis_error)?;
         let _: usize = conn
             .hdel(self.jobs_key(), job_id)
             .await
@@ -401,6 +529,7 @@ impl RedisJobQueue {
         parent.processed_at = None;
         parent.finished_at = None;
         parent.worker_id = None;
+        parent.lock_token = None;
         parent.lease_expires_at = None;
         parent.failed_reason = None;
         let released = parent.clone();
@@ -445,6 +574,7 @@ impl RedisJobQueue {
         parent.state = JobState::Failed;
         parent.finished_at = Some(now);
         parent.worker_id = None;
+        parent.lock_token = None;
         parent.lease_expires_at = None;
         parent.failed_reason = Some(reason);
         let failed = parent.clone();
@@ -501,6 +631,7 @@ impl JobQueueBackend for RedisJobQueue {
         }
 
         let lease_expires_at = add_duration(now, lease_for);
+        let lock_token = Uuid::new_v4().to_string();
         let raw: Option<String> = redis::cmd("EVAL")
             .arg(CLAIM_SCRIPT)
             .arg(3)
@@ -511,30 +642,55 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(now.to_rfc3339())
             .arg(worker_id)
             .arg(lease_expires_at.to_rfc3339())
+            .arg(&lock_token)
+            .arg(lock_duration_millis(lease_for))
+            .arg(self.lock_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
 
-        raw.map(|raw| decode_job(&raw)).transpose()
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        let mut job = decode_job(&raw)?;
+        job.lock_token = Some(lock_token);
+        Ok(Some(job))
     }
 
-    async fn complete_job(&self, job_id: &str, value: Value, now: DateTime<Utc>) -> Result<Job> {
+    async fn complete_job(
+        &self,
+        job_id: &str,
+        lock_token: &str,
+        value: Value,
+        now: DateTime<Utc>,
+    ) -> Result<Job> {
         let mut conn = self.connection().await?;
-        let mut job = self.require_job(&mut conn, job_id).await?;
-        require_active(&job, "complete")?;
-        let parent_id = job.parent_id.clone();
-        job.state = JobState::Completed;
-        job.finished_at = Some(now);
-        job.worker_id = None;
-        job.lease_expires_at = None;
-        job.return_value = Some(value);
-        let completed = job.clone();
-        if job.options.remove_on_complete {
-            self.remove_job_record(&mut conn, job_id).await?;
-        } else {
-            self.move_to_state(&mut conn, &job, JobState::Completed, millis(now))
-                .await?;
-        }
+        let remove_on_complete = self
+            .load_job(&mut conn, job_id)
+            .await?
+            .is_some_and(|job| job.options.remove_on_complete);
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(COMPLETE_SCRIPT)
+            .arg(4)
+            .arg(self.jobs_key())
+            .arg(self.state_key(JobState::Active))
+            .arg(self.state_key(JobState::Completed))
+            .arg(self.lock_key(job_id))
+            .arg(job_id)
+            .arg(lock_token)
+            .arg(now.to_rfc3339())
+            .arg(serde_json::to_string(&value).map_err(|error| {
+                LaneError::Other(format!(
+                    "failed to encode Redis job completion value: {error}"
+                ))
+            })?)
+            .arg(millis(now))
+            .arg(if remove_on_complete { "1" } else { "0" })
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        let completed = decode_transition_result(&result, job_id, "complete")?;
+        let parent_id = completed.parent_id.clone();
         if let Some(next_job) = next_repeat_job(&completed, now)? {
             self.store_job(&mut conn, &next_job).await?;
             self.index_new_job(&mut conn, &next_job).await?;
@@ -546,56 +702,55 @@ impl JobQueueBackend for RedisJobQueue {
         Ok(completed)
     }
 
-    async fn fail_job(&self, job_id: &str, error: String, now: DateTime<Utc>) -> Result<Job> {
+    async fn fail_job(
+        &self,
+        job_id: &str,
+        lock_token: &str,
+        error: String,
+        now: DateTime<Utc>,
+    ) -> Result<Job> {
         let mut conn = self.connection().await?;
-        let mut job = self.require_job(&mut conn, job_id).await?;
-        require_active(&job, "fail")?;
-        let parent_id = job.parent_id.clone();
-        job.worker_id = None;
-        job.lease_expires_at = None;
-        job.failed_reason = Some(error);
-
-        if should_retry(&job) {
+        let job = self.require_job(&mut conn, job_id).await?;
+        let retry_at = if should_retry(&job) {
             let delay = job
                 .options
                 .retry_policy
                 .delay_for_attempt(job.attempts_made);
-            job.state = JobState::Delayed;
-            job.scheduled_at = add_duration(now, delay);
-            job.finished_at = None;
-            self.move_to_state(&mut conn, &job, JobState::Delayed, millis(job.scheduled_at))
-                .await?;
+            Some(add_duration(now, delay))
         } else {
-            job.state = JobState::Failed;
-            job.finished_at = Some(now);
-            if job.options.remove_on_fail {
-                let failed = job.clone();
-                self.remove_job_record(&mut conn, job_id).await?;
-                if let Some(parent_id) = parent_id {
-                    self.fail_waiting_parent(
-                        &mut conn,
-                        &parent_id,
-                        format!(
-                            "child job {} failed: {}",
-                            failed.id,
-                            failed.failed_reason.as_deref().unwrap_or("unknown error")
-                        ),
-                        now,
-                    )
-                    .await?;
-                }
-                return Ok(failed);
-            }
-            self.move_to_state(&mut conn, &job, JobState::Failed, millis(now))
-                .await?;
-            if let Some(parent_id) = parent_id {
+            None
+        };
+        let scheduled_at = retry_at.unwrap_or(now);
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(FAIL_SCRIPT)
+            .arg(5)
+            .arg(self.jobs_key())
+            .arg(self.state_key(JobState::Active))
+            .arg(self.state_key(JobState::Delayed))
+            .arg(self.state_key(JobState::Failed))
+            .arg(self.lock_key(job_id))
+            .arg(job_id)
+            .arg(lock_token)
+            .arg(now.to_rfc3339())
+            .arg(error)
+            .arg(if retry_at.is_some() { "1" } else { "0" })
+            .arg(scheduled_at.to_rfc3339())
+            .arg(millis(scheduled_at))
+            .arg(millis(now))
+            .arg(if job.options.remove_on_fail { "1" } else { "0" })
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        let failed = decode_transition_result(&result, job_id, "fail")?;
+        if failed.state == JobState::Failed {
+            if let Some(parent_id) = failed.parent_id.clone() {
                 self.fail_waiting_parent(
                     &mut conn,
                     &parent_id,
                     format!(
                         "child job {} failed: {}",
-                        job.id,
-                        job.failed_reason.as_deref().unwrap_or("unknown error")
+                        failed.id,
+                        failed.failed_reason.as_deref().unwrap_or("unknown error")
                     ),
                     now,
                 )
@@ -603,28 +758,34 @@ impl JobQueueBackend for RedisJobQueue {
             }
         }
 
-        Ok(job)
+        Ok(failed)
     }
 
     async fn renew_lease(
         &self,
         job_id: &str,
-        worker_id: &str,
+        lock_token: &str,
         lease_for: Duration,
         now: DateTime<Utc>,
     ) -> Result<Job> {
         let mut conn = self.connection().await?;
-        let mut job = self.require_job(&mut conn, job_id).await?;
-        require_active(&job, "renew lease")?;
-        require_worker(&job, worker_id)?;
-        job.lease_expires_at = Some(add_duration(now, lease_for));
-        self.move_to_state(
-            &mut conn,
-            &job,
-            JobState::Active,
-            millis(job.lease_expires_at.unwrap_or(now)),
-        )
-        .await?;
+        let lease_expires_at = add_duration(now, lease_for);
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(RENEW_LEASE_SCRIPT)
+            .arg(3)
+            .arg(self.jobs_key())
+            .arg(self.state_key(JobState::Active))
+            .arg(self.lock_key(job_id))
+            .arg(job_id)
+            .arg(lock_token)
+            .arg(lease_expires_at.to_rfc3339())
+            .arg(millis(lease_expires_at))
+            .arg(lock_duration_millis(lease_for))
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        let mut job = decode_transition_result(&result, job_id, "renew lease")?;
+        job.lock_token = Some(lock_token.to_string());
         Ok(job)
     }
 
@@ -660,6 +821,7 @@ impl JobQueueBackend for RedisJobQueue {
         job.processed_at = None;
         job.finished_at = None;
         job.worker_id = None;
+        job.lock_token = None;
         job.lease_expires_at = None;
         job.failed_reason = None;
         let sequence = self.next_sequence(&mut conn).await?;
@@ -670,6 +832,32 @@ impl JobQueueBackend for RedisJobQueue {
             waiting_score(job.priority, sequence),
         )
         .await?;
+        Ok(job)
+    }
+
+    async fn update_priority(&self, job_id: &str, priority: JobPriority) -> Result<Job> {
+        let mut conn = self.connection().await?;
+        let mut job = self.require_job(&mut conn, job_id).await?;
+        if job.state.is_terminal() {
+            return Err(LaneError::JobStateConflict(format!(
+                "cannot update priority for terminal job {}",
+                job.id
+            )));
+        }
+        job.priority = priority;
+        job.options.priority = priority;
+        if job.state == JobState::Waiting {
+            let sequence = self.next_sequence(&mut conn).await?;
+            self.move_to_state(
+                &mut conn,
+                &job,
+                JobState::Waiting,
+                waiting_score(priority, sequence),
+            )
+            .await?;
+        } else {
+            self.store_job(&mut conn, &job).await?;
+        }
         Ok(job)
     }
 
@@ -863,8 +1051,14 @@ impl JobQueueBackend for RedisJobQueue {
                 if matches!(job.lease_expires_at, Some(expires_at) if expires_at > now) {
                     continue;
                 }
+                let lock_exists: bool =
+                    conn.exists(self.lock_key(&id)).await.map_err(redis_error)?;
+                if lock_exists {
+                    continue;
+                }
                 job.stalled_count = job.stalled_count.saturating_add(1);
                 job.worker_id = None;
+                job.lock_token = None;
                 job.lease_expires_at = None;
                 job.failed_reason = Some("job stalled after worker lease expired".to_string());
                 if job.stalled_count > job.options.max_stalled_count {
@@ -1014,6 +1208,34 @@ fn decode_job(raw: &str) -> Result<Job> {
         .map_err(|error| LaneError::Other(format!("failed to decode Redis job: {error}")))
 }
 
+fn decode_transition_result(result: &[String], job_id: &str, action: &str) -> Result<Job> {
+    match result.first().map(String::as_str) {
+        Some("ok") => {
+            let raw = result.get(1).ok_or_else(|| {
+                LaneError::Other(format!("Redis job {action} script returned no job payload"))
+            })?;
+            decode_job(raw)
+        }
+        Some("missing") => Err(LaneError::JobNotFound(job_id.to_string())),
+        Some("state") => Err(LaneError::JobStateConflict(format!(
+            "cannot {action} job {job_id} from state {}",
+            result.get(1).map(String::as_str).unwrap_or("unknown")
+        ))),
+        Some("lock_missing") => Err(LaneError::JobLeaseConflict(format!(
+            "missing lock for job {job_id}"
+        ))),
+        Some("lock_mismatch") => Err(LaneError::JobLeaseConflict(format!(
+            "lock token does not own job {job_id}"
+        ))),
+        Some(other) => Err(LaneError::Other(format!(
+            "unexpected Redis job {action} script status `{other}`"
+        ))),
+        None => Err(LaneError::Other(format!(
+            "Redis job {action} script returned no status"
+        ))),
+    }
+}
+
 fn normalize_lua_empty_array(value: &mut Value, field: &str) {
     let Some(object) = value.as_object_mut() else {
         return;
@@ -1042,26 +1264,8 @@ fn waiting_score(priority: JobPriority, sequence: u64) -> f64 {
     (priority as f64 * WAITING_SCORE_BUCKET) + sequence as f64
 }
 
-fn require_active(job: &Job, action: &str) -> Result<()> {
-    if job.state == JobState::Active {
-        Ok(())
-    } else {
-        Err(LaneError::JobStateConflict(format!(
-            "cannot {action} job {} from state {:?}",
-            job.id, job.state
-        )))
-    }
-}
-
-fn require_worker(job: &Job, worker_id: &str) -> Result<()> {
-    if job.worker_id.as_deref() == Some(worker_id) {
-        Ok(())
-    } else {
-        Err(LaneError::JobLeaseConflict(format!(
-            "worker {worker_id} does not own job {}",
-            job.id
-        )))
-    }
+fn lock_duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX).max(1)
 }
 
 fn should_retry(job: &Job) -> bool {

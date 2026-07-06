@@ -17,6 +17,9 @@ pub type QueueName = String;
 /// Worker identifier used for leased processing.
 pub type JobWorkerId = String;
 
+/// Opaque token proving ownership of a claimed job lease.
+pub type JobLockToken = String;
+
 /// Job priority. Lower values run first.
 pub type JobPriority = u32;
 
@@ -408,6 +411,8 @@ pub struct Job {
     pub processed_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
     pub worker_id: Option<JobWorkerId>,
+    #[serde(default, skip)]
+    pub lock_token: Option<JobLockToken>,
     pub lease_expires_at: Option<DateTime<Utc>>,
     pub failed_reason: Option<String>,
     pub return_value: Option<Value>,
@@ -464,6 +469,7 @@ impl Job {
             processed_at: None,
             finished_at: None,
             worker_id: None,
+            lock_token: None,
             lease_expires_at: None,
             failed_reason: None,
             return_value: None,

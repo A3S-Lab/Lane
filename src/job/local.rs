@@ -1,8 +1,8 @@
 use super::backend::JobQueueBackend;
 use super::memory::InMemoryJobQueue;
 use super::types::{
-    Job, JobFlow, JobListOptions, JobListPage, JobOptions, JobQueueSnapshot, JobQueueStats,
-    JobSpec, JobState, JobWorkerId,
+    Job, JobFlow, JobListOptions, JobListPage, JobOptions, JobPriority, JobQueueSnapshot,
+    JobQueueStats, JobSpec, JobState, JobWorkerId,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -155,14 +155,29 @@ impl JobQueueBackend for LocalJobQueue {
         Ok(job)
     }
 
-    async fn complete_job(&self, job_id: &str, value: Value, now: DateTime<Utc>) -> Result<Job> {
-        let job = self.inner.complete_job(job_id, value, now).await?;
+    async fn complete_job(
+        &self,
+        job_id: &str,
+        lock_token: &str,
+        value: Value,
+        now: DateTime<Utc>,
+    ) -> Result<Job> {
+        let job = self
+            .inner
+            .complete_job(job_id, lock_token, value, now)
+            .await?;
         self.persist().await?;
         Ok(job)
     }
 
-    async fn fail_job(&self, job_id: &str, error: String, now: DateTime<Utc>) -> Result<Job> {
-        let job = self.inner.fail_job(job_id, error, now).await?;
+    async fn fail_job(
+        &self,
+        job_id: &str,
+        lock_token: &str,
+        error: String,
+        now: DateTime<Utc>,
+    ) -> Result<Job> {
+        let job = self.inner.fail_job(job_id, lock_token, error, now).await?;
         self.persist().await?;
         Ok(job)
     }
@@ -170,13 +185,13 @@ impl JobQueueBackend for LocalJobQueue {
     async fn renew_lease(
         &self,
         job_id: &str,
-        worker_id: &str,
+        lock_token: &str,
         lease_for: Duration,
         now: DateTime<Utc>,
     ) -> Result<Job> {
         let job = self
             .inner
-            .renew_lease(job_id, worker_id, lease_for, now)
+            .renew_lease(job_id, lock_token, lease_for, now)
             .await?;
         self.persist().await?;
         Ok(job)
@@ -190,6 +205,12 @@ impl JobQueueBackend for LocalJobQueue {
 
     async fn retry_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {
         let job = self.inner.retry_job(job_id, now).await?;
+        self.persist().await?;
+        Ok(job)
+    }
+
+    async fn update_priority(&self, job_id: &str, priority: JobPriority) -> Result<Job> {
+        let job = self.inner.update_priority(job_id, priority).await?;
         self.persist().await?;
         Ok(job)
     }

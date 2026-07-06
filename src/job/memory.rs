@@ -1,7 +1,7 @@
 use super::backend::JobQueueBackend;
 use super::types::{
-    Job, JobFlow, JobId, JobListOptions, JobListPage, JobLogEntry, JobOptions, JobQueueSnapshot,
-    JobQueueStats, JobSpec, JobState, JobWorkerId, QueueName,
+    Job, JobFlow, JobId, JobListOptions, JobListPage, JobLogEntry, JobOptions, JobPriority,
+    JobQueueSnapshot, JobQueueStats, JobSpec, JobState, JobWorkerId, QueueName,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 #[derive(Debug, Default)]
 struct InMemoryJobQueueState {
@@ -248,6 +249,7 @@ impl InMemoryJobQueue {
         job.processed_at = None;
         job.finished_at = None;
         job.worker_id = None;
+        job.lock_token = None;
         job.lease_expires_at = None;
         job.failed_reason = None;
         Ok(job.clone())
@@ -257,7 +259,7 @@ impl InMemoryJobQueue {
     pub async fn renew(
         &self,
         job_id: &str,
-        worker_id: &str,
+        lock_token: &str,
         lease_for: Duration,
         now: DateTime<Utc>,
     ) -> Result<Job> {
@@ -267,8 +269,26 @@ impl InMemoryJobQueue {
             .get_mut(job_id)
             .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
         require_active(job, "renew lease")?;
-        require_worker(job, worker_id)?;
+        require_lock_token(job, lock_token)?;
         job.lease_expires_at = Some(add_duration(now, lease_for));
+        Ok(job.clone())
+    }
+
+    /// Update a non-terminal job priority.
+    pub async fn set_priority(&self, job_id: &str, priority: JobPriority) -> Result<Job> {
+        let mut inner = self.inner.lock().await;
+        let job = inner
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
+        if job.state.is_terminal() {
+            return Err(LaneError::JobStateConflict(format!(
+                "cannot update priority for terminal job {}",
+                job.id
+            )));
+        }
+        job.priority = priority;
+        job.options.priority = priority;
         Ok(job.clone())
     }
 
@@ -430,6 +450,7 @@ impl InMemoryJobQueue {
         parent.processed_at = None;
         parent.finished_at = None;
         parent.worker_id = None;
+        parent.lock_token = None;
         parent.lease_expires_at = None;
         parent.failed_reason = None;
         Some(parent.clone())
@@ -448,6 +469,7 @@ impl InMemoryJobQueue {
         parent.state = JobState::Failed;
         parent.finished_at = Some(now);
         parent.worker_id = None;
+        parent.lock_token = None;
         parent.lease_expires_at = None;
         parent.failed_reason = Some(reason);
         let failed = parent.clone();
@@ -507,12 +529,19 @@ impl JobQueueBackend for InMemoryJobQueue {
         job.attempts_made = job.attempts_made.saturating_add(1);
         job.processed_at = Some(now);
         job.worker_id = Some(worker_id);
+        job.lock_token = Some(Uuid::new_v4().to_string());
         job.lease_expires_at = Some(add_duration(now, lease_for));
         job.failed_reason = None;
         Ok(Some(job.clone()))
     }
 
-    async fn complete_job(&self, job_id: &str, value: Value, now: DateTime<Utc>) -> Result<Job> {
+    async fn complete_job(
+        &self,
+        job_id: &str,
+        lock_token: &str,
+        value: Value,
+        now: DateTime<Utc>,
+    ) -> Result<Job> {
         let mut inner = self.inner.lock().await;
         let completed = {
             let job = inner
@@ -520,9 +549,11 @@ impl JobQueueBackend for InMemoryJobQueue {
                 .get_mut(job_id)
                 .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
             require_active(job, "complete")?;
+            require_lock_token(job, lock_token)?;
             job.state = JobState::Completed;
             job.finished_at = Some(now);
             job.worker_id = None;
+            job.lock_token = None;
             job.lease_expires_at = None;
             job.return_value = Some(value);
             job.clone()
@@ -539,7 +570,13 @@ impl JobQueueBackend for InMemoryJobQueue {
         Ok(completed)
     }
 
-    async fn fail_job(&self, job_id: &str, error: String, now: DateTime<Utc>) -> Result<Job> {
+    async fn fail_job(
+        &self,
+        job_id: &str,
+        lock_token: &str,
+        error: String,
+        now: DateTime<Utc>,
+    ) -> Result<Job> {
         let mut inner = self.inner.lock().await;
         let failed = {
             let job = inner
@@ -547,7 +584,9 @@ impl JobQueueBackend for InMemoryJobQueue {
                 .get_mut(job_id)
                 .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
             require_active(job, "fail")?;
+            require_lock_token(job, lock_token)?;
             job.worker_id = None;
+            job.lock_token = None;
             job.lease_expires_at = None;
             job.failed_reason = Some(error);
 
@@ -589,11 +628,11 @@ impl JobQueueBackend for InMemoryJobQueue {
     async fn renew_lease(
         &self,
         job_id: &str,
-        worker_id: &str,
+        lock_token: &str,
         lease_for: Duration,
         now: DateTime<Utc>,
     ) -> Result<Job> {
-        self.renew(job_id, worker_id, lease_for, now).await
+        self.renew(job_id, lock_token, lease_for, now).await
     }
 
     async fn promote_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {
@@ -602,6 +641,10 @@ impl JobQueueBackend for InMemoryJobQueue {
 
     async fn retry_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {
         self.retry(job_id, now).await
+    }
+
+    async fn update_priority(&self, job_id: &str, priority: JobPriority) -> Result<Job> {
+        self.set_priority(job_id, priority).await
     }
 
     async fn remove_job(&self, job_id: &str) -> Result<Option<Job>> {
@@ -660,6 +703,7 @@ impl JobQueueBackend for InMemoryJobQueue {
 
             job.stalled_count = job.stalled_count.saturating_add(1);
             job.worker_id = None;
+            job.lock_token = None;
             job.lease_expires_at = None;
             job.failed_reason = Some("job stalled after worker lease expired".to_string());
             if job.stalled_count > job.options.max_stalled_count {
@@ -831,12 +875,12 @@ fn require_active(job: &Job, action: &str) -> Result<()> {
     }
 }
 
-fn require_worker(job: &Job, worker_id: &str) -> Result<()> {
-    if job.worker_id.as_deref() == Some(worker_id) {
+fn require_lock_token(job: &Job, lock_token: &str) -> Result<()> {
+    if job.lock_token.as_deref() == Some(lock_token) {
         Ok(())
     } else {
         Err(LaneError::JobLeaseConflict(format!(
-            "worker {worker_id} does not own job {}",
+            "lock token does not own job {}",
             job.id
         )))
     }

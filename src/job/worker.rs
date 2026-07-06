@@ -1,5 +1,5 @@
 use super::backend::JobQueueBackend;
-use super::types::{Job, JobId, JobWorkerId};
+use super::types::{Job, JobId, JobLockToken, JobWorkerId};
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -122,6 +122,7 @@ pub struct JobContext {
     backend: Arc<dyn JobQueueBackend>,
     job_id: JobId,
     worker_id: JobWorkerId,
+    lock_token: JobLockToken,
     lease_duration: Duration,
     log_retention: usize,
 }
@@ -131,6 +132,7 @@ impl JobContext {
         backend: Arc<dyn JobQueueBackend>,
         job_id: JobId,
         worker_id: JobWorkerId,
+        lock_token: JobLockToken,
         lease_duration: Duration,
         log_retention: usize,
     ) -> Self {
@@ -138,6 +140,7 @@ impl JobContext {
             backend,
             job_id,
             worker_id,
+            lock_token,
             lease_duration,
             log_retention,
         }
@@ -151,6 +154,11 @@ impl JobContext {
     /// Current worker ID.
     pub fn worker_id(&self) -> &str {
         &self.worker_id
+    }
+
+    /// Current lease lock token.
+    pub fn lock_token(&self) -> &str {
+        &self.lock_token
     }
 
     /// Store a progress value for the current job.
@@ -170,7 +178,7 @@ impl JobContext {
         self.backend
             .renew_lease(
                 &self.job_id,
-                &self.worker_id,
+                &self.lock_token,
                 self.lease_duration,
                 Utc::now(),
             )
@@ -377,10 +385,14 @@ impl JobWorker {
     }
 
     async fn process_claimed(&self, job: Job) -> Result<JobRunOutcome> {
+        let lock_token = job.lock_token.clone().ok_or_else(|| {
+            LaneError::JobLeaseConflict(format!("claimed job {} has no lock token", job.id))
+        })?;
         let context = JobContext::new(
             Arc::clone(&self.backend),
             job.id.clone(),
             self.config.worker_id.clone(),
+            lock_token.clone(),
             self.config.lease_duration,
             self.config.log_retention,
         );
@@ -400,14 +412,14 @@ impl JobWorker {
             Ok(value) => {
                 let completed = self
                     .backend
-                    .complete_job(&job_id, value, Utc::now())
+                    .complete_job(&job_id, &lock_token, value, Utc::now())
                     .await?;
                 Ok(JobRunOutcome::Completed(completed))
             }
             Err(error) => {
                 let failed = self
                     .backend
-                    .fail_job(&job_id, error.to_string(), Utc::now())
+                    .fail_job(&job_id, &lock_token, error.to_string(), Utc::now())
                     .await?;
                 Ok(JobRunOutcome::Failed(failed))
             }

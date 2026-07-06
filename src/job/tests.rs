@@ -10,6 +10,12 @@ fn ts(ms: i64) -> DateTime<Utc> {
     Utc.timestamp_millis_opt(ms).unwrap()
 }
 
+fn lock_token(job: &Job) -> &str {
+    job.lock_token
+        .as_deref()
+        .expect("claimed job should carry a lock token")
+}
+
 #[tokio::test]
 async fn claims_waiting_jobs_by_priority_then_fifo() {
     let queue = InMemoryJobQueue::new("email");
@@ -167,6 +173,64 @@ async fn add_many_rejects_invalid_jobs_without_partial_insert() {
 }
 
 #[tokio::test]
+async fn priority_updates_reorder_waiting_jobs() {
+    let queue = InMemoryJobQueue::new("priority-update");
+    let now = ts(1_000);
+    let first = queue
+        .add_at(
+            "first",
+            serde_json::json!({}),
+            JobOptions::new().with_priority(50),
+            now,
+        )
+        .await
+        .unwrap();
+    let second = queue
+        .add_at(
+            "second",
+            serde_json::json!({}),
+            JobOptions::new().with_priority(60),
+            now,
+        )
+        .await
+        .unwrap();
+
+    let updated = queue.update_priority(&second.id, 1).await.unwrap();
+    assert_eq!(updated.priority, 1);
+    assert_eq!(updated.options.priority, 1);
+
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, second.id);
+    assert_ne!(claimed.id, first.id);
+}
+
+#[tokio::test]
+async fn priority_updates_reject_terminal_jobs() {
+    let queue = InMemoryJobQueue::new("priority-terminal");
+    let now = ts(1_000);
+    let job = queue
+        .add_at("task", serde_json::json!({}), JobOptions::new(), now)
+        .await
+        .unwrap();
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .complete_job(&job.id, lock_token(&claimed), serde_json::json!({}), now)
+        .await
+        .unwrap();
+
+    let error = queue.update_priority(&job.id, 1).await.unwrap_err();
+    assert!(matches!(error, LaneError::JobStateConflict(_)));
+}
+
+#[tokio::test]
 async fn repeatable_jobs_schedule_next_occurrence_after_completion() {
     let queue = InMemoryJobQueue::new("repeat");
     let now = ts(1_000);
@@ -193,7 +257,12 @@ async fn repeatable_jobs_schedule_next_occurrence_after_completion() {
         .unwrap();
     assert_eq!(first.id, job.id);
     queue
-        .complete_job(&first.id, serde_json::json!({ "ok": true }), ts(1_100))
+        .complete_job(
+            &first.id,
+            lock_token(&first),
+            serde_json::json!({ "ok": true }),
+            ts(1_100),
+        )
         .await
         .unwrap();
 
@@ -221,7 +290,12 @@ async fn repeatable_jobs_schedule_next_occurrence_after_completion() {
         .unwrap();
     assert_eq!(second.repeat_count, 1);
     queue
-        .complete_job(&second.id, serde_json::json!({ "ok": true }), ts(6_200))
+        .complete_job(
+            &second.id,
+            lock_token(&second),
+            serde_json::json!({ "ok": true }),
+            ts(6_200),
+        )
         .await
         .unwrap();
 
@@ -257,7 +331,12 @@ async fn cron_repeatable_jobs_schedule_next_matching_occurrence() {
         .unwrap()
         .unwrap();
     queue
-        .complete_job(&first.id, serde_json::json!({ "ok": true }), now)
+        .complete_job(
+            &first.id,
+            lock_token(&first),
+            serde_json::json!({ "ok": true }),
+            now,
+        )
         .await
         .unwrap();
 
@@ -316,7 +395,12 @@ async fn repeat_successors_do_not_reuse_custom_job_ids() {
         .unwrap()
         .unwrap();
     queue
-        .complete_job(&first.id, serde_json::json!({}), ts(1_100))
+        .complete_job(
+            &first.id,
+            lock_token(&first),
+            serde_json::json!({}),
+            ts(1_100),
+        )
         .await
         .unwrap();
 
@@ -401,7 +485,12 @@ async fn failed_jobs_retry_with_backoff_then_terminal_failure() {
     assert_eq!(first.id, job.id);
 
     let retry = queue
-        .fail_job(&job.id, "network".to_string(), ts(1_100))
+        .fail_job(
+            &job.id,
+            lock_token(&first),
+            "network".to_string(),
+            ts(1_100),
+        )
         .await
         .unwrap();
     assert_eq!(retry.state, JobState::Delayed);
@@ -415,7 +504,12 @@ async fn failed_jobs_retry_with_backoff_then_terminal_failure() {
     assert_eq!(second.attempts_made, 2);
 
     let failed = queue
-        .fail_job(&job.id, "still down".to_string(), ts(3_200))
+        .fail_job(
+            &job.id,
+            lock_token(&second),
+            "still down".to_string(),
+            ts(3_200),
+        )
         .await
         .unwrap();
     assert_eq!(failed.state, JobState::Failed);
@@ -495,13 +589,19 @@ async fn remove_on_complete_deletes_record_after_returning_snapshot() {
         )
         .await
         .unwrap();
-    queue
+    let claimed = queue
         .claim_next("worker-a".to_string(), Duration::from_secs(1), now)
         .await
+        .unwrap()
         .unwrap();
 
     let completed = queue
-        .complete_job(&job.id, serde_json::json!({"ok": true}), ts(1_100))
+        .complete_job(
+            &job.id,
+            lock_token(&claimed),
+            serde_json::json!({"ok": true}),
+            ts(1_100),
+        )
         .await
         .unwrap();
     assert_eq!(completed.state, JobState::Completed);
@@ -518,24 +618,30 @@ async fn lease_renewal_requires_active_owner() {
         .unwrap();
 
     let waiting_error = queue
-        .renew_lease(&job.id, "worker-a", Duration::from_secs(1), now)
+        .renew_lease(&job.id, "missing-token", Duration::from_secs(1), now)
         .await
         .unwrap_err();
     assert!(matches!(waiting_error, LaneError::JobStateConflict(_)));
 
-    queue
+    let claimed = queue
         .claim_next("worker-a".to_string(), Duration::from_secs(1), now)
         .await
+        .unwrap()
         .unwrap();
 
-    let wrong_worker = queue
-        .renew_lease(&job.id, "worker-b", Duration::from_secs(1), ts(1_500))
+    let wrong_token = queue
+        .renew_lease(&job.id, "wrong-token", Duration::from_secs(1), ts(1_500))
         .await
         .unwrap_err();
-    assert!(matches!(wrong_worker, LaneError::JobLeaseConflict(_)));
+    assert!(matches!(wrong_token, LaneError::JobLeaseConflict(_)));
 
     let renewed = queue
-        .renew_lease(&job.id, "worker-a", Duration::from_secs(3), ts(1_500))
+        .renew_lease(
+            &job.id,
+            lock_token(&claimed),
+            Duration::from_secs(3),
+            ts(1_500),
+        )
         .await
         .unwrap();
     assert_eq!(renewed.lease_expires_at, Some(ts(4_500)));
@@ -628,7 +734,12 @@ async fn management_api_lists_progress_logs_retries_and_cleans_jobs() {
     assert_eq!(claimed.id, faster.id);
 
     let failed = queue
-        .fail_job(&faster.id, "boom".to_string(), ts(1_400))
+        .fail_job(
+            &faster.id,
+            lock_token(&claimed),
+            "boom".to_string(),
+            ts(1_400),
+        )
         .await
         .unwrap();
     assert_eq!(failed.state, JobState::Failed);
@@ -637,12 +748,18 @@ async fn management_api_lists_progress_logs_retries_and_cleans_jobs() {
     assert_eq!(retried.state, JobState::Waiting);
     assert!(retried.failed_reason.is_none());
 
-    queue
+    let claimed = queue
         .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(1_500))
         .await
+        .unwrap()
         .unwrap();
     queue
-        .complete_job(&faster.id, serde_json::json!({ "ok": true }), ts(1_600))
+        .complete_job(
+            &faster.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            ts(1_600),
+        )
         .await
         .unwrap();
 
@@ -698,7 +815,12 @@ async fn flow_parent_waits_for_children_before_claiming() {
         .unwrap();
     assert_eq!(first_child.id, flow.children[0].id);
     queue
-        .complete_job(&first_child.id, serde_json::json!({ "ok": 1 }), ts(1_200))
+        .complete_job(
+            &first_child.id,
+            lock_token(&first_child),
+            serde_json::json!({ "ok": 1 }),
+            ts(1_200),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -713,7 +835,12 @@ async fn flow_parent_waits_for_children_before_claiming() {
         .unwrap();
     assert_eq!(second_child.id, flow.children[1].id);
     queue
-        .complete_job(&second_child.id, serde_json::json!({ "ok": 2 }), ts(1_400))
+        .complete_job(
+            &second_child.id,
+            lock_token(&second_child),
+            serde_json::json!({ "ok": 2 }),
+            ts(1_400),
+        )
         .await
         .unwrap();
 
@@ -776,7 +903,12 @@ async fn flow_parent_fails_when_child_terminally_fails() {
         .unwrap()
         .unwrap();
     queue
-        .fail_job(&child.id, "temporary".to_string(), ts(1_100))
+        .fail_job(
+            &child.id,
+            lock_token(&child),
+            "temporary".to_string(),
+            ts(1_100),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -785,12 +917,18 @@ async fn flow_parent_fails_when_child_terminally_fails() {
     );
 
     queue.promote_due_jobs(ts(1_200)).await.unwrap();
-    queue
+    let child = queue
         .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(1_200))
         .await
+        .unwrap()
         .unwrap();
     queue
-        .fail_job(&child.id, "terminal".to_string(), ts(1_300))
+        .fail_job(
+            &child.id,
+            lock_token(&child),
+            "terminal".to_string(),
+            ts(1_300),
+        )
         .await
         .unwrap();
 
@@ -813,13 +951,13 @@ async fn completing_or_failing_requires_active_job() {
         .unwrap();
 
     let complete_error = queue
-        .complete_job(&job.id, serde_json::json!({}), now)
+        .complete_job(&job.id, "missing-token", serde_json::json!({}), now)
         .await
         .unwrap_err();
     assert!(matches!(complete_error, LaneError::JobStateConflict(_)));
 
     let fail_error = queue
-        .fail_job(&job.id, "boom".to_string(), now)
+        .fail_job(&job.id, "missing-token", "boom".to_string(), now)
         .await
         .unwrap_err();
     assert!(matches!(fail_error, LaneError::JobStateConflict(_)));
@@ -890,6 +1028,33 @@ async fn local_job_queue_persists_bulk_jobs() {
 }
 
 #[tokio::test]
+async fn local_job_queue_persists_priority_updates() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("jobs").join("priority.json");
+    let queue = LocalJobQueue::open("durable-priority", &snapshot_path)
+        .await
+        .unwrap();
+    let job = queue
+        .add_at(
+            "task",
+            serde_json::json!({}),
+            JobOptions::new().with_priority(100),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    queue.update_priority(&job.id, 5).await.unwrap();
+
+    let reopened = LocalJobQueue::open("durable-priority", &snapshot_path)
+        .await
+        .unwrap();
+    let restored = reopened.get_job(&job.id).await.unwrap().unwrap();
+    assert_eq!(restored.priority, 5);
+    assert_eq!(restored.options.priority, 5);
+}
+
+#[tokio::test]
 async fn local_job_queue_persists_repeat_successors() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let snapshot_path = temp_dir.path().join("jobs").join("repeat.json");
@@ -909,12 +1074,18 @@ async fn local_job_queue_persists_repeat_successors() {
         )
         .await
         .unwrap();
-    queue
+    let claimed = queue
         .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(1_000))
         .await
+        .unwrap()
         .unwrap();
     queue
-        .complete_job(&job.id, serde_json::json!({}), ts(1_500))
+        .complete_job(
+            &job.id,
+            lock_token(&claimed),
+            serde_json::json!({}),
+            ts(1_500),
+        )
         .await
         .unwrap();
 
@@ -977,7 +1148,12 @@ async fn local_job_queue_persists_snapshot_across_reopen() {
         .await
         .unwrap();
     reopened
-        .complete_job(&job.id, serde_json::json!({ "ok": true }), ts(1_300))
+        .complete_job(
+            &job.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            ts(1_300),
+        )
         .await
         .unwrap();
 

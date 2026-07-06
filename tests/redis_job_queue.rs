@@ -1,12 +1,18 @@
 #![cfg(feature = "redis-backend")]
 
 use a3s_lane::{
-    JobListOptions, JobOptions, JobQueueBackend, JobSpec, JobState, RedisJobQueue, RepeatOptions,
-    RetryPolicy,
+    JobListOptions, JobOptions, JobQueueBackend, JobSpec, JobState, LaneError, RedisJobQueue,
+    RepeatOptions, RetryPolicy,
 };
 use chrono::{DateTime, Utc};
 use redis::AsyncCommands;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+fn lock_token(job: &a3s_lane::Job) -> &str {
+    job.lock_token
+        .as_deref()
+        .expect("claimed job should carry a lock token")
+}
 
 #[tokio::test]
 async fn redis_backend_runs_job_lifecycle_against_real_server() {
@@ -28,6 +34,49 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("valid Redis URL should build the producer queue");
     let worker = RedisJobQueue::with_namespace(&redis_url, &namespace, "jobs")
         .expect("valid Redis URL should build the worker queue");
+
+    let priority_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "priority")
+        .expect("valid Redis URL should build the priority queue");
+    let first_priority = priority_queue
+        .add_job(
+            "first-priority".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_priority(50),
+        )
+        .await
+        .expect("first priority job should be added");
+    let second_priority = priority_queue
+        .add_job(
+            "second-priority".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_priority(60),
+        )
+        .await
+        .expect("second priority job should be added");
+    priority_queue
+        .update_priority(&second_priority.id, 1)
+        .await
+        .expect("priority should update");
+    let priority_claim = priority_queue
+        .claim_next(
+            "worker-priority".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("priority claim should return")
+        .expect("updated priority job should be claimable");
+    assert_eq!(priority_claim.id, second_priority.id);
+    assert_ne!(priority_claim.id, first_priority.id);
+    priority_queue
+        .complete_job(
+            &priority_claim.id,
+            lock_token(&priority_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("priority job should complete");
 
     producer.pause().await.expect("pause should succeed");
     let high = producer
@@ -68,6 +117,20 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     assert_eq!(first.id, high.id);
     assert_eq!(first.state, JobState::Active);
     assert_eq!(first.worker_id.as_deref(), Some("worker-a"));
+    assert!(first.lock_token.is_some());
+    let wrong_token_complete = worker
+        .complete_job(
+            &first.id,
+            "wrong-token",
+            serde_json::json!({ "ok": false }),
+            Utc::now(),
+        )
+        .await
+        .expect_err("wrong token must not complete an active job");
+    assert!(matches!(
+        wrong_token_complete,
+        LaneError::JobLeaseConflict(_)
+    ));
 
     worker
         .update_progress(&first.id, serde_json::json!({ "percent": 50 }))
@@ -78,7 +141,12 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect("log update should succeed");
     let completed = worker
-        .complete_job(&first.id, serde_json::json!({ "ok": true }), Utc::now())
+        .complete_job(
+            &first.id,
+            lock_token(&first),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
         .await
         .expect("complete should succeed");
     assert_eq!(completed.state, JobState::Completed);
@@ -91,7 +159,12 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     assert_eq!(second.id, low.id);
 
     let retry = worker
-        .fail_job(&second.id, "temporary".to_string(), Utc::now())
+        .fail_job(
+            &second.id,
+            lock_token(&second),
+            "temporary".to_string(),
+            Utc::now(),
+        )
         .await
         .expect("retryable failure should succeed");
     assert_eq!(retry.state, JobState::Delayed);
@@ -108,7 +181,12 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("retry should be claimable");
     assert_eq!(retried.id, low.id);
     let failed = worker
-        .fail_job(&retried.id, "terminal".to_string(), Utc::now())
+        .fail_job(
+            &retried.id,
+            lock_token(&retried),
+            "terminal".to_string(),
+            Utc::now(),
+        )
         .await
         .expect("terminal failure should succeed");
     assert_eq!(failed.state, JobState::Failed);
@@ -145,6 +223,63 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("delayed job should be claimable");
     assert_eq!(claimed_delayed.id, delayed.id);
 
+    let stalled = producer
+        .add_job(
+            "stalled".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_max_stalled_count(2),
+        )
+        .await
+        .expect("stalled job should be added");
+    let stale_claim = worker
+        .claim_next(
+            "worker-stale".to_string(),
+            Duration::from_millis(50),
+            Utc::now(),
+        )
+        .await
+        .expect("stale claim should return")
+        .expect("stalled job should be claimable");
+    assert_eq!(stale_claim.id, stalled.id);
+    let stale_token = lock_token(&stale_claim).to_string();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        producer
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("stalled recovery should run"),
+        1
+    );
+    let reclaimed = worker
+        .claim_next(
+            "worker-reclaim".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("reclaim should return")
+        .expect("recovered job should be claimable");
+    assert_eq!(reclaimed.id, stalled.id);
+    let stale_complete = worker
+        .complete_job(
+            &reclaimed.id,
+            &stale_token,
+            serde_json::json!({ "ok": false }),
+            Utc::now(),
+        )
+        .await
+        .expect_err("stale token must not complete a reclaimed job");
+    assert!(matches!(stale_complete, LaneError::JobLeaseConflict(_)));
+    worker
+        .complete_job(
+            &reclaimed.id,
+            lock_token(&reclaimed),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("valid reclaimed token should complete");
+
     let stored_high = producer
         .get_job(&high.id)
         .await
@@ -158,7 +293,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     assert_eq!(stored_high.logs[0].line, "accepted");
 
     let stats = producer.stats().await.expect("stats should load");
-    assert_eq!(stats.completed, 1);
+    assert_eq!(stats.completed, 2);
     assert_eq!(stats.failed, 1);
     assert_eq!(stats.active, 1);
 
@@ -189,7 +324,12 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("first flow child should be claimable");
     assert_eq!(child_a.id, flow.children[0].id);
     worker
-        .complete_job(&child_a.id, serde_json::json!({ "ok": 1 }), Utc::now())
+        .complete_job(
+            &child_a.id,
+            lock_token(&child_a),
+            serde_json::json!({ "ok": 1 }),
+            Utc::now(),
+        )
         .await
         .expect("first child should complete");
     assert_eq!(
@@ -213,7 +353,12 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("second flow child should be claimable");
     assert_eq!(child_b.id, flow.children[1].id);
     worker
-        .complete_job(&child_b.id, serde_json::json!({ "ok": 2 }), Utc::now())
+        .complete_job(
+            &child_b.id,
+            lock_token(&child_b),
+            serde_json::json!({ "ok": 2 }),
+            Utc::now(),
+        )
         .await
         .expect("second child should complete");
 
@@ -259,6 +404,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     worker
         .complete_job(
             &first_repeat.id,
+            lock_token(&first_repeat),
             serde_json::json!({ "tick": 1 }),
             Utc::now(),
         )
@@ -294,6 +440,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     worker
         .complete_job(
             &second_repeat.id,
+            lock_token(&second_repeat),
             serde_json::json!({ "tick": 2 }),
             Utc::now(),
         )
@@ -334,6 +481,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     worker
         .complete_job(
             &first_cron_repeat.id,
+            lock_token(&first_cron_repeat),
             serde_json::json!({ "tick": 1 }),
             cron_completed_at,
         )
@@ -373,6 +521,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     worker
         .complete_job(
             &second_cron_repeat.id,
+            lock_token(&second_cron_repeat),
             serde_json::json!({ "tick": 2 }),
             Utc::now(),
         )

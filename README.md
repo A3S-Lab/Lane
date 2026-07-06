@@ -369,10 +369,10 @@ A3S stack and language SDKs.
 | Phase | Status | Scope |
 | --- | --- | --- |
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
-| Generic job runtime | In progress | JSON jobs, bulk submission, idempotent custom job IDs, explicit job states, priority ordering, delayed jobs, worker leases, completion/failure snapshots, retry backoff, stalled-job recovery, pause/resume. |
-| Job management API | In progress | Add/get/remove/promote/retry/pause/resume/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
+| Generic job runtime | In progress | JSON jobs, bulk submission, idempotent custom job IDs, explicit job states, priority ordering, delayed jobs, token-owned worker leases, completion/failure snapshots, retry backoff, stalled-job recovery, pause/resume. |
+| Job management API | In progress | Add/get/remove/promote/retry/update-priority/pause/resume/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, timeouts, and stalled recovery loops. |
-| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` for multi-process distributed claims. Postgres/NATS backends remain planned. |
+| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed claim, complete, fail, renew, and stalled recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, and end timestamps are available across in-memory, local durable, and Redis backends. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
@@ -416,15 +416,24 @@ let claimed = queue
     .claim_next("worker-1".to_string(), Duration::from_secs(30), chrono::Utc::now())
     .await?;
 
-if claimed.is_some() {
+if let Some(claimed) = claimed {
+    let lock_token = claimed
+        .lock_token
+        .as_deref()
+        .expect("claimed jobs include a lock token");
     queue
-        .update_progress(&job.id, serde_json::json!({ "percent": 50 }))
+        .update_progress(&claimed.id, serde_json::json!({ "percent": 50 }))
         .await?;
     queue
-        .add_log(&job.id, "smtp accepted message".to_string(), 100, chrono::Utc::now())
+        .add_log(&claimed.id, "smtp accepted message".to_string(), 100, chrono::Utc::now())
         .await?;
     queue
-        .complete_job(&job.id, serde_json::json!({ "ok": true }), chrono::Utc::now())
+        .complete_job(
+            &claimed.id,
+            lock_token,
+            serde_json::json!({ "ok": true }),
+            chrono::Utc::now(),
+        )
         .await?;
 }
 # Ok(())
@@ -434,11 +443,17 @@ if claimed.is_some() {
 Management APIs are part of the backend contract: `list_jobs()` returns
 paginated `JobListPage` values, `add_jobs()` submits a batch with the same
 idempotency semantics as `add_job()`, `promote_job()` moves delayed jobs to
-waiting, `retry_job()` manually requeues failed jobs, `renew_lease()` extends
-an active worker lease, and `clean_jobs()` removes old records by state.
+waiting, `retry_job()` manually requeues failed jobs, `update_priority()`
+changes non-terminal job priority, `renew_lease()` extends an active worker
+lease with the claim token, and `clean_jobs()` removes old records by state.
 Set `JobOptions::with_job_id()` when producers need idempotent submission:
 adding the same job id again returns the existing job instead of enqueueing a
 duplicate.
+
+Every claimed job carries an opaque `lock_token`. Workers must pass that token
+to `complete_job()`, `fail_job()`, and `renew_lease()`. This prevents a stale
+worker from completing a job after its lease expired and another worker
+reclaimed it.
 
 Flow jobs create a parent job and one or more child jobs in a single operation.
 The parent starts in `waiting_children`, children are claimed normally, and the
@@ -535,9 +550,18 @@ let claimed = queue
     .claim_next("worker-1".to_string(), std::time::Duration::from_secs(30), chrono::Utc::now())
     .await?;
 
-if claimed.is_some() {
+if let Some(claimed) = claimed {
+    let lock_token = claimed
+        .lock_token
+        .as_deref()
+        .expect("claimed jobs include a lock token");
     queue
-        .complete_job(&job.id, serde_json::json!({ "ok": true }), chrono::Utc::now())
+        .complete_job(
+            &claimed.id,
+            lock_token,
+            serde_json::json!({ "ok": true }),
+            chrono::Utc::now(),
+        )
         .await?;
 }
 # Ok(())
@@ -546,8 +570,12 @@ if claimed.is_some() {
 
 Use `RedisJobQueue` when multiple workers or processes need to claim from the
 same durable priority queue. It stores jobs as JSON in a Redis hash, indexes
-states with sorted sets, and uses a Lua script to atomically claim the next
-waiting job into an active worker lease:
+states with sorted sets, and uses Lua scripts to atomically claim and transition
+leased jobs. The Redis backend follows the core BullMQ locking mechanism: a
+claim creates an independent TTL lock key for the job, and complete, fail, and
+renew operations must prove ownership by matching the lock token before the
+script mutates the active/completed/failed/delayed indexes. Stalled recovery
+checks the TTL lock key, not only the job JSON snapshot:
 
 ```rust
 use a3s_lane::{JobOptions, JobQueueBackend, RedisJobQueue, RetryPolicy};
@@ -574,8 +602,17 @@ if let Some(claimed) = queue
     .claim_next("worker-1".to_string(), Duration::from_secs(30), chrono::Utc::now())
     .await?
 {
+    let lock_token = claimed
+        .lock_token
+        .as_deref()
+        .expect("claimed jobs include a lock token");
     queue
-        .complete_job(&claimed.id, serde_json::json!({ "ok": true }), chrono::Utc::now())
+        .complete_job(
+            &claimed.id,
+            lock_token,
+            serde_json::json!({ "ok": true }),
+            chrono::Utc::now(),
+        )
         .await?;
 }
 

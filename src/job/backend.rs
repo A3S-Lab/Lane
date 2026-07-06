@@ -1,6 +1,6 @@
 use super::types::{
-    Job, JobFlow, JobListOptions, JobListPage, JobOptions, JobQueueStats, JobSpec, JobState,
-    JobWorkerId,
+    Job, JobFlow, JobListOptions, JobListPage, JobOptions, JobPriority, JobQueueStats, JobSpec,
+    JobState, JobWorkerId,
 };
 use crate::error::Result;
 use async_trait::async_trait;
@@ -30,14 +30,26 @@ pub trait JobQueueBackend: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<Option<Job>>;
 
-    async fn complete_job(&self, job_id: &str, value: Value, now: DateTime<Utc>) -> Result<Job>;
+    async fn complete_job(
+        &self,
+        job_id: &str,
+        lock_token: &str,
+        value: Value,
+        now: DateTime<Utc>,
+    ) -> Result<Job>;
 
-    async fn fail_job(&self, job_id: &str, error: String, now: DateTime<Utc>) -> Result<Job>;
+    async fn fail_job(
+        &self,
+        job_id: &str,
+        lock_token: &str,
+        error: String,
+        now: DateTime<Utc>,
+    ) -> Result<Job>;
 
     async fn renew_lease(
         &self,
         job_id: &str,
-        worker_id: &str,
+        lock_token: &str,
         lease_for: Duration,
         now: DateTime<Utc>,
     ) -> Result<Job>;
@@ -45,6 +57,8 @@ pub trait JobQueueBackend: Send + Sync {
     async fn promote_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job>;
 
     async fn retry_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job>;
+
+    async fn update_priority(&self, job_id: &str, priority: JobPriority) -> Result<Job>;
 
     async fn remove_job(&self, job_id: &str) -> Result<Option<Job>>;
 
