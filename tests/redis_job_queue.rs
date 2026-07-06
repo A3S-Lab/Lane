@@ -1,8 +1,8 @@
 #![cfg(feature = "redis-backend")]
 
 use a3s_lane::{
-    JobListOptions, JobOptions, JobQueueBackend, JobRateLimit, JobSpec, JobState, LaneError,
-    RedisJobQueue, RepeatOptions, RetryPolicy,
+    DeduplicationOptions, JobListOptions, JobOptions, JobQueueBackend, JobRateLimit, JobSpec,
+    JobState, LaneError, RedisJobQueue, RepeatOptions, RetryPolicy,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use redis::AsyncCommands;
@@ -111,7 +111,9 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .add_job(
             "dedup-fail".to_string(),
             serde_json::json!({ "version": 4 }),
-            JobOptions::new().with_deduplication_id("tenant:fail"),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("tenant:fail").with_ttl(Duration::from_secs(5)),
+            ),
         )
         .await
         .expect("dedup fail job should be added");
@@ -147,11 +149,18 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .get(format!("{namespace}:dedup:deduplication:tenant:fail"))
         .await?;
     assert_eq!(retry_dedup_owner.as_deref(), Some(fail_dedup.id.as_str()));
+    let retry_dedup_ttl: i64 = redis::cmd("PTTL")
+        .arg(format!("{namespace}:dedup:deduplication:tenant:fail"))
+        .query_async(&mut dedup_conn)
+        .await?;
+    assert!(retry_dedup_ttl > 0);
     let retry_duplicate = dedup_queue
         .add_job(
             "dedup-fail-duplicate".to_string(),
             serde_json::json!({ "version": 5 }),
-            JobOptions::new().with_deduplication_id("tenant:fail"),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("tenant:fail").with_ttl(Duration::from_secs(5)),
+            ),
         )
         .await
         .expect("duplicate add after dedup retry should return retried job");
@@ -244,6 +253,68 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .get(format!("{namespace}:dedup:deduplication:tenant:clean"))
         .await?;
     assert!(cleaned_dedup_owner.is_none());
+
+    let ttl_dedup_key = format!("{namespace}:dedup:deduplication:tenant:ttl");
+    let ttl_dedup = dedup_queue
+        .add_job(
+            "dedup-ttl".to_string(),
+            serde_json::json!({ "version": 6 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("tenant:ttl").with_ttl(Duration::from_millis(200)),
+            ),
+        )
+        .await
+        .expect("ttl dedup job should be added");
+    let ttl_duplicate = dedup_queue
+        .add_job(
+            "dedup-ttl-duplicate".to_string(),
+            serde_json::json!({ "version": 7 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("tenant:ttl").with_ttl(Duration::from_millis(200)),
+            ),
+        )
+        .await
+        .expect("duplicate before ttl should return owner");
+    assert_eq!(ttl_duplicate.id, ttl_dedup.id);
+    let ttl_dedup_pttl: i64 = redis::cmd("PTTL")
+        .arg(&ttl_dedup_key)
+        .query_async(&mut dedup_conn)
+        .await?;
+    assert!(ttl_dedup_pttl > 0);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let ttl_after_expiration = dedup_queue
+        .add_job(
+            "dedup-ttl-after-expiration".to_string(),
+            serde_json::json!({ "version": 8 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("tenant:ttl").with_ttl(Duration::from_millis(200)),
+            ),
+        )
+        .await
+        .expect("dedup id should be reusable after ttl");
+    assert_ne!(ttl_after_expiration.id, ttl_dedup.id);
+    let ttl_owner_after_expiration: Option<String> = dedup_conn.get(&ttl_dedup_key).await?;
+    assert_eq!(
+        ttl_owner_after_expiration.as_deref(),
+        Some(ttl_after_expiration.id.as_str())
+    );
+    dedup_queue
+        .remove_job(&ttl_dedup.id)
+        .await
+        .expect("expired ttl owner should remove")
+        .expect("expired ttl owner should be returned");
+    let ttl_owner_after_old_remove: Option<String> = dedup_conn.get(&ttl_dedup_key).await?;
+    assert_eq!(
+        ttl_owner_after_old_remove.as_deref(),
+        Some(ttl_after_expiration.id.as_str())
+    );
+    dedup_queue
+        .remove_job(&ttl_after_expiration.id)
+        .await
+        .expect("current ttl owner should remove")
+        .expect("current ttl owner should be returned");
+    let ttl_owner_after_current_remove: Option<String> = dedup_conn.get(&ttl_dedup_key).await?;
+    assert!(ttl_owner_after_current_remove.is_none());
     trace_stage("dedup:done");
 
     let priority_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "priority")

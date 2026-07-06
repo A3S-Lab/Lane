@@ -369,10 +369,10 @@ A3S stack and language SDKs.
 | Phase | Status | Scope |
 | --- | --- | --- |
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
-| Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication, repeat-key ownership, explicit job states, priority ordering, delayed jobs, token-owned worker leases, completion/failure snapshots, retry backoff, rate-limited claims, shared active concurrency limits, stalled-job recovery, pause/resume. |
+| Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, repeat-key ownership, explicit job states, priority ordering, delayed jobs, token-owned worker leases, completion/failure snapshots, retry backoff, rate-limited claims, shared active concurrency limits, stalled-job recovery, pause/resume. |
 | Job management API | In progress | Add/get/remove/promote/retry/update-priority/pause/resume/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, and stalled recovery loops. |
-| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, simple deduplication, repeat-key ownership, flow submission, delayed promotion, single-job promote, manual retry, priority update, progress update, log append, list/stat snapshots, clean, claim, rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
+| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, simple deduplication with TTL, repeat-key ownership, flow submission, delayed promotion, single-job promote, manual retry, priority update, progress update, log append, list/stat snapshots, clean, claim, rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, and end timestamps are available across in-memory, local durable, and Redis backends. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
@@ -549,10 +549,12 @@ assert_eq!(duplicate.id, job.id);
 ```
 
 Simple deduplication coalesces duplicate submissions while the first matching
-job is still non-terminal:
+job is still non-terminal. An optional TTL limits how long a non-terminal job
+owns its deduplication id:
 
 ```rust
-use a3s_lane::{InMemoryJobQueue, JobOptions};
+use a3s_lane::{DeduplicationOptions, InMemoryJobQueue, JobOptions};
+use std::time::Duration;
 
 # async fn dedup_example() -> a3s_lane::Result<()> {
 let queue = InMemoryJobQueue::new("billing");
@@ -574,16 +576,29 @@ let duplicate = queue
     .await?;
 
 assert_eq!(duplicate.id, first.id);
+
+let ttl_owner = queue
+    .add(
+        "refresh-account",
+        serde_json::json!({ "account_id": "acct_42" }),
+        JobOptions::new().with_deduplication(
+            DeduplicationOptions::new("account-refresh:acct_42")
+                .with_ttl(Duration::from_secs(30)),
+        ),
+    )
+    .await?;
+
+assert!(ttl_owner.deduplication_expires_at.is_some());
 # Ok(())
 # }
 ```
 
 The current deduplication mode intentionally covers BullMQ's simple mode: a
 deduplication id blocks duplicate adds until the owning job completes, fails
-terminally, is removed, or is cleaned. TTL, replace/debounce, and
-keep-last-if-active behavior remain planned. Retrying a failed deduplicated job
-reclaims the deduplication id while the job is waiting or active again; retry is
-rejected if another non-terminal job already owns that id.
+terminally, is removed, is cleaned, or its configured TTL expires.
+Replace/debounce and keep-last-if-active behavior remain planned. Retrying a
+failed deduplicated job reclaims the deduplication id while the job is waiting or
+active again; retry is rejected if another non-terminal job already owns that id.
 
 Use `LocalJobQueue` when a process-local runtime needs durable restart
 recovery:
@@ -706,11 +721,14 @@ waiting sequence or writing duplicate state indexes. Bulk add follows the same
 mechanism in one script call while preserving the caller's input order.
 For simple deduplication, the same add scripts use an independent
 `deduplication:<id>` key, equivalent to BullMQ's `de:<id>` role, to return the
-currently active job before writing a duplicate. Completion, terminal failure,
-remove, clean, and stalled terminal failure scripts release that key only when it
-still points at the job being finalized or removed. Manual retry reclaims the key
-inside the retry script and refuses to move the failed job back to waiting if a
-newer non-terminal job already owns the same deduplication id.
+currently active job before writing a duplicate. If `DeduplicationOptions` has a
+TTL, the Lua scripts write that owner key with `PX` so Redis expires the
+deduplication window even while the original job remains non-terminal.
+Completion, terminal failure, remove, clean, and stalled terminal failure scripts
+release that key only when it still points at the job being finalized or removed.
+Manual retry reclaims the key inside the retry script, reapplies the TTL, and
+refuses to move the failed job back to waiting if a newer non-terminal job
+already owns the same deduplication id.
 
 Redis flow submission is all-or-nothing: the flow add script first checks every
 parent and child job id, then writes the parent, children, and all state indexes
@@ -754,7 +772,8 @@ another state. `retry_job()` clears terminal failure metadata, treats the failed
 zset as the Redis movement gate, prunes orphaned or stale failed members, and
 moves valid failed jobs back to waiting inside one script. For deduplicated and
 repeat-keyed jobs, that same script reclaims the owner key before returning the
-job to waiting. `update_priority()`
+job to waiting; deduplication TTL is re-applied during that same retry script.
+`update_priority()`
 rewrites the job hash and, for waiting jobs, replaces the waiting zset score in
 the same script; for jobs that are no longer waiting, it prunes stale waiting
 members while preserving the stored non-terminal state. This is intentionally

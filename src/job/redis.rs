@@ -1,7 +1,7 @@
 use super::backend::JobQueueBackend;
 use super::types::{
-    add_duration, Job, JobFlow, JobListOptions, JobListPage, JobOptions, JobPriority,
-    JobQueueStats, JobRateLimit, JobSpec, JobState, JobWorkerId, QueueName,
+    add_duration, deduplication_expiration, Job, JobFlow, JobListOptions, JobListPage, JobOptions,
+    JobPriority, JobQueueStats, JobRateLimit, JobSpec, JobState, JobWorkerId, QueueName,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -40,6 +40,43 @@ local function active_deduplicated_raw(jobs_key, deduplication_prefix, deduplica
   end
 
   return existing_raw
+end
+
+local function duration_millis(duration)
+  if not duration or duration == cjson.null then
+    return nil
+  end
+  if type(duration) == 'number' then
+    return math.floor(duration)
+  end
+  local secs = tonumber(duration["secs"] or duration["seconds"] or 0) or 0
+  local nanos = tonumber(duration["nanos"] or duration["subsec_nanos"] or 0) or 0
+  local millis = (secs * 1000) + math.floor(nanos / 1000000)
+  if millis <= 0 then
+    return nil
+  end
+  return millis
+end
+
+local function deduplication_ttl_millis(job)
+  if not job["options"] or job["options"] == cjson.null then
+    return nil
+  end
+  local deduplication = job["options"]["deduplication"]
+  if not deduplication or deduplication == cjson.null then
+    return nil
+  end
+  return duration_millis(deduplication["ttl"])
+end
+
+local function set_deduplication_key(job, job_id, deduplication_prefix)
+  local ttl = deduplication_ttl_millis(job)
+  local id = job["options"]["deduplication"]["id"]
+  if ttl then
+    redis.call('SET', deduplication_prefix .. id, job_id, 'PX', ttl)
+  else
+    redis.call('SET', deduplication_prefix .. id, job_id)
+  end
 end
 
 local function active_repeat_raw(jobs_key, repeat_prefix, repeat_key)
@@ -104,7 +141,7 @@ elseif state == 'waiting_children' then
 end
 
 if ARGV[7] ~= '' then
-  redis.call('SET', ARGV[8] .. ARGV[7], ARGV[1])
+  set_deduplication_key(cjson.decode(ARGV[2]), ARGV[1], ARGV[8])
 end
 if ARGV[9] ~= '' then
   redis.call('SET', ARGV[10] .. ARGV[9], ARGV[1])
@@ -138,6 +175,43 @@ local function active_deduplicated_raw(jobs_key, deduplication_prefix, deduplica
   end
 
   return existing_raw
+end
+
+local function duration_millis(duration)
+  if not duration or duration == cjson.null then
+    return nil
+  end
+  if type(duration) == 'number' then
+    return math.floor(duration)
+  end
+  local secs = tonumber(duration["secs"] or duration["seconds"] or 0) or 0
+  local nanos = tonumber(duration["nanos"] or duration["subsec_nanos"] or 0) or 0
+  local millis = (secs * 1000) + math.floor(nanos / 1000000)
+  if millis <= 0 then
+    return nil
+  end
+  return millis
+end
+
+local function deduplication_ttl_millis(job)
+  if not job["options"] or job["options"] == cjson.null then
+    return nil
+  end
+  local deduplication = job["options"]["deduplication"]
+  if not deduplication or deduplication == cjson.null then
+    return nil
+  end
+  return duration_millis(deduplication["ttl"])
+end
+
+local function set_deduplication_key(job, job_id, deduplication_prefix)
+  local ttl = deduplication_ttl_millis(job)
+  local id = job["options"]["deduplication"]["id"]
+  if ttl then
+    redis.call('SET', deduplication_prefix .. id, job_id, 'PX', ttl)
+  else
+    redis.call('SET', deduplication_prefix .. id, job_id)
+  end
 end
 
 local function active_repeat_raw(jobs_key, repeat_prefix, repeat_key)
@@ -214,7 +288,7 @@ for index = 1, count do
             redis.call('ZADD', KEYS[4], scheduled_score, id)
           end
           if deduplication_id ~= '' then
-            redis.call('SET', deduplication_prefix .. deduplication_id, id)
+            set_deduplication_key(cjson.decode(raw), id, deduplication_prefix)
           end
           if repeat_key ~= '' then
             redis.call('SET', repeat_prefix .. repeat_key, id)
@@ -256,6 +330,43 @@ local function active_deduplication_id(jobs_key, deduplication_prefix, deduplica
   end
 
   return existing_id
+end
+
+local function duration_millis(duration)
+  if not duration or duration == cjson.null then
+    return nil
+  end
+  if type(duration) == 'number' then
+    return math.floor(duration)
+  end
+  local secs = tonumber(duration["secs"] or duration["seconds"] or 0) or 0
+  local nanos = tonumber(duration["nanos"] or duration["subsec_nanos"] or 0) or 0
+  local millis = (secs * 1000) + math.floor(nanos / 1000000)
+  if millis <= 0 then
+    return nil
+  end
+  return millis
+end
+
+local function deduplication_ttl_millis(job)
+  if not job["options"] or job["options"] == cjson.null then
+    return nil
+  end
+  local deduplication = job["options"]["deduplication"]
+  if not deduplication or deduplication == cjson.null then
+    return nil
+  end
+  return duration_millis(deduplication["ttl"])
+end
+
+local function set_deduplication_key(job, job_id, deduplication_prefix)
+  local ttl = deduplication_ttl_millis(job)
+  local id = job["options"]["deduplication"]["id"]
+  if ttl then
+    redis.call('SET', deduplication_prefix .. id, job_id, 'PX', ttl)
+  else
+    redis.call('SET', deduplication_prefix .. id, job_id)
+  end
 end
 
 local function active_repeat_id(jobs_key, repeat_prefix, repeat_key)
@@ -345,7 +456,7 @@ for index = 1, count do
     redis.call('ZADD', KEYS[4], scheduled_score, id)
   end
   if deduplication_id ~= '' then
-    redis.call('SET', deduplication_prefix .. deduplication_id, id)
+    set_deduplication_key(cjson.decode(raw), id, deduplication_prefix)
   end
   if repeat_key ~= '' then
     redis.call('SET', repeat_prefix .. repeat_key, id)
@@ -508,6 +619,33 @@ local function deduplication_id(job)
   return id
 end
 
+local function duration_millis(duration)
+  if not duration or duration == cjson.null then
+    return nil
+  end
+  if type(duration) == 'number' then
+    return math.floor(duration)
+  end
+  local secs = tonumber(duration["secs"] or duration["seconds"] or 0) or 0
+  local nanos = tonumber(duration["nanos"] or duration["subsec_nanos"] or 0) or 0
+  local millis = (secs * 1000) + math.floor(nanos / 1000000)
+  if millis <= 0 then
+    return nil
+  end
+  return millis
+end
+
+local function deduplication_ttl_millis(job)
+  if not job["options"] or job["options"] == cjson.null then
+    return nil
+  end
+  local deduplication = job["options"]["deduplication"]
+  if not deduplication or deduplication == cjson.null then
+    return nil
+  end
+  return duration_millis(deduplication["ttl"])
+end
+
 local function release_deduplication_key(job, job_id, deduplication_prefix)
   local id = deduplication_id(job)
   if id then
@@ -521,7 +659,12 @@ end
 local function set_deduplication_key(job, job_id, deduplication_prefix)
   local id = deduplication_id(job)
   if id then
-    redis.call('SET', deduplication_prefix .. id, job_id)
+    local ttl = deduplication_ttl_millis(job)
+    if ttl then
+      redis.call('SET', deduplication_prefix .. id, job_id, 'PX', ttl)
+    else
+      redis.call('SET', deduplication_prefix .. id, job_id)
+    end
   end
 end
 
@@ -1114,6 +1257,13 @@ job["worker_id"] = cjson.null
 job["lock_token"] = cjson.null
 job["lease_expires_at"] = cjson.null
 job["failed_reason"] = cjson.null
+if retry_deduplication_id then
+  if ARGV[6] ~= '' then
+    job["deduplication_expires_at"] = ARGV[6]
+  else
+    job["deduplication_expires_at"] = cjson.null
+  end
+end
 
 local priority = tonumber(job["priority"] or '1000') or 1000
 local sequence = redis.call('INCR', KEYS[4])
@@ -1123,7 +1273,11 @@ local updated = cjson.encode(job)
 redis.call('ZADD', KEYS[3], waiting_score, ARGV[1])
 redis.call('HSET', KEYS[1], ARGV[1], updated)
 if retry_deduplication_id then
-  redis.call('SET', ARGV[4] .. retry_deduplication_id, ARGV[1])
+  if ARGV[7] ~= '' then
+    redis.call('SET', ARGV[4] .. retry_deduplication_id, ARGV[1], 'PX', ARGV[7])
+  else
+    redis.call('SET', ARGV[4] .. retry_deduplication_id, ARGV[1])
+  end
 end
 if retry_repeat_key then
   redis.call('SET', ARGV[5] .. retry_repeat_key, ARGV[1])
@@ -2404,6 +2558,17 @@ impl JobQueueBackend for RedisJobQueue {
 
     async fn retry_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {
         let mut conn = self.connection().await?;
+        let retry_job = self.load_job(&mut conn, job_id).await?;
+        let deduplication_expires_at = retry_job
+            .as_ref()
+            .and_then(|job| deduplication_expiration(&job.options, now))
+            .map(|expires_at| expires_at.to_rfc3339())
+            .unwrap_or_default();
+        let deduplication_ttl_millis = retry_job
+            .as_ref()
+            .and_then(job_deduplication_ttl_millis)
+            .map(|ttl| ttl.to_string())
+            .unwrap_or_default();
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(RETRY_JOB_SCRIPT)
             .arg(4)
@@ -2416,6 +2581,8 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(WAITING_SCORE_BUCKET)
             .arg(self.deduplication_key_prefix())
             .arg(self.repeat_key_prefix())
+            .arg(deduplication_expires_at)
+            .arg(deduplication_ttl_millis)
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -2672,6 +2839,14 @@ fn job_deduplication_id(job: &Job) -> Option<&str> {
         .deduplication
         .as_ref()
         .map(|deduplication| deduplication.id.as_str())
+}
+
+fn job_deduplication_ttl_millis(job: &Job) -> Option<u64> {
+    job.options
+        .deduplication
+        .as_ref()
+        .and_then(|deduplication| deduplication.ttl)
+        .map(lock_duration_millis)
 }
 
 fn job_repeat_key(job: &Job) -> Option<&str> {

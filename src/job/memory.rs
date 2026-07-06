@@ -1,7 +1,8 @@
 use super::backend::JobQueueBackend;
 use super::types::{
-    Job, JobFlow, JobId, JobListOptions, JobListPage, JobLogEntry, JobOptions, JobPriority,
-    JobQueueSnapshot, JobQueueStats, JobSpec, JobState, JobWorkerId, QueueName,
+    deduplication_expiration, Job, JobFlow, JobId, JobListOptions, JobListPage, JobLogEntry,
+    JobOptions, JobPriority, JobQueueSnapshot, JobQueueStats, JobSpec, JobState, JobWorkerId,
+    QueueName,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -96,7 +97,7 @@ impl InMemoryJobQueue {
         if let Some(existing) = inner.jobs.get(&job.id) {
             return Ok(existing.clone());
         }
-        if let Some(existing) = find_active_deduplicated_job(&inner.jobs, &job) {
+        if let Some(existing) = find_active_deduplicated_job(&inner.jobs, &job, now) {
             return Ok(existing.clone());
         }
         if let Some(existing) = find_active_repeat_job(&inner.jobs, &job) {
@@ -141,8 +142,8 @@ impl InMemoryJobQueue {
                 added.push(existing.clone());
                 continue;
             }
-            if let Some(existing) = find_active_deduplicated_job(&inner.jobs, &job)
-                .or_else(|| find_active_deduplicated_job(&staged, &job))
+            if let Some(existing) = find_active_deduplicated_job(&inner.jobs, &job, now)
+                .or_else(|| find_active_deduplicated_job(&staged, &job, now))
             {
                 added.push(existing.clone());
                 continue;
@@ -216,8 +217,8 @@ impl InMemoryJobQueue {
         }
         let mut flow_deduplication_ids = HashSet::new();
         for job in std::iter::once(&parent_job).chain(child_jobs.iter()) {
-            if let Some(deduplication_id) = active_deduplication_id(job) {
-                if find_active_deduplication_id(&inner.jobs, deduplication_id).is_some()
+            if let Some(deduplication_id) = active_deduplication_id(job, now) {
+                if find_active_deduplication_id(&inner.jobs, deduplication_id, now).is_some()
                     || !flow_deduplication_ids.insert(deduplication_id.to_string())
                 {
                     return Err(LaneError::ConfigError(format!(
@@ -296,7 +297,7 @@ impl InMemoryJobQueue {
             .map(|value| &value.id)
         {
             if let Some(existing) =
-                find_active_deduplication_id_except(&inner.jobs, deduplication_id, job_id)
+                find_active_deduplication_id_except(&inner.jobs, deduplication_id, job_id, now)
             {
                 return Err(LaneError::JobStateConflict(format!(
                     "cannot retry job {job_id}; deduplication id `{deduplication_id}` is active on job {}",
@@ -319,6 +320,7 @@ impl InMemoryJobQueue {
             .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
         job.state = JobState::Waiting;
         job.scheduled_at = now;
+        job.deduplication_expires_at = deduplication_expiration(&job.options, now);
         job.processed_at = None;
         job.finished_at = None;
         job.worker_id = None;
@@ -889,8 +891,11 @@ fn state_rank(state: JobState) -> u8 {
     }
 }
 
-fn active_deduplication_id(job: &Job) -> Option<&str> {
+fn active_deduplication_id(job: &Job, now: DateTime<Utc>) -> Option<&str> {
     if job.state.is_terminal() {
+        return None;
+    }
+    if matches!(job.deduplication_expires_at, Some(expires_at) if expires_at <= now) {
         return None;
     }
 
@@ -903,26 +908,29 @@ fn active_deduplication_id(job: &Job) -> Option<&str> {
 fn find_active_deduplicated_job<'a>(
     jobs: &'a HashMap<JobId, Job>,
     candidate: &Job,
+    now: DateTime<Utc>,
 ) -> Option<&'a Job> {
-    let deduplication_id = active_deduplication_id(candidate)?;
-    find_active_deduplication_id(jobs, deduplication_id)
+    let deduplication_id = active_deduplication_id(candidate, now)?;
+    find_active_deduplication_id(jobs, deduplication_id, now)
 }
 
 fn find_active_deduplication_id<'a>(
     jobs: &'a HashMap<JobId, Job>,
     deduplication_id: &str,
+    now: DateTime<Utc>,
 ) -> Option<&'a Job> {
     jobs.values()
-        .find(|job| active_deduplication_id(job) == Some(deduplication_id))
+        .find(|job| active_deduplication_id(job, now) == Some(deduplication_id))
 }
 
 fn find_active_deduplication_id_except<'a>(
     jobs: &'a HashMap<JobId, Job>,
     deduplication_id: &str,
     excluded_job_id: &str,
+    now: DateTime<Utc>,
 ) -> Option<&'a Job> {
     jobs.values().find(|job| {
-        job.id != excluded_job_id && active_deduplication_id(job) == Some(deduplication_id)
+        job.id != excluded_job_id && active_deduplication_id(job, now) == Some(deduplication_id)
     })
 }
 

@@ -327,23 +327,40 @@ impl RepeatOptions {
 ///
 /// Jobs with the same deduplication id are coalesced while the first job is
 /// still in a non-terminal state. The deduplication id is released when that
-/// job completes, fails terminally, or is removed.
+/// job completes, fails terminally, is removed, or its optional TTL expires.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeduplicationOptions {
     /// Queue-local id used to coalesce duplicate submissions.
     pub id: String,
+    /// Optional owner-key TTL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<Duration>,
 }
 
 impl DeduplicationOptions {
     /// Create simple deduplication options.
     pub fn new(id: impl Into<String>) -> Self {
-        Self { id: id.into() }
+        Self {
+            id: id.into(),
+            ttl: None,
+        }
+    }
+
+    /// Set how long this job owns its deduplication id.
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
+        self
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
         if self.id.trim().is_empty() {
             return Err(LaneError::ConfigError(
                 "deduplication id must not be empty".to_string(),
+            ));
+        }
+        if matches!(self.ttl, Some(ttl) if ttl.is_zero()) {
+            return Err(LaneError::ConfigError(
+                "deduplication ttl must be greater than zero".to_string(),
             ));
         }
 
@@ -462,6 +479,12 @@ impl JobOptions {
         self
     }
 
+    /// Configure deduplication with explicit options such as TTL.
+    pub fn with_deduplication(mut self, deduplication: DeduplicationOptions) -> Self {
+        self.deduplication = Some(deduplication);
+        self
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         if matches!(self.job_id.as_deref(), Some(job_id) if job_id.trim().is_empty()) {
             return Err(LaneError::ConfigError(
@@ -511,6 +534,8 @@ pub struct Job {
     pub repeat_key: Option<String>,
     #[serde(default)]
     pub repeat_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deduplication_expires_at: Option<DateTime<Utc>>,
 }
 
 impl Job {
@@ -536,6 +561,7 @@ impl Job {
                 .clone()
                 .unwrap_or_else(|| format!("{queue}:{name}"))
         });
+        let deduplication_expires_at = deduplication_expiration(&options, now);
         let id = options
             .job_id
             .clone()
@@ -566,8 +592,20 @@ impl Job {
             child_ids: Vec::new(),
             repeat_key,
             repeat_count: 0,
+            deduplication_expires_at,
         }
     }
+}
+
+pub(crate) fn deduplication_expiration(
+    options: &JobOptions,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    options
+        .deduplication
+        .as_ref()
+        .and_then(|deduplication| deduplication.ttl)
+        .map(|ttl| add_duration(now, ttl))
 }
 
 pub(crate) fn add_duration(at: DateTime<Utc>, duration: Duration) -> DateTime<Utc> {

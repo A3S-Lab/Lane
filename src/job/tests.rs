@@ -181,6 +181,99 @@ async fn simple_deduplication_coalesces_non_terminal_jobs() {
 }
 
 #[tokio::test]
+async fn deduplication_ttl_allows_new_non_terminal_owner_after_expiration() {
+    let queue = InMemoryJobQueue::new("dedup-ttl");
+    let first = queue
+        .add_at(
+            "sync",
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("account:ttl").with_ttl(Duration::from_secs(1)),
+            ),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.deduplication_expires_at, Some(ts(2_000)));
+
+    let duplicate_before_ttl = queue
+        .add_at(
+            "sync-before-ttl",
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("account:ttl").with_ttl(Duration::from_secs(1)),
+            ),
+            ts(1_999),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate_before_ttl.id, first.id);
+
+    let after_ttl = queue
+        .add_at(
+            "sync-after-ttl",
+            serde_json::json!({ "version": 3 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("account:ttl").with_ttl(Duration::from_secs(1)),
+            ),
+            ts(2_000),
+        )
+        .await
+        .unwrap();
+    assert_ne!(after_ttl.id, first.id);
+    assert_eq!(after_ttl.name, "sync-after-ttl");
+    assert_eq!(after_ttl.deduplication_expires_at, Some(ts(3_000)));
+    assert_eq!(queue.stats().await.unwrap().waiting, 2);
+}
+
+#[tokio::test]
+async fn retry_resets_deduplication_ttl_owner_window() {
+    let queue = InMemoryJobQueue::new("dedup-retry-ttl");
+    let first = queue
+        .add_at(
+            "sync",
+            serde_json::json!({}),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("account:retry-ttl").with_ttl(Duration::from_secs(1)),
+            ),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(1_100))
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .fail_job(
+            &claimed.id,
+            lock_token(&claimed),
+            "boom".to_string(),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+
+    let retried = queue.retry_job(&first.id, ts(3_000)).await.unwrap();
+    assert_eq!(retried.state, JobState::Waiting);
+    assert_eq!(retried.deduplication_expires_at, Some(ts(4_000)));
+
+    let duplicate = queue
+        .add_at(
+            "sync-duplicate",
+            serde_json::json!({}),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("account:retry-ttl").with_ttl(Duration::from_secs(1)),
+            ),
+            ts(3_500),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate.id, first.id);
+}
+
+#[tokio::test]
 async fn retry_reclaims_simple_deduplication() {
     let queue = InMemoryJobQueue::new("dedup-retry");
     let now = ts(1_000);
