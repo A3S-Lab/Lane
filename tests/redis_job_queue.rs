@@ -4289,6 +4289,125 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         remove_release_flow.parent.id
     );
 
+    let remove_unprocessed_flow = producer
+        .add_flow_at(
+            JobSpec::new(
+                "remove-unprocessed-flow-parent",
+                serde_json::json!({ "kind": "aggregate" }),
+            )
+            .with_options(JobOptions::new().with_priority(1)),
+            vec![
+                JobSpec::new(
+                    "remove-unprocessed-flow-child-a",
+                    serde_json::json!({ "n": 1 }),
+                )
+                .with_options(JobOptions::new().with_priority(1)),
+                JobSpec::new(
+                    "remove-unprocessed-flow-child-b",
+                    serde_json::json!({ "n": 2 }),
+                )
+                .with_options(JobOptions::new().with_priority(2)),
+                JobSpec::new(
+                    "remove-unprocessed-flow-child-c",
+                    serde_json::json!({ "n": 3 }),
+                )
+                .with_options(JobOptions::new().with_priority(3)),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("remove-unprocessed flow should be added");
+    let remove_unprocessed_child_a = worker
+        .claim_next(
+            "worker-remove-unprocessed-child-a".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("remove-unprocessed child a claim should return")
+        .expect("remove-unprocessed child a should be claimable");
+    assert_eq!(
+        remove_unprocessed_child_a.id,
+        remove_unprocessed_flow.children[0].id
+    );
+    worker
+        .complete_job(
+            &remove_unprocessed_child_a.id,
+            lock_token(&remove_unprocessed_child_a),
+            serde_json::json!({ "ok": 1 }),
+            Utc::now(),
+        )
+        .await
+        .expect("remove-unprocessed child a should complete");
+    let remove_unprocessed_child_b = worker
+        .claim_next(
+            "worker-remove-unprocessed-child-b".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("remove-unprocessed child b claim should return")
+        .expect("remove-unprocessed child b should be claimable");
+    assert_eq!(
+        remove_unprocessed_child_b.id,
+        remove_unprocessed_flow.children[1].id
+    );
+    let removed_unprocessed = producer
+        .remove_unprocessed_children(&remove_unprocessed_flow.parent.id, Utc::now())
+        .await
+        .expect("remove-unprocessed children should run")
+        .expect("remove-unprocessed parent should exist");
+    assert_eq!(removed_unprocessed.len(), 1);
+    assert_eq!(
+        removed_unprocessed[0].id,
+        remove_unprocessed_flow.children[2].id
+    );
+    let remove_unprocessed_dependency_key = format!(
+        "{namespace}:jobs:dependencies:{}",
+        remove_unprocessed_flow.parent.id
+    );
+    let remove_unprocessed_dependencies: usize = flow_index_conn
+        .scard(&remove_unprocessed_dependency_key)
+        .await?;
+    assert_eq!(remove_unprocessed_dependencies, 1);
+    let removed_unprocessed_child_hash: Option<String> = flow_index_conn
+        .hget(
+            format!("{namespace}:jobs:jobs"),
+            &remove_unprocessed_flow.children[2].id,
+        )
+        .await?;
+    assert!(removed_unprocessed_child_hash.is_none());
+    let remove_unprocessed_parent = producer
+        .get_job(&remove_unprocessed_flow.parent.id)
+        .await
+        .expect("remove-unprocessed parent should load")
+        .expect("remove-unprocessed parent should exist");
+    assert_eq!(remove_unprocessed_parent.state, JobState::WaitingChildren);
+    worker
+        .complete_job(
+            &remove_unprocessed_child_b.id,
+            lock_token(&remove_unprocessed_child_b),
+            serde_json::json!({ "ok": 2 }),
+            Utc::now(),
+        )
+        .await
+        .expect("remove-unprocessed child b should complete");
+    let remove_unprocessed_released_parent = producer
+        .get_job(&remove_unprocessed_flow.parent.id)
+        .await
+        .expect("remove-unprocessed released parent should load")
+        .expect("remove-unprocessed released parent should exist");
+    assert_eq!(remove_unprocessed_released_parent.state, JobState::Waiting);
+    let remove_unprocessed_counts = producer
+        .get_flow_dependency_counts(&remove_unprocessed_flow.parent.id)
+        .await
+        .expect("remove-unprocessed counts should load")
+        .expect("remove-unprocessed counts should exist");
+    assert_eq!(remove_unprocessed_counts.processed, 2);
+    assert_eq!(remove_unprocessed_counts.unprocessed, 0);
+    assert_eq!(remove_unprocessed_counts.failed, 0);
+    assert_eq!(remove_unprocessed_counts.missing, 1);
+
     let clean_release_flow = producer
         .add_flow_at(
             JobSpec::new(

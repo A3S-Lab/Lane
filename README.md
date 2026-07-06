@@ -370,7 +370,7 @@ A3S stack and language SDKs.
 | --- | --- | --- |
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
 | Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, debounce TTL extension, delayed-owner replace, and keep-last-if-active requeue, repeat-key ownership, explicit job states, priority ordering, delayed jobs, token-owned worker leases, active-to-wait/delayed movement, completion/failure snapshots, retry backoff, Redis-shared rate-limit and active-concurrency controls, stalled-job recovery, pause/resume. |
-| Job management API | In progress | Add/get/get-state/get-job-counts/get-job-count/count-pending/remove/remove-repeat/remove-deduplication-key/get-deduplication-job-id/list-repeats/get-flow-dependencies/get-flow-dependency-counts/promote/reschedule/delay-active/release-active/retry/update-priority/update-data/pause/resume/is-paused/drain/clean/obliterate APIs, pagination, waiting priority counts, add-log/get-logs, progress updates, lease renewal. |
+| Job management API | In progress | Add/get/get-state/get-job-counts/get-job-count/count-pending/remove/remove-repeat/remove-deduplication-key/get-deduplication-job-id/list-repeats/get-flow-dependencies/get-flow-dependency-counts/remove-unprocessed-children/promote/reschedule/delay-active/release-active/retry/update-priority/update-data/pause/resume/is-paused/drain/clean/obliterate APIs, pagination, waiting priority counts, add-log/get-logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, and stalled recovery loops. |
 | Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership/listing/removal, flow submission, flow dependency inspection, delayed promotion and rescheduling, active-to-wait/delayed movement, single-job promote, state-index queries, job count snapshots, manual retry, priority update, progress update, log append, list/stat snapshots, drain, clean, obliterate, claim, Redis-shared rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, dependency inspection, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
@@ -460,7 +460,8 @@ deduplication id, `list_repeats()` lists current non-terminal repeat-series
 owners,
 `get_flow_dependencies()` returns a flow parent's child snapshots plus pending
 and missing child ids, `get_flow_dependency_counts()` returns processed,
-unprocessed, failed, and missing child counts,
+unprocessed, failed, and missing child counts, `remove_unprocessed_children()`
+removes children that are still unprocessed and not active,
 `drain_jobs(false)` removes waiting jobs, `drain_jobs(true)` also removes
 ordinary delayed jobs while preserving current delayed repeat owners,
 `clean_jobs()` removes old records by state, `obliterate(false)` pauses the
@@ -518,6 +519,12 @@ let counts = queue
     .await?
     .unwrap();
 assert_eq!(counts.unprocessed, 2);
+
+let removed = queue
+    .remove_unprocessed_children(&flow.parent.id, chrono::Utc::now())
+    .await?
+    .unwrap();
+assert_eq!(removed.len(), 2);
 # Ok(())
 # }
 ```
@@ -935,6 +942,13 @@ in the queue jobs hash and keeps the still-blocking children in
 one turn and returns processed, unprocessed, failed, and missing totals without
 returning every child snapshot to the client. Lane does not currently expose
 BullMQ's ignored-child bucket.
+`remove_unprocessed_children()` follows BullMQ's `removeUnprocessedChildren`
+script shape at the dependency-set level: it removes children that are still in
+the parent's pending dependency set, skips completed, failed, active, or locked
+children, deletes the removed child records and per-child metadata in the same
+Redis turn, then checks whether the parent can leave `waiting_children`. Lane
+returns the removed child snapshots for auditability while preserving the parent
+`child_ids`, so later dependency inspection reports removed children as missing.
 
 Flow fan-in is also protected in Redis transitions. Redis flow submission writes
 a pending dependency set for the parent, and child completion, removal, and

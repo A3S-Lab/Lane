@@ -31,6 +31,12 @@ pub trait JobQueueBackend: Send + Sync {
         parent_id: &str,
     ) -> Result<Option<JobFlowDependencyCounts>>;
 
+    async fn remove_unprocessed_children(
+        &self,
+        parent_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Vec<Job>>>;
+
     async fn claim_next(
         &self,
         worker_id: JobWorkerId,

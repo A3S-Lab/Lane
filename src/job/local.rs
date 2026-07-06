@@ -133,6 +133,20 @@ impl LocalJobQueue {
         self.inner.get_flow_dependency_counts(parent_id).await
     }
 
+    /// Remove children that are still unprocessed and not active.
+    pub async fn remove_unprocessed_children(
+        &self,
+        parent_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Vec<Job>>> {
+        let removed = self
+            .inner
+            .remove_unprocessed_children(parent_id, now)
+            .await?;
+        self.persist().await?;
+        Ok(removed)
+    }
+
     /// Return the current state for a job id.
     pub async fn get_state(&self, job_id: &str) -> Result<Option<JobState>> {
         self.inner.get_state(job_id).await
@@ -216,6 +230,14 @@ impl JobQueueBackend for LocalJobQueue {
         parent_id: &str,
     ) -> Result<Option<JobFlowDependencyCounts>> {
         LocalJobQueue::get_flow_dependency_counts(self, parent_id).await
+    }
+
+    async fn remove_unprocessed_children(
+        &self,
+        parent_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Vec<Job>>> {
+        LocalJobQueue::remove_unprocessed_children(self, parent_id, now).await
     }
 
     async fn claim_next(

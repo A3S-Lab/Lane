@@ -389,6 +389,32 @@ impl InMemoryJobQueue {
         Ok(Some(flow_dependency_counts(parent, &inner.jobs)))
     }
 
+    /// Remove children that are still unprocessed and not active.
+    pub async fn remove_unprocessed_children(
+        &self,
+        parent_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Vec<Job>>> {
+        let mut inner = self.inner.lock().await;
+        let Some(parent) = inner.jobs.get(parent_id) else {
+            return Ok(None);
+        };
+
+        let mut ids = Vec::new();
+        let mut seen = HashSet::new();
+        collect_removable_unprocessed_children(&inner.jobs, &parent.child_ids, &mut ids, &mut seen);
+
+        let mut removed = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(job) = Self::remove_job_record_locked(&mut inner, &id) {
+                removed.push(job);
+            }
+        }
+        Self::release_parent_if_ready_locked(&mut inner, parent_id, now);
+
+        Ok(Some(removed))
+    }
+
     /// Return the current state for a job id.
     pub async fn get_state(&self, job_id: &str) -> Result<Option<JobState>> {
         let inner = self.inner.lock().await;
@@ -1081,6 +1107,14 @@ impl JobQueueBackend for InMemoryJobQueue {
         InMemoryJobQueue::get_flow_dependency_counts(self, parent_id).await
     }
 
+    async fn remove_unprocessed_children(
+        &self,
+        parent_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Vec<Job>>> {
+        InMemoryJobQueue::remove_unprocessed_children(self, parent_id, now).await
+    }
+
     async fn claim_next(
         &self,
         worker_id: JobWorkerId,
@@ -1588,6 +1622,27 @@ fn flow_dependency_counts(parent: &Job, jobs: &HashMap<JobId, Job>) -> JobFlowDe
     }
 
     counts
+}
+
+fn collect_removable_unprocessed_children(
+    jobs: &HashMap<JobId, Job>,
+    child_ids: &[JobId],
+    out: &mut Vec<JobId>,
+    seen: &mut HashSet<JobId>,
+) {
+    for child_id in child_ids {
+        if !seen.insert(child_id.clone()) {
+            continue;
+        }
+        let Some(child) = jobs.get(child_id) else {
+            continue;
+        };
+        if child.state == JobState::Active || child.state.is_terminal() {
+            continue;
+        }
+        collect_removable_unprocessed_children(jobs, &child.child_ids, out, seen);
+        out.push(child.id.clone());
+    }
 }
 
 fn active_deduplication_id(job: &Job, now: DateTime<Utc>) -> Option<&str> {

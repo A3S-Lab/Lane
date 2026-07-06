@@ -3267,6 +3267,234 @@ end
 return {'ok', tostring(processed), tostring(unprocessed), tostring(failed), tostring(missing)}
 "#;
 
+const REMOVE_UNPROCESSED_CHILDREN_SCRIPT: &str = r#"
+local function days_from_civil(year, month, day)
+  year = year - (month <= 2 and 1 or 0)
+  local era = math.floor(year / 400)
+  local yoe = year - era * 400
+  local shifted_month = month
+  if month > 2 then
+    shifted_month = month - 3
+  else
+    shifted_month = month + 9
+  end
+  local doy = math.floor((153 * shifted_month + 2) / 5) + day - 1
+  local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+  return era * 146097 + doe - 719468
+end
+
+local function iso_to_millis(value)
+  local year = tonumber(string.sub(value, 1, 4))
+  local month = tonumber(string.sub(value, 6, 7))
+  local day = tonumber(string.sub(value, 9, 10))
+  local hour = tonumber(string.sub(value, 12, 13))
+  local minute = tonumber(string.sub(value, 15, 16))
+  local second = tonumber(string.sub(value, 18, 19))
+  if not year or not month or not day or not hour or not minute or not second then
+    return 0
+  end
+
+  local millis = 0
+  if string.sub(value, 20, 20) == "." then
+    local digits = string.match(string.sub(value, 21), "^(%d+)")
+    if digits then
+      digits = string.sub(digits .. "000", 1, 3)
+      millis = tonumber(digits) or 0
+    end
+  end
+
+  local days = days_from_civil(year, month, day)
+  return (((days * 24 + hour) * 60 + minute) * 60 + second) * 1000 + millis
+end
+
+local function deduplication_id(job)
+  if not job["options"] or job["options"] == cjson.null then
+    return nil
+  end
+  local deduplication = job["options"]["deduplication"]
+  if not deduplication or deduplication == cjson.null then
+    return nil
+  end
+  local id = deduplication["id"]
+  if not id or id == cjson.null or id == '' then
+    return nil
+  end
+  return id
+end
+
+local function release_deduplication_key(job, job_id)
+  local id = deduplication_id(job)
+  if id then
+    local key = ARGV[7] .. id
+    if redis.call('GET', key) == job_id then
+      redis.call('DEL', key)
+    end
+  end
+end
+
+local function repeat_key(job)
+  local key = job["repeat_key"]
+  if not key or key == cjson.null or key == '' then
+    return nil
+  end
+  return key
+end
+
+local function release_repeat_key(job, job_id)
+  local key = repeat_key(job)
+  if key then
+    local owner_key = ARGV[8] .. key
+    if redis.call('GET', owner_key) == job_id then
+      redis.call('DEL', owner_key)
+    end
+  end
+end
+
+local function remove_state_indexes(job_id)
+  for index = 2, 7 do
+    redis.call('ZREM', KEYS[index], job_id)
+  end
+end
+
+local function remove_job_record(job_id, job)
+  release_deduplication_key(job, job_id)
+  release_repeat_key(job, job_id)
+  remove_state_indexes(job_id)
+  redis.call('HDEL', KEYS[1], job_id)
+  redis.call('DEL', ARGV[5] .. job_id)
+  redis.call('DEL', ARGV[6] .. job_id)
+  redis.call('DEL', ARGV[9] .. job_id)
+end
+
+local function dependency_members(dependency_key)
+  local members = {}
+  if redis.call('EXISTS', dependency_key) == 1 then
+    for _, child_id in ipairs(redis.call('SMEMBERS', dependency_key)) do
+      members[child_id] = true
+    end
+    return members
+  end
+  return nil
+end
+
+local removed = {'ok'}
+
+local remove_unprocessed_children
+remove_unprocessed_children = function(parent, dependency_key)
+  local pending = dependency_members(dependency_key)
+  for _, child_id in ipairs(parent["child_ids"] or {}) do
+    if not pending or pending[child_id] then
+      local child_raw = redis.call('HGET', KEYS[1], child_id)
+      if not child_raw then
+        redis.call('SREM', dependency_key, child_id)
+      else
+        local child = cjson.decode(child_raw)
+        local state = child["state"]
+        local locked = redis.call('GET', ARGV[5] .. child_id)
+        if not locked and state ~= "active" and state ~= "completed" and state ~= "failed" then
+          remove_unprocessed_children(child, ARGV[6] .. child_id)
+          redis.call('SREM', dependency_key, child_id)
+          remove_job_record(child_id, child)
+          removed[#removed + 1] = child_raw
+        end
+      end
+    end
+  end
+end
+
+local function release_parent_if_ready(parent_id, parent)
+  if parent["state"] ~= "waiting_children" then
+    return
+  end
+
+  local all_done = true
+  local failed_child_id = nil
+  local failed_reason = nil
+
+  if redis.call('SCARD', KEYS[9]) > 0 then
+    all_done = false
+  else
+    for _, child_id in ipairs(parent["child_ids"] or {}) do
+      local child_raw = redis.call('HGET', KEYS[1], child_id)
+      if child_raw then
+        local child = cjson.decode(child_raw)
+        if child["state"] == "failed" then
+          failed_child_id = child_id
+          failed_reason = child["failed_reason"]
+          if not failed_reason or failed_reason == cjson.null then
+            failed_reason = "unknown error"
+          end
+          break
+        elseif child["state"] ~= "completed" then
+          all_done = false
+          break
+        end
+      end
+    end
+  end
+
+  if failed_child_id then
+    redis.call('DEL', KEYS[9])
+    redis.call('ZREM', KEYS[5], parent_id)
+    parent["state"] = "failed"
+    parent["finished_at"] = ARGV[2]
+    parent["worker_id"] = cjson.null
+    parent["lock_token"] = cjson.null
+    parent["lease_expires_at"] = cjson.null
+    parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
+    release_deduplication_key(parent, parent_id)
+    release_repeat_key(parent, parent_id)
+    if parent["options"] and parent["options"]["remove_on_fail"] == true then
+      remove_state_indexes(parent_id)
+      redis.call('HDEL', KEYS[1], parent_id)
+      redis.call('DEL', ARGV[6] .. parent_id)
+      redis.call('DEL', ARGV[9] .. parent_id)
+    else
+      redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+      redis.call('ZADD', KEYS[7], ARGV[3], parent_id)
+    end
+  elseif all_done then
+    redis.call('DEL', KEYS[9])
+    redis.call('ZREM', KEYS[5], parent_id)
+    parent["processed_at"] = cjson.null
+    parent["finished_at"] = cjson.null
+    parent["worker_id"] = cjson.null
+    parent["lock_token"] = cjson.null
+    parent["lease_expires_at"] = cjson.null
+    parent["failed_reason"] = cjson.null
+
+    local parent_scheduled_millis = iso_to_millis(parent["scheduled_at"])
+    if parent_scheduled_millis <= tonumber(ARGV[3]) then
+      parent["state"] = "waiting"
+      local priority = tonumber(parent["priority"] or '1000') or 1000
+      local sequence = redis.call('INCR', KEYS[8])
+      local waiting_score = (priority * tonumber(ARGV[4])) + sequence
+      redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+      redis.call('ZADD', KEYS[2], waiting_score, parent_id)
+    else
+      parent["state"] = "delayed"
+      redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+      redis.call('ZADD', KEYS[3], parent_scheduled_millis, parent_id)
+    end
+  end
+end
+
+local parent_raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not parent_raw then
+  redis.call('DEL', KEYS[9])
+  return {'missing'}
+end
+
+local parent = cjson.decode(parent_raw)
+remove_unprocessed_children(parent, KEYS[9])
+local updated_parent_raw = redis.call('HGET', KEYS[1], ARGV[1])
+if updated_parent_raw then
+  release_parent_if_ready(ARGV[1], cjson.decode(updated_parent_raw))
+end
+
+return removed
+"#;
+
 const FLOW_DEPENDENCIES_SCRIPT: &str = r#"
 local parent_raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not parent_raw then
@@ -3678,6 +3906,40 @@ impl RedisJobQueue {
         decode_flow_dependency_counts_result(&result, parent_id)
     }
 
+    /// Remove children that are still unprocessed and not active.
+    pub async fn remove_unprocessed_children(
+        &self,
+        parent_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Vec<Job>>> {
+        let mut conn = self.connection().await?;
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(REMOVE_UNPROCESSED_CHILDREN_SCRIPT)
+            .arg(9)
+            .arg(self.jobs_key())
+            .arg(self.state_key(JobState::Waiting))
+            .arg(self.state_key(JobState::Delayed))
+            .arg(self.state_key(JobState::Active))
+            .arg(self.state_key(JobState::WaitingChildren))
+            .arg(self.state_key(JobState::Completed))
+            .arg(self.state_key(JobState::Failed))
+            .arg(self.sequence_key())
+            .arg(self.dependencies_key(parent_id))
+            .arg(parent_id)
+            .arg(now.to_rfc3339())
+            .arg(millis(now))
+            .arg(WAITING_SCORE_BUCKET)
+            .arg(self.lock_key_prefix())
+            .arg(self.dependencies_key_prefix())
+            .arg(self.deduplication_key_prefix())
+            .arg(self.repeat_key_prefix())
+            .arg(self.logs_key_prefix())
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_remove_unprocessed_children_result(&result, parent_id)
+    }
+
     async fn connection(&self) -> Result<ConnectionManager> {
         self.client
             .get_connection_manager()
@@ -3924,6 +4186,14 @@ impl JobQueueBackend for RedisJobQueue {
         parent_id: &str,
     ) -> Result<Option<JobFlowDependencyCounts>> {
         RedisJobQueue::get_flow_dependency_counts(self, parent_id).await
+    }
+
+    async fn remove_unprocessed_children(
+        &self,
+        parent_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Vec<Job>>> {
+        RedisJobQueue::remove_unprocessed_children(self, parent_id, now).await
     }
 
     async fn claim_next(
@@ -4903,6 +5173,27 @@ fn decode_usize_field(raw: &str, field: &str, owner_id: &str) -> Result<usize> {
             "failed to decode Redis {field} count for {owner_id}: {error}"
         ))
     })
+}
+
+fn decode_remove_unprocessed_children_result(
+    result: &[String],
+    parent_id: &str,
+) -> Result<Option<Vec<Job>>> {
+    match result.first().map(String::as_str) {
+        Some("missing") => Ok(None),
+        Some("ok") => result
+            .iter()
+            .skip(1)
+            .map(|raw| decode_job(raw))
+            .collect::<Result<Vec<_>>>()
+            .map(Some),
+        Some(other) => Err(LaneError::Other(format!(
+            "unexpected Redis remove unprocessed children script status `{other}` for {parent_id}"
+        ))),
+        None => Err(LaneError::Other(format!(
+            "Redis remove unprocessed children script returned no status for {parent_id}"
+        ))),
+    }
 }
 
 fn decode_flow_dependencies_result(
