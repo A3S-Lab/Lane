@@ -651,16 +651,18 @@ mechanism in one script call while preserving the caller's input order.
 
 Redis flow submission is all-or-nothing: the flow add script first checks every
 parent and child job id, then writes the parent, children, and all state indexes
-in one Redis turn. If any job id already exists, no partial parent or child
-records are created.
+plus the parent's pending dependency set in one Redis turn. If any job id
+already exists, no partial parent, child, index, or dependency records are
+created.
 
-Flow fan-in is also protected in Redis transitions. When a child job completes,
-is removed, is cleaned, or reaches terminal failure, the relevant Lua script
-updates the parent in the same Redis turn when the parent can be released to
-`waiting`, parked in `delayed` until its own schedule is due, or failed because a
-remaining child failed. This follows BullMQ's dependency-removal mechanism:
-cleanup that removes a child also updates the parent dependency state instead of
-relying on a later client-side cleanup pass.
+Flow fan-in is also protected in Redis transitions. Redis flow submission writes
+a pending dependency set for the parent, and child completion, removal, and
+cleanup scripts remove the child id from that set before checking whether the
+parent can be released to `waiting`, parked in `delayed` until its own schedule
+is due, or failed because a child reached terminal failure. This follows
+BullMQ's dependency-removal mechanism: cleanup that removes a child also updates
+the parent dependency state instead of relying on a later client-side cleanup
+pass.
 
 Repeat successors are created during the Redis completion script too. The
 worker computes the next occurrence from `RepeatOptions`, then the Lua script
@@ -695,10 +697,10 @@ the stalled count, and either requeues the job or fails it in the same Redis
 turn.
 
 `remove_job()` uses a Redis script to reject active jobs and remove the job
-hash, lock key, and all state indexes in one Redis turn. If the removed job is a
-flow child, the same script rechecks the parent's children and atomically moves
-the parent from `waiting_children` to `waiting`, `delayed`, or `failed` as
-appropriate.
+hash, lock key, all state indexes, and any child dependency set in one Redis
+turn. If the removed job is a flow child, the same script updates the parent's
+dependency set and atomically moves the parent from `waiting_children` to
+`waiting`, `delayed`, or `failed` as appropriate.
 
 Run the Redis integration test against any reachable Redis server:
 

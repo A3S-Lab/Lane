@@ -91,6 +91,8 @@ return added
 const ADD_FLOW_SCRIPT: &str = r#"
 local count = tonumber(ARGV[1])
 local offset = 2
+local waiting_score_bucket = tonumber(ARGV[2 + count * 5])
+local dependency_prefix = ARGV[3 + count * 5]
 
 for index = 1, count do
   local id = ARGV[offset]
@@ -111,7 +113,7 @@ for index = 1, count do
   redis.call('HSET', KEYS[1], id, raw)
   if state == 'waiting' then
     local sequence = redis.call('INCR', KEYS[5])
-    local waiting_score = (priority * tonumber(ARGV[2 + count * 5])) + sequence
+    local waiting_score = (priority * waiting_score_bucket) + sequence
     redis.call('ZADD', KEYS[2], waiting_score, id)
   elseif state == 'delayed' then
     redis.call('ZADD', KEYS[3], scheduled_score, id)
@@ -120,6 +122,18 @@ for index = 1, count do
   end
 
   offset = offset + 5
+end
+
+if count > 1 and ARGV[4] == 'waiting_children' then
+  local parent_id = ARGV[2]
+  local dependency_key = dependency_prefix .. parent_id
+  redis.call('DEL', dependency_key)
+
+  local child_offset = 7
+  for index = 2, count do
+    redis.call('SADD', dependency_key, ARGV[child_offset])
+    child_offset = child_offset + 5
+  end
 end
 
 return {'ok'}
@@ -286,27 +300,38 @@ if parent_id and parent_id ~= cjson.null then
       local all_done = true
       local failed_child_id = nil
       local failed_reason = nil
-      for _, child_id in ipairs(parent["child_ids"] or {}) do
-        local child_raw = nil
-        if child_id == ARGV[1] then
-          child_raw = updated
-        else
-          child_raw = redis.call('HGET', KEYS[1], child_id)
+      local dependency_key = ARGV[13] .. parent_id
+      local had_dependency_set = redis.call('EXISTS', dependency_key) == 1
+
+      if had_dependency_set then
+        redis.call('SREM', dependency_key, ARGV[1])
+        if redis.call('SCARD', dependency_key) > 0 then
+          all_done = false
         end
-        if child_raw then
-          local child = cjson.decode(child_raw)
-          if child["state"] == "failed" then
-            failed_child_id = child_id
-            failed_reason = child["failed_reason"] or "unknown error"
-            break
-          elseif child["state"] ~= "completed" then
-            all_done = false
-            break
+      else
+        for _, child_id in ipairs(parent["child_ids"] or {}) do
+          local child_raw = nil
+          if child_id == ARGV[1] then
+            child_raw = updated
+          else
+            child_raw = redis.call('HGET', KEYS[1], child_id)
+          end
+          if child_raw then
+            local child = cjson.decode(child_raw)
+            if child["state"] == "failed" then
+              failed_child_id = child_id
+              failed_reason = child["failed_reason"] or "unknown error"
+              break
+            elseif child["state"] ~= "completed" then
+              all_done = false
+              break
+            end
           end
         end
       end
 
       if failed_child_id then
+        redis.call('DEL', dependency_key)
         redis.call('ZREM', KEYS[6], parent_id)
         parent["state"] = "failed"
         parent["finished_at"] = ARGV[3]
@@ -321,6 +346,7 @@ if parent_id and parent_id ~= cjson.null then
           redis.call('ZADD', KEYS[8], ARGV[5], parent_id)
         end
       elseif all_done then
+        redis.call('DEL', dependency_key)
         redis.call('ZREM', KEYS[6], parent_id)
         parent["processed_at"] = cjson.null
         parent["finished_at"] = cjson.null
@@ -420,6 +446,7 @@ if parent_id and parent_id ~= cjson.null then
   if parent_raw then
     local parent = cjson.decode(parent_raw)
     if parent["state"] == "waiting_children" then
+      redis.call('DEL', ARGV[10] .. parent_id)
       redis.call('ZREM', KEYS[6], parent_id)
       parent["state"] = "failed"
       parent["finished_at"] = ARGV[3]
@@ -495,6 +522,7 @@ for _, id in ipairs(ids) do
         if job["stalled_count"] > max_stalled then
           job["state"] = "failed"
           job["finished_at"] = ARGV[2]
+          redis.call('DEL', ARGV[6] .. id)
 
           if job["options"] and job["options"]["remove_on_fail"] == true then
             redis.call('HDEL', KEYS[1], id)
@@ -509,6 +537,7 @@ for _, id in ipairs(ids) do
             if parent_raw then
               local parent = cjson.decode(parent_raw)
               if parent["state"] == "waiting_children" then
+                redis.call('DEL', ARGV[6] .. parent_id)
                 redis.call('ZREM', KEYS[6], parent_id)
                 parent["state"] = "failed"
                 parent["finished_at"] = ARGV[2]
@@ -712,6 +741,7 @@ for index = 3, 8 do
   redis.call('ZREM', KEYS[index], ARGV[1])
 end
 redis.call('HDEL', KEYS[1], ARGV[1])
+redis.call('DEL', ARGV[5] .. ARGV[1])
 
 local parent_id = job["parent_id"]
 if parent_id and parent_id ~= cjson.null then
@@ -722,27 +752,37 @@ if parent_id and parent_id ~= cjson.null then
       local all_done = true
       local failed_child_id = nil
       local failed_reason = nil
+      local dependency_key = ARGV[5] .. parent_id
+      local had_dependency_set = redis.call('EXISTS', dependency_key) == 1
 
-      for _, child_id in ipairs(parent["child_ids"] or {}) do
-        local child_raw = nil
-        if child_id ~= ARGV[1] then
-          child_raw = redis.call('HGET', KEYS[1], child_id)
+      if had_dependency_set then
+        redis.call('SREM', dependency_key, ARGV[1])
+        if redis.call('SCARD', dependency_key) > 0 then
+          all_done = false
         end
+      else
+        for _, child_id in ipairs(parent["child_ids"] or {}) do
+          local child_raw = nil
+          if child_id ~= ARGV[1] then
+            child_raw = redis.call('HGET', KEYS[1], child_id)
+          end
 
-        if child_raw then
-          local child = cjson.decode(child_raw)
-          if child["state"] == "failed" then
-            failed_child_id = child_id
-            failed_reason = child["failed_reason"] or "unknown error"
-            break
-          elseif child["state"] ~= "completed" then
-            all_done = false
-            break
+          if child_raw then
+            local child = cjson.decode(child_raw)
+            if child["state"] == "failed" then
+              failed_child_id = child_id
+              failed_reason = child["failed_reason"] or "unknown error"
+              break
+            elseif child["state"] ~= "completed" then
+              all_done = false
+              break
+            end
           end
         end
       end
 
       if failed_child_id then
+        redis.call('DEL', dependency_key)
         redis.call('ZREM', KEYS[6], parent_id)
         parent["state"] = "failed"
         parent["finished_at"] = ARGV[2]
@@ -757,6 +797,7 @@ if parent_id and parent_id ~= cjson.null then
           redis.call('ZADD', KEYS[8], ARGV[3], parent_id)
         end
       elseif all_done then
+        redis.call('DEL', dependency_key)
         redis.call('ZREM', KEYS[6], parent_id)
         parent["processed_at"] = cjson.null
         parent["finished_at"] = cjson.null
@@ -847,30 +888,40 @@ local function release_parent_after_removed_child(job, removed_id)
   local all_done = true
   local failed_child_id = nil
   local failed_reason = nil
+  local dependency_key = ARGV[8] .. parent_id
+  local had_dependency_set = redis.call('EXISTS', dependency_key) == 1
 
-  for _, child_id in ipairs(parent["child_ids"] or {}) do
-    local child_raw = nil
-    if child_id ~= removed_id then
-      child_raw = redis.call('HGET', KEYS[1], child_id)
+  if had_dependency_set then
+    redis.call('SREM', dependency_key, removed_id)
+    if redis.call('SCARD', dependency_key) > 0 then
+      all_done = false
     end
+  else
+    for _, child_id in ipairs(parent["child_ids"] or {}) do
+      local child_raw = nil
+      if child_id ~= removed_id then
+        child_raw = redis.call('HGET', KEYS[1], child_id)
+      end
 
-    if child_raw then
-      local child = cjson.decode(child_raw)
-      if child["state"] == "failed" then
-        failed_child_id = child_id
-        failed_reason = child["failed_reason"]
-        if not failed_reason or failed_reason == cjson.null then
-          failed_reason = "unknown error"
+      if child_raw then
+        local child = cjson.decode(child_raw)
+        if child["state"] == "failed" then
+          failed_child_id = child_id
+          failed_reason = child["failed_reason"]
+          if not failed_reason or failed_reason == cjson.null then
+            failed_reason = "unknown error"
+          end
+          break
+        elseif child["state"] ~= "completed" then
+          all_done = false
+          break
         end
-        break
-      elseif child["state"] ~= "completed" then
-        all_done = false
-        break
       end
     end
   end
 
   if failed_child_id then
+    redis.call('DEL', dependency_key)
     redis.call('ZREM', KEYS[5], parent_id)
     parent["state"] = "failed"
     parent["finished_at"] = ARGV[5]
@@ -885,6 +936,7 @@ local function release_parent_after_removed_child(job, removed_id)
       redis.call('ZADD', KEYS[7], ARGV[6], parent_id)
     end
   elseif all_done then
+    redis.call('DEL', dependency_key)
     redis.call('ZREM', KEYS[5], parent_id)
     parent["processed_at"] = cjson.null
     parent["finished_at"] = cjson.null
@@ -977,6 +1029,7 @@ for index = 1, count do
   for key_index = 2, 7 do
     redis.call('ZREM', KEYS[key_index], candidate.id)
   end
+  redis.call('DEL', ARGV[8] .. candidate.id)
   redis.call('HDEL', KEYS[1], candidate.id)
   release_parent_after_removed_child(candidate.job, candidate.id)
   removed[index] = candidate.raw
@@ -1274,6 +1327,10 @@ impl RedisJobQueue {
         format!("{}:{}:locks:", self.namespace, self.queue)
     }
 
+    fn dependencies_key_prefix(&self) -> String {
+        format!("{}:{}:dependencies:", self.namespace, self.queue)
+    }
+
     fn state_key(&self, state: JobState) -> String {
         self.key(match state {
             JobState::Waiting => "waiting",
@@ -1333,7 +1390,9 @@ impl RedisJobQueue {
                 .arg(millis(job.scheduled_at))
                 .arg(job.priority);
         }
-        command.arg(WAITING_SCORE_BUCKET);
+        command
+            .arg(WAITING_SCORE_BUCKET)
+            .arg(self.dependencies_key_prefix());
 
         let result: Vec<String> = command.query_async(conn).await.map_err(redis_error)?;
         decode_add_flow_result(&result)
@@ -1485,6 +1544,7 @@ impl JobQueueBackend for RedisJobQueue {
                     .map(|job| job.priority)
                     .unwrap_or_default(),
             )
+            .arg(self.dependencies_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -1528,6 +1588,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(millis(scheduled_at))
             .arg(millis(now))
             .arg(if job.options.remove_on_fail { "1" } else { "0" })
+            .arg(self.dependencies_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -1634,6 +1695,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(now.to_rfc3339())
             .arg(millis(now))
             .arg(WAITING_SCORE_BUCKET)
+            .arg(self.dependencies_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -1671,6 +1733,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(now.to_rfc3339())
             .arg(millis(now))
             .arg(WAITING_SCORE_BUCKET)
+            .arg(self.dependencies_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -1817,6 +1880,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.lock_key_prefix())
             .arg(WAITING_SCORE_BUCKET)
             .arg(1_000_u16)
+            .arg(self.dependencies_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)

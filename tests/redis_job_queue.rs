@@ -1149,6 +1149,17 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect("flow should be added");
     assert_eq!(flow.parent.state, JobState::WaitingChildren);
+    let flow_dependencies_key = format!("{namespace}:jobs:dependencies:{}", flow.parent.id);
+    let initial_flow_dependencies: usize = flow_index_conn.scard(&flow_dependencies_key).await?;
+    assert_eq!(initial_flow_dependencies, 2);
+    let child_a_is_dependency: bool = flow_index_conn
+        .sismember(&flow_dependencies_key, &flow.children[0].id)
+        .await?;
+    let child_b_is_dependency: bool = flow_index_conn
+        .sismember(&flow_dependencies_key, &flow.children[1].id)
+        .await?;
+    assert!(child_a_is_dependency);
+    assert!(child_b_is_dependency);
 
     let child_a = worker
         .claim_next(
@@ -1169,6 +1180,16 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("first child should complete");
+    let dependencies_after_child_a: usize = flow_index_conn.scard(&flow_dependencies_key).await?;
+    assert_eq!(dependencies_after_child_a, 1);
+    let child_a_is_dependency: bool = flow_index_conn
+        .sismember(&flow_dependencies_key, &flow.children[0].id)
+        .await?;
+    let child_b_is_dependency: bool = flow_index_conn
+        .sismember(&flow_dependencies_key, &flow.children[1].id)
+        .await?;
+    assert!(!child_a_is_dependency);
+    assert!(child_b_is_dependency);
     assert_eq!(
         producer
             .get_job(&flow.parent.id)
@@ -1216,6 +1237,8 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await?;
     assert!(released_parent_waiting_children_score.is_none());
+    let dependencies_after_release: usize = flow_index_conn.exists(&flow_dependencies_key).await?;
+    assert_eq!(dependencies_after_release, 0);
     let claimed_parent = worker
         .claim_next(
             "worker-flow-parent".to_string(),
