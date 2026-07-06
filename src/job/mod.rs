@@ -25,8 +25,8 @@ pub use types::{
     RepeatSchedule, DEFAULT_JOB_PRIORITY,
 };
 pub use worker::{
-    job_processor_fn, JobContext, JobProcessor, JobProcessorFn, JobRunOutcome, JobWorker,
-    JobWorkerConfig, JobWorkerHandle,
+    job_processor_fn, JobContext, JobProcessor, JobProcessorFn, JobProcessorRouter, JobRunOutcome,
+    JobWorker, JobWorkerConfig, JobWorkerHandle,
 };
 
 #[cfg(test)]

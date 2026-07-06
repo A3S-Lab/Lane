@@ -982,6 +982,112 @@ async fn worker_completes_claimed_job_and_preserves_context_updates() {
 }
 
 #[tokio::test]
+async fn worker_router_dispatches_jobs_by_name() {
+    let backend: Arc<dyn JobQueueBackend> = Arc::new(InMemoryJobQueue::new("worker-router"));
+    let send = backend
+        .add_job(
+            "send".to_string(),
+            serde_json::json!({ "to": "ops@example.com" }),
+            JobOptions::new().with_priority(1),
+        )
+        .await
+        .unwrap();
+    let archive = backend
+        .add_job(
+            "archive".to_string(),
+            serde_json::json!({ "path": "/tmp/report.json" }),
+            JobOptions::new().with_priority(2),
+        )
+        .await
+        .unwrap();
+
+    let send_processor: Arc<dyn JobProcessor> = Arc::new(job_processor_fn(
+        |job: Job, context: JobContext| async move {
+            context.add_log("send handler").await?;
+            Ok(serde_json::json!({
+                "handler": "send",
+                "to": job.payload["to"].clone()
+            }))
+        },
+    ));
+    let archive_processor: Arc<dyn JobProcessor> = Arc::new(job_processor_fn(
+        |job: Job, context: JobContext| async move {
+            context.add_log("archive handler").await?;
+            Ok(serde_json::json!({
+                "handler": "archive",
+                "path": job.payload["path"].clone()
+            }))
+        },
+    ));
+    let router = JobProcessorRouter::new()
+        .with_processor("send", send_processor)
+        .with_processor("archive", archive_processor);
+    assert_eq!(router.len(), 2);
+    assert!(router.contains_processor("send"));
+
+    let processor: Arc<dyn JobProcessor> = Arc::new(router);
+    let worker = JobWorker::new(
+        Arc::clone(&backend),
+        processor,
+        JobWorkerConfig::new("worker-a").with_lease_renew_interval(Duration::ZERO),
+    );
+
+    assert_eq!(worker.run_until_idle(10).await.unwrap(), 2);
+    let stored_send = backend.get_job(&send.id).await.unwrap().unwrap();
+    let stored_archive = backend.get_job(&archive.id).await.unwrap().unwrap();
+    assert_eq!(stored_send.state, JobState::Completed);
+    assert_eq!(stored_archive.state, JobState::Completed);
+    assert_eq!(
+        stored_send.return_value,
+        Some(serde_json::json!({
+            "handler": "send",
+            "to": "ops@example.com"
+        }))
+    );
+    assert_eq!(
+        stored_archive.return_value,
+        Some(serde_json::json!({
+            "handler": "archive",
+            "path": "/tmp/report.json"
+        }))
+    );
+    assert_eq!(stored_send.logs[0].line, "send handler");
+    assert_eq!(stored_archive.logs[0].line, "archive handler");
+}
+
+#[tokio::test]
+async fn worker_router_fails_jobs_without_registered_processor() {
+    let backend: Arc<dyn JobQueueBackend> = Arc::new(InMemoryJobQueue::new("worker-router"));
+    let job = backend
+        .add_job(
+            "unregistered".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .unwrap();
+    let processor: Arc<dyn JobProcessor> = Arc::new(JobProcessorRouter::new());
+    let worker = JobWorker::new(
+        Arc::clone(&backend),
+        processor,
+        JobWorkerConfig::new("worker-a").with_lease_renew_interval(Duration::ZERO),
+    );
+
+    let outcome = worker.run_once(ts(1_000)).await.unwrap();
+    let failed = match outcome {
+        JobRunOutcome::Failed(job) => job,
+        other => panic!("expected failed job, got {other:?}"),
+    };
+    assert_eq!(failed.id, job.id);
+    assert_eq!(failed.state, JobState::Failed);
+    assert!(failed
+        .failed_reason
+        .as_deref()
+        .unwrap_or_default()
+        .contains("no processor registered for job `unregistered`"));
+}
+
+#[tokio::test]
 async fn worker_failure_marks_job_failed() {
     let backend: Arc<dyn JobQueueBackend> = Arc::new(InMemoryJobQueue::new("worker"));
     let job = backend

@@ -4,6 +4,7 @@ use crate::error::{LaneError, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -37,6 +38,81 @@ where
 {
     async fn process(&self, job: Job, context: JobContext) -> Result<Value> {
         (self.f)(job, context).await
+    }
+}
+
+/// Routes jobs to processors by job name.
+#[derive(Clone, Default)]
+pub struct JobProcessorRouter {
+    processors: HashMap<String, Arc<dyn JobProcessor>>,
+    default_processor: Option<Arc<dyn JobProcessor>>,
+}
+
+impl JobProcessorRouter {
+    /// Create an empty processor router.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a processor for a job name.
+    pub fn register_processor(
+        &mut self,
+        name: impl Into<String>,
+        processor: Arc<dyn JobProcessor>,
+    ) {
+        self.processors.insert(name.into(), processor);
+    }
+
+    /// Add a named processor with builder-style chaining.
+    pub fn with_processor(
+        mut self,
+        name: impl Into<String>,
+        processor: Arc<dyn JobProcessor>,
+    ) -> Self {
+        self.register_processor(name, processor);
+        self
+    }
+
+    /// Register a fallback processor used when a job name is not registered.
+    pub fn register_default_processor(&mut self, processor: Arc<dyn JobProcessor>) {
+        self.default_processor = Some(processor);
+    }
+
+    /// Add a fallback processor with builder-style chaining.
+    pub fn with_default_processor(mut self, processor: Arc<dyn JobProcessor>) -> Self {
+        self.register_default_processor(processor);
+        self
+    }
+
+    /// Whether a processor is registered for the job name.
+    pub fn contains_processor(&self, name: &str) -> bool {
+        self.processors.contains_key(name)
+    }
+
+    /// Number of named processors.
+    pub fn len(&self) -> usize {
+        self.processors.len()
+    }
+
+    /// Whether no named processors are registered.
+    pub fn is_empty(&self) -> bool {
+        self.processors.is_empty()
+    }
+}
+
+#[async_trait]
+impl JobProcessor for JobProcessorRouter {
+    async fn process(&self, job: Job, context: JobContext) -> Result<Value> {
+        let processor = self
+            .processors
+            .get(&job.name)
+            .or(self.default_processor.as_ref())
+            .cloned()
+            .ok_or_else(|| {
+                LaneError::ConfigError(format!("no processor registered for job `{}`", job.name))
+            })?;
+
+        processor.process(job, context).await
     }
 }
 

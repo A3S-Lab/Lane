@@ -371,7 +371,7 @@ A3S stack and language SDKs.
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
 | Generic job runtime | In progress | JSON jobs, idempotent custom job IDs, explicit job states, priority ordering, delayed jobs, worker leases, completion/failure snapshots, retry backoff, stalled-job recovery, pause/resume. |
 | Job management API | In progress | Add/get/remove/promote/retry/pause/resume/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
-| Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, runs async processors, completes/fails jobs, supports processor progress/log updates, timeouts, and stalled recovery loops. |
+| Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, timeouts, and stalled recovery loops. |
 | Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` for multi-process distributed claims. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, and end timestamps are available across in-memory, local durable, and Redis backends. |
@@ -583,7 +583,8 @@ Use `JobWorker` to run async processors against any backend:
 
 ```rust
 use a3s_lane::{
-    job_processor_fn, InMemoryJobQueue, JobOptions, JobQueueBackend, JobWorker, JobWorkerConfig,
+    job_processor_fn, InMemoryJobQueue, JobOptions, JobProcessor, JobProcessorRouter,
+    JobQueueBackend, JobWorker, JobWorkerConfig,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -597,11 +598,12 @@ backend
     )
     .await?;
 
-let processor = Arc::new(job_processor_fn(|job, context| async move {
+let send_processor: Arc<dyn JobProcessor> = Arc::new(job_processor_fn(|job, context| async move {
     context.update_progress(serde_json::json!({ "phase": "sending" })).await?;
     context.add_log("provider accepted message").await?;
     Ok(serde_json::json!({ "sent": job.payload["to"] }))
 }));
+let processor = Arc::new(JobProcessorRouter::new().with_processor("send", send_processor));
 
 let worker = JobWorker::new(
     backend,
