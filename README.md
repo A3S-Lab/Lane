@@ -445,7 +445,8 @@ paginated `JobListPage` values, `add_jobs()` submits a batch with the same
 idempotency semantics as `add_job()`, `promote_job()` moves delayed jobs to
 waiting, `retry_job()` manually requeues failed jobs, `update_priority()`
 changes non-terminal job priority, `renew_lease()` extends an active worker
-lease with the claim token, and `clean_jobs()` removes old records by state.
+lease with the claim token, `remove_job()` removes non-active jobs, and
+`clean_jobs()` removes old records by state.
 Set `JobOptions::with_job_id()` when producers need idempotent submission:
 adding the same job id again returns the existing job instead of enqueueing a
 duplicate.
@@ -453,7 +454,8 @@ duplicate.
 Every claimed job carries an opaque `lock_token`. Workers must pass that token
 to `complete_job()`, `fail_job()`, and `renew_lease()`. This prevents a stale
 worker from completing a job after its lease expired and another worker
-reclaimed it.
+reclaimed it. Active leased jobs cannot be removed through the normal
+management API; run stalled recovery first when a worker lease has expired.
 
 Flow jobs create a parent job and one or more child jobs in a single operation.
 The parent starts in `waiting_children`, children are claimed normally, and the

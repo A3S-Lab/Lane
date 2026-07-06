@@ -222,6 +222,20 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("delayed claim should return")
         .expect("delayed job should be claimable");
     assert_eq!(claimed_delayed.id, delayed.id);
+    let active_remove = producer
+        .remove_job(&claimed_delayed.id)
+        .await
+        .expect_err("active leased jobs must not be removed");
+    assert!(matches!(active_remove, LaneError::JobLeaseConflict(_)));
+    assert_eq!(
+        producer
+            .get_job(&claimed_delayed.id)
+            .await
+            .expect("active job should load")
+            .expect("active job should still exist")
+            .state,
+        JobState::Active
+    );
 
     let stalled = producer
         .add_job(

@@ -609,6 +609,40 @@ async fn remove_on_complete_deletes_record_after_returning_snapshot() {
 }
 
 #[tokio::test]
+async fn remove_rejects_active_leased_jobs() {
+    let queue = InMemoryJobQueue::new("remove-active");
+    let now = ts(1_000);
+    let job = queue
+        .add_at("task", serde_json::json!({}), JobOptions::new(), now)
+        .await
+        .unwrap();
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let error = queue.remove_job(&job.id).await.unwrap_err();
+    assert!(matches!(error, LaneError::JobLeaseConflict(_)));
+    assert_eq!(
+        queue.get_job(&job.id).await.unwrap().unwrap().state,
+        JobState::Active
+    );
+
+    queue
+        .complete_job(
+            &job.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            ts(1_100),
+        )
+        .await
+        .unwrap();
+    let removed = queue.remove_job(&job.id).await.unwrap().unwrap();
+    assert_eq!(removed.id, job.id);
+}
+
+#[tokio::test]
 async fn lease_renewal_requires_active_owner() {
     let queue = InMemoryJobQueue::new("leases");
     let now = ts(1_000);

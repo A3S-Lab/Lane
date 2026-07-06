@@ -863,6 +863,11 @@ impl JobQueueBackend for RedisJobQueue {
 
     async fn remove_job(&self, job_id: &str) -> Result<Option<Job>> {
         let mut conn = self.connection().await?;
+        if let Some(job) = self.load_job(&mut conn, job_id).await? {
+            require_removable(&job)?;
+        } else {
+            return Ok(None);
+        }
         let removed = self.remove_job_record(&mut conn, job_id).await?;
         if let Some(parent_id) = removed.as_ref().and_then(|job| job.parent_id.clone()) {
             self.release_parent_if_ready(&mut conn, &parent_id, Utc::now())
@@ -1233,6 +1238,17 @@ fn decode_transition_result(result: &[String], job_id: &str, action: &str) -> Re
         None => Err(LaneError::Other(format!(
             "Redis job {action} script returned no status"
         ))),
+    }
+}
+
+fn require_removable(job: &Job) -> Result<()> {
+    if job.state == JobState::Active {
+        Err(LaneError::JobLeaseConflict(format!(
+            "cannot remove active leased job {}",
+            job.id
+        )))
+    } else {
+        Ok(())
     }
 }
 

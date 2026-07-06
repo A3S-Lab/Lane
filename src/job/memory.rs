@@ -210,6 +210,9 @@ impl InMemoryJobQueue {
     /// Remove a job from the queue.
     pub async fn remove(&self, job_id: &str) -> Result<Option<Job>> {
         let mut inner = self.inner.lock().await;
+        if let Some(job) = inner.jobs.get(job_id) {
+            require_removable(job)?;
+        }
         let removed = inner.jobs.remove(job_id);
         if let Some(parent_id) = removed.as_ref().and_then(|job| job.parent_id.clone()) {
             Self::release_parent_if_ready_locked(&mut inner, &parent_id, Utc::now());
@@ -883,6 +886,17 @@ fn require_lock_token(job: &Job, lock_token: &str) -> Result<()> {
             "lock token does not own job {}",
             job.id
         )))
+    }
+}
+
+fn require_removable(job: &Job) -> Result<()> {
+    if job.state == JobState::Active {
+        Err(LaneError::JobLeaseConflict(format!(
+            "cannot remove active leased job {}",
+            job.id
+        )))
+    } else {
+        Ok(())
     }
 }
 
