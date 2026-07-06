@@ -20,7 +20,7 @@ async fn redis_backend_runs_job_lifecycle_against_real_server() {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
         return;
     };
-    tokio::time::timeout(Duration::from_secs(20), run_job_lifecycle(redis_url))
+    tokio::time::timeout(Duration::from_secs(60), run_job_lifecycle(redis_url))
         .await
         .expect("Redis integration test timed out")
         .unwrap();
@@ -28,12 +28,15 @@ async fn redis_backend_runs_job_lifecycle_against_real_server() {
 
 async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     let namespace = unique_namespace();
+    trace_stage("cleanup:start");
     cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("cleanup:done");
 
     let producer = RedisJobQueue::with_namespace(&redis_url, &namespace, "jobs")
         .expect("valid Redis URL should build the producer queue");
     let worker = RedisJobQueue::with_namespace(&redis_url, &namespace, "jobs")
         .expect("valid Redis URL should build the worker queue");
+    trace_stage("queues:created");
 
     let priority_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "priority")
         .expect("valid Redis URL should build the priority queue");
@@ -77,6 +80,57 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("priority job should complete");
+    trace_stage("priority:done");
+
+    let delayed_priority_queue =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "delayed-priority")
+            .expect("valid Redis URL should build the delayed priority queue");
+    let delayed_priority_slow = delayed_priority_queue
+        .add_job(
+            "delayed-priority-slow".to_string(),
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_priority(50)
+                .with_delay(Duration::from_millis(120)),
+        )
+        .await
+        .expect("slow delayed priority job should be added");
+    let delayed_priority_fast = delayed_priority_queue
+        .add_job(
+            "delayed-priority-fast".to_string(),
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_priority(60)
+                .with_delay(Duration::from_millis(120)),
+        )
+        .await
+        .expect("fast delayed priority job should be added");
+    delayed_priority_queue
+        .update_priority(&delayed_priority_fast.id, 1)
+        .await
+        .expect("delayed priority should update in the job hash");
+    tokio::time::sleep(Duration::from_millis(160)).await;
+    let delayed_priority_claim = delayed_priority_queue
+        .claim_next(
+            "worker-delayed-priority".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("delayed priority claim should return")
+        .expect("updated delayed priority job should be claimable");
+    assert_eq!(delayed_priority_claim.id, delayed_priority_fast.id);
+    assert_ne!(delayed_priority_claim.id, delayed_priority_slow.id);
+    delayed_priority_queue
+        .complete_job(
+            &delayed_priority_claim.id,
+            lock_token(&delayed_priority_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("delayed priority job should complete");
+    trace_stage("delayed-priority:done");
 
     let rate_producer = RedisJobQueue::with_namespace(&redis_url, &namespace, "rate")
         .expect("valid Redis URL should build the rate producer");
@@ -148,6 +202,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("second rate job should complete");
+    trace_stage("rate:done");
 
     let claim_promote_queue =
         RedisJobQueue::with_namespace(&redis_url, &namespace, "claim-promote")
@@ -191,6 +246,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("claim-promoted job should complete");
+    trace_stage("claim-promote:done");
 
     let paused_promote_queue =
         RedisJobQueue::with_namespace(&redis_url, &namespace, "paused-promote")
@@ -248,6 +304,61 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("paused-promoted job should complete");
+    trace_stage("paused-promote:done");
+
+    let single_promote_queue =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "single-promote")
+            .expect("valid Redis URL should build the single-promote queue");
+    let single_promoted = single_promote_queue
+        .add_job(
+            "single-promoted".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_delay(Duration::from_secs(60)),
+        )
+        .await
+        .expect("single-promoted delayed job should be added");
+    let promoted_now = single_promote_queue
+        .promote_job(&single_promoted.id, Utc::now())
+        .await
+        .expect("single delayed job should promote");
+    assert_eq!(promoted_now.state, JobState::Waiting);
+    let mut single_promote_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let single_promote_delayed_score: Option<f64> = single_promote_conn
+        .zscore(
+            format!("{namespace}:single-promote:delayed"),
+            &single_promoted.id,
+        )
+        .await?;
+    assert!(single_promote_delayed_score.is_none());
+    let single_promote_waiting_score: Option<f64> = single_promote_conn
+        .zscore(
+            format!("{namespace}:single-promote:waiting"),
+            &single_promoted.id,
+        )
+        .await?;
+    assert!(single_promote_waiting_score.is_some());
+    let single_promote_claim = single_promote_queue
+        .claim_next(
+            "worker-single-promote".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("single-promote claim should return")
+        .expect("single-promoted job should be claimable");
+    assert_eq!(single_promote_claim.id, single_promoted.id);
+    single_promote_queue
+        .complete_job(
+            &single_promote_claim.id,
+            lock_token(&single_promote_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("single-promoted job should complete");
+    trace_stage("single-promote:done");
 
     let active_limit_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "active-limit")
         .expect("valid Redis URL should build the active limit queue");
@@ -393,6 +504,78 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("second unlimited active-limit job should complete");
+    trace_stage("active-limit:done");
+
+    let manual_retry_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "manual-retry")
+        .expect("valid Redis URL should build the manual retry queue");
+    let manual_retry = manual_retry_queue
+        .add_job(
+            "manual-retry".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_priority(10),
+        )
+        .await
+        .expect("manual retry job should be added");
+    let manual_retry_claim = manual_retry_queue
+        .claim_next(
+            "worker-manual-retry-a".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("manual retry claim should return")
+        .expect("manual retry job should be claimable");
+    assert_eq!(manual_retry_claim.id, manual_retry.id);
+    let manual_retry_failed = manual_retry_queue
+        .fail_job(
+            &manual_retry_claim.id,
+            lock_token(&manual_retry_claim),
+            "manual retry terminal failure".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("manual retry job should fail");
+    assert_eq!(manual_retry_failed.state, JobState::Failed);
+    let retried_manual = manual_retry_queue
+        .retry_job(&manual_retry.id, Utc::now())
+        .await
+        .expect("manual retry job should move back to waiting");
+    assert_eq!(retried_manual.state, JobState::Waiting);
+    assert!(retried_manual.failed_reason.is_none());
+    let mut manual_retry_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let manual_retry_failed_score: Option<f64> = manual_retry_conn
+        .zscore(format!("{namespace}:manual-retry:failed"), &manual_retry.id)
+        .await?;
+    assert!(manual_retry_failed_score.is_none());
+    let manual_retry_waiting_score: Option<f64> = manual_retry_conn
+        .zscore(
+            format!("{namespace}:manual-retry:waiting"),
+            &manual_retry.id,
+        )
+        .await?;
+    assert!(manual_retry_waiting_score.is_some());
+    let manual_retry_reclaimed = manual_retry_queue
+        .claim_next(
+            "worker-manual-retry-b".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("manual retried claim should return")
+        .expect("manual retried job should be claimable");
+    assert_eq!(manual_retry_reclaimed.id, manual_retry.id);
+    manual_retry_queue
+        .complete_job(
+            &manual_retry_reclaimed.id,
+            lock_token(&manual_retry_reclaimed),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("manual retried job should complete");
+    trace_stage("manual-retry:done");
 
     producer.pause().await.expect("pause should succeed");
     let high = producer
@@ -543,6 +726,13 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect_err("active leased jobs must not be removed");
     assert!(matches!(active_remove, LaneError::JobLeaseConflict(_)));
+    let mut remove_index_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let active_after_failed_remove: Option<f64> = remove_index_conn
+        .zscore(format!("{namespace}:jobs:active"), &claimed_delayed.id)
+        .await?;
+    assert!(active_after_failed_remove.is_some());
     assert_eq!(
         producer
             .get_job(&claimed_delayed.id)
@@ -552,6 +742,39 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             .state,
         JobState::Active
     );
+
+    let removable = producer
+        .add_job(
+            "removable".to_string(),
+            serde_json::json!({ "kind": "cleanup" }),
+            JobOptions::new().with_priority(25),
+        )
+        .await
+        .expect("removable job should be added");
+    let removed = producer
+        .remove_job(&removable.id)
+        .await
+        .expect("removable job should remove")
+        .expect("removable job should be returned");
+    assert_eq!(removed.id, removable.id);
+    assert!(producer
+        .get_job(&removable.id)
+        .await
+        .expect("removed job lookup should return")
+        .is_none());
+    let removed_waiting_score: Option<f64> = remove_index_conn
+        .zscore(format!("{namespace}:jobs:waiting"), &removable.id)
+        .await?;
+    assert!(removed_waiting_score.is_none());
+    let removed_hash: Option<String> = remove_index_conn
+        .hget(format!("{namespace}:jobs:jobs"), &removable.id)
+        .await?;
+    assert!(removed_hash.is_none());
+    assert!(producer
+        .remove_job("missing-job")
+        .await
+        .expect("missing job remove should return")
+        .is_none());
 
     let locked_stalled = producer
         .add_job(
@@ -718,6 +941,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     assert_eq!(stats.completed, 3);
     assert_eq!(stats.failed, 2);
     assert_eq!(stats.active, 1);
+    trace_stage("main-lifecycle:done");
 
     let mut flow_index_conn = redis::Client::open(redis_url.as_str())?
         .get_connection_manager()
@@ -931,6 +1155,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await?;
     assert!(failed_parent_waiting_children_score.is_none());
+    trace_stage("flow:done");
 
     let repeat = producer
         .add_job(
@@ -1011,6 +1236,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .jobs
         .iter()
         .any(|job| job.repeat_key.as_deref() == Some("heartbeat")));
+    trace_stage("repeat:done");
 
     let cron_repeat = producer
         .add_job(
@@ -1092,6 +1318,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .jobs
         .iter()
         .any(|job| job.repeat_key.as_deref() == Some("cron-heartbeat")));
+    trace_stage("cron-repeat:done");
 
     let repeat_remove_queue =
         RedisJobQueue::with_namespace(&redis_url, &namespace, "repeat-remove")
@@ -1152,6 +1379,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await?;
     assert!(repeat_remove_delayed_score.is_some());
+    trace_stage("repeat-remove:done");
 
     let idempotent_job_id = format!("{namespace}:invoice:42");
     let idempotent = producer
@@ -1218,6 +1446,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             .count(),
         2
     );
+    trace_stage("idempotent-bulk:done");
 
     let atomic_add_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "atomic-add")
         .expect("valid Redis URL should build the atomic-add queue");
@@ -1297,7 +1526,9 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await?;
     assert!(atomic_delayed_score.is_some());
 
+    trace_stage("cleanup:final:start");
     cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("cleanup:final:done");
     Ok(())
 }
 
@@ -1323,6 +1554,12 @@ fn unique_namespace() -> String {
         .unwrap_or_default()
         .as_millis();
     format!("a3s:lane:test:{}:{timestamp}", std::process::id())
+}
+
+fn trace_stage(stage: &str) {
+    if std::env::var_os("A3S_LANE_REDIS_TRACE").is_some() {
+        eprintln!("[redis_job_queue] {stage}");
+    }
 }
 
 async fn cleanup_namespace(redis_url: &str, namespace: &str) -> redis::RedisResult<()> {

@@ -369,10 +369,10 @@ A3S stack and language SDKs.
 | Phase | Status | Scope |
 | --- | --- | --- |
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
-| Generic job runtime | In progress | JSON jobs, bulk submission, idempotent custom job IDs, explicit job states, priority ordering, delayed jobs, token-owned worker leases, completion/failure snapshots, retry backoff, rate-limited claims, shared active concurrency limits, stalled-job recovery, pause/resume. |
+| Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, explicit job states, priority ordering, delayed jobs, token-owned worker leases, completion/failure snapshots, retry backoff, rate-limited claims, shared active concurrency limits, stalled-job recovery, pause/resume. |
 | Job management API | In progress | Add/get/remove/promote/retry/update-priority/pause/resume/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, timeouts, and stalled recovery loops. |
-| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, flow submission, delayed promotion, claim, rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, and stalled recovery semantics. Postgres/NATS backends remain planned. |
+| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, flow submission, delayed promotion, single-job promote, manual retry, priority update, claim, rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, and end timestamps are available across in-memory, local durable, and Redis backends. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
@@ -642,10 +642,11 @@ inside the same Lua script before checking pause, rate-limit, max-active, and
 the next claim. A paused or maxed queue can still move due delayed jobs back to
 `waiting`; it simply returns `None` instead of leasing work.
 
-Redis adds are Lua-backed as well. The add script writes the job JSON and the
+Redis adds are Lua-backed as well. The add scripts write job JSON and the
 waiting, delayed, or waiting-children index in the same Redis turn. If a custom
 job id already exists, the script returns the existing job without advancing the
-waiting sequence or writing duplicate state indexes.
+waiting sequence or writing duplicate state indexes. Bulk add follows the same
+mechanism in one script call while preserving the caller's input order.
 
 Redis flow submission is all-or-nothing: the flow add script first checks every
 parent and child job id, then writes the parent, children, and all state indexes
@@ -662,10 +663,22 @@ worker computes the next occurrence from `RepeatOptions`, then the Lua script
 finishes the current job and writes the next delayed or waiting occurrence in
 the same Redis turn.
 
+Manual lifecycle management follows the same Redis-side state movement rule:
+`promote_job()` removes a delayed job from the delayed zset and inserts it into
+waiting inside one script; `retry_job()` clears terminal failure metadata and
+moves failed jobs back to waiting inside one script; `update_priority()` rewrites
+the job hash and, for waiting jobs, replaces the waiting zset score in the same
+script. This is intentionally aligned with BullMQ's mechanism of moving job
+state through Redis scripts instead of coordinating several client-side Redis
+commands.
+
 Stalled recovery is Lua-backed as well. The recovery script scans expired
 active scores, verifies that the independent lock key is missing, increments
 the stalled count, and either requeues the job or fails it in the same Redis
 turn.
+
+`remove_job()` uses a Redis script to reject active jobs and remove the job
+hash, lock key, and all state indexes in one Redis turn.
 
 Run the Redis integration test against any reachable Redis server:
 

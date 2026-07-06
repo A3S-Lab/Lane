@@ -44,6 +44,50 @@ end
 return {'inserted', ARGV[2]}
 "#;
 
+const ADD_JOBS_SCRIPT: &str = r#"
+local count = tonumber(ARGV[1])
+local offset = 2
+local added = {}
+
+for index = 1, count do
+  local id = ARGV[offset]
+  local raw = ARGV[offset + 1]
+  local state = ARGV[offset + 2]
+  local scheduled_score = ARGV[offset + 3]
+  local priority = tonumber(ARGV[offset + 4])
+  local existing = redis.call('HGET', KEYS[1], id)
+
+  if existing then
+    added[index] = existing
+  else
+    local inserted = redis.call('HSETNX', KEYS[1], id, raw)
+    if inserted == 0 then
+      local current = redis.call('HGET', KEYS[1], id)
+      if current then
+        added[index] = current
+      else
+        return {'missing', id}
+      end
+    else
+      if state == 'waiting' then
+        local sequence = redis.call('INCR', KEYS[5])
+        local waiting_score = (priority * tonumber(ARGV[2 + count * 5])) + sequence
+        redis.call('ZADD', KEYS[2], waiting_score, id)
+      elseif state == 'delayed' then
+        redis.call('ZADD', KEYS[3], scheduled_score, id)
+      elseif state == 'waiting_children' then
+        redis.call('ZADD', KEYS[4], scheduled_score, id)
+      end
+      added[index] = raw
+    end
+  end
+
+  offset = offset + 5
+end
+
+return added
+"#;
+
 const ADD_FLOW_SCRIPT: &str = r#"
 local count = tonumber(ARGV[1])
 local offset = 2
@@ -451,6 +495,137 @@ end
 return recovered
 "#;
 
+const PROMOTE_JOB_SCRIPT: &str = r#"
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not raw then
+  return {'missing'}
+end
+
+local job = cjson.decode(raw)
+if job["state"] ~= "delayed" then
+  return {'ok', raw}
+end
+
+job["state"] = "waiting"
+job["scheduled_at"] = ARGV[2]
+local priority = tonumber(job["priority"] or '1000') or 1000
+local sequence = redis.call('INCR', KEYS[4])
+local waiting_score = (priority * tonumber(ARGV[3])) + sequence
+local updated = cjson.encode(job)
+
+redis.call('ZREM', KEYS[3], ARGV[1])
+redis.call('ZADD', KEYS[2], waiting_score, ARGV[1])
+redis.call('HSET', KEYS[1], ARGV[1], updated)
+
+return {'ok', updated}
+"#;
+
+const RETRY_JOB_SCRIPT: &str = r#"
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not raw then
+  return {'missing'}
+end
+
+local job = cjson.decode(raw)
+if job["state"] ~= "failed" then
+  return {'state', job["state"] or ''}
+end
+
+job["state"] = "waiting"
+job["scheduled_at"] = ARGV[2]
+job["processed_at"] = cjson.null
+job["finished_at"] = cjson.null
+job["worker_id"] = cjson.null
+job["lock_token"] = cjson.null
+job["lease_expires_at"] = cjson.null
+job["failed_reason"] = cjson.null
+
+local priority = tonumber(job["priority"] or '1000') or 1000
+local sequence = redis.call('INCR', KEYS[4])
+local waiting_score = (priority * tonumber(ARGV[3])) + sequence
+local updated = cjson.encode(job)
+
+redis.call('ZREM', KEYS[2], ARGV[1])
+redis.call('ZADD', KEYS[3], waiting_score, ARGV[1])
+redis.call('HSET', KEYS[1], ARGV[1], updated)
+
+return {'ok', updated}
+"#;
+
+const UPDATE_PRIORITY_SCRIPT: &str = r#"
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not raw then
+  return {'missing'}
+end
+
+local job = cjson.decode(raw)
+if job["state"] == "completed" or job["state"] == "failed" then
+  return {'terminal'}
+end
+
+local priority = tonumber(ARGV[2])
+job["priority"] = priority
+if not job["options"] or job["options"] == cjson.null then
+  job["options"] = {}
+end
+job["options"]["priority"] = priority
+
+if job["state"] == "waiting" then
+  local sequence = redis.call('INCR', KEYS[3])
+  local waiting_score = (priority * tonumber(ARGV[3])) + sequence
+  redis.call('ZADD', KEYS[2], waiting_score, ARGV[1])
+end
+
+local updated = cjson.encode(job)
+redis.call('HSET', KEYS[1], ARGV[1], updated)
+
+return {'ok', updated}
+"#;
+
+const PROMOTE_DUE_JOBS_SCRIPT: &str = r#"
+local ids = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1], 'LIMIT', 0, ARGV[3])
+local promoted = 0
+
+for _, id in ipairs(ids) do
+  local raw = redis.call('HGET', KEYS[1], id)
+  redis.call('ZREM', KEYS[2], id)
+  if raw then
+    local job = cjson.decode(raw)
+    if job["state"] == "delayed" then
+      job["state"] = "waiting"
+      local priority = tonumber(job["priority"] or '1000') or 1000
+      local sequence = redis.call('INCR', KEYS[4])
+      local waiting_score = (priority * tonumber(ARGV[2])) + sequence
+      redis.call('ZADD', KEYS[3], waiting_score, id)
+      redis.call('HSET', KEYS[1], id, cjson.encode(job))
+      promoted = promoted + 1
+    end
+  end
+end
+
+return promoted
+"#;
+
+const REMOVE_JOB_SCRIPT: &str = r#"
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not raw then
+  return {'missing'}
+end
+
+local job = cjson.decode(raw)
+if job["state"] == "active" then
+  return {'active'}
+end
+
+redis.call('DEL', KEYS[2])
+for index = 3, 8 do
+  redis.call('ZREM', KEYS[index], ARGV[1])
+end
+redis.call('HDEL', KEYS[1], ARGV[1])
+
+return {'ok', raw}
+"#;
+
 /// Redis-backed generic job queue.
 ///
 /// Redis stores each job as JSON in a hash and indexes lifecycle states with
@@ -561,11 +736,33 @@ impl RedisJobQueue {
             })
             .collect::<Vec<_>>();
 
-        let mut conn = self.connection().await?;
-        let mut added = Vec::with_capacity(created.len());
-        for job in created {
-            added.push(self.add_new_job(&mut conn, &job).await?);
+        if created.is_empty() {
+            return Ok(Vec::new());
         }
+
+        let mut conn = self.connection().await?;
+        let mut command = redis::cmd("EVAL");
+        command
+            .arg(ADD_JOBS_SCRIPT)
+            .arg(5)
+            .arg(self.jobs_key())
+            .arg(self.state_key(JobState::Waiting))
+            .arg(self.state_key(JobState::Delayed))
+            .arg(self.state_key(JobState::WaitingChildren))
+            .arg(self.sequence_key())
+            .arg(created.len());
+        for job in &created {
+            command
+                .arg(&job.id)
+                .arg(encode_job(job)?)
+                .arg(job_state_name(job.state))
+                .arg(millis(job.scheduled_at))
+                .arg(job.priority);
+        }
+        command.arg(WAITING_SCORE_BUCKET);
+
+        let result: Vec<String> = command.query_async(&mut conn).await.map_err(redis_error)?;
+        let added = decode_add_jobs_result(&result, created.len())?;
 
         Ok(added)
     }
@@ -1143,84 +1340,75 @@ impl JobQueueBackend for RedisJobQueue {
 
     async fn promote_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {
         let mut conn = self.connection().await?;
-        let mut job = self.require_job(&mut conn, job_id).await?;
-        if job.state == JobState::Delayed {
-            job.state = JobState::Waiting;
-            job.scheduled_at = now;
-            let sequence = self.next_sequence(&mut conn).await?;
-            self.move_to_state(
-                &mut conn,
-                &job,
-                JobState::Waiting,
-                waiting_score(job.priority, sequence),
-            )
-            .await?;
-        }
-        Ok(job)
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(PROMOTE_JOB_SCRIPT)
+            .arg(4)
+            .arg(self.jobs_key())
+            .arg(self.state_key(JobState::Waiting))
+            .arg(self.state_key(JobState::Delayed))
+            .arg(self.sequence_key())
+            .arg(job_id)
+            .arg(now.to_rfc3339())
+            .arg(WAITING_SCORE_BUCKET)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_transition_result(&result, job_id, "promote")
     }
 
     async fn retry_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {
         let mut conn = self.connection().await?;
-        let mut job = self.require_job(&mut conn, job_id).await?;
-        if job.state != JobState::Failed {
-            return Err(LaneError::JobStateConflict(format!(
-                "cannot retry job {} from state {:?}",
-                job.id, job.state
-            )));
-        }
-        job.state = JobState::Waiting;
-        job.scheduled_at = now;
-        job.processed_at = None;
-        job.finished_at = None;
-        job.worker_id = None;
-        job.lock_token = None;
-        job.lease_expires_at = None;
-        job.failed_reason = None;
-        let sequence = self.next_sequence(&mut conn).await?;
-        self.move_to_state(
-            &mut conn,
-            &job,
-            JobState::Waiting,
-            waiting_score(job.priority, sequence),
-        )
-        .await?;
-        Ok(job)
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(RETRY_JOB_SCRIPT)
+            .arg(4)
+            .arg(self.jobs_key())
+            .arg(self.state_key(JobState::Failed))
+            .arg(self.state_key(JobState::Waiting))
+            .arg(self.sequence_key())
+            .arg(job_id)
+            .arg(now.to_rfc3339())
+            .arg(WAITING_SCORE_BUCKET)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_transition_result(&result, job_id, "retry")
     }
 
     async fn update_priority(&self, job_id: &str, priority: JobPriority) -> Result<Job> {
         let mut conn = self.connection().await?;
-        let mut job = self.require_job(&mut conn, job_id).await?;
-        if job.state.is_terminal() {
-            return Err(LaneError::JobStateConflict(format!(
-                "cannot update priority for terminal job {}",
-                job.id
-            )));
-        }
-        job.priority = priority;
-        job.options.priority = priority;
-        if job.state == JobState::Waiting {
-            let sequence = self.next_sequence(&mut conn).await?;
-            self.move_to_state(
-                &mut conn,
-                &job,
-                JobState::Waiting,
-                waiting_score(priority, sequence),
-            )
-            .await?;
-        } else {
-            self.store_job(&mut conn, &job).await?;
-        }
-        Ok(job)
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(UPDATE_PRIORITY_SCRIPT)
+            .arg(3)
+            .arg(self.jobs_key())
+            .arg(self.state_key(JobState::Waiting))
+            .arg(self.sequence_key())
+            .arg(job_id)
+            .arg(priority)
+            .arg(WAITING_SCORE_BUCKET)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_priority_update_result(&result, job_id)
     }
 
     async fn remove_job(&self, job_id: &str) -> Result<Option<Job>> {
         let mut conn = self.connection().await?;
-        if let Some(job) = self.load_job(&mut conn, job_id).await? {
-            require_removable(&job)?;
-        } else {
-            return Ok(None);
-        }
-        let removed = self.remove_job_record(&mut conn, job_id).await?;
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(REMOVE_JOB_SCRIPT)
+            .arg(8)
+            .arg(self.jobs_key())
+            .arg(self.lock_key(job_id))
+            .arg(self.state_key(JobState::Waiting))
+            .arg(self.state_key(JobState::Delayed))
+            .arg(self.state_key(JobState::Active))
+            .arg(self.state_key(JobState::WaitingChildren))
+            .arg(self.state_key(JobState::Completed))
+            .arg(self.state_key(JobState::Failed))
+            .arg(job_id)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        let removed = decode_remove_job_result(&result, job_id)?;
         if let Some(parent_id) = removed.as_ref().and_then(|job| job.parent_id.clone()) {
             self.release_parent_if_ready(&mut conn, &parent_id, Utc::now())
                 .await?;
@@ -1361,32 +1549,27 @@ impl JobQueueBackend for RedisJobQueue {
 
     async fn promote_due_jobs(&self, now: DateTime<Utc>) -> Result<usize> {
         let mut conn = self.connection().await?;
-        let ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
-            .arg(self.state_key(JobState::Delayed))
-            .arg("-inf")
-            .arg(millis(now))
-            .query_async(&mut conn)
-            .await
-            .map_err(redis_error)?;
-
-        let mut promoted = 0;
-        for id in ids {
-            if let Some(mut job) = self.load_job(&mut conn, &id).await? {
-                if job.state == JobState::Delayed && job.scheduled_at <= now {
-                    job.state = JobState::Waiting;
-                    let sequence = self.next_sequence(&mut conn).await?;
-                    self.move_to_state(
-                        &mut conn,
-                        &job,
-                        JobState::Waiting,
-                        waiting_score(job.priority, sequence),
-                    )
-                    .await?;
-                    promoted += 1;
-                }
+        let mut total = 0;
+        loop {
+            let promoted: usize = redis::cmd("EVAL")
+                .arg(PROMOTE_DUE_JOBS_SCRIPT)
+                .arg(4)
+                .arg(self.jobs_key())
+                .arg(self.state_key(JobState::Delayed))
+                .arg(self.state_key(JobState::Waiting))
+                .arg(self.sequence_key())
+                .arg(millis(now))
+                .arg(WAITING_SCORE_BUCKET)
+                .arg(1_000_u16)
+                .query_async(&mut conn)
+                .await
+                .map_err(redis_error)?;
+            total += promoted;
+            if promoted < 1_000 {
+                break;
             }
         }
-        Ok(promoted)
+        Ok(total)
     }
 
     async fn recover_stalled_jobs(&self, now: DateTime<Utc>) -> Result<usize> {
@@ -1535,6 +1718,22 @@ fn decode_add_job_result(result: &[String], job_id: &str) -> Result<Job> {
     }
 }
 
+fn decode_add_jobs_result(result: &[String], expected_len: usize) -> Result<Vec<Job>> {
+    if result.first().map(String::as_str) == Some("missing") {
+        let id = result.get(1).map(String::as_str).unwrap_or("unknown");
+        return Err(LaneError::JobNotFound(id.to_string()));
+    }
+
+    if result.len() != expected_len {
+        return Err(LaneError::Other(format!(
+            "Redis add jobs script returned {} jobs, expected {expected_len}",
+            result.len()
+        )));
+    }
+
+    result.iter().map(|raw| decode_job(raw)).collect()
+}
+
 fn decode_add_flow_result(result: &[String]) -> Result<()> {
     match result.first().map(String::as_str) {
         Some("ok") => Ok(()),
@@ -1550,6 +1749,29 @@ fn decode_add_flow_result(result: &[String]) -> Result<()> {
         None => Err(LaneError::Other(
             "Redis add flow script returned no status".to_string(),
         )),
+    }
+}
+
+fn decode_priority_update_result(result: &[String], job_id: &str) -> Result<Job> {
+    match result.first().map(String::as_str) {
+        Some("ok") => {
+            let raw = result.get(1).ok_or_else(|| {
+                LaneError::Other(format!(
+                    "Redis priority update script returned no payload for {job_id}"
+                ))
+            })?;
+            decode_job(raw)
+        }
+        Some("missing") => Err(LaneError::JobNotFound(job_id.to_string())),
+        Some("terminal") => Err(LaneError::JobStateConflict(format!(
+            "cannot update priority for terminal job {job_id}"
+        ))),
+        Some(other) => Err(LaneError::Other(format!(
+            "unexpected Redis priority update script status `{other}` for {job_id}"
+        ))),
+        None => Err(LaneError::Other(format!(
+            "Redis priority update script returned no status for {job_id}"
+        ))),
     }
 }
 
@@ -1581,14 +1803,26 @@ fn decode_transition_result(result: &[String], job_id: &str, action: &str) -> Re
     }
 }
 
-fn require_removable(job: &Job) -> Result<()> {
-    if job.state == JobState::Active {
-        Err(LaneError::JobLeaseConflict(format!(
-            "cannot remove active leased job {}",
-            job.id
-        )))
-    } else {
-        Ok(())
+fn decode_remove_job_result(result: &[String], job_id: &str) -> Result<Option<Job>> {
+    match result.first().map(String::as_str) {
+        Some("ok") => {
+            let raw = result.get(1).ok_or_else(|| {
+                LaneError::Other(format!(
+                    "Redis remove job script returned no payload for {job_id}"
+                ))
+            })?;
+            decode_job(raw).map(Some)
+        }
+        Some("missing") => Ok(None),
+        Some("active") => Err(LaneError::JobLeaseConflict(format!(
+            "cannot remove active leased job {job_id}"
+        ))),
+        Some(other) => Err(LaneError::Other(format!(
+            "unexpected Redis remove job script status `{other}` for {job_id}"
+        ))),
+        None => Err(LaneError::Other(format!(
+            "Redis remove job script returned no status for {job_id}"
+        ))),
     }
 }
 
