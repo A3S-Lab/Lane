@@ -702,7 +702,9 @@ several client-side reads.
 Stalled recovery is Lua-backed as well. The recovery script scans expired
 active scores, verifies that the independent lock key is missing, increments
 the stalled count, and either requeues the job or fails it in the same Redis
-turn.
+turn. If an active sorted-set member points at a job that has already moved to a
+different state, the same script prunes that stale active index instead of
+treating it as recoverable work.
 
 `remove_job()` uses a Redis script to reject active jobs and remove the job
 hash, lock key, all state indexes, and any child dependency set in one Redis

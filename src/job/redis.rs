@@ -573,6 +573,8 @@ for _, id in ipairs(ids) do
 
         recovered = recovered + 1
       end
+    else
+      redis.call('ZREM', KEYS[2], id)
     end
   end
 end

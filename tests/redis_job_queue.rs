@@ -987,6 +987,26 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("locked-stalled job should complete with valid token");
+    let _: usize = stalled_index_conn
+        .zadd(format!("{namespace}:jobs:active"), &locked_stalled.id, 0.0)
+        .await?;
+    assert_eq!(
+        producer
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("stale active index recovery should run"),
+        0
+    );
+    let stale_completed_active_score: Option<f64> = stalled_index_conn
+        .zscore(format!("{namespace}:jobs:active"), &locked_stalled.id)
+        .await?;
+    assert!(stale_completed_active_score.is_none());
+    let stale_completed_after_recovery = producer
+        .get_job(&locked_stalled.id)
+        .await
+        .expect("stale completed job should load")
+        .expect("stale completed job should still exist");
+    assert_eq!(stale_completed_after_recovery.state, JobState::Completed);
 
     let stalled = producer
         .add_job(
