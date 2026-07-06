@@ -147,6 +147,17 @@ impl LocalJobQueue {
         Ok(removed)
     }
 
+    /// Remove a single child from its parent dependency list without deleting the child job.
+    pub async fn remove_child_dependency(
+        &self,
+        child_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let removed = self.inner.remove_child_dependency(child_id, now).await?;
+        self.persist().await?;
+        Ok(removed)
+    }
+
     /// Return the current state for a job id.
     pub async fn get_state(&self, job_id: &str) -> Result<Option<JobState>> {
         self.inner.get_state(job_id).await
@@ -238,6 +249,10 @@ impl JobQueueBackend for LocalJobQueue {
         now: DateTime<Utc>,
     ) -> Result<Option<Vec<Job>>> {
         LocalJobQueue::remove_unprocessed_children(self, parent_id, now).await
+    }
+
+    async fn remove_child_dependency(&self, child_id: &str, now: DateTime<Utc>) -> Result<bool> {
+        LocalJobQueue::remove_child_dependency(self, child_id, now).await
     }
 
     async fn claim_next(

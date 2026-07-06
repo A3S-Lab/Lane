@@ -3048,6 +3048,63 @@ async fn flow_remove_unprocessed_children_skips_active_children() {
 }
 
 #[tokio::test]
+async fn flow_remove_child_dependency_releases_parent_without_deleting_child() {
+    let queue = InMemoryJobQueue::new("flow-remove-child-dependency");
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({ "kind": "aggregate" }))
+                .with_options(JobOptions::new().with_priority(1)),
+            vec![JobSpec::new("child", serde_json::json!({ "n": 1 }))
+                .with_options(JobOptions::new().with_priority(10))],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    assert!(queue
+        .remove_child_dependency(&flow.children[0].id, ts(1_100))
+        .await
+        .unwrap());
+    assert!(!queue
+        .remove_child_dependency(&flow.children[0].id, ts(1_200))
+        .await
+        .unwrap());
+
+    let parent = queue
+        .get_job(&flow.parent.id)
+        .await
+        .unwrap()
+        .expect("parent should remain stored");
+    assert_eq!(parent.state, JobState::Waiting);
+    assert!(parent.child_ids.is_empty());
+
+    let child = queue
+        .get_job(&flow.children[0].id)
+        .await
+        .unwrap()
+        .expect("child should remain stored");
+    assert_eq!(child.state, JobState::Waiting);
+    assert!(child.parent_id.is_none());
+
+    let dependencies = queue
+        .get_flow_dependencies(&flow.parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(dependencies.children.is_empty());
+    assert!(dependencies.pending_child_ids.is_empty());
+    assert!(dependencies.missing_child_ids.is_empty());
+
+    assert!(matches!(
+        queue
+            .remove_child_dependency("missing-child", ts(1_300))
+            .await
+            .unwrap_err(),
+        LaneError::JobNotFound(_)
+    ));
+}
+
+#[tokio::test]
 async fn flow_rejects_duplicate_custom_job_ids() {
     let queue = InMemoryJobQueue::new("flow-ids");
     let error = queue
@@ -3269,6 +3326,48 @@ async fn local_job_queue_persists_removed_unprocessed_children() {
         dependencies.missing_child_ids,
         vec![flow.children[0].id.clone()]
     );
+}
+
+#[tokio::test]
+async fn local_job_queue_persists_removed_child_dependency() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let snapshot_path = temp_dir
+        .path()
+        .join("jobs")
+        .join("remove-child-dependency-flow.json");
+    let queue = LocalJobQueue::open("durable-remove-child-dependency-flow", &snapshot_path)
+        .await
+        .unwrap();
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({})),
+            vec![JobSpec::new("child", serde_json::json!({ "n": 1 }))],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    assert!(queue
+        .remove_child_dependency(&flow.children[0].id, ts(1_100))
+        .await
+        .unwrap());
+
+    let reopened = LocalJobQueue::open("durable-remove-child-dependency-flow", &snapshot_path)
+        .await
+        .unwrap();
+    let parent = reopened
+        .get_job(&flow.parent.id)
+        .await
+        .unwrap()
+        .expect("parent should be restored");
+    assert_eq!(parent.state, JobState::Waiting);
+    assert!(parent.child_ids.is_empty());
+    let child = reopened
+        .get_job(&flow.children[0].id)
+        .await
+        .unwrap()
+        .expect("child should be restored");
+    assert!(child.parent_id.is_none());
 }
 
 #[tokio::test]

@@ -415,6 +415,36 @@ impl InMemoryJobQueue {
         Ok(Some(removed))
     }
 
+    /// Remove a single child from its parent dependency list without deleting the child job.
+    pub async fn remove_child_dependency(
+        &self,
+        child_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let mut inner = self.inner.lock().await;
+        let Some(child) = inner.jobs.get(child_id) else {
+            return Err(LaneError::JobNotFound(child_id.to_string()));
+        };
+        let Some(parent_id) = child.parent_id.clone() else {
+            return Ok(false);
+        };
+        let Some(parent) = inner.jobs.get(&parent_id) else {
+            return Err(LaneError::JobNotFound(parent_id));
+        };
+        if child.state.is_terminal() || !parent.child_ids.iter().any(|id| id == child_id) {
+            return Ok(false);
+        }
+
+        if let Some(parent) = inner.jobs.get_mut(&parent_id) {
+            parent.child_ids.retain(|id| id != child_id);
+        }
+        if let Some(child) = inner.jobs.get_mut(child_id) {
+            child.parent_id = None;
+        }
+        Self::release_parent_if_ready_locked(&mut inner, &parent_id, now);
+        Ok(true)
+    }
+
     /// Return the current state for a job id.
     pub async fn get_state(&self, job_id: &str) -> Result<Option<JobState>> {
         let inner = self.inner.lock().await;
@@ -1113,6 +1143,10 @@ impl JobQueueBackend for InMemoryJobQueue {
         now: DateTime<Utc>,
     ) -> Result<Option<Vec<Job>>> {
         InMemoryJobQueue::remove_unprocessed_children(self, parent_id, now).await
+    }
+
+    async fn remove_child_dependency(&self, child_id: &str, now: DateTime<Utc>) -> Result<bool> {
+        InMemoryJobQueue::remove_child_dependency(self, child_id, now).await
     }
 
     async fn claim_next(

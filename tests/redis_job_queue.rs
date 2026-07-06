@@ -4408,6 +4408,57 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     assert_eq!(remove_unprocessed_counts.failed, 0);
     assert_eq!(remove_unprocessed_counts.missing, 1);
 
+    let remove_dependency_flow = producer
+        .add_flow_at(
+            JobSpec::new(
+                "remove-child-dependency-flow-parent",
+                serde_json::json!({ "kind": "aggregate" }),
+            )
+            .with_options(JobOptions::new().with_priority(1)),
+            vec![JobSpec::new(
+                "remove-child-dependency-flow-child",
+                serde_json::json!({ "n": 1 }),
+            )
+            .with_options(JobOptions::new().with_priority(5))],
+            Utc::now(),
+        )
+        .await
+        .expect("remove-child-dependency flow should be added");
+    assert!(producer
+        .remove_child_dependency(&remove_dependency_flow.children[0].id, Utc::now())
+        .await
+        .expect("child dependency should remove"));
+    assert!(!producer
+        .remove_child_dependency(&remove_dependency_flow.children[0].id, Utc::now())
+        .await
+        .expect("removed child dependency should not remove twice"));
+    let remove_dependency_parent = producer
+        .get_job(&remove_dependency_flow.parent.id)
+        .await
+        .expect("remove-dependency parent should load")
+        .expect("remove-dependency parent should exist");
+    assert_eq!(remove_dependency_parent.state, JobState::Waiting);
+    assert!(remove_dependency_parent.child_ids.is_empty());
+    let remove_dependency_child = producer
+        .get_job(&remove_dependency_flow.children[0].id)
+        .await
+        .expect("remove-dependency child should load")
+        .expect("remove-dependency child should exist");
+    assert!(remove_dependency_child.parent_id.is_none());
+    let remove_dependency_key = format!(
+        "{namespace}:jobs:dependencies:{}",
+        remove_dependency_flow.parent.id
+    );
+    let remove_dependency_key_exists: bool = flow_index_conn.exists(&remove_dependency_key).await?;
+    assert!(!remove_dependency_key_exists);
+    let remove_dependency_parent_waiting_score: Option<f64> = flow_index_conn
+        .zscore(
+            format!("{namespace}:jobs:waiting"),
+            &remove_dependency_flow.parent.id,
+        )
+        .await?;
+    assert!(remove_dependency_parent_waiting_score.is_some());
+
     let clean_release_flow = producer
         .add_flow_at(
             JobSpec::new(

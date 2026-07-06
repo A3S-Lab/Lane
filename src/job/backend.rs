@@ -37,6 +37,8 @@ pub trait JobQueueBackend: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<Option<Vec<Job>>>;
 
+    async fn remove_child_dependency(&self, child_id: &str, now: DateTime<Utc>) -> Result<bool>;
+
     async fn claim_next(
         &self,
         worker_id: JobWorkerId,
