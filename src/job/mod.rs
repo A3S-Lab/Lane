@@ -21,8 +21,9 @@ pub use memory::InMemoryJobQueue;
 pub use redis::RedisJobQueue;
 pub use types::{
     DeduplicationOptions, Job, JobFlow, JobId, JobListOptions, JobListPage, JobLockToken,
-    JobLogEntry, JobOptions, JobPriority, JobQueueSnapshot, JobQueueStats, JobRateLimit, JobSpec,
-    JobState, JobWorkerId, QueueName, RepeatOptions, RepeatSchedule, DEFAULT_JOB_PRIORITY,
+    JobLogEntry, JobOptions, JobPriority, JobQueueSnapshot, JobQueueStats, JobRateLimit,
+    JobRepeatEntry, JobSpec, JobState, JobWorkerId, QueueName, RepeatOptions, RepeatSchedule,
+    DEFAULT_JOB_PRIORITY,
 };
 pub use worker::{
     job_processor_fn, JobContext, JobProcessor, JobProcessorFn, JobProcessorRouter, JobRunOutcome,

@@ -997,6 +997,82 @@ async fn repeat_key_coalesces_active_series_to_current_owner() {
 }
 
 #[tokio::test]
+async fn list_repeats_returns_current_series_owners() {
+    let queue = InMemoryJobQueue::new("repeat-list");
+    let now = ts(1_000);
+    let slower = queue
+        .add_at(
+            "slow-heartbeat",
+            serde_json::json!({ "target": "crm" }),
+            JobOptions::new().with_priority(10).with_repeat(
+                RepeatOptions::every(Duration::from_secs(10)).with_key("slow-heartbeat"),
+            ),
+            now,
+        )
+        .await
+        .unwrap();
+    let faster = queue
+        .add_at(
+            "fast-heartbeat",
+            serde_json::json!({ "target": "search" }),
+            JobOptions::new().with_priority(1).with_repeat(
+                RepeatOptions::every(Duration::from_secs(5)).with_key("fast-heartbeat"),
+            ),
+            now,
+        )
+        .await
+        .unwrap();
+
+    let repeats = queue.list_repeats().await.unwrap();
+    assert_eq!(
+        repeats
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["fast-heartbeat", "slow-heartbeat"]
+    );
+    assert_eq!(repeats[0].job_id, faster.id);
+    assert_eq!(repeats[0].name, "fast-heartbeat");
+    assert_eq!(repeats[0].state, JobState::Waiting);
+    assert_eq!(repeats[0].scheduled_at, now);
+    assert_eq!(repeats[0].repeat_count, 0);
+    assert_eq!(repeats[0].options.interval(), Some(Duration::from_secs(5)));
+
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .complete_job(
+            &claimed.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            ts(1_100),
+        )
+        .await
+        .unwrap();
+
+    let after_successor = queue.list_repeats().await.unwrap();
+    let faster_entry = after_successor
+        .iter()
+        .find(|entry| entry.key == "fast-heartbeat")
+        .unwrap();
+    assert_ne!(faster_entry.job_id, faster.id);
+    assert_eq!(faster_entry.state, JobState::Delayed);
+    assert_eq!(faster_entry.repeat_count, 1);
+
+    queue
+        .remove_repeat("fast-heartbeat")
+        .await
+        .unwrap()
+        .unwrap();
+    let after_remove = queue.list_repeats().await.unwrap();
+    assert_eq!(after_remove.len(), 1);
+    assert_eq!(after_remove[0].job_id, slower.id);
+}
+
+#[tokio::test]
 async fn remove_repeat_removes_current_series_owner_by_key() {
     let queue = InMemoryJobQueue::new("repeat-remove-key");
     let now = ts(1_000);
@@ -2153,6 +2229,13 @@ async fn local_job_queue_persists_repeat_successors() {
     assert_eq!(delayed.total, 1);
     assert_eq!(delayed.jobs[0].repeat_key.as_deref(), Some("sync"));
     assert_eq!(delayed.jobs[0].repeat_count, 1);
+
+    let repeats = reopened.list_repeats().await.unwrap();
+    assert_eq!(repeats.len(), 1);
+    assert_eq!(repeats[0].key, "sync");
+    assert_eq!(repeats[0].job_id, delayed.jobs[0].id);
+    assert_eq!(repeats[0].state, JobState::Delayed);
+    assert_eq!(repeats[0].repeat_count, 1);
 }
 
 #[tokio::test]

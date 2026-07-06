@@ -1,8 +1,8 @@
 use super::backend::JobQueueBackend;
 use super::types::{
     deduplication_expiration, Job, JobFlow, JobId, JobListOptions, JobListPage, JobLogEntry,
-    JobOptions, JobPriority, JobQueueSnapshot, JobQueueStats, JobSpec, JobState, JobWorkerId,
-    QueueName,
+    JobOptions, JobPriority, JobQueueSnapshot, JobQueueStats, JobRepeatEntry, JobSpec, JobState,
+    JobWorkerId, QueueName,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -375,6 +375,18 @@ impl InMemoryJobQueue {
             .released_deduplication_owners
             .insert((deduplication_id.to_string(), owner_id));
         Ok(true)
+    }
+
+    /// List current non-terminal repeat series owners.
+    pub async fn list_repeats(&self) -> Result<Vec<JobRepeatEntry>> {
+        let inner = self.inner.lock().await;
+        let mut repeats = inner
+            .jobs
+            .values()
+            .filter_map(repeat_entry)
+            .collect::<Vec<_>>();
+        repeats.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.job_id.cmp(&b.job_id)));
+        Ok(repeats)
     }
 
     /// Remove the current non-terminal occurrence for a repeat series.
@@ -988,6 +1000,10 @@ impl JobQueueBackend for InMemoryJobQueue {
         InMemoryJobQueue::remove_deduplication_key(self, deduplication_id).await
     }
 
+    async fn list_repeats(&self) -> Result<Vec<JobRepeatEntry>> {
+        InMemoryJobQueue::list_repeats(self).await
+    }
+
     async fn clean_jobs(
         &self,
         state: JobState,
@@ -1307,6 +1323,20 @@ fn active_repeat_key(job: &Job) -> Option<&str> {
     }
 
     job.repeat_key.as_deref()
+}
+
+fn repeat_entry(job: &Job) -> Option<JobRepeatEntry> {
+    let key = active_repeat_key(job)?.to_string();
+    let options = job.options.repeat.clone()?;
+    Some(JobRepeatEntry {
+        key,
+        job_id: job.id.clone(),
+        name: job.name.clone(),
+        state: job.state,
+        scheduled_at: job.scheduled_at,
+        repeat_count: job.repeat_count,
+        options,
+    })
 }
 
 fn find_active_repeat_job<'a>(jobs: &'a HashMap<JobId, Job>, candidate: &Job) -> Option<&'a Job> {

@@ -1,7 +1,8 @@
 use super::backend::JobQueueBackend;
 use super::types::{
     add_duration, deduplication_expiration, Job, JobFlow, JobListOptions, JobListPage, JobOptions,
-    JobPriority, JobQueueStats, JobRateLimit, JobSpec, JobState, JobWorkerId, QueueName,
+    JobPriority, JobQueueStats, JobRateLimit, JobRepeatEntry, JobSpec, JobState, JobWorkerId,
+    QueueName,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -2891,6 +2892,61 @@ impl RedisJobQueue {
         self.add_many_at(jobs, Utc::now()).await
     }
 
+    /// List current non-terminal repeat series owners.
+    pub async fn list_repeats(&self) -> Result<Vec<JobRepeatEntry>> {
+        let mut conn = self.connection().await?;
+        let prefix = self.repeat_key_prefix();
+        let pattern = format!("{prefix}*");
+        let mut cursor = 0_u64;
+        let mut repeats = Vec::new();
+
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(100)
+                .query_async(&mut conn)
+                .await
+                .map_err(redis_error)?;
+
+            for owner_key in keys {
+                let Some(repeat_key) = owner_key.strip_prefix(&prefix) else {
+                    continue;
+                };
+                let owner_id: Option<String> = conn.get(&owner_key).await.map_err(redis_error)?;
+                let Some(owner_id) = owner_id else {
+                    continue;
+                };
+                let Some(job) = self.load_job(&mut conn, &owner_id).await? else {
+                    self.clear_repeat_owner_if_stale(&mut conn, repeat_key, &owner_id)
+                        .await?;
+                    continue;
+                };
+                if job.state.is_terminal() || job.repeat_key.as_deref() != Some(repeat_key) {
+                    self.clear_repeat_owner_if_stale(&mut conn, repeat_key, &owner_id)
+                        .await?;
+                    continue;
+                }
+                if let Some(entry) = repeat_entry(&job) {
+                    repeats.push(entry);
+                } else {
+                    self.clear_repeat_owner_if_stale(&mut conn, repeat_key, &owner_id)
+                        .await?;
+                }
+            }
+
+            if next_cursor == 0 {
+                break;
+            }
+            cursor = next_cursor;
+        }
+
+        repeats.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.job_id.cmp(&b.job_id)));
+        Ok(repeats)
+    }
+
     /// Add multiple jobs at an explicit timestamp.
     pub async fn add_many_at(&self, jobs: Vec<JobSpec>, now: DateTime<Utc>) -> Result<Vec<Job>> {
         for spec in &jobs {
@@ -3529,6 +3585,10 @@ impl JobQueueBackend for RedisJobQueue {
         Ok(removed > 0)
     }
 
+    async fn list_repeats(&self) -> Result<Vec<JobRepeatEntry>> {
+        RedisJobQueue::list_repeats(self).await
+    }
+
     async fn clean_jobs(
         &self,
         state: JobState,
@@ -3777,6 +3837,20 @@ fn job_deduplication_ttl_millis(job: &Job) -> Option<u64> {
 
 fn job_repeat_key(job: &Job) -> Option<&str> {
     job.repeat_key.as_deref()
+}
+
+fn repeat_entry(job: &Job) -> Option<JobRepeatEntry> {
+    let key = job_repeat_key(job)?.to_string();
+    let options = job.options.repeat.clone()?;
+    Some(JobRepeatEntry {
+        key,
+        job_id: job.id.clone(),
+        name: job.name.clone(),
+        state: job.state,
+        scheduled_at: job.scheduled_at,
+        repeat_count: job.repeat_count,
+        options,
+    })
 }
 
 fn decode_job(raw: &str) -> Result<Job> {

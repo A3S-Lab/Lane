@@ -323,6 +323,25 @@ impl RepeatOptions {
     }
 }
 
+/// Current owner snapshot for a repeat series.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobRepeatEntry {
+    /// Queue-local repeat series key.
+    pub key: String,
+    /// Current non-terminal owner job id for the series.
+    pub job_id: JobId,
+    /// Job name used by the current owner.
+    pub name: String,
+    /// Current lifecycle state of the owner job.
+    pub state: JobState,
+    /// Scheduled time of the current owner occurrence.
+    pub scheduled_at: DateTime<Utc>,
+    /// Completed occurrence count carried by the current owner.
+    pub repeat_count: u32,
+    /// Repeat schedule and limits for the series.
+    pub options: RepeatOptions,
+}
+
 /// Simple deduplication settings for a generic job.
 ///
 /// Jobs with the same deduplication id are coalesced while the first job is

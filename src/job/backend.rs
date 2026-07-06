@@ -1,6 +1,6 @@
 use super::types::{
-    Job, JobFlow, JobListOptions, JobListPage, JobOptions, JobPriority, JobQueueStats, JobSpec,
-    JobState, JobWorkerId,
+    Job, JobFlow, JobListOptions, JobListPage, JobOptions, JobPriority, JobQueueStats,
+    JobRepeatEntry, JobSpec, JobState, JobWorkerId,
 };
 use crate::error::Result;
 use async_trait::async_trait;
@@ -65,6 +65,8 @@ pub trait JobQueueBackend: Send + Sync {
     async fn remove_repeat(&self, repeat_key: &str) -> Result<Option<Job>>;
 
     async fn remove_deduplication_key(&self, deduplication_id: &str) -> Result<bool>;
+
+    async fn list_repeats(&self) -> Result<Vec<JobRepeatEntry>>;
 
     async fn clean_jobs(
         &self,

@@ -2,7 +2,7 @@ use super::backend::JobQueueBackend;
 use super::memory::InMemoryJobQueue;
 use super::types::{
     Job, JobFlow, JobListOptions, JobListPage, JobOptions, JobPriority, JobQueueSnapshot,
-    JobQueueStats, JobSpec, JobState, JobWorkerId,
+    JobQueueStats, JobRepeatEntry, JobSpec, JobState, JobWorkerId,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -138,6 +138,11 @@ impl LocalJobQueue {
         Ok(removed)
     }
 
+    /// List current non-terminal repeat series owners.
+    pub async fn list_repeats(&self) -> Result<Vec<JobRepeatEntry>> {
+        self.inner.list_repeats().await
+    }
+
     /// Drain waiting jobs and optionally non-repeat delayed jobs.
     pub async fn drain(&self, include_delayed: bool) -> Result<Vec<Job>> {
         let jobs = self.inner.drain(include_delayed).await?;
@@ -251,6 +256,10 @@ impl JobQueueBackend for LocalJobQueue {
 
     async fn remove_deduplication_key(&self, deduplication_id: &str) -> Result<bool> {
         LocalJobQueue::remove_deduplication_key(self, deduplication_id).await
+    }
+
+    async fn list_repeats(&self) -> Result<Vec<JobRepeatEntry>> {
+        LocalJobQueue::list_repeats(self).await
     }
 
     async fn clean_jobs(

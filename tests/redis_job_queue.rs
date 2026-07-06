@@ -329,7 +329,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             "dedup-ttl".to_string(),
             serde_json::json!({ "version": 6 }),
             JobOptions::new().with_deduplication(
-                DeduplicationOptions::new("tenant:ttl").with_ttl(Duration::from_millis(200)),
+                DeduplicationOptions::new("tenant:ttl").with_ttl(Duration::from_secs(1)),
             ),
         )
         .await
@@ -339,7 +339,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             "dedup-ttl-duplicate".to_string(),
             serde_json::json!({ "version": 7 }),
             JobOptions::new().with_deduplication(
-                DeduplicationOptions::new("tenant:ttl").with_ttl(Duration::from_millis(200)),
+                DeduplicationOptions::new("tenant:ttl").with_ttl(Duration::from_secs(1)),
             ),
         )
         .await
@@ -350,13 +350,13 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .query_async(&mut dedup_conn)
         .await?;
     assert!(ttl_dedup_pttl > 0);
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
     let ttl_after_expiration = dedup_queue
         .add_job(
             "dedup-ttl-after-expiration".to_string(),
             serde_json::json!({ "version": 8 }),
             JobOptions::new().with_deduplication(
-                DeduplicationOptions::new("tenant:ttl").with_ttl(Duration::from_millis(200)),
+                DeduplicationOptions::new("tenant:ttl").with_ttl(Duration::from_secs(1)),
             ),
         )
         .await
@@ -3000,6 +3000,17 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .get(format!("{namespace}:jobs:repeat:heartbeat"))
         .await?;
     assert_eq!(repeat_owner.as_deref(), Some(repeat.id.as_str()));
+    let repeat_entries = producer
+        .list_repeats()
+        .await
+        .expect("repeat series should list");
+    assert!(repeat_entries.iter().any(|entry| {
+        entry.key == "heartbeat"
+            && entry.job_id == repeat.id
+            && entry.name == "repeat"
+            && entry.state == JobState::Waiting
+            && entry.repeat_count == 0
+    }));
     let first_repeat = worker
         .claim_next(
             "worker-repeat-a".to_string(),
@@ -3037,6 +3048,17 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         repeat_successor_owner.as_deref(),
         Some(repeat_successor.id.as_str())
     );
+    let repeat_entries_after_successor = producer
+        .list_repeats()
+        .await
+        .expect("repeat successor series should list");
+    let heartbeat_entry = repeat_entries_after_successor
+        .iter()
+        .find(|entry| entry.key == "heartbeat")
+        .expect("heartbeat repeat entry should exist");
+    assert_eq!(heartbeat_entry.job_id, repeat_successor.id);
+    assert_eq!(heartbeat_entry.state, JobState::Delayed);
+    assert_eq!(heartbeat_entry.repeat_count, 1);
     let repeat_duplicate_during_delay = producer
         .add_job(
             "repeat-duplicate-delayed".to_string(),
@@ -3084,6 +3106,13 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .get(format!("{namespace}:jobs:repeat:heartbeat"))
         .await?;
     assert!(repeat_owner_after_limit.is_none());
+    let repeat_entries_after_limit = producer
+        .list_repeats()
+        .await
+        .expect("repeat series list after limit should return");
+    assert!(!repeat_entries_after_limit
+        .iter()
+        .any(|entry| entry.key == "heartbeat"));
     let delayed_after_limit = producer
         .list_jobs(JobListOptions::new().with_state(JobState::Delayed))
         .await
@@ -3417,6 +3446,17 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             "missing-repeat-owner",
         )
         .await?;
+    let repeat_remove_entries_after_stale = repeat_remove_queue
+        .list_repeats()
+        .await
+        .expect("repeat list should prune stale owner keys");
+    assert!(!repeat_remove_entries_after_stale
+        .iter()
+        .any(|entry| entry.key == "stale-heartbeat"));
+    let stale_repeat_owner_after_list: Option<String> = repeat_remove_conn
+        .get(format!("{namespace}:repeat-remove:repeat:stale-heartbeat"))
+        .await?;
+    assert!(stale_repeat_owner_after_list.is_none());
     assert!(repeat_remove_queue
         .remove_repeat("stale-heartbeat")
         .await
