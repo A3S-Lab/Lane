@@ -1,6 +1,6 @@
 use super::types::{
-    Job, JobFlow, JobListOptions, JobListPage, JobOptions, JobPriority, JobQueueStats,
-    JobRepeatEntry, JobSpec, JobState, JobWorkerId,
+    Job, JobFlow, JobFlowDependencies, JobListOptions, JobListPage, JobOptions, JobPriority,
+    JobQueueStats, JobRepeatEntry, JobSpec, JobState, JobWorkerId,
 };
 use crate::error::Result;
 use async_trait::async_trait;
@@ -22,6 +22,8 @@ pub trait JobQueueBackend: Send + Sync {
         children: Vec<JobSpec>,
         now: DateTime<Utc>,
     ) -> Result<JobFlow>;
+
+    async fn get_flow_dependencies(&self, parent_id: &str) -> Result<Option<JobFlowDependencies>>;
 
     async fn claim_next(
         &self,

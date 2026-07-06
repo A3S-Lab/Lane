@@ -1,8 +1,8 @@
 use super::backend::JobQueueBackend;
 use super::memory::InMemoryJobQueue;
 use super::types::{
-    Job, JobFlow, JobListOptions, JobListPage, JobOptions, JobPriority, JobQueueSnapshot,
-    JobQueueStats, JobRepeatEntry, JobSpec, JobState, JobWorkerId,
+    Job, JobFlow, JobFlowDependencies, JobListOptions, JobListPage, JobOptions, JobPriority,
+    JobQueueSnapshot, JobQueueStats, JobRepeatEntry, JobSpec, JobState, JobWorkerId,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -116,6 +116,14 @@ impl LocalJobQueue {
         Ok(flow)
     }
 
+    /// Return a parent flow's current child dependency snapshot.
+    pub async fn get_flow_dependencies(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowDependencies>> {
+        self.inner.get_flow_dependencies(parent_id).await
+    }
+
     /// Capture the durable queue snapshot.
     pub async fn snapshot(&self) -> JobQueueSnapshot {
         self.inner.snapshot().await
@@ -171,6 +179,10 @@ impl JobQueueBackend for LocalJobQueue {
         now: DateTime<Utc>,
     ) -> Result<JobFlow> {
         self.add_flow_at(parent, children, now).await
+    }
+
+    async fn get_flow_dependencies(&self, parent_id: &str) -> Result<Option<JobFlowDependencies>> {
+        LocalJobQueue::get_flow_dependencies(self, parent_id).await
     }
 
     async fn claim_next(

@@ -1,8 +1,8 @@
 use super::backend::JobQueueBackend;
 use super::types::{
-    deduplication_expiration, Job, JobFlow, JobId, JobListOptions, JobListPage, JobLogEntry,
-    JobOptions, JobPriority, JobQueueSnapshot, JobQueueStats, JobRepeatEntry, JobSpec, JobState,
-    JobWorkerId, QueueName,
+    deduplication_expiration, Job, JobFlow, JobFlowDependencies, JobId, JobListOptions,
+    JobListPage, JobLogEntry, JobOptions, JobPriority, JobQueueSnapshot, JobQueueStats,
+    JobRepeatEntry, JobSpec, JobState, JobWorkerId, QueueName,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -340,6 +340,39 @@ impl InMemoryJobQueue {
             parent: parent_job,
             children: child_jobs,
         })
+    }
+
+    /// Return a parent flow's current child dependency snapshot.
+    pub async fn get_flow_dependencies(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowDependencies>> {
+        let inner = self.inner.lock().await;
+        let Some(parent) = inner.jobs.get(parent_id).cloned() else {
+            return Ok(None);
+        };
+
+        let mut children = Vec::new();
+        let mut pending_child_ids = Vec::new();
+        let mut missing_child_ids = Vec::new();
+        for child_id in &parent.child_ids {
+            match inner.jobs.get(child_id).cloned() {
+                Some(child) => {
+                    if !child.state.is_terminal() {
+                        pending_child_ids.push(child.id.clone());
+                    }
+                    children.push(child);
+                }
+                None => missing_child_ids.push(child_id.clone()),
+            }
+        }
+
+        Ok(Some(JobFlowDependencies {
+            parent,
+            children,
+            pending_child_ids,
+            missing_child_ids,
+        }))
     }
 
     /// Remove a job from the queue.
@@ -832,6 +865,10 @@ impl JobQueueBackend for InMemoryJobQueue {
         now: DateTime<Utc>,
     ) -> Result<JobFlow> {
         self.add_flow_at(parent, children, now).await
+    }
+
+    async fn get_flow_dependencies(&self, parent_id: &str) -> Result<Option<JobFlowDependencies>> {
+        InMemoryJobQueue::get_flow_dependencies(self, parent_id).await
     }
 
     async fn claim_next(

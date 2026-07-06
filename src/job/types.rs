@@ -190,6 +190,19 @@ pub struct JobFlow {
     pub children: Vec<Job>,
 }
 
+/// Current dependency snapshot for a flow parent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobFlowDependencies {
+    /// Parent job snapshot.
+    pub parent: Job,
+    /// Existing child job snapshots in the parent's child order.
+    pub children: Vec<Job>,
+    /// Child ids that still block a `waiting_children` parent.
+    pub pending_child_ids: Vec<JobId>,
+    /// Child ids recorded on the parent but no longer retained.
+    pub missing_child_ids: Vec<JobId>,
+}
+
 /// Repeat schedule used by a generic job.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]

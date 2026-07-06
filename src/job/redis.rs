@@ -1,8 +1,8 @@
 use super::backend::JobQueueBackend;
 use super::types::{
-    add_duration, deduplication_expiration, Job, JobFlow, JobListOptions, JobListPage, JobOptions,
-    JobPriority, JobQueueStats, JobRateLimit, JobRepeatEntry, JobSpec, JobState, JobWorkerId,
-    QueueName,
+    add_duration, deduplication_expiration, Job, JobFlow, JobFlowDependencies, JobListOptions,
+    JobListPage, JobOptions, JobPriority, JobQueueStats, JobRateLimit, JobRepeatEntry, JobSpec,
+    JobState, JobWorkerId, QueueName,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -2800,6 +2800,27 @@ return {
 }
 "#;
 
+const FLOW_DEPENDENCIES_SCRIPT: &str = r#"
+local parent_raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not parent_raw then
+  return {'missing'}
+end
+
+local parent = cjson.decode(parent_raw)
+local result = {'ok', parent_raw}
+for _, child_id in ipairs(parent['child_ids'] or {}) do
+  local child_raw = redis.call('HGET', KEYS[1], child_id)
+  table.insert(result, child_id)
+  if child_raw then
+    table.insert(result, child_raw)
+  else
+    table.insert(result, '')
+  end
+end
+
+return result
+"#;
+
 /// Redis-backed generic job queue.
 ///
 /// Redis stores each job as JSON in a hash and indexes lifecycle states with
@@ -3052,6 +3073,23 @@ impl RedisJobQueue {
         })
     }
 
+    /// Return a parent flow's current child dependency snapshot.
+    pub async fn get_flow_dependencies(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowDependencies>> {
+        let mut conn = self.connection().await?;
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(FLOW_DEPENDENCIES_SCRIPT)
+            .arg(1)
+            .arg(self.jobs_key())
+            .arg(parent_id)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_flow_dependencies_result(&result, parent_id)
+    }
+
     async fn connection(&self) -> Result<ConnectionManager> {
         self.client
             .get_connection_manager()
@@ -3265,6 +3303,10 @@ impl JobQueueBackend for RedisJobQueue {
         now: DateTime<Utc>,
     ) -> Result<JobFlow> {
         self.add_flow_at(parent, children, now).await
+    }
+
+    async fn get_flow_dependencies(&self, parent_id: &str) -> Result<Option<JobFlowDependencies>> {
+        RedisJobQueue::get_flow_dependencies(self, parent_id).await
     }
 
     async fn claim_next(
@@ -3947,6 +3989,60 @@ fn decode_priority_update_result(result: &[String], job_id: &str) -> Result<Job>
         ))),
         None => Err(LaneError::Other(format!(
             "Redis priority update script returned no status for {job_id}"
+        ))),
+    }
+}
+
+fn decode_flow_dependencies_result(
+    result: &[String],
+    parent_id: &str,
+) -> Result<Option<JobFlowDependencies>> {
+    match result.first().map(String::as_str) {
+        Some("missing") => Ok(None),
+        Some("ok") => {
+            let parent_raw = result.get(1).ok_or_else(|| {
+                LaneError::Other(format!(
+                    "Redis flow dependency script returned no parent payload for {parent_id}"
+                ))
+            })?;
+            let parent = decode_job(parent_raw)?;
+            let child_pairs = result.get(2..).unwrap_or_default();
+            if child_pairs.len() % 2 != 0 {
+                return Err(LaneError::Other(format!(
+                    "Redis flow dependency script returned an odd child payload count for {parent_id}"
+                )));
+            }
+
+            let mut children = Vec::new();
+            let mut pending_child_ids = Vec::new();
+            let mut missing_child_ids = Vec::new();
+            for pair in child_pairs.chunks(2) {
+                let child_id = &pair[0];
+                let child_raw = &pair[1];
+                if child_raw.is_empty() {
+                    missing_child_ids.push(child_id.clone());
+                    continue;
+                }
+
+                let child = decode_job(child_raw)?;
+                if !child.state.is_terminal() {
+                    pending_child_ids.push(child.id.clone());
+                }
+                children.push(child);
+            }
+
+            Ok(Some(JobFlowDependencies {
+                parent,
+                children,
+                pending_child_ids,
+                missing_child_ids,
+            }))
+        }
+        Some(other) => Err(LaneError::Other(format!(
+            "unexpected Redis flow dependency script status `{other}` for {parent_id}"
+        ))),
+        None => Err(LaneError::Other(format!(
+            "Redis flow dependency script returned no status for {parent_id}"
         ))),
     }
 }

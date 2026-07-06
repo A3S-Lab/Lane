@@ -20,10 +20,10 @@ pub use memory::InMemoryJobQueue;
 #[cfg(feature = "redis-backend")]
 pub use redis::RedisJobQueue;
 pub use types::{
-    DeduplicationOptions, Job, JobFlow, JobId, JobListOptions, JobListPage, JobLockToken,
-    JobLogEntry, JobOptions, JobPriority, JobQueueSnapshot, JobQueueStats, JobRateLimit,
-    JobRepeatEntry, JobSpec, JobState, JobWorkerId, QueueName, RepeatOptions, RepeatSchedule,
-    DEFAULT_JOB_PRIORITY,
+    DeduplicationOptions, Job, JobFlow, JobFlowDependencies, JobId, JobListOptions, JobListPage,
+    JobLockToken, JobLogEntry, JobOptions, JobPriority, JobQueueSnapshot, JobQueueStats,
+    JobRateLimit, JobRepeatEntry, JobSpec, JobState, JobWorkerId, QueueName, RepeatOptions,
+    RepeatSchedule, DEFAULT_JOB_PRIORITY,
 };
 pub use worker::{
     job_processor_fn, JobContext, JobProcessor, JobProcessorFn, JobProcessorRouter, JobRunOutcome,
