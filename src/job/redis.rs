@@ -201,6 +201,47 @@ return updated
 "#;
 
 const COMPLETE_SCRIPT: &str = r#"
+local function days_from_civil(year, month, day)
+  if month <= 2 then
+    year = year - 1
+  end
+  local era = math.floor(year / 400)
+  local yoe = year - era * 400
+  local shifted_month = month
+  if month > 2 then
+    shifted_month = month - 3
+  else
+    shifted_month = month + 9
+  end
+  local doy = math.floor((153 * shifted_month + 2) / 5) + day - 1
+  local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+  return era * 146097 + doe - 719468
+end
+
+local function iso_to_millis(value)
+  local year = tonumber(string.sub(value, 1, 4))
+  local month = tonumber(string.sub(value, 6, 7))
+  local day = tonumber(string.sub(value, 9, 10))
+  local hour = tonumber(string.sub(value, 12, 13))
+  local minute = tonumber(string.sub(value, 15, 16))
+  local second = tonumber(string.sub(value, 18, 19))
+  if not year or not month or not day or not hour or not minute or not second then
+    return 0
+  end
+
+  local millis = 0
+  if string.sub(value, 20, 20) == "." then
+    local digits = string.match(string.sub(value, 21), "^(%d+)")
+    if digits then
+      digits = string.sub(digits .. "000", 1, 3)
+      millis = tonumber(digits) or 0
+    end
+  end
+
+  local days = days_from_civil(year, month, day)
+  return (((days * 24 + hour) * 60 + minute) * 60 + second) * 1000 + millis
+end
+
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
   return {'missing'}
@@ -279,20 +320,28 @@ if parent_id and parent_id ~= cjson.null then
           redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
           redis.call('ZADD', KEYS[8], ARGV[5], parent_id)
         end
-      elseif all_done and parent["scheduled_at"] <= ARGV[3] then
+      elseif all_done then
         redis.call('ZREM', KEYS[6], parent_id)
-        parent["state"] = "waiting"
         parent["processed_at"] = cjson.null
         parent["finished_at"] = cjson.null
         parent["worker_id"] = cjson.null
         parent["lock_token"] = cjson.null
         parent["lease_expires_at"] = cjson.null
         parent["failed_reason"] = cjson.null
-        local priority = tonumber(parent["priority"] or '1000') or 1000
-        local sequence = redis.call('INCR', KEYS[7])
-        local waiting_score = (priority * tonumber(ARGV[7])) + sequence
-        redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
-        redis.call('ZADD', KEYS[5], waiting_score, parent_id)
+
+        local parent_scheduled_millis = iso_to_millis(parent["scheduled_at"])
+        if parent_scheduled_millis <= tonumber(ARGV[5]) then
+          parent["state"] = "waiting"
+          local priority = tonumber(parent["priority"] or '1000') or 1000
+          local sequence = redis.call('INCR', KEYS[7])
+          local waiting_score = (priority * tonumber(ARGV[7])) + sequence
+          redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+          redis.call('ZADD', KEYS[5], waiting_score, parent_id)
+        else
+          parent["state"] = "delayed"
+          redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+          redis.call('ZADD', KEYS[9], parent_scheduled_millis, parent_id)
+        end
       end
     end
   end
@@ -1363,13 +1412,7 @@ impl JobQueueBackend for RedisJobQueue {
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
-        let completed = decode_transition_result(&result, job_id, "complete")?;
-        let parent_id = completed.parent_id.clone();
-        if let Some(parent_id) = parent_id {
-            self.release_parent_if_ready(&mut conn, &parent_id, now)
-                .await?;
-        }
-        Ok(completed)
+        decode_transition_result(&result, job_id, "complete")
     }
 
     async fn fail_job(
@@ -1412,24 +1455,7 @@ impl JobQueueBackend for RedisJobQueue {
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
-        let failed = decode_transition_result(&result, job_id, "fail")?;
-        if failed.state == JobState::Failed {
-            if let Some(parent_id) = failed.parent_id.clone() {
-                self.fail_waiting_parent(
-                    &mut conn,
-                    &parent_id,
-                    format!(
-                        "child job {} failed: {}",
-                        failed.id,
-                        failed.failed_reason.as_deref().unwrap_or("unknown error")
-                    ),
-                    now,
-                )
-                .await?;
-            }
-        }
-
-        Ok(failed)
+        decode_transition_result(&result, job_id, "fail")
     }
 
     async fn renew_lease(

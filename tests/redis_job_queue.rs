@@ -1227,6 +1227,71 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("flow parent should be claimable");
     assert_eq!(claimed_parent.id, flow.parent.id);
 
+    let delayed_flow = producer
+        .add_flow_at(
+            JobSpec::new(
+                "delayed-flow-parent",
+                serde_json::json!({ "kind": "delayed-aggregate" }),
+            )
+            .with_options(
+                JobOptions::new()
+                    .with_priority(1)
+                    .with_delay(Duration::from_secs(60)),
+            ),
+            vec![
+                JobSpec::new("delayed-flow-child", serde_json::json!({ "n": 1 }))
+                    .with_options(JobOptions::new().with_priority(1)),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("delayed flow should be added");
+    let delayed_child = worker
+        .claim_next(
+            "worker-delayed-flow-child".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("delayed flow child claim should return")
+        .expect("delayed flow child should be claimable");
+    assert_eq!(delayed_child.id, delayed_flow.children[0].id);
+    worker
+        .complete_job(
+            &delayed_child.id,
+            lock_token(&delayed_child),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("delayed flow child should complete");
+    let delayed_parent = producer
+        .get_job(&delayed_flow.parent.id)
+        .await
+        .expect("delayed parent should load")
+        .expect("delayed parent should exist");
+    assert_eq!(delayed_parent.state, JobState::Delayed);
+    let delayed_parent_delayed_score: Option<f64> = flow_index_conn
+        .zscore(format!("{namespace}:jobs:delayed"), &delayed_flow.parent.id)
+        .await?;
+    assert!(delayed_parent_delayed_score.is_some());
+    let delayed_parent_waiting_children_score: Option<f64> = flow_index_conn
+        .zscore(
+            format!("{namespace}:jobs:waiting_children"),
+            &delayed_flow.parent.id,
+        )
+        .await?;
+    assert!(delayed_parent_waiting_children_score.is_none());
+    assert!(worker
+        .claim_next(
+            "worker-delayed-flow-parent-early".to_string(),
+            Duration::from_secs(30),
+            Utc::now()
+        )
+        .await
+        .expect("early delayed flow parent claim should return")
+        .is_none());
+
     let failed_flow = producer
         .add_flow_at(
             JobSpec::new(

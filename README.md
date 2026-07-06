@@ -655,8 +655,9 @@ records are created.
 
 Flow fan-in is also protected in Redis transitions. When a child job completes
 or reaches terminal failure, the completion/failure Lua script updates the
-parent in the same Redis turn when the parent can be released to `waiting` or
-failed because a child failed.
+parent in the same Redis turn when the parent can be released to `waiting`,
+parked in `delayed` until its own schedule is due, or failed because a child
+failed.
 
 Repeat successors are created during the Redis completion script too. The
 worker computes the next occurrence from `RepeatOptions`, then the Lua script
