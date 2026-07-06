@@ -427,6 +427,74 @@ async fn active_jobs_can_be_moved_back_to_delayed_with_lock() {
 }
 
 #[tokio::test]
+async fn active_jobs_can_be_released_back_to_waiting_with_lock() {
+    let queue = InMemoryJobQueue::new("active-release");
+    let now = ts(1_000);
+    let job = queue
+        .add_at(
+            "yielding",
+            serde_json::json!({}),
+            JobOptions::new().with_priority(5),
+            now,
+        )
+        .await
+        .unwrap();
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let wrong_token = queue
+        .release_active_job(&job.id, "wrong-token", ts(1_100))
+        .await
+        .unwrap_err();
+    assert!(matches!(wrong_token, LaneError::JobLeaseConflict(_)));
+
+    let released = queue
+        .release_active_job(&job.id, lock_token(&claimed), ts(1_100))
+        .await
+        .unwrap();
+    assert_eq!(released.state, JobState::Waiting);
+    assert_eq!(released.scheduled_at, ts(1_100));
+    assert_eq!(released.attempts_made, 1);
+    assert!(released.worker_id.is_none());
+    assert!(released.lock_token.is_none());
+    assert!(released.lease_expires_at.is_none());
+
+    let complete_error = queue
+        .complete_job(
+            &job.id,
+            lock_token(&claimed),
+            serde_json::json!({}),
+            ts(1_200),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(complete_error, LaneError::JobStateConflict(_)));
+
+    let reclaimed = queue
+        .claim_next("worker-b".to_string(), Duration::from_secs(30), ts(1_200))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reclaimed.id, job.id);
+    assert_eq!(reclaimed.state, JobState::Active);
+    assert_eq!(reclaimed.attempts_made, 2);
+    assert_eq!(reclaimed.worker_id.as_deref(), Some("worker-b"));
+
+    let waiting = queue
+        .add_at("waiting", serde_json::json!({}), JobOptions::new(), now)
+        .await
+        .unwrap();
+    let state_error = queue
+        .release_active_job(&waiting.id, "missing-token", ts(1_300))
+        .await
+        .unwrap_err();
+    assert!(matches!(state_error, LaneError::JobStateConflict(_)));
+}
+
+#[tokio::test]
 async fn custom_job_ids_make_add_idempotent() {
     let queue = InMemoryJobQueue::new("idempotent");
     let now = ts(1_000);
@@ -3082,6 +3150,41 @@ async fn local_job_queue_persists_active_jobs_delayed_by_workers() {
     assert_eq!(restored.state, JobState::Delayed);
     assert_eq!(restored.scheduled_at, ts(3_500));
     assert_eq!(restored.options.delay, Some(Duration::from_secs(2)));
+    assert!(restored.worker_id.is_none());
+    assert!(restored.lock_token.is_none());
+    assert!(restored.lease_expires_at.is_none());
+}
+
+#[tokio::test]
+async fn local_job_queue_persists_active_jobs_released_by_workers() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("jobs").join("active-release.json");
+    let queue = LocalJobQueue::open("durable-active-release", &snapshot_path)
+        .await
+        .unwrap();
+    let job = queue
+        .add_at("task", serde_json::json!({}), JobOptions::new(), ts(1_000))
+        .await
+        .unwrap();
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(1_000))
+        .await
+        .unwrap()
+        .unwrap();
+
+    queue
+        .release_active_job(&job.id, lock_token(&claimed), ts(1_500))
+        .await
+        .unwrap();
+
+    let reopened = LocalJobQueue::open("durable-active-release", &snapshot_path)
+        .await
+        .unwrap();
+    let restored = reopened.get_job(&job.id).await.unwrap().unwrap();
+    assert_eq!(restored.state, JobState::Waiting);
+    assert_eq!(restored.scheduled_at, ts(1_500));
+    assert_eq!(restored.attempts_made, 1);
+    assert!(restored.processed_at.is_none());
     assert!(restored.worker_id.is_none());
     assert!(restored.lock_token.is_none());
     assert!(restored.lease_expires_at.is_none());

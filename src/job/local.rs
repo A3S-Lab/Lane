@@ -271,6 +271,20 @@ impl JobQueueBackend for LocalJobQueue {
         Ok(job)
     }
 
+    async fn release_active_job(
+        &self,
+        job_id: &str,
+        lock_token: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Job> {
+        let job = self
+            .inner
+            .release_active_job(job_id, lock_token, now)
+            .await?;
+        self.persist().await?;
+        Ok(job)
+    }
+
     async fn promote_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {
         let job = self.inner.promote_job(job_id, now).await?;
         self.persist().await?;

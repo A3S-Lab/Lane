@@ -616,6 +616,30 @@ impl InMemoryJobQueue {
         Ok(job.clone())
     }
 
+    /// Release an active leased job back to waiting state.
+    pub async fn release_active(
+        &self,
+        job_id: &str,
+        lock_token: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Job> {
+        let mut inner = self.inner.lock().await;
+        let job = inner
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
+        require_active(job, "release active")?;
+        require_lock_token(job, lock_token)?;
+        job.state = JobState::Waiting;
+        job.scheduled_at = now;
+        job.processed_at = None;
+        job.worker_id = None;
+        job.lock_token = None;
+        job.lease_expires_at = None;
+        job.failed_reason = None;
+        Ok(job.clone())
+    }
+
     /// Update a non-terminal job priority.
     pub async fn set_priority(&self, job_id: &str, priority: JobPriority) -> Result<Job> {
         let mut inner = self.inner.lock().await;
@@ -1190,6 +1214,15 @@ impl JobQueueBackend for InMemoryJobQueue {
         now: DateTime<Utc>,
     ) -> Result<Job> {
         self.delay_active(job_id, lock_token, delay, now).await
+    }
+
+    async fn release_active_job(
+        &self,
+        job_id: &str,
+        lock_token: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Job> {
+        self.release_active(job_id, lock_token, now).await
     }
 
     async fn promote_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {

@@ -65,6 +65,13 @@ pub trait JobQueueBackend: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<Job>;
 
+    async fn release_active_job(
+        &self,
+        job_id: &str,
+        lock_token: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Job>;
+
     async fn promote_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job>;
 
     async fn reschedule_job(

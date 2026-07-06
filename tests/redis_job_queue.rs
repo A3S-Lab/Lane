@@ -2765,6 +2765,94 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect("delayed-again job should complete");
 
+    let release_active = producer
+        .add_job(
+            "release-active".to_string(),
+            serde_json::json!({ "kind": "yield" }),
+            JobOptions::new().with_priority(3),
+        )
+        .await
+        .expect("release-active job should be added");
+    let claimed_release = worker
+        .claim_next(
+            "worker-release-active".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("release-active claim should return")
+        .expect("release-active job should be claimable");
+    assert_eq!(claimed_release.id, release_active.id);
+    let wrong_release_token = producer
+        .release_active_job(&claimed_release.id, "wrong-token", Utc::now())
+        .await
+        .expect_err("wrong token must not release an active job");
+    assert!(matches!(
+        wrong_release_token,
+        LaneError::JobLeaseConflict(_)
+    ));
+    let released_active = producer
+        .release_active_job(
+            &claimed_release.id,
+            lock_token(&claimed_release),
+            Utc::now(),
+        )
+        .await
+        .expect("active job should release back to waiting");
+    assert_eq!(released_active.state, JobState::Waiting);
+    assert_eq!(released_active.attempts_made, claimed_release.attempts_made);
+    assert!(released_active.worker_id.is_none());
+    assert!(released_active.lock_token.is_none());
+    assert!(released_active.lease_expires_at.is_none());
+    let release_active_score: Option<f64> = remove_index_conn
+        .zscore(format!("{namespace}:jobs:active"), &claimed_release.id)
+        .await?;
+    assert!(release_active_score.is_none());
+    let release_waiting_score: Option<f64> = remove_index_conn
+        .zscore(format!("{namespace}:jobs:waiting"), &claimed_release.id)
+        .await?;
+    assert!(release_waiting_score.is_some());
+    let release_lock_exists: usize = remove_index_conn
+        .exists(format!("{namespace}:jobs:locks:{}", claimed_release.id))
+        .await?;
+    assert_eq!(release_lock_exists, 0);
+    let complete_after_release = producer
+        .complete_job(
+            &claimed_release.id,
+            lock_token(&claimed_release),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect_err("waiting job must not complete with the old active token");
+    assert!(matches!(
+        complete_after_release,
+        LaneError::JobStateConflict(_)
+    ));
+    let reclaimed_release = worker
+        .claim_next(
+            "worker-release-active-again".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("released job claim should return")
+        .expect("released job should be claimable again");
+    assert_eq!(reclaimed_release.id, claimed_release.id);
+    assert_eq!(
+        reclaimed_release.attempts_made,
+        claimed_release.attempts_made + 1
+    );
+    worker
+        .complete_job(
+            &reclaimed_release.id,
+            lock_token(&reclaimed_release),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("released job should complete after reclaim");
+
     let stale_active_delay = producer
         .add_job(
             "stale-active-delay".to_string(),

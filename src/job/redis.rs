@@ -1625,6 +1625,54 @@ redis.call('ZADD', KEYS[3], ARGV[4], ARGV[1])
 return {'ok', updated}
 "#;
 
+const RELEASE_ACTIVE_JOB_SCRIPT: &str = r#"
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not raw then
+  redis.call('ZREM', KEYS[2], ARGV[1])
+  redis.call('DEL', KEYS[5])
+  return {'missing'}
+end
+
+local job = cjson.decode(raw)
+if job["state"] ~= "active" then
+  redis.call('ZREM', KEYS[2], ARGV[1])
+  return {'state', job["state"] or ''}
+end
+
+local lock_token = redis.call('GET', KEYS[5])
+if not lock_token then
+  return {'lock_missing'}
+end
+if lock_token ~= ARGV[2] then
+  return {'lock_mismatch'}
+end
+
+local removed_from_active = redis.call('ZREM', KEYS[2], ARGV[1])
+if removed_from_active == 0 then
+  return {'state', 'active_index_missing'}
+end
+
+redis.call('DEL', KEYS[5])
+
+job["state"] = "waiting"
+job["scheduled_at"] = ARGV[3]
+job["processed_at"] = cjson.null
+job["worker_id"] = cjson.null
+job["lock_token"] = cjson.null
+job["lease_expires_at"] = cjson.null
+job["failed_reason"] = cjson.null
+
+local priority = tonumber(job["priority"] or '1000') or 1000
+local sequence = redis.call('INCR', KEYS[4])
+local waiting_score = (priority * tonumber(ARGV[5])) + sequence
+local updated = cjson.encode(job)
+
+redis.call('HSET', KEYS[1], ARGV[1], updated)
+redis.call('ZADD', KEYS[3], waiting_score, ARGV[1])
+
+return {'ok', updated}
+"#;
+
 const RECOVER_STALLED_SCRIPT: &str = r#"
 local function deduplication_id(job)
   if not job["options"] or job["options"] == cjson.null then
@@ -4043,6 +4091,32 @@ impl JobQueueBackend for RedisJobQueue {
             .await
             .map_err(redis_error)?;
         decode_transition_result(&result, job_id, "delay active")
+    }
+
+    async fn release_active_job(
+        &self,
+        job_id: &str,
+        lock_token: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Job> {
+        let mut conn = self.connection().await?;
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(RELEASE_ACTIVE_JOB_SCRIPT)
+            .arg(5)
+            .arg(self.jobs_key())
+            .arg(self.state_key(JobState::Active))
+            .arg(self.state_key(JobState::Waiting))
+            .arg(self.sequence_key())
+            .arg(self.lock_key(job_id))
+            .arg(job_id)
+            .arg(lock_token)
+            .arg(now.to_rfc3339())
+            .arg(millis(now))
+            .arg(WAITING_SCORE_BUCKET)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_transition_result(&result, job_id, "release active")
     }
 
     async fn promote_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {
