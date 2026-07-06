@@ -698,6 +698,20 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("released parent should load")
         .expect("released parent should exist");
     assert_eq!(parent.state, JobState::Waiting);
+    let mut flow_index_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let released_parent_waiting_score: Option<f64> = flow_index_conn
+        .zscore(format!("{namespace}:jobs:waiting"), &flow.parent.id)
+        .await?;
+    assert!(released_parent_waiting_score.is_some());
+    let released_parent_waiting_children_score: Option<f64> = flow_index_conn
+        .zscore(
+            format!("{namespace}:jobs:waiting_children"),
+            &flow.parent.id,
+        )
+        .await?;
+    assert!(released_parent_waiting_children_score.is_none());
     let claimed_parent = worker
         .claim_next(
             "worker-flow-parent".to_string(),
@@ -708,6 +722,66 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("flow parent claim should return")
         .expect("flow parent should be claimable");
     assert_eq!(claimed_parent.id, flow.parent.id);
+
+    let failed_flow = producer
+        .add_flow_at(
+            JobSpec::new(
+                "failed-flow-parent",
+                serde_json::json!({ "kind": "aggregate" }),
+            )
+            .with_options(JobOptions::new().with_priority(1)),
+            vec![
+                JobSpec::new("failed-flow-child", serde_json::json!({ "n": 1 }))
+                    .with_options(JobOptions::new().with_priority(1)),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("failed flow should be added");
+    let failed_child = worker
+        .claim_next(
+            "worker-failed-flow-child".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("failed flow child claim should return")
+        .expect("failed flow child should be claimable");
+    assert_eq!(failed_child.id, failed_flow.children[0].id);
+    worker
+        .fail_job(
+            &failed_child.id,
+            lock_token(&failed_child),
+            "terminal child failure".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("failed flow child should fail");
+    let failed_parent = producer
+        .get_job(&failed_flow.parent.id)
+        .await
+        .expect("failed parent should load")
+        .expect("failed parent should exist");
+    assert_eq!(failed_parent.state, JobState::Failed);
+    let expected_failed_reason = format!(
+        "child job {} failed: terminal child failure",
+        failed_child.id
+    );
+    assert_eq!(
+        failed_parent.failed_reason.as_deref(),
+        Some(expected_failed_reason.as_str())
+    );
+    let failed_parent_failed_score: Option<f64> = flow_index_conn
+        .zscore(format!("{namespace}:jobs:failed"), &failed_flow.parent.id)
+        .await?;
+    assert!(failed_parent_failed_score.is_some());
+    let failed_parent_waiting_children_score: Option<f64> = flow_index_conn
+        .zscore(
+            format!("{namespace}:jobs:waiting_children"),
+            &failed_flow.parent.id,
+        )
+        .await?;
+    assert!(failed_parent_waiting_children_score.is_none());
 
     let repeat = producer
         .add_job(

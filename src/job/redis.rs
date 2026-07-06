@@ -155,6 +155,68 @@ else
   redis.call('ZADD', KEYS[3], ARGV[5], ARGV[1])
 end
 
+local parent_id = job["parent_id"]
+if parent_id and parent_id ~= cjson.null then
+  local parent_raw = redis.call('HGET', KEYS[1], parent_id)
+  if parent_raw then
+    local parent = cjson.decode(parent_raw)
+    if parent["state"] == "waiting_children" then
+      local all_done = true
+      local failed_child_id = nil
+      local failed_reason = nil
+      for _, child_id in ipairs(parent["child_ids"] or {}) do
+        local child_raw = nil
+        if child_id == ARGV[1] then
+          child_raw = updated
+        else
+          child_raw = redis.call('HGET', KEYS[1], child_id)
+        end
+        if child_raw then
+          local child = cjson.decode(child_raw)
+          if child["state"] == "failed" then
+            failed_child_id = child_id
+            failed_reason = child["failed_reason"] or "unknown error"
+            break
+          elseif child["state"] ~= "completed" then
+            all_done = false
+            break
+          end
+        end
+      end
+
+      if failed_child_id then
+        redis.call('ZREM', KEYS[6], parent_id)
+        parent["state"] = "failed"
+        parent["finished_at"] = ARGV[3]
+        parent["worker_id"] = cjson.null
+        parent["lock_token"] = cjson.null
+        parent["lease_expires_at"] = cjson.null
+        parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
+        if parent["options"] and parent["options"]["remove_on_fail"] == true then
+          redis.call('HDEL', KEYS[1], parent_id)
+        else
+          redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+          redis.call('ZADD', KEYS[8], ARGV[5], parent_id)
+        end
+      elseif all_done and parent["scheduled_at"] <= ARGV[3] then
+        redis.call('ZREM', KEYS[6], parent_id)
+        parent["state"] = "waiting"
+        parent["processed_at"] = cjson.null
+        parent["finished_at"] = cjson.null
+        parent["worker_id"] = cjson.null
+        parent["lock_token"] = cjson.null
+        parent["lease_expires_at"] = cjson.null
+        parent["failed_reason"] = cjson.null
+        local priority = tonumber(parent["priority"] or '1000') or 1000
+        local sequence = redis.call('INCR', KEYS[7])
+        local waiting_score = (priority * tonumber(ARGV[7])) + sequence
+        redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+        redis.call('ZADD', KEYS[5], waiting_score, parent_id)
+      end
+    end
+  end
+end
+
 return {'ok', updated}
 "#;
 
@@ -202,6 +264,29 @@ if ARGV[9] == '1' then
 else
   redis.call('HSET', KEYS[1], ARGV[1], updated)
   redis.call('ZADD', KEYS[4], ARGV[8], ARGV[1])
+end
+
+local parent_id = job["parent_id"]
+if parent_id and parent_id ~= cjson.null then
+  local parent_raw = redis.call('HGET', KEYS[1], parent_id)
+  if parent_raw then
+    local parent = cjson.decode(parent_raw)
+    if parent["state"] == "waiting_children" then
+      redis.call('ZREM', KEYS[6], parent_id)
+      parent["state"] = "failed"
+      parent["finished_at"] = ARGV[3]
+      parent["worker_id"] = cjson.null
+      parent["lock_token"] = cjson.null
+      parent["lease_expires_at"] = cjson.null
+      parent["failed_reason"] = "child job " .. ARGV[1] .. " failed: " .. ARGV[4]
+      if parent["options"] and parent["options"]["remove_on_fail"] == true then
+        redis.call('HDEL', KEYS[1], parent_id)
+      else
+        redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+        redis.call('ZADD', KEYS[4], ARGV[8], parent_id)
+      end
+    end
+  end
 end
 
 return {'ok', updated}
@@ -790,11 +875,15 @@ impl JobQueueBackend for RedisJobQueue {
             .is_some_and(|job| job.options.remove_on_complete);
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(COMPLETE_SCRIPT)
-            .arg(4)
+            .arg(8)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.state_key(JobState::Completed))
             .arg(self.lock_key(job_id))
+            .arg(self.state_key(JobState::Waiting))
+            .arg(self.state_key(JobState::WaitingChildren))
+            .arg(self.sequence_key())
+            .arg(self.state_key(JobState::Failed))
             .arg(job_id)
             .arg(lock_token)
             .arg(now.to_rfc3339())
@@ -805,6 +894,7 @@ impl JobQueueBackend for RedisJobQueue {
             })?)
             .arg(millis(now))
             .arg(if remove_on_complete { "1" } else { "0" })
+            .arg(WAITING_SCORE_BUCKET)
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -842,12 +932,13 @@ impl JobQueueBackend for RedisJobQueue {
         let scheduled_at = retry_at.unwrap_or(now);
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(FAIL_SCRIPT)
-            .arg(5)
+            .arg(6)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.state_key(JobState::Delayed))
             .arg(self.state_key(JobState::Failed))
             .arg(self.lock_key(job_id))
+            .arg(self.state_key(JobState::WaitingChildren))
             .arg(job_id)
             .arg(lock_token)
             .arg(now.to_rfc3339())
