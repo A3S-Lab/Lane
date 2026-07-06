@@ -52,6 +52,7 @@ anyhow = "1"
 [[bench]]
 name = "queue_benchmark"
 harness = false
+required-features = ["metrics", "distributed"]
 
 [[example]]
 name = "observability"

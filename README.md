@@ -354,6 +354,57 @@ a3s-gateway → a3s-box (MicroVM) → SafeClaw → a3s-code → a3s-lane
 
 Works standalone for any priority-based async scheduling: web servers, background job processors, rate-limited API clients.
 
+## Universal job queue roadmap
+
+A3S Lane is evolving from an in-process lane scheduler into a general
+distributed priority job queue. The direction is BullMQ-like, but native to the
+A3S stack and language SDKs.
+
+| Phase | Status | Scope |
+| --- | --- | --- |
+| Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
+| Generic job runtime | In progress | JSON jobs, explicit job states, priority ordering, delayed jobs, worker leases, completion/failure snapshots, retry backoff, stalled-job recovery, pause/resume. |
+| Durable backend | Planned | Redis/Postgres/NATS backends behind the `JobQueueBackend` contract, atomic claim/complete/fail operations, lease renewal, recovery after process crash. |
+| Job management API | Planned | Add/get/remove/promote/retry/pause/resume/clean APIs, state queries, pagination, job logs, progress updates. |
+| Repeat and flow jobs | Planned | Cron/repeatable jobs, parent-child dependencies, waiting-children state, fan-out/fan-in flows. |
+| SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
+
+The first generic job runtime is available as `InMemoryJobQueue` and
+`JobQueueBackend`. It is process-local and intended as the reference
+implementation for future distributed backends:
+
+```rust
+use a3s_lane::{InMemoryJobQueue, JobOptions, JobQueueBackend, RetryPolicy};
+use std::time::Duration;
+
+# async fn example() -> a3s_lane::Result<()> {
+let queue = InMemoryJobQueue::new("email");
+
+let job = queue
+    .add(
+        "send",
+        serde_json::json!({ "to": "ops@example.com" }),
+        JobOptions::new()
+            .with_priority(10)
+            .with_delay(Duration::from_secs(5))
+            .with_retry_policy(RetryPolicy::fixed(3, Duration::from_secs(1))),
+    )
+    .await?;
+
+queue.promote_due_jobs(chrono::Utc::now()).await?;
+let claimed = queue
+    .claim_next("worker-1".to_string(), Duration::from_secs(30), chrono::Utc::now())
+    .await?;
+
+if claimed.is_some() {
+    queue
+        .complete_job(&job.id, serde_json::json!({ "ok": true }), chrono::Utc::now())
+        .await?;
+}
+# Ok(())
+# }
+```
+
 ## Benchmarks
 
 Apple Silicon (M-series), release build, steady-state throughput with pre-warmed manager:

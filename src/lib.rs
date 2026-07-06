@@ -57,6 +57,7 @@ pub mod config;
 pub mod dlq;
 pub mod error;
 pub mod event;
+pub mod job;
 pub mod manager;
 pub mod queue;
 pub mod retry;
@@ -85,6 +86,10 @@ pub use config::LaneConfig;
 pub use dlq::{DeadLetter, DeadLetterQueue};
 pub use error::{LaneError, Result};
 pub use event::{EventEmitter, EventPayload, EventStream, LaneEvent};
+pub use job::{
+    InMemoryJobQueue, Job, JobId, JobOptions, JobPriority, JobQueueBackend, JobQueueStats,
+    JobState, JobWorkerId, QueueName, DEFAULT_JOB_PRIORITY,
+};
 pub use manager::{QueueManager, QueueManagerBuilder};
 pub use queue::{
     lane_ids, priorities, Command, CommandId, CommandQueue, JsonCommand, Lane, LaneId, LaneStatus,

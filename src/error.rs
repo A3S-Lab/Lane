@@ -9,6 +9,7 @@
 //! - Lane configuration errors (lane not found, invalid config)
 //! - Queue operation errors (capacity exceeded, shutdown in progress)
 //! - Command execution errors (timeout, execution failure)
+//! - Generic job runtime errors (job not found)
 //!
 //! # Example
 //!
@@ -41,6 +42,7 @@ use thiserror::Error;
 /// * `QueueError` - General queue operation error (e.g., capacity exceeded)
 /// * `ConfigError` - Invalid configuration (e.g., min > max concurrency)
 /// * `CommandError` - Command execution failed
+/// * `JobNotFound` - The specified generic job ID does not exist
 /// * `Timeout` - Command exceeded its timeout duration
 /// * `ShutdownInProgress` - Queue is shutting down and not accepting new commands
 /// * `Other` - Catch-all for unexpected errors
@@ -61,6 +63,10 @@ pub enum LaneError {
     /// Command execution error
     #[error("Command execution error: {0}")]
     CommandError(String),
+
+    /// Job not found
+    #[error("Job not found: {0}")]
+    JobNotFound(String),
 
     /// Command timeout
     #[error("Command timed out after {0:?}")]
@@ -119,6 +125,12 @@ mod tests {
     fn test_timeout_error() {
         let error = LaneError::Timeout(std::time::Duration::from_secs(5));
         assert_eq!(error.to_string(), "Command timed out after 5s");
+    }
+
+    #[test]
+    fn test_job_not_found_error() {
+        let error = LaneError::JobNotFound("job-1".to_string());
+        assert_eq!(error.to_string(), "Job not found: job-1");
     }
 
     #[test]
