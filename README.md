@@ -369,10 +369,10 @@ A3S stack and language SDKs.
 | Phase | Status | Scope |
 | --- | --- | --- |
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
-| Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, explicit job states, priority ordering, delayed jobs, token-owned worker leases, completion/failure snapshots, retry backoff, rate-limited claims, shared active concurrency limits, stalled-job recovery, pause/resume. |
+| Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication, explicit job states, priority ordering, delayed jobs, token-owned worker leases, completion/failure snapshots, retry backoff, rate-limited claims, shared active concurrency limits, stalled-job recovery, pause/resume. |
 | Job management API | In progress | Add/get/remove/promote/retry/update-priority/pause/resume/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, and stalled recovery loops. |
-| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, flow submission, delayed promotion, single-job promote, manual retry, priority update, progress update, log append, list/stat snapshots, clean, claim, rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
+| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, simple deduplication, flow submission, delayed promotion, single-job promote, manual retry, priority update, progress update, log append, list/stat snapshots, clean, claim, rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, and end timestamps are available across in-memory, local durable, and Redis backends. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
@@ -532,6 +532,41 @@ assert_eq!(
 # }
 ```
 
+Simple deduplication coalesces duplicate submissions while the first matching
+job is still non-terminal:
+
+```rust
+use a3s_lane::{InMemoryJobQueue, JobOptions};
+
+# async fn dedup_example() -> a3s_lane::Result<()> {
+let queue = InMemoryJobQueue::new("billing");
+
+let first = queue
+    .add(
+        "recalculate-account",
+        serde_json::json!({ "account_id": "acct_42" }),
+        JobOptions::new().with_deduplication_id("account:acct_42"),
+    )
+    .await?;
+
+let duplicate = queue
+    .add(
+        "recalculate-account",
+        serde_json::json!({ "account_id": "acct_42", "duplicate": true }),
+        JobOptions::new().with_deduplication_id("account:acct_42"),
+    )
+    .await?;
+
+assert_eq!(duplicate.id, first.id);
+# Ok(())
+# }
+```
+
+The current deduplication mode intentionally covers BullMQ's simple mode: a
+deduplication id blocks duplicate adds until the owning job completes, fails
+terminally, is removed, or is cleaned. TTL, replace/debounce, and
+keep-last-if-active behavior remain planned.
+
 Use `LocalJobQueue` when a process-local runtime needs durable restart
 recovery:
 
@@ -651,6 +686,11 @@ waiting, delayed, or waiting-children index in the same Redis turn. If a custom
 job id already exists, the script returns the existing job without advancing the
 waiting sequence or writing duplicate state indexes. Bulk add follows the same
 mechanism in one script call while preserving the caller's input order.
+For simple deduplication, the same add scripts use an independent
+`deduplication:<id>` key, equivalent to BullMQ's `de:<id>` role, to return the
+currently active job before writing a duplicate. Completion, terminal failure,
+remove, clean, and stalled terminal failure scripts release that key only when it
+still points at the job being finalized or removed.
 
 Redis flow submission is all-or-nothing: the flow add script first checks every
 parent and child job id, then writes the parent, children, and all state indexes

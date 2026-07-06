@@ -323,6 +323,34 @@ impl RepeatOptions {
     }
 }
 
+/// Simple deduplication settings for a generic job.
+///
+/// Jobs with the same deduplication id are coalesced while the first job is
+/// still in a non-terminal state. The deduplication id is released when that
+/// job completes, fails terminally, or is removed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeduplicationOptions {
+    /// Queue-local id used to coalesce duplicate submissions.
+    pub id: String,
+}
+
+impl DeduplicationOptions {
+    /// Create simple deduplication options.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self { id: id.into() }
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.id.trim().is_empty() {
+            return Err(LaneError::ConfigError(
+                "deduplication id must not be empty".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 /// Options used when adding a generic queue job.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JobOptions {
@@ -346,6 +374,9 @@ pub struct JobOptions {
     /// Optional repeat schedule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat: Option<RepeatOptions>,
+    /// Optional simple deduplication settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deduplication: Option<DeduplicationOptions>,
 }
 
 impl Default for JobOptions {
@@ -360,6 +391,7 @@ impl Default for JobOptions {
             remove_on_fail: false,
             max_stalled_count: 1,
             repeat: None,
+            deduplication: None,
         }
     }
 }
@@ -424,6 +456,12 @@ impl JobOptions {
         self
     }
 
+    /// Coalesce duplicate submissions while a matching job is still non-terminal.
+    pub fn with_deduplication_id(mut self, id: impl Into<String>) -> Self {
+        self.deduplication = Some(DeduplicationOptions::new(id));
+        self
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         if matches!(self.job_id.as_deref(), Some(job_id) if job_id.trim().is_empty()) {
             return Err(LaneError::ConfigError(
@@ -433,6 +471,10 @@ impl JobOptions {
 
         if let Some(repeat) = &self.repeat {
             repeat.validate()?;
+        }
+
+        if let Some(deduplication) = &self.deduplication {
+            deduplication.validate()?;
         }
 
         Ok(())

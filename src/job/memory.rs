@@ -96,6 +96,9 @@ impl InMemoryJobQueue {
         if let Some(existing) = inner.jobs.get(&job.id) {
             return Ok(existing.clone());
         }
+        if let Some(existing) = find_active_deduplicated_job(&inner.jobs, &job) {
+            return Ok(existing.clone());
+        }
         inner.jobs.insert(job.id.clone(), job.clone());
         Ok(job)
     }
@@ -132,6 +135,12 @@ impl InMemoryJobQueue {
                 continue;
             }
             if let Some(existing) = staged.get(&job.id) {
+                added.push(existing.clone());
+                continue;
+            }
+            if let Some(existing) = find_active_deduplicated_job(&inner.jobs, &job)
+                .or_else(|| find_active_deduplicated_job(&staged, &job))
+            {
                 added.push(existing.clone());
                 continue;
             }
@@ -194,6 +203,18 @@ impl InMemoryJobQueue {
                 return Err(LaneError::ConfigError(format!(
                     "flow job id `{id}` already exists"
                 )));
+            }
+        }
+        let mut flow_deduplication_ids = HashSet::new();
+        for job in std::iter::once(&parent_job).chain(child_jobs.iter()) {
+            if let Some(deduplication_id) = active_deduplication_id(job) {
+                if find_active_deduplication_id(&inner.jobs, deduplication_id).is_some()
+                    || !flow_deduplication_ids.insert(deduplication_id.to_string())
+                {
+                    return Err(LaneError::ConfigError(format!(
+                        "flow deduplication id `{deduplication_id}` already active"
+                    )));
+                }
             }
         }
         inner.jobs.insert(parent_job.id.clone(), parent_job.clone());
@@ -817,6 +838,33 @@ fn state_rank(state: JobState) -> u8 {
         JobState::Completed => 4,
         JobState::Failed => 5,
     }
+}
+
+fn active_deduplication_id(job: &Job) -> Option<&str> {
+    if job.state.is_terminal() {
+        return None;
+    }
+
+    job.options
+        .deduplication
+        .as_ref()
+        .map(|deduplication| deduplication.id.as_str())
+}
+
+fn find_active_deduplicated_job<'a>(
+    jobs: &'a HashMap<JobId, Job>,
+    candidate: &Job,
+) -> Option<&'a Job> {
+    let deduplication_id = active_deduplication_id(candidate)?;
+    find_active_deduplication_id(jobs, deduplication_id)
+}
+
+fn find_active_deduplication_id<'a>(
+    jobs: &'a HashMap<JobId, Job>,
+    deduplication_id: &str,
+) -> Option<&'a Job> {
+    jobs.values()
+        .find(|job| active_deduplication_id(job) == Some(deduplication_id))
 }
 
 fn state_after_dependencies(scheduled_at: DateTime<Utc>, now: DateTime<Utc>) -> JobState {

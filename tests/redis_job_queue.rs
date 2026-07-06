@@ -38,6 +38,127 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("valid Redis URL should build the worker queue");
     trace_stage("queues:created");
 
+    let dedup_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "dedup")
+        .expect("valid Redis URL should build the dedup queue");
+    let first_dedup = dedup_queue
+        .add_job(
+            "dedup-sync".to_string(),
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new().with_deduplication_id("tenant:42"),
+        )
+        .await
+        .expect("dedup job should be added");
+    let duplicate_dedup = dedup_queue
+        .add_job(
+            "dedup-sync-duplicate".to_string(),
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new().with_deduplication_id("tenant:42"),
+        )
+        .await
+        .expect("duplicate dedup job should return existing job");
+    assert_eq!(duplicate_dedup, first_dedup);
+    let mut dedup_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let dedup_owner: Option<String> = dedup_conn
+        .get(format!("{namespace}:dedup:deduplication:tenant:42"))
+        .await?;
+    assert_eq!(dedup_owner.as_deref(), Some(first_dedup.id.as_str()));
+
+    let first_dedup_claim = dedup_queue
+        .claim_next(
+            "worker-dedup".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("dedup claim should return")
+        .expect("dedup job should be claimable");
+    dedup_queue
+        .complete_job(
+            &first_dedup_claim.id,
+            lock_token(&first_dedup_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("dedup job should complete");
+    let released_dedup_owner: Option<String> = dedup_conn
+        .get(format!("{namespace}:dedup:deduplication:tenant:42"))
+        .await?;
+    assert!(released_dedup_owner.is_none());
+
+    let after_terminal_dedup = dedup_queue
+        .add_job(
+            "dedup-after-terminal".to_string(),
+            serde_json::json!({ "version": 3 }),
+            JobOptions::new().with_deduplication_id("tenant:42"),
+        )
+        .await
+        .expect("dedup id should be reusable after terminal completion");
+    assert_ne!(after_terminal_dedup.id, first_dedup.id);
+    dedup_queue
+        .remove_job(&after_terminal_dedup.id)
+        .await
+        .expect("dedup waiting job should remove")
+        .expect("dedup waiting job should be returned");
+    let removed_dedup_owner: Option<String> = dedup_conn
+        .get(format!("{namespace}:dedup:deduplication:tenant:42"))
+        .await?;
+    assert!(removed_dedup_owner.is_none());
+
+    let fail_dedup = dedup_queue
+        .add_job(
+            "dedup-fail".to_string(),
+            serde_json::json!({ "version": 4 }),
+            JobOptions::new().with_deduplication_id("tenant:fail"),
+        )
+        .await
+        .expect("dedup fail job should be added");
+    let fail_dedup_claim = dedup_queue
+        .claim_next(
+            "worker-dedup-fail".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("dedup fail claim should return")
+        .expect("dedup fail job should be claimable");
+    assert_eq!(fail_dedup_claim.id, fail_dedup.id);
+    dedup_queue
+        .fail_job(
+            &fail_dedup_claim.id,
+            lock_token(&fail_dedup_claim),
+            "terminal failure".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("terminal failure should release dedup key");
+    let failed_dedup_owner: Option<String> = dedup_conn
+        .get(format!("{namespace}:dedup:deduplication:tenant:fail"))
+        .await?;
+    assert!(failed_dedup_owner.is_none());
+
+    let clean_dedup = dedup_queue
+        .add_job(
+            "dedup-clean".to_string(),
+            serde_json::json!({ "version": 5 }),
+            JobOptions::new().with_deduplication_id("tenant:clean"),
+        )
+        .await
+        .expect("dedup clean job should be added");
+    let cleaned_dedup = dedup_queue
+        .clean_jobs(JobState::Waiting, Duration::ZERO, 1, Utc::now())
+        .await
+        .expect("clean should release dedup key");
+    assert_eq!(cleaned_dedup.len(), 1);
+    assert_eq!(cleaned_dedup[0].id, clean_dedup.id);
+    let cleaned_dedup_owner: Option<String> = dedup_conn
+        .get(format!("{namespace}:dedup:deduplication:tenant:clean"))
+        .await?;
+    assert!(cleaned_dedup_owner.is_none());
+    trace_stage("dedup:done");
+
     let priority_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "priority")
         .expect("valid Redis URL should build the priority queue");
     let first_priority = priority_queue

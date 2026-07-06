@@ -126,6 +126,61 @@ async fn custom_job_ids_make_add_idempotent() {
 }
 
 #[tokio::test]
+async fn simple_deduplication_coalesces_non_terminal_jobs() {
+    let queue = InMemoryJobQueue::new("dedup");
+    let now = ts(1_000);
+    let first = queue
+        .add_at(
+            "sync",
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new().with_deduplication_id("account:42"),
+            now,
+        )
+        .await
+        .unwrap();
+    let duplicate = queue
+        .add_at(
+            "sync-duplicate",
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new().with_deduplication_id("account:42"),
+            ts(2_000),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(duplicate, first);
+    assert_eq!(queue.stats().await.unwrap().waiting, 1);
+
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(3_000))
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .complete_job(
+            &claimed.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            ts(4_000),
+        )
+        .await
+        .unwrap();
+
+    let after_terminal = queue
+        .add_at(
+            "sync-after-terminal",
+            serde_json::json!({ "version": 3 }),
+            JobOptions::new().with_deduplication_id("account:42"),
+            ts(5_000),
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(after_terminal.id, first.id);
+    assert_eq!(after_terminal.name, "sync-after-terminal");
+}
+
+#[tokio::test]
 async fn add_many_preserves_order_and_idempotent_custom_ids() {
     let queue = InMemoryJobQueue::new("bulk");
     let now = ts(1_000);
