@@ -365,6 +365,7 @@ A3S stack and language SDKs.
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
 | Generic job runtime | In progress | JSON jobs, explicit job states, priority ordering, delayed jobs, worker leases, completion/failure snapshots, retry backoff, stalled-job recovery, pause/resume. |
 | Job management API | In progress | Add/get/remove/promote/retry/pause/resume/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
+| Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, runs async processors, completes/fails jobs, supports processor progress/log updates, timeouts, and stalled recovery loops. |
 | Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; Redis/Postgres/NATS backends remain planned for multi-process distributed claims. |
 | Repeat and flow jobs | Planned | Cron/repeatable jobs, parent-child dependencies, waiting-children state, fan-out/fan-in flows. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
@@ -442,6 +443,41 @@ if claimed.is_some() {
         .complete_job(&job.id, serde_json::json!({ "ok": true }), chrono::Utc::now())
         .await?;
 }
+# Ok(())
+# }
+```
+
+Use `JobWorker` to run async processors against any backend:
+
+```rust
+use a3s_lane::{
+    job_processor_fn, InMemoryJobQueue, JobOptions, JobQueueBackend, JobWorker, JobWorkerConfig,
+};
+use std::{sync::Arc, time::Duration};
+
+# async fn worker_example() -> a3s_lane::Result<()> {
+let backend: Arc<dyn JobQueueBackend> = Arc::new(InMemoryJobQueue::new("email"));
+backend
+    .add_job(
+        "send".to_string(),
+        serde_json::json!({ "to": "ops@example.com" }),
+        JobOptions::new().with_timeout(Duration::from_secs(30)),
+    )
+    .await?;
+
+let processor = Arc::new(job_processor_fn(|job, context| async move {
+    context.update_progress(serde_json::json!({ "phase": "sending" })).await?;
+    context.add_log("provider accepted message").await?;
+    Ok(serde_json::json!({ "sent": job.payload["to"] }))
+}));
+
+let worker = JobWorker::new(
+    backend,
+    processor,
+    JobWorkerConfig::new("worker-1").with_concurrency(4),
+);
+
+worker.run_until_idle(100).await?;
 # Ok(())
 # }
 ```

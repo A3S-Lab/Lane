@@ -2,6 +2,8 @@ use super::*;
 use crate::error::LaneError;
 use crate::retry::RetryPolicy;
 use chrono::{DateTime, TimeZone, Utc};
+use serde_json::Value;
+use std::sync::Arc;
 use std::time::Duration;
 
 fn ts(ms: i64) -> DateTime<Utc> {
@@ -464,4 +466,149 @@ async fn local_job_queue_rejects_mismatched_snapshot_queue() {
 
     let error = LocalJobQueue::open("b", &snapshot_path).await.unwrap_err();
     assert!(matches!(error, LaneError::ConfigError(_)));
+}
+
+#[tokio::test]
+async fn worker_completes_claimed_job_and_preserves_context_updates() {
+    let backend: Arc<dyn JobQueueBackend> = Arc::new(InMemoryJobQueue::new("worker"));
+    let job = backend
+        .add_job(
+            "send".to_string(),
+            serde_json::json!({ "to": "ops@example.com" }),
+            JobOptions::new().with_priority(1),
+        )
+        .await
+        .unwrap();
+
+    let processor = Arc::new(job_processor_fn(
+        |job: Job, context: JobContext| async move {
+            context
+                .update_progress(serde_json::json!({ "percent": 50 }))
+                .await?;
+            context.add_log("accepted by provider").await?;
+            Ok(serde_json::json!({ "processed": job.name }))
+        },
+    ));
+    let worker = JobWorker::new(
+        Arc::clone(&backend),
+        processor,
+        JobWorkerConfig::new("worker-a").with_lease_renew_interval(Duration::ZERO),
+    );
+
+    let outcome = worker.run_once(ts(1_000)).await.unwrap();
+    let completed = match outcome {
+        JobRunOutcome::Completed(job) => job,
+        other => panic!("expected completed job, got {other:?}"),
+    };
+    assert_eq!(completed.id, job.id);
+    assert_eq!(
+        completed.return_value,
+        Some(serde_json::json!({ "processed": "send" }))
+    );
+
+    let stored = backend.get_job(&job.id).await.unwrap().unwrap();
+    assert_eq!(stored.state, JobState::Completed);
+    assert_eq!(stored.progress, Some(serde_json::json!({ "percent": 50 })));
+    assert_eq!(stored.logs.len(), 1);
+    assert_eq!(stored.logs[0].line, "accepted by provider");
+}
+
+#[tokio::test]
+async fn worker_failure_marks_job_failed() {
+    let backend: Arc<dyn JobQueueBackend> = Arc::new(InMemoryJobQueue::new("worker"));
+    let job = backend
+        .add_job("fail".to_string(), serde_json::json!({}), JobOptions::new())
+        .await
+        .unwrap();
+
+    let processor = Arc::new(job_processor_fn(|_, _| async {
+        Err::<Value, LaneError>(LaneError::Other("processor failed".to_string()))
+    }));
+    let worker = JobWorker::new(
+        Arc::clone(&backend),
+        processor,
+        JobWorkerConfig::new("worker-a").with_lease_renew_interval(Duration::ZERO),
+    );
+
+    let outcome = worker.run_once(ts(1_000)).await.unwrap();
+    let failed = match outcome {
+        JobRunOutcome::Failed(job) => job,
+        other => panic!("expected failed job, got {other:?}"),
+    };
+    assert_eq!(failed.state, JobState::Failed);
+    assert_eq!(failed.failed_reason.as_deref(), Some("processor failed"));
+    assert_eq!(
+        backend
+            .get_job(&job.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .failed_reason
+            .as_deref(),
+        Some("processor failed")
+    );
+}
+
+#[tokio::test]
+async fn worker_timeout_fails_job() {
+    let backend: Arc<dyn JobQueueBackend> = Arc::new(InMemoryJobQueue::new("worker"));
+    let job = backend
+        .add_job(
+            "slow".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_timeout(Duration::from_millis(10)),
+        )
+        .await
+        .unwrap();
+
+    let processor = Arc::new(job_processor_fn(|_, _| async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        Ok(serde_json::json!({ "late": true }))
+    }));
+    let worker = JobWorker::new(
+        Arc::clone(&backend),
+        processor,
+        JobWorkerConfig::new("worker-a").with_lease_renew_interval(Duration::ZERO),
+    );
+
+    let outcome = worker.run_once(ts(1_000)).await.unwrap();
+    let failed = match outcome {
+        JobRunOutcome::Failed(job) => job,
+        other => panic!("expected failed job, got {other:?}"),
+    };
+    assert_eq!(failed.state, JobState::Failed);
+    assert!(failed
+        .failed_reason
+        .as_deref()
+        .unwrap_or_default()
+        .contains("timed out"));
+    assert_eq!(
+        backend.get_job(&job.id).await.unwrap().unwrap().state,
+        JobState::Failed
+    );
+}
+
+#[tokio::test]
+async fn worker_run_until_idle_processes_ready_jobs() {
+    let backend: Arc<dyn JobQueueBackend> = Arc::new(InMemoryJobQueue::new("worker"));
+    for name in ["a", "b"] {
+        backend
+            .add_job(name.to_string(), serde_json::json!({}), JobOptions::new())
+            .await
+            .unwrap();
+    }
+
+    let processor = Arc::new(job_processor_fn(
+        |job: Job, _context: JobContext| async move { Ok(serde_json::json!({ "name": job.name })) },
+    ));
+    let worker = JobWorker::new(
+        Arc::clone(&backend),
+        processor,
+        JobWorkerConfig::new("worker-a").with_lease_renew_interval(Duration::ZERO),
+    );
+
+    assert_eq!(worker.run_until_idle(10).await.unwrap(), 2);
+    let stats = backend.stats().await.unwrap();
+    assert_eq!(stats.completed, 2);
+    assert_eq!(stats.waiting, 0);
 }

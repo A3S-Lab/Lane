@@ -87,9 +87,10 @@ pub use dlq::{DeadLetter, DeadLetterQueue};
 pub use error::{LaneError, Result};
 pub use event::{EventEmitter, EventPayload, EventStream, LaneEvent};
 pub use job::{
-    InMemoryJobQueue, Job, JobId, JobListOptions, JobListPage, JobLogEntry, JobOptions,
-    JobPriority, JobQueueBackend, JobQueueSnapshot, JobQueueStats, JobState, JobWorkerId,
-    LocalJobQueue, QueueName, DEFAULT_JOB_PRIORITY,
+    job_processor_fn, InMemoryJobQueue, Job, JobContext, JobId, JobListOptions, JobListPage,
+    JobLogEntry, JobOptions, JobPriority, JobProcessor, JobProcessorFn, JobQueueBackend,
+    JobQueueSnapshot, JobQueueStats, JobRunOutcome, JobState, JobWorker, JobWorkerConfig,
+    JobWorkerHandle, JobWorkerId, LocalJobQueue, QueueName, DEFAULT_JOB_PRIORITY,
 };
 pub use manager::{QueueManager, QueueManagerBuilder};
 pub use queue::{
