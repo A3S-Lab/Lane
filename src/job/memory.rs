@@ -1310,6 +1310,11 @@ impl JobQueueBackend for InMemoryJobQueue {
         Ok(())
     }
 
+    async fn is_paused(&self) -> Result<bool> {
+        let inner = self.inner.lock().await;
+        Ok(inner.paused)
+    }
+
     async fn get_job(&self, job_id: &str) -> Result<Option<Job>> {
         let inner = self.inner.lock().await;
         Ok(inner.jobs.get(job_id).cloned())

@@ -391,6 +391,10 @@ impl JobQueueBackend for LocalJobQueue {
         self.persist().await
     }
 
+    async fn is_paused(&self) -> Result<bool> {
+        self.inner.is_paused().await
+    }
+
     async fn get_job(&self, job_id: &str) -> Result<Option<Job>> {
         self.inner.get_job(job_id).await
     }

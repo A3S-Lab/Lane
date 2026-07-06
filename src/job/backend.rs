@@ -156,6 +156,9 @@ pub trait JobQueueBackend: Send + Sync {
 
     async fn resume(&self) -> Result<()>;
 
+    /// Return whether this queue is currently paused.
+    async fn is_paused(&self) -> Result<bool>;
+
     async fn get_job(&self, job_id: &str) -> Result<Option<Job>>;
 
     async fn get_job_state(&self, job_id: &str) -> Result<Option<JobState>>;

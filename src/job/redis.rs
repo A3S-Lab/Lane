@@ -4254,6 +4254,15 @@ impl JobQueueBackend for RedisJobQueue {
             .map_err(redis_error)
     }
 
+    async fn is_paused(&self) -> Result<bool> {
+        let mut conn = self.connection().await?;
+        let paused: Option<String> = conn
+            .hget(self.meta_key(), "paused")
+            .await
+            .map_err(redis_error)?;
+        Ok(paused.as_deref().is_some_and(|value| value != "0"))
+    }
+
     async fn get_job(&self, job_id: &str) -> Result<Option<Job>> {
         let mut conn = self.connection().await?;
         self.load_job(&mut conn, job_id).await

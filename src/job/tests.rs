@@ -1974,7 +1974,9 @@ async fn stalled_jobs_are_recovered_until_limit() {
 async fn pause_blocks_claiming_without_rejecting_adds() {
     let queue = InMemoryJobQueue::new("paused");
     let now = ts(1_000);
+    assert!(!queue.is_paused().await.unwrap());
     queue.pause().await.unwrap();
+    assert!(queue.is_paused().await.unwrap());
     queue
         .add_at("task", serde_json::json!({}), JobOptions::new(), now)
         .await
@@ -1990,6 +1992,7 @@ async fn pause_blocks_claiming_without_rejecting_adds() {
     assert_eq!(stats.waiting, 1);
 
     queue.resume().await.unwrap();
+    assert!(!queue.is_paused().await.unwrap());
     assert!(queue
         .claim_next("worker-a".to_string(), Duration::from_secs(1), now)
         .await
@@ -2848,6 +2851,7 @@ async fn local_job_queue_persists_snapshot_across_reopen() {
     let queue = LocalJobQueue::open("durable", &snapshot_path)
         .await
         .unwrap();
+    assert!(!queue.is_paused().await.unwrap());
     let job = queue
         .add_at(
             "email",
@@ -2858,10 +2862,12 @@ async fn local_job_queue_persists_snapshot_across_reopen() {
         .await
         .unwrap();
     queue.pause().await.unwrap();
+    assert!(queue.is_paused().await.unwrap());
 
     let reopened = LocalJobQueue::open("durable", &snapshot_path)
         .await
         .unwrap();
+    assert!(reopened.is_paused().await.unwrap());
     let stats = reopened.stats().await.unwrap();
     assert!(stats.paused);
     assert_eq!(stats.waiting, 1);
@@ -2871,6 +2877,7 @@ async fn local_job_queue_persists_snapshot_across_reopen() {
     );
 
     reopened.resume().await.unwrap();
+    assert!(!reopened.is_paused().await.unwrap());
     let claimed = reopened
         .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(1_100))
         .await

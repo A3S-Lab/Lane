@@ -1331,10 +1331,24 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     let paused_promote_queue =
         RedisJobQueue::with_namespace(&redis_url, &namespace, "paused-promote")
             .expect("valid Redis URL should build the paused-promote queue");
+    assert!(!paused_promote_queue
+        .is_paused()
+        .await
+        .expect("paused-promote pause state should load before pause"));
     paused_promote_queue
         .pause()
         .await
         .expect("paused-promote queue should pause");
+    assert!(paused_promote_queue
+        .is_paused()
+        .await
+        .expect("paused-promote pause state should load after pause"));
+    let mut paused_promote_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let paused_meta_key = format!("{namespace}:paused-promote:meta");
+    let paused_raw: Option<u8> = paused_promote_conn.hget(&paused_meta_key, "paused").await?;
+    assert_eq!(paused_raw, Some(1));
     let paused_promoted = paused_promote_queue
         .add_job(
             "paused-promoted".to_string(),
@@ -1365,6 +1379,12 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .resume()
         .await
         .expect("paused-promote queue should resume");
+    assert!(!paused_promote_queue
+        .is_paused()
+        .await
+        .expect("paused-promote pause state should load after resume"));
+    let resumed_raw: Option<u8> = paused_promote_conn.hget(&paused_meta_key, "paused").await?;
+    assert_eq!(resumed_raw, Some(0));
     let paused_promoted_claim = paused_promote_queue
         .claim_next(
             "worker-paused-promote-resumed".to_string(),
