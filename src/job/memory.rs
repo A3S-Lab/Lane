@@ -120,7 +120,13 @@ impl InMemoryJobQueue {
                 inner.jobs.remove(&existing_id);
             } else {
                 Self::store_deduplicated_next_locked(&mut inner, &job, &existing);
-                return Ok(existing);
+                Self::extend_deduplication_expiration_locked(
+                    &mut inner.jobs,
+                    &job,
+                    &existing.id,
+                    now,
+                );
+                return Ok(inner.jobs.get(&existing.id).cloned().unwrap_or(existing));
             }
         }
         if let Some(existing) = find_active_repeat_job(&inner.jobs, &job) {
@@ -172,7 +178,13 @@ impl InMemoryJobQueue {
                     inner.jobs.remove(&existing_id);
                 } else {
                     Self::store_deduplicated_next_locked(&mut inner, &job, &existing);
-                    added.push(existing);
+                    Self::extend_deduplication_expiration_locked(
+                        &mut inner.jobs,
+                        &job,
+                        &existing.id,
+                        now,
+                    );
+                    added.push(inner.jobs.get(&existing.id).cloned().unwrap_or(existing));
                     continue;
                 }
             }
@@ -182,7 +194,13 @@ impl InMemoryJobQueue {
                     let existing_id = existing.id.clone();
                     staged.remove(&existing_id);
                 } else {
-                    added.push(existing);
+                    Self::extend_deduplication_expiration_locked(
+                        &mut staged,
+                        &job,
+                        &existing.id,
+                        now,
+                    );
+                    added.push(staged.get(&existing.id).cloned().unwrap_or(existing));
                     continue;
                 }
             }
@@ -563,6 +581,22 @@ impl InMemoryJobQueue {
         }
         inner.jobs.insert(next.id.clone(), next.clone());
         Some(next)
+    }
+
+    fn extend_deduplication_expiration_locked(
+        jobs: &mut HashMap<JobId, Job>,
+        candidate: &Job,
+        existing_id: &str,
+        now: DateTime<Utc>,
+    ) -> bool {
+        if !deduplication_extends_ttl(candidate) {
+            return false;
+        }
+        let Some(existing) = jobs.get_mut(existing_id) else {
+            return false;
+        };
+        existing.deduplication_expires_at = deduplication_expiration(&candidate.options, now);
+        true
     }
 
     fn release_parent_if_ready_locked(
@@ -1048,6 +1082,16 @@ fn deduplication_stores_next_if_active(candidate: &Job, existing: &Job) -> bool 
         && candidate.parent_id.is_none()
         && candidate.child_ids.is_empty()
         && candidate.repeat_key.is_none()
+}
+
+fn deduplication_extends_ttl(candidate: &Job) -> bool {
+    matches!(
+        candidate.options.deduplication.as_ref(),
+        Some(deduplication)
+            if deduplication.extend
+                && deduplication.ttl.is_some()
+                && !deduplication.keep_last_if_active
+    )
 }
 
 fn preserve_replacement_deduplication_expiration(candidate: &mut Job, existing: &Job) {

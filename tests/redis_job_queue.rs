@@ -316,11 +316,54 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     let ttl_owner_after_current_remove: Option<String> = dedup_conn.get(&ttl_dedup_key).await?;
     assert!(ttl_owner_after_current_remove.is_none());
 
+    let extend_dedup_key = format!("{namespace}:dedup:deduplication:tenant:extend");
+    let extend_owner = dedup_queue
+        .add_job(
+            "dedup-extend".to_string(),
+            serde_json::json!({ "version": 9 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("tenant:extend")
+                    .with_ttl(Duration::from_secs(5))
+                    .extend_ttl(true),
+            ),
+        )
+        .await
+        .expect("extend dedup job should be added");
+    let extend_ttl_shortened: bool = redis::cmd("PEXPIRE")
+        .arg(&extend_dedup_key)
+        .arg(250)
+        .query_async(&mut dedup_conn)
+        .await?;
+    assert!(extend_ttl_shortened);
+    let extend_duplicate = dedup_queue
+        .add_job(
+            "dedup-extend-duplicate".to_string(),
+            serde_json::json!({ "version": 10 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("tenant:extend")
+                    .with_ttl(Duration::from_secs(5))
+                    .extend_ttl(true),
+            ),
+        )
+        .await
+        .expect("extend duplicate should return owner");
+    assert_eq!(extend_duplicate.id, extend_owner.id);
+    let extend_ttl_after_duplicate: i64 = redis::cmd("PTTL")
+        .arg(&extend_dedup_key)
+        .query_async(&mut dedup_conn)
+        .await?;
+    assert!(extend_ttl_after_duplicate > 1_000);
+    dedup_queue
+        .remove_job(&extend_owner.id)
+        .await
+        .expect("extend owner should remove")
+        .expect("extend owner should be returned");
+
     let replace_dedup_key = format!("{namespace}:dedup:deduplication:tenant:replace");
     let replace_old = dedup_queue
         .add_job(
             "dedup-replace-old".to_string(),
-            serde_json::json!({ "version": 9 }),
+            serde_json::json!({ "version": 11 }),
             JobOptions::new()
                 .with_delay(Duration::from_secs(30))
                 .with_deduplication(
@@ -336,7 +379,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     let replace_new = dedup_queue
         .add_job(
             "dedup-replace-new".to_string(),
-            serde_json::json!({ "version": 10 }),
+            serde_json::json!({ "version": 12 }),
             JobOptions::new()
                 .with_delay(Duration::from_secs(60))
                 .with_deduplication(
@@ -372,7 +415,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     let _replace_ttl_old = dedup_queue
         .add_job(
             "dedup-replace-ttl-old".to_string(),
-            serde_json::json!({ "version": 11 }),
+            serde_json::json!({ "version": 13 }),
             JobOptions::new()
                 .with_delay(Duration::from_secs(30))
                 .with_deduplication(
@@ -397,7 +440,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     let replace_ttl_new = dedup_queue
         .add_job(
             "dedup-replace-ttl-new".to_string(),
-            serde_json::json!({ "version": 12 }),
+            serde_json::json!({ "version": 14 }),
             JobOptions::new()
                 .with_delay(Duration::from_secs(60))
                 .with_deduplication(
@@ -420,11 +463,60 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("replace ttl new owner should remove")
         .expect("replace ttl new owner should be returned");
 
+    let replace_extend_key = format!("{namespace}:dedup:deduplication:tenant:replace-extend");
+    let replace_extend_old = dedup_queue
+        .add_job(
+            "dedup-replace-extend-old".to_string(),
+            serde_json::json!({ "version": 15 }),
+            JobOptions::new()
+                .with_delay(Duration::from_secs(30))
+                .with_deduplication(
+                    DeduplicationOptions::new("tenant:replace-extend")
+                        .with_ttl(Duration::from_secs(5))
+                        .replace_delayed(true)
+                        .extend_ttl(true),
+                ),
+        )
+        .await
+        .expect("replace extend old dedup job should be added");
+    let replace_extend_shortened: bool = redis::cmd("PEXPIRE")
+        .arg(&replace_extend_key)
+        .arg(250)
+        .query_async(&mut dedup_conn)
+        .await?;
+    assert!(replace_extend_shortened);
+    let replace_extend_new = dedup_queue
+        .add_job(
+            "dedup-replace-extend-new".to_string(),
+            serde_json::json!({ "version": 16 }),
+            JobOptions::new()
+                .with_delay(Duration::from_secs(60))
+                .with_deduplication(
+                    DeduplicationOptions::new("tenant:replace-extend")
+                        .with_ttl(Duration::from_secs(5))
+                        .replace_delayed(true)
+                        .extend_ttl(true),
+                ),
+        )
+        .await
+        .expect("replace extend should insert a new delayed owner");
+    assert_ne!(replace_extend_new.id, replace_extend_old.id);
+    let replace_extend_ttl: i64 = redis::cmd("PTTL")
+        .arg(&replace_extend_key)
+        .query_async(&mut dedup_conn)
+        .await?;
+    assert!(replace_extend_ttl > 1_000);
+    dedup_queue
+        .remove_job(&replace_extend_new.id)
+        .await
+        .expect("replace extend new owner should remove")
+        .expect("replace extend new owner should be returned");
+
     let replace_stale_key = format!("{namespace}:dedup:deduplication:tenant:replace-stale");
     let replace_stale_old = dedup_queue
         .add_job(
             "dedup-replace-stale-old".to_string(),
-            serde_json::json!({ "version": 13 }),
+            serde_json::json!({ "version": 17 }),
             JobOptions::new()
                 .with_delay(Duration::from_secs(30))
                 .with_deduplication(
@@ -440,7 +532,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     let replace_stale_duplicate = dedup_queue
         .add_job(
             "dedup-replace-stale-new".to_string(),
-            serde_json::json!({ "version": 14 }),
+            serde_json::json!({ "version": 18 }),
             JobOptions::new()
                 .with_delay(Duration::from_secs(60))
                 .with_deduplication(
@@ -470,7 +562,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     let keep_last_owner = dedup_queue
         .add_job(
             "dedup-keep-last-owner".to_string(),
-            serde_json::json!({ "version": 15 }),
+            serde_json::json!({ "version": 19 }),
             JobOptions::new().with_deduplication(
                 DeduplicationOptions::new("tenant:keep-last")
                     .with_ttl(Duration::from_secs(30))
@@ -497,7 +589,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     let keep_last_stale = dedup_queue
         .add_job(
             "dedup-keep-last-stale".to_string(),
-            serde_json::json!({ "version": 16 }),
+            serde_json::json!({ "version": 20 }),
             JobOptions::new().with_deduplication(
                 DeduplicationOptions::new("tenant:keep-last").keep_last_if_active(true),
             ),
@@ -508,7 +600,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     let keep_last_latest = dedup_queue
         .add_job(
             "dedup-keep-last-latest".to_string(),
-            serde_json::json!({ "version": 17 }),
+            serde_json::json!({ "version": 21 }),
             JobOptions::new()
                 .with_delay(Duration::from_millis(150))
                 .with_deduplication(

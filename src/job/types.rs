@@ -341,6 +341,9 @@ pub struct DeduplicationOptions {
     /// Keep the latest duplicate while the current owner is active.
     #[serde(default)]
     pub keep_last_if_active: bool,
+    /// Refresh the deduplication TTL when a duplicate is added.
+    #[serde(default)]
+    pub extend: bool,
 }
 
 impl DeduplicationOptions {
@@ -351,6 +354,7 @@ impl DeduplicationOptions {
             ttl: None,
             replace: false,
             keep_last_if_active: false,
+            extend: false,
         }
     }
 
@@ -376,6 +380,15 @@ impl DeduplicationOptions {
     /// materialized as a new job when the owner finishes terminally.
     pub fn keep_last_if_active(mut self, keep: bool) -> Self {
         self.keep_last_if_active = keep;
+        self
+    }
+
+    /// Refresh this deduplication id's TTL when a duplicate is added.
+    ///
+    /// This mirrors BullMQ's `extend` debounce option. It only has an effect
+    /// when a positive TTL is configured and keep-last-if-active is disabled.
+    pub fn extend_ttl(mut self, extend: bool) -> Self {
+        self.extend = extend;
         self
     }
 

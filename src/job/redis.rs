@@ -74,8 +74,9 @@ end
 
 local function set_deduplication_key(job, job_id, deduplication_prefix, keep_existing_ttl)
   local ttl = deduplication_ttl_millis(job)
-  local id = job["options"]["deduplication"]["id"]
-  if keep_existing_ttl and ttl then
+  local deduplication = job["options"]["deduplication"]
+  local id = deduplication["id"]
+  if keep_existing_ttl and ttl and deduplication["extend"] ~= true then
     redis.call('SET', deduplication_prefix .. id, job_id, 'KEEPTTL')
   elseif ttl then
     redis.call('SET', deduplication_prefix .. id, job_id, 'PX', ttl)
@@ -142,6 +143,23 @@ local function store_deduplicated_next(candidate_raw, candidate_job, existing_jo
   redis.call('PERSIST', deduplication_prefix .. deduplication_id)
 end
 
+local function extend_deduplicated_owner(candidate_job, existing_job, deduplication_prefix)
+  if not candidate_job["options"] or candidate_job["options"] == cjson.null then
+    return
+  end
+  local deduplication = candidate_job["options"]["deduplication"]
+  if not deduplication or deduplication == cjson.null then
+    return
+  end
+  if deduplication["replace"] == true or deduplication["extend"] ~= true or deduplication["keep_last_if_active"] == true then
+    return
+  end
+  local ttl = duration_millis(deduplication["ttl"])
+  if ttl then
+    redis.call('SET', deduplication_prefix .. deduplication["id"], existing_job["id"], 'PX', ttl)
+  end
+end
+
 local function active_repeat_raw(jobs_key, repeat_prefix, repeat_key)
   if not repeat_key or repeat_key == '' then
     return nil
@@ -190,6 +208,7 @@ if deduplicated then
     store_deduplicated_next(ARGV[2], candidate_job, existing_job, ARGV[8], ARGV[11])
     return {'deduplicated', deduplicated}
   else
+    extend_deduplicated_owner(candidate_job, existing_job, ARGV[8])
     return {'deduplicated', deduplicated}
   end
 end
@@ -288,8 +307,9 @@ end
 
 local function set_deduplication_key(job, job_id, deduplication_prefix, keep_existing_ttl)
   local ttl = deduplication_ttl_millis(job)
-  local id = job["options"]["deduplication"]["id"]
-  if keep_existing_ttl and ttl then
+  local deduplication = job["options"]["deduplication"]
+  local id = deduplication["id"]
+  if keep_existing_ttl and ttl and deduplication["extend"] ~= true then
     redis.call('SET', deduplication_prefix .. id, job_id, 'KEEPTTL')
   elseif ttl then
     redis.call('SET', deduplication_prefix .. id, job_id, 'PX', ttl)
@@ -354,6 +374,23 @@ local function store_deduplicated_next(candidate_raw, candidate_job, deduplicati
   local deduplication_id = candidate_job["options"]["deduplication"]["id"]
   redis.call('SET', deduplication_next_prefix .. deduplication_id, candidate_raw)
   redis.call('PERSIST', deduplication_prefix .. deduplication_id)
+end
+
+local function extend_deduplicated_owner(candidate_job, existing_job, deduplication_prefix)
+  if not candidate_job["options"] or candidate_job["options"] == cjson.null then
+    return
+  end
+  local deduplication = candidate_job["options"]["deduplication"]
+  if not deduplication or deduplication == cjson.null then
+    return
+  end
+  if deduplication["replace"] == true or deduplication["extend"] ~= true or deduplication["keep_last_if_active"] == true then
+    return
+  end
+  local ttl = duration_millis(deduplication["ttl"])
+  if ttl then
+    redis.call('SET', deduplication_prefix .. deduplication["id"], existing_job["id"], 'PX', ttl)
+  end
 end
 
 local function active_repeat_raw(jobs_key, repeat_prefix, repeat_key)
@@ -424,6 +461,7 @@ for index = 1, count do
         added[index] = deduplicated
         should_insert = false
       else
+        extend_deduplicated_owner(candidate_job, existing_job, deduplication_prefix)
         added[index] = deduplicated
         should_insert = false
       end

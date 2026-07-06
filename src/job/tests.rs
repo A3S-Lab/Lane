@@ -227,6 +227,61 @@ async fn deduplication_ttl_allows_new_non_terminal_owner_after_expiration() {
 }
 
 #[tokio::test]
+async fn deduplication_extend_ttl_refreshes_owner_window() {
+    let queue = InMemoryJobQueue::new("dedup-extend");
+    let first = queue
+        .add_at(
+            "sync",
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("account:extend").with_ttl(Duration::from_secs(1)),
+            ),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.deduplication_expires_at, Some(ts(2_000)));
+
+    let duplicate = queue
+        .add_at(
+            "sync-duplicate",
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("account:extend")
+                    .with_ttl(Duration::from_secs(1))
+                    .extend_ttl(true),
+            ),
+            ts(1_500),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate.id, first.id);
+    assert_eq!(duplicate.deduplication_expires_at, Some(ts(2_500)));
+
+    let still_owned = queue
+        .add_at(
+            "sync-still-owned",
+            serde_json::json!({ "version": 3 }),
+            JobOptions::new().with_deduplication_id("account:extend"),
+            ts(2_250),
+        )
+        .await
+        .unwrap();
+    assert_eq!(still_owned.id, first.id);
+
+    let after_extended_ttl = queue
+        .add_at(
+            "sync-after-extended-ttl",
+            serde_json::json!({ "version": 4 }),
+            JobOptions::new().with_deduplication_id("account:extend"),
+            ts(2_500),
+        )
+        .await
+        .unwrap();
+    assert_ne!(after_extended_ttl.id, first.id);
+}
+
+#[tokio::test]
 async fn deduplication_replace_swaps_delayed_owner() {
     let queue = InMemoryJobQueue::new("dedup-replace");
     let first = queue
