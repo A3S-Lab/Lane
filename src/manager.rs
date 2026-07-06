@@ -344,7 +344,7 @@ mod tests {
         let cmd = Box::new(TestCommand {
             result: serde_json::json!({}),
         });
-        let _ = manager.submit(lane_ids::QUERY, cmd).await.unwrap();
+        std::mem::drop(manager.submit(lane_ids::QUERY, cmd).await.unwrap());
 
         // The first event emitted is QUEUE_COMMAND_SUBMITTED
         let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())

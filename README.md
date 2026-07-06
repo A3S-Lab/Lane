@@ -23,6 +23,12 @@ a3s-lane = { version = "0.4", default-features = false }
 a3s-lane = { version = "0.4", default-features = false, features = ["metrics", "distributed"] }
 ```
 
+Enable the optional Redis generic job backend for multi-process workers:
+
+```toml
+a3s-lane = { version = "0.4", features = ["redis-backend"] }
+```
+
 ## Usage
 
 Implement the `Command` trait for each task type:
@@ -366,13 +372,13 @@ A3S stack and language SDKs.
 | Generic job runtime | In progress | JSON jobs, explicit job states, priority ordering, delayed jobs, worker leases, completion/failure snapshots, retry backoff, stalled-job recovery, pause/resume. |
 | Job management API | In progress | Add/get/remove/promote/retry/pause/resume/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, runs async processors, completes/fails jobs, supports processor progress/log updates, timeouts, and stalled recovery loops. |
-| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; Redis/Postgres/NATS backends remain planned for multi-process distributed claims. |
+| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` for multi-process distributed claims. Postgres/NATS backends remain planned. |
 | Repeat and flow jobs | Planned | Cron/repeatable jobs, parent-child dependencies, waiting-children state, fan-out/fan-in flows. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
 
-The first generic job runtime is available as `InMemoryJobQueue` and
-`JobQueueBackend`. It is process-local and intended as the reference
-implementation for future distributed backends:
+The generic job runtime is exposed through the `JobQueueBackend` trait.
+`InMemoryJobQueue` is process-local and intended for tests, embedded runtimes,
+and reference semantics:
 
 ```rust
 use a3s_lane::{InMemoryJobQueue, JobOptions, JobQueueBackend, RetryPolicy};
@@ -443,6 +449,46 @@ if claimed.is_some() {
         .complete_job(&job.id, serde_json::json!({ "ok": true }), chrono::Utc::now())
         .await?;
 }
+# Ok(())
+# }
+```
+
+Use `RedisJobQueue` when multiple workers or processes need to claim from the
+same durable priority queue. It stores jobs as JSON in a Redis hash, indexes
+states with sorted sets, and uses a Lua script to atomically claim the next
+waiting job into an active worker lease:
+
+```rust
+use a3s_lane::{JobOptions, JobQueueBackend, RedisJobQueue, RetryPolicy};
+use std::time::Duration;
+
+# async fn redis_example() -> a3s_lane::Result<()> {
+let queue = RedisJobQueue::with_namespace(
+    "redis://127.0.0.1/",
+    "a3s:lane",
+    "email",
+)?;
+
+let job = queue
+    .add_job(
+        "send".to_string(),
+        serde_json::json!({ "to": "ops@example.com" }),
+        JobOptions::new()
+            .with_priority(10)
+            .with_retry_policy(RetryPolicy::fixed(3, Duration::from_secs(1))),
+    )
+    .await?;
+
+if let Some(claimed) = queue
+    .claim_next("worker-1".to_string(), Duration::from_secs(30), chrono::Utc::now())
+    .await?
+{
+    queue
+        .complete_job(&claimed.id, serde_json::json!({ "ok": true }), chrono::Utc::now())
+        .await?;
+}
+
+assert_eq!(queue.get_job(&job.id).await?.map(|job| job.name), Some("send".to_string()));
 # Ok(())
 # }
 ```

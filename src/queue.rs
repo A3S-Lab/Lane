@@ -1499,7 +1499,7 @@ mod tests {
         // Enqueue 2 commands (meets threshold=2)
         for _ in 0..2 {
             let cmd = Box::new(TestCommand::new(serde_json::json!({})));
-            let _ = queue.submit("test-lane", cmd).await.unwrap();
+            std::mem::drop(queue.submit("test-lane", cmd).await.unwrap());
         }
 
         // Start scheduler — first tick calls check_pressure → pending=2 >= 2 → emit PRESSURE
@@ -1531,7 +1531,7 @@ mod tests {
 
         // Enqueue 1 command (meets threshold=1)
         let cmd = Box::new(TestCommand::new(serde_json::json!({})));
-        let _ = queue.submit("test-lane", cmd).await.unwrap();
+        std::mem::drop(queue.submit("test-lane", cmd).await.unwrap());
 
         // Start scheduler
         Arc::clone(&queue).start_scheduler().await;
@@ -1570,7 +1570,7 @@ mod tests {
         // Enqueue several commands
         for _ in 0..5 {
             let cmd = Box::new(TestCommand::new(serde_json::json!({})));
-            let _ = queue.submit("test-lane", cmd).await.unwrap();
+            std::mem::drop(queue.submit("test-lane", cmd).await.unwrap());
         }
 
         Arc::clone(&queue).start_scheduler().await;
@@ -1605,7 +1605,7 @@ mod tests {
         queue.register_lane(lane).await;
 
         let cmd = Box::new(TestCommand::new(serde_json::json!({"result": "ok"})));
-        let _ = queue.submit("test-lane", cmd).await.unwrap();
+        std::mem::drop(queue.submit("test-lane", cmd).await.unwrap());
 
         let event = tokio::time::timeout(std::time::Duration::from_millis(200), async {
             rx.recv().await.unwrap()

@@ -86,6 +86,8 @@ pub use config::LaneConfig;
 pub use dlq::{DeadLetter, DeadLetterQueue};
 pub use error::{LaneError, Result};
 pub use event::{EventEmitter, EventPayload, EventStream, LaneEvent};
+#[cfg(feature = "redis-backend")]
+pub use job::RedisJobQueue;
 pub use job::{
     job_processor_fn, InMemoryJobQueue, Job, JobContext, JobId, JobListOptions, JobListPage,
     JobLogEntry, JobOptions, JobPriority, JobProcessor, JobProcessorFn, JobQueueBackend,

@@ -9,12 +9,16 @@
 mod backend;
 mod local;
 mod memory;
+#[cfg(feature = "redis-backend")]
+mod redis;
 mod types;
 mod worker;
 
 pub use backend::JobQueueBackend;
 pub use local::LocalJobQueue;
 pub use memory::InMemoryJobQueue;
+#[cfg(feature = "redis-backend")]
+pub use redis::RedisJobQueue;
 pub use types::{
     Job, JobId, JobListOptions, JobListPage, JobLogEntry, JobOptions, JobPriority,
     JobQueueSnapshot, JobQueueStats, JobState, JobWorkerId, QueueName, DEFAULT_JOB_PRIORITY,

@@ -163,7 +163,10 @@ impl InMemoryJobQueue {
         let mut jobs = inner
             .jobs
             .values()
-            .filter(|job| options.state.map_or(true, |state| job.state == state))
+            .filter(|job| match options.state {
+                Some(state) => job.state == state,
+                None => true,
+            })
             .cloned()
             .collect::<Vec<_>>();
         jobs.sort_by(compare_list_order);

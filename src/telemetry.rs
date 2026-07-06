@@ -277,7 +277,7 @@ mod tests {
 
     #[test]
     fn test_attribute_keys_are_unique() {
-        let keys = vec![
+        let keys = [
             ATTR_COMMAND_ID,
             ATTR_LANE_NAME,
             ATTR_COMMAND_TYPE,

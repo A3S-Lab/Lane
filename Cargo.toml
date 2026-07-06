@@ -21,6 +21,7 @@ metrics = []
 monitoring = ["metrics"]
 telemetry = ["metrics", "dep:opentelemetry", "dep:opentelemetry_sdk", "dep:dashmap"]
 distributed = ["dep:num_cpus"]
+redis-backend = ["dep:redis"]
 
 [dependencies]
 tokio = { version = "1", features = ["sync", "time", "rt", "macros", "fs"] }
@@ -36,6 +37,9 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Optional: distributed
 num_cpus = { version = "1", optional = true }
+
+# Optional: Redis-backed generic job queue
+redis = { version = "0.32.7", default-features = false, features = ["tokio-comp", "connection-manager", "script"], optional = true }
 
 # Optional: telemetry
 opentelemetry = { version = "0.21", features = ["metrics"], optional = true }
