@@ -1,6 +1,6 @@
 use super::backend::JobQueueBackend;
 use super::types::{
-    add_duration, Job, JobFlow, JobListOptions, JobListPage, JobLogEntry, JobOptions, JobPriority,
+    add_duration, Job, JobFlow, JobListOptions, JobListPage, JobOptions, JobPriority,
     JobQueueStats, JobRateLimit, JobSpec, JobState, JobWorkerId, QueueName,
 };
 use crate::error::{LaneError, Result};
@@ -624,6 +624,128 @@ end
 redis.call('HDEL', KEYS[1], ARGV[1])
 
 return {'ok', raw}
+"#;
+
+const CLEAN_JOBS_SCRIPT: &str = r#"
+local state = ARGV[1]
+local cutoff = ARGV[2]
+local limit = tonumber(ARGV[3])
+local lock_prefix = ARGV[4]
+local state_key = nil
+
+if state == 'waiting' then
+  state_key = KEYS[2]
+elseif state == 'delayed' then
+  state_key = KEYS[3]
+elseif state == 'active' then
+  state_key = KEYS[4]
+elseif state == 'waiting_children' then
+  state_key = KEYS[5]
+elseif state == 'completed' then
+  state_key = KEYS[6]
+elseif state == 'failed' then
+  state_key = KEYS[7]
+else
+  return {'bad_state'}
+end
+
+if state == 'active' or limit <= 0 then
+  return {}
+end
+
+local ids = redis.call('ZRANGE', state_key, 0, -1)
+local candidates = {}
+
+for _, id in ipairs(ids) do
+  local raw = redis.call('HGET', KEYS[1], id)
+  if raw then
+    local job = cjson.decode(raw)
+    if job["state"] == state then
+      local reference = job["finished_at"]
+      if not reference or reference == cjson.null then
+        reference = job["processed_at"]
+      end
+      if not reference or reference == cjson.null then
+        reference = job["scheduled_at"]
+      end
+
+      if reference and reference ~= cjson.null and reference <= cutoff then
+        table.insert(candidates, { id = id, reference = reference, raw = raw })
+      end
+    else
+      redis.call('ZREM', state_key, id)
+    end
+  else
+    redis.call('ZREM', state_key, id)
+  end
+end
+
+table.sort(candidates, function(left, right)
+  if left.reference == right.reference then
+    return left.id < right.id
+  end
+  return left.reference < right.reference
+end)
+
+local removed = {}
+local count = math.min(limit, #candidates)
+for index = 1, count do
+  local candidate = candidates[index]
+  redis.call('DEL', lock_prefix .. candidate.id)
+  for key_index = 2, 7 do
+    redis.call('ZREM', KEYS[key_index], candidate.id)
+  end
+  redis.call('HDEL', KEYS[1], candidate.id)
+  removed[index] = candidate.raw
+end
+
+return removed
+"#;
+
+const UPDATE_PROGRESS_SCRIPT: &str = r#"
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not raw then
+  return {'missing'}
+end
+
+local job = cjson.decode(raw)
+if job["state"] == "completed" or job["state"] == "failed" then
+  return {'state', job["state"] or ''}
+end
+
+job["progress"] = cjson.decode(ARGV[2])
+local updated = cjson.encode(job)
+redis.call('HSET', KEYS[1], ARGV[1], updated)
+
+return {'ok', updated}
+"#;
+
+const ADD_LOG_SCRIPT: &str = r#"
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not raw then
+  return {'missing'}
+end
+
+local job = cjson.decode(raw)
+local logs = job["logs"]
+if not logs or logs == cjson.null or type(logs) ~= "table" then
+  logs = {}
+end
+
+table.insert(logs, { timestamp = ARGV[2], line = ARGV[3] })
+
+local keep = tonumber(ARGV[4])
+if keep and keep > 0 then
+  while #logs > keep do
+    table.remove(logs, 1)
+  end
+end
+
+job["logs"] = logs
+local updated = cjson.encode(job)
+redis.call('HSET', KEYS[1], ARGV[1], updated)
+
+return {'ok', updated}
 "#;
 
 /// Redis-backed generic job queue.
@@ -1429,26 +1551,24 @@ impl JobQueueBackend for RedisJobQueue {
 
         let cutoff = subtract_duration(now, grace);
         let mut conn = self.connection().await?;
-        let ids = self.ids_for_state(&mut conn, state).await?;
-        let mut jobs = Vec::new();
-        for id in ids {
-            if let Some(job) = self.load_job(&mut conn, &id).await? {
-                if job_reference_time(&job) <= cutoff {
-                    jobs.push(job);
-                }
-            }
-        }
-        jobs.sort_by(|a, b| {
-            job_reference_time(a)
-                .cmp(&job_reference_time(b))
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        jobs.truncate(limit);
-
-        for job in &jobs {
-            self.remove_job_record(&mut conn, &job.id).await?;
-        }
-        Ok(jobs)
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(CLEAN_JOBS_SCRIPT)
+            .arg(7)
+            .arg(self.jobs_key())
+            .arg(self.state_key(JobState::Waiting))
+            .arg(self.state_key(JobState::Delayed))
+            .arg(self.state_key(JobState::Active))
+            .arg(self.state_key(JobState::WaitingChildren))
+            .arg(self.state_key(JobState::Completed))
+            .arg(self.state_key(JobState::Failed))
+            .arg(job_state_name(state))
+            .arg(cutoff.to_rfc3339())
+            .arg(limit)
+            .arg(self.lock_key_prefix())
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_clean_jobs_result(&result)
     }
 
     async fn list_jobs(&self, options: JobListOptions) -> Result<JobListPage> {
@@ -1514,16 +1634,18 @@ impl JobQueueBackend for RedisJobQueue {
 
     async fn update_progress(&self, job_id: &str, progress: Value) -> Result<Job> {
         let mut conn = self.connection().await?;
-        let mut job = self.require_job(&mut conn, job_id).await?;
-        if job.state.is_terminal() {
-            return Err(LaneError::JobStateConflict(format!(
-                "cannot update progress for terminal job {}",
-                job.id
-            )));
-        }
-        job.progress = Some(progress);
-        self.store_job(&mut conn, &job).await?;
-        Ok(job)
+        let progress = serde_json::to_string(&progress)
+            .map_err(|error| LaneError::Other(format!("failed to encode job progress: {error}")))?;
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(UPDATE_PROGRESS_SCRIPT)
+            .arg(1)
+            .arg(self.jobs_key())
+            .arg(job_id)
+            .arg(progress)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_transition_result(&result, job_id, "update progress")
     }
 
     async fn add_log(
@@ -1534,17 +1656,18 @@ impl JobQueueBackend for RedisJobQueue {
         now: DateTime<Utc>,
     ) -> Result<Job> {
         let mut conn = self.connection().await?;
-        let mut job = self.require_job(&mut conn, job_id).await?;
-        job.logs.push(JobLogEntry {
-            timestamp: now,
-            line,
-        });
-        if keep > 0 && job.logs.len() > keep {
-            let remove_count = job.logs.len() - keep;
-            job.logs.drain(0..remove_count);
-        }
-        self.store_job(&mut conn, &job).await?;
-        Ok(job)
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(ADD_LOG_SCRIPT)
+            .arg(1)
+            .arg(self.jobs_key())
+            .arg(job_id)
+            .arg(now.to_rfc3339())
+            .arg(line)
+            .arg(keep)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_transition_result(&result, job_id, "add log")
     }
 
     async fn promote_due_jobs(&self, now: DateTime<Utc>) -> Result<usize> {
@@ -1657,20 +1780,6 @@ impl RedisJobQueue {
         self.load_job(conn, job_id)
             .await?
             .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))
-    }
-
-    async fn ids_for_state(
-        &self,
-        conn: &mut ConnectionManager,
-        state: JobState,
-    ) -> Result<Vec<String>> {
-        redis::cmd("ZRANGE")
-            .arg(self.state_key(state))
-            .arg(0)
-            .arg(-1)
-            .query_async(conn)
-            .await
-            .map_err(redis_error)
     }
 
     async fn load_jobs(&self, conn: &mut ConnectionManager, ids: Vec<String>) -> Result<Vec<Job>> {
@@ -1826,6 +1935,16 @@ fn decode_remove_job_result(result: &[String], job_id: &str) -> Result<Option<Jo
     }
 }
 
+fn decode_clean_jobs_result(result: &[String]) -> Result<Vec<Job>> {
+    if result.first().map(String::as_str) == Some("bad_state") {
+        return Err(LaneError::Other(
+            "Redis clean jobs script received an unknown state".to_string(),
+        ));
+    }
+
+    result.iter().map(|raw| decode_job(raw)).collect()
+}
+
 fn normalize_lua_empty_array(value: &mut Value, field: &str) {
     let Some(object) = value.as_object_mut() else {
         return;
@@ -1952,12 +2071,6 @@ fn next_repeat_job(job: &Job, now: DateTime<Utc>) -> Result<Option<Job>> {
     next.repeat_key = job.repeat_key.clone();
     next.repeat_count = next_count;
     Ok(Some(next))
-}
-
-fn job_reference_time(job: &Job) -> DateTime<Utc> {
-    job.finished_at
-        .or(job.processed_at)
-        .unwrap_or(job.scheduled_at)
 }
 
 #[cfg(test)]

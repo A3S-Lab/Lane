@@ -372,7 +372,7 @@ A3S stack and language SDKs.
 | Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, explicit job states, priority ordering, delayed jobs, token-owned worker leases, completion/failure snapshots, retry backoff, rate-limited claims, shared active concurrency limits, stalled-job recovery, pause/resume. |
 | Job management API | In progress | Add/get/remove/promote/retry/update-priority/pause/resume/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, timeouts, and stalled recovery loops. |
-| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, flow submission, delayed promotion, single-job promote, manual retry, priority update, claim, rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
+| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, flow submission, delayed promotion, single-job promote, manual retry, priority update, progress update, log append, clean, claim, rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, and end timestamps are available across in-memory, local durable, and Redis backends. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
@@ -671,6 +671,12 @@ the job hash and, for waiting jobs, replaces the waiting zset score in the same
 script. This is intentionally aligned with BullMQ's mechanism of moving job
 state through Redis scripts instead of coordinating several client-side Redis
 commands.
+
+Redis job management mutations are script-backed too. `update_progress()` checks
+the current state and writes the progress value in one Redis turn; `add_log()`
+appends and trims retained log entries inside one script; `clean_jobs()` filters
+retained records by the job reference time, removes their lock keys, hash
+entries, and state indexes atomically, and returns the removed snapshots.
 
 Stalled recovery is Lua-backed as well. The recovery script scans expired
 active scores, verifies that the independent lock key is missing, increments

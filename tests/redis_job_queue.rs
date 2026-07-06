@@ -639,6 +639,14 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .add_log(&first.id, "accepted".to_string(), 10, Utc::now())
         .await
         .expect("log update should succeed");
+    worker
+        .add_log(&first.id, "provider accepted".to_string(), 2, Utc::now())
+        .await
+        .expect("second log update should succeed");
+    worker
+        .add_log(&first.id, "provider delivered".to_string(), 2, Utc::now())
+        .await
+        .expect("third log update should trim retained logs");
     let completed = worker
         .complete_job(
             &first.id,
@@ -649,6 +657,11 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect("complete should succeed");
     assert_eq!(completed.state, JobState::Completed);
+    let terminal_progress = worker
+        .update_progress(&first.id, serde_json::json!({ "percent": 100 }))
+        .await
+        .expect_err("terminal completed jobs must reject progress updates");
+    assert!(matches!(terminal_progress, LaneError::JobStateConflict(_)));
 
     let second = worker
         .claim_next("worker-b".to_string(), Duration::from_secs(30), Utc::now())
@@ -934,14 +947,132 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         stored_high.progress,
         Some(serde_json::json!({ "percent": 50 }))
     );
-    assert_eq!(stored_high.logs.len(), 1);
-    assert_eq!(stored_high.logs[0].line, "accepted");
+    assert_eq!(stored_high.logs.len(), 2);
+    assert_eq!(stored_high.logs[0].line, "provider accepted");
+    assert_eq!(stored_high.logs[1].line, "provider delivered");
 
     let stats = producer.stats().await.expect("stats should load");
     assert_eq!(stats.completed, 3);
     assert_eq!(stats.failed, 2);
     assert_eq!(stats.active, 1);
     trace_stage("main-lifecycle:done");
+
+    let clean_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "clean-script")
+        .expect("valid Redis URL should build the clean-script queue");
+    let clean_old_a = clean_queue
+        .add_job(
+            "clean-old-a".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("first clean job should be added");
+    let clean_old_b = clean_queue
+        .add_job(
+            "clean-old-b".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("second clean job should be added");
+    let clean_new = clean_queue
+        .add_job(
+            "clean-new".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("new clean job should be added");
+    let clean_claim_a = clean_queue
+        .claim_next(
+            "worker-clean-a".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("first clean claim should return")
+        .expect("first clean job should be claimable");
+    let clean_claim_b = clean_queue
+        .claim_next(
+            "worker-clean-b".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("second clean claim should return")
+        .expect("second clean job should be claimable");
+    let clean_claim_new = clean_queue
+        .claim_next(
+            "worker-clean-new".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("new clean claim should return")
+        .expect("new clean job should be claimable");
+    assert_eq!(clean_claim_a.id, clean_old_a.id);
+    assert_eq!(clean_claim_b.id, clean_old_b.id);
+    assert_eq!(clean_claim_new.id, clean_new.id);
+    let clean_now = Utc::now();
+    clean_queue
+        .complete_job(
+            &clean_claim_a.id,
+            lock_token(&clean_claim_a),
+            serde_json::json!({ "ok": true }),
+            clean_now - chrono::Duration::seconds(10),
+        )
+        .await
+        .expect("first old clean job should complete");
+    clean_queue
+        .complete_job(
+            &clean_claim_b.id,
+            lock_token(&clean_claim_b),
+            serde_json::json!({ "ok": true }),
+            clean_now - chrono::Duration::seconds(9),
+        )
+        .await
+        .expect("second old clean job should complete");
+    clean_queue
+        .complete_job(
+            &clean_claim_new.id,
+            lock_token(&clean_claim_new),
+            serde_json::json!({ "ok": true }),
+            clean_now,
+        )
+        .await
+        .expect("new clean job should complete");
+    let first_cleaned = clean_queue
+        .clean_jobs(JobState::Completed, Duration::from_secs(5), 1, clean_now)
+        .await
+        .expect("first clean should run");
+    assert_eq!(first_cleaned.len(), 1);
+    assert_eq!(first_cleaned[0].id, clean_old_a.id);
+    let mut clean_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let cleaned_hash: Option<String> = clean_conn
+        .hget(format!("{namespace}:clean-script:jobs"), &clean_old_a.id)
+        .await?;
+    assert!(cleaned_hash.is_none());
+    let cleaned_completed_score: Option<f64> = clean_conn
+        .zscore(
+            format!("{namespace}:clean-script:completed"),
+            &clean_old_a.id,
+        )
+        .await?;
+    assert!(cleaned_completed_score.is_none());
+    let retained_old_score: Option<f64> = clean_conn
+        .zscore(
+            format!("{namespace}:clean-script:completed"),
+            &clean_old_b.id,
+        )
+        .await?;
+    assert!(retained_old_score.is_some());
+    let retained_new_score: Option<f64> = clean_conn
+        .zscore(format!("{namespace}:clean-script:completed"), &clean_new.id)
+        .await?;
+    assert!(retained_new_score.is_some());
+    trace_stage("clean-script:done");
 
     let mut flow_index_conn = redis::Client::open(redis_url.as_str())?
         .get_connection_manager()
