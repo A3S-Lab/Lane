@@ -957,6 +957,87 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     assert_eq!(stats.active, 1);
     trace_stage("main-lifecycle:done");
 
+    let stale_claim_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "claim-stale")
+        .expect("valid Redis URL should build the claim-stale queue");
+    let stale_claim_completed = stale_claim_queue
+        .add_job(
+            "claim-stale-completed".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("stale completed job should add");
+    let stale_claim_waiting = stale_claim_queue
+        .add_job(
+            "claim-stale-waiting".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("stale waiting job should add");
+    let stale_claim_completed_claim = stale_claim_queue
+        .claim_next(
+            "worker-claim-stale-completed".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("stale completed claim should return")
+        .expect("stale completed job should claim");
+    assert_eq!(stale_claim_completed_claim.id, stale_claim_completed.id);
+    stale_claim_queue
+        .complete_job(
+            &stale_claim_completed_claim.id,
+            lock_token(&stale_claim_completed_claim),
+            serde_json::json!({}),
+            Utc::now(),
+        )
+        .await
+        .expect("stale completed job should complete");
+    let mut stale_claim_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let _: usize = stale_claim_conn
+        .zadd(
+            format!("{namespace}:claim-stale:waiting"),
+            &stale_claim_completed.id,
+            0.0,
+        )
+        .await?;
+    let claimed_after_stale = stale_claim_queue
+        .claim_next(
+            "worker-claim-stale-waiting".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("claim should skip stale waiting index")
+        .expect("real waiting job should still claim");
+    assert_eq!(claimed_after_stale.id, stale_claim_waiting.id);
+    let stale_waiting_score: Option<f64> = stale_claim_conn
+        .zscore(
+            format!("{namespace}:claim-stale:waiting"),
+            &stale_claim_completed.id,
+        )
+        .await?;
+    assert!(stale_waiting_score.is_none());
+    let stale_completed_after_claim = stale_claim_queue
+        .get_job(&stale_claim_completed.id)
+        .await
+        .expect("stale completed job should load")
+        .expect("stale completed job should still exist");
+    assert_eq!(stale_completed_after_claim.state, JobState::Completed);
+    stale_claim_queue
+        .complete_job(
+            &claimed_after_stale.id,
+            lock_token(&claimed_after_stale),
+            serde_json::json!({}),
+            Utc::now(),
+        )
+        .await
+        .expect("real waiting job should complete");
+    trace_stage("claim-stale:done");
+
     let clean_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "clean-script")
         .expect("valid Redis URL should build the clean-script queue");
     let clean_old_a = clean_queue

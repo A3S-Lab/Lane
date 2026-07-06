@@ -178,40 +178,47 @@ if max_concurrency and max_concurrency > 0 then
   end
 end
 
-local ids = redis.call('ZRANGE', KEYS[1], 0, 0)
+local candidate_limit = tonumber(ARGV[13]) or 1
+local ids = redis.call('ZRANGE', KEYS[1], 0, candidate_limit - 1)
 if #ids == 0 then
   return nil
 end
 
-local id = ids[1]
-local raw = redis.call('HGET', KEYS[3], id)
-if not raw then
-  redis.call('ZREM', KEYS[1], id)
-  return nil
-end
+for _, id in ipairs(ids) do
+  local raw = redis.call('HGET', KEYS[3], id)
+  if not raw then
+    redis.call('ZREM', KEYS[1], id)
+  else
+    local job = cjson.decode(raw)
+    if job["state"] ~= "waiting" then
+      redis.call('ZREM', KEYS[1], id)
+    else
+      local lock_key = ARGV[7] .. id
+      redis.call('SET', lock_key, ARGV[5], 'PX', ARGV[6])
+      if rate_limit_max and rate_limit_max > 0 then
+        local counter = redis.call('INCR', KEYS[4])
+        if counter == 1 then
+          redis.call('PEXPIRE', KEYS[4], ARGV[9])
+        end
+      end
 
-local lock_key = ARGV[7] .. id
-redis.call('SET', lock_key, ARGV[5], 'PX', ARGV[6])
-if rate_limit_max and rate_limit_max > 0 then
-  local counter = redis.call('INCR', KEYS[4])
-  if counter == 1 then
-    redis.call('PEXPIRE', KEYS[4], ARGV[9])
+      job["state"] = "active"
+      job["attempts_made"] = (job["attempts_made"] or 0) + 1
+      job["processed_at"] = ARGV[2]
+      job["worker_id"] = ARGV[3]
+      job["lease_expires_at"] = ARGV[4]
+      job["failed_reason"] = cjson.null
+
+      local updated = cjson.encode(job)
+      redis.call('ZREM', KEYS[1], id)
+      redis.call('ZADD', KEYS[2], ARGV[1], id)
+      redis.call('HSET', KEYS[3], id, updated)
+      return updated
+    end
   end
 end
 
-local job = cjson.decode(raw)
-job["state"] = "active"
-job["attempts_made"] = (job["attempts_made"] or 0) + 1
-job["processed_at"] = ARGV[2]
-job["worker_id"] = ARGV[3]
-job["lease_expires_at"] = ARGV[4]
-job["failed_reason"] = cjson.null
-
-local updated = cjson.encode(job)
-redis.call('ZREM', KEYS[1], id)
-redis.call('ZADD', KEYS[2], ARGV[1], id)
-redis.call('HSET', KEYS[3], id, updated)
-return updated
+return nil
 "#;
 
 const COMPLETE_SCRIPT: &str = r#"
@@ -1595,6 +1602,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(rate_limit_window_ms)
             .arg(millis(now))
             .arg(WAITING_SCORE_BUCKET)
+            .arg(1_000_u16)
             .arg(1_000_u16)
             .query_async(&mut conn)
             .await

@@ -641,7 +641,10 @@ maxed. `clear_max_active_jobs()` removes the shared ceiling.
 Like BullMQ's `moveToActive` script, Redis claims also promote due delayed jobs
 inside the same Lua script before checking pause, rate-limit, max-active, and
 the next claim. A paused or maxed queue can still move due delayed jobs back to
-`waiting`; it simply returns `None` instead of leasing work.
+`waiting`; it simply returns `None` instead of leasing work. Claiming also
+validates the stored job state before moving a waiting-index entry to `active`,
+pruning stale waiting sorted-set entries instead of reactivating jobs that have
+already moved elsewhere.
 
 Redis adds are Lua-backed as well. The add scripts write job JSON and the
 waiting, delayed, or waiting-children index in the same Redis turn. If a custom
