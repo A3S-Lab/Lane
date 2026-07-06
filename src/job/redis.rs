@@ -656,6 +656,47 @@ return promoted
 "#;
 
 const REMOVE_JOB_SCRIPT: &str = r#"
+local function days_from_civil(year, month, day)
+  if month <= 2 then
+    year = year - 1
+  end
+  local era = math.floor(year / 400)
+  local yoe = year - era * 400
+  local shifted_month = month
+  if month > 2 then
+    shifted_month = month - 3
+  else
+    shifted_month = month + 9
+  end
+  local doy = math.floor((153 * shifted_month + 2) / 5) + day - 1
+  local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+  return era * 146097 + doe - 719468
+end
+
+local function iso_to_millis(value)
+  local year = tonumber(string.sub(value, 1, 4))
+  local month = tonumber(string.sub(value, 6, 7))
+  local day = tonumber(string.sub(value, 9, 10))
+  local hour = tonumber(string.sub(value, 12, 13))
+  local minute = tonumber(string.sub(value, 15, 16))
+  local second = tonumber(string.sub(value, 18, 19))
+  if not year or not month or not day or not hour or not minute or not second then
+    return 0
+  end
+
+  local millis = 0
+  if string.sub(value, 20, 20) == "." then
+    local digits = string.match(string.sub(value, 21), "^(%d+)")
+    if digits then
+      digits = string.sub(digits .. "000", 1, 3)
+      millis = tonumber(digits) or 0
+    end
+  end
+
+  local days = days_from_civil(year, month, day)
+  return (((days * 24 + hour) * 60 + minute) * 60 + second) * 1000 + millis
+end
+
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
   return {'missing'}
@@ -671,6 +712,76 @@ for index = 3, 8 do
   redis.call('ZREM', KEYS[index], ARGV[1])
 end
 redis.call('HDEL', KEYS[1], ARGV[1])
+
+local parent_id = job["parent_id"]
+if parent_id and parent_id ~= cjson.null then
+  local parent_raw = redis.call('HGET', KEYS[1], parent_id)
+  if parent_raw then
+    local parent = cjson.decode(parent_raw)
+    if parent["state"] == "waiting_children" then
+      local all_done = true
+      local failed_child_id = nil
+      local failed_reason = nil
+
+      for _, child_id in ipairs(parent["child_ids"] or {}) do
+        local child_raw = nil
+        if child_id ~= ARGV[1] then
+          child_raw = redis.call('HGET', KEYS[1], child_id)
+        end
+
+        if child_raw then
+          local child = cjson.decode(child_raw)
+          if child["state"] == "failed" then
+            failed_child_id = child_id
+            failed_reason = child["failed_reason"] or "unknown error"
+            break
+          elseif child["state"] ~= "completed" then
+            all_done = false
+            break
+          end
+        end
+      end
+
+      if failed_child_id then
+        redis.call('ZREM', KEYS[6], parent_id)
+        parent["state"] = "failed"
+        parent["finished_at"] = ARGV[2]
+        parent["worker_id"] = cjson.null
+        parent["lock_token"] = cjson.null
+        parent["lease_expires_at"] = cjson.null
+        parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
+        if parent["options"] and parent["options"]["remove_on_fail"] == true then
+          redis.call('HDEL', KEYS[1], parent_id)
+        else
+          redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+          redis.call('ZADD', KEYS[8], ARGV[3], parent_id)
+        end
+      elseif all_done then
+        redis.call('ZREM', KEYS[6], parent_id)
+        parent["processed_at"] = cjson.null
+        parent["finished_at"] = cjson.null
+        parent["worker_id"] = cjson.null
+        parent["lock_token"] = cjson.null
+        parent["lease_expires_at"] = cjson.null
+        parent["failed_reason"] = cjson.null
+
+        local parent_scheduled_millis = iso_to_millis(parent["scheduled_at"])
+        if parent_scheduled_millis <= tonumber(ARGV[3]) then
+          parent["state"] = "waiting"
+          local priority = tonumber(parent["priority"] or '1000') or 1000
+          local sequence = redis.call('INCR', KEYS[9])
+          local waiting_score = (priority * tonumber(ARGV[4])) + sequence
+          redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+          redis.call('ZADD', KEYS[3], waiting_score, parent_id)
+        else
+          parent["state"] = "delayed"
+          redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+          redis.call('ZADD', KEYS[4], parent_scheduled_millis, parent_id)
+        end
+      end
+    end
+  end
+end
 
 return {'ok', raw}
 "#;
@@ -1033,30 +1144,6 @@ impl RedisJobQueue {
         })
     }
 
-    fn state_keys(&self) -> [String; 6] {
-        [
-            self.state_key(JobState::Waiting),
-            self.state_key(JobState::Delayed),
-            self.state_key(JobState::Active),
-            self.state_key(JobState::WaitingChildren),
-            self.state_key(JobState::Completed),
-            self.state_key(JobState::Failed),
-        ]
-    }
-
-    async fn next_sequence(&self, conn: &mut ConnectionManager) -> Result<u64> {
-        conn.incr(self.sequence_key(), 1_u8)
-            .await
-            .map_err(redis_error)
-    }
-
-    async fn store_job(&self, conn: &mut ConnectionManager, job: &Job) -> Result<()> {
-        let encoded = encode_job(job)?;
-        conn.hset(self.jobs_key(), &job.id, encoded)
-            .await
-            .map_err(redis_error)
-    }
-
     async fn add_new_job(&self, conn: &mut ConnectionManager, job: &Job) -> Result<Job> {
         let encoded = encode_job(job)?;
         let result: Vec<String> = redis::cmd("EVAL")
@@ -1119,156 +1206,12 @@ impl RedisJobQueue {
         raw.map(|raw| decode_job(&raw)).transpose()
     }
 
-    async fn remove_from_state_sets(
-        &self,
-        conn: &mut ConnectionManager,
-        job_id: &str,
-    ) -> Result<()> {
-        for key in self.state_keys() {
-            let _: usize = conn.zrem(key, job_id).await.map_err(redis_error)?;
-        }
-        Ok(())
-    }
-
-    async fn move_to_state(
-        &self,
-        conn: &mut ConnectionManager,
-        job: &Job,
-        state: JobState,
-        score: f64,
-    ) -> Result<()> {
-        self.remove_from_state_sets(conn, &job.id).await?;
-        let _: usize = conn
-            .zadd(self.state_key(state), &job.id, score)
-            .await
-            .map_err(redis_error)?;
-        self.store_job(conn, job).await
-    }
-
-    async fn remove_job_record(
-        &self,
-        conn: &mut ConnectionManager,
-        job_id: &str,
-    ) -> Result<Option<Job>> {
-        let job = self.load_job(conn, job_id).await?;
-        self.remove_from_state_sets(conn, job_id).await?;
-        let _: usize = conn.del(self.lock_key(job_id)).await.map_err(redis_error)?;
-        let _: usize = conn
-            .hdel(self.jobs_key(), job_id)
-            .await
-            .map_err(redis_error)?;
-        Ok(job)
-    }
-
     async fn is_paused(&self, conn: &mut ConnectionManager) -> Result<bool> {
         let paused: Option<u8> = conn
             .hget(self.meta_key(), "paused")
             .await
             .map_err(redis_error)?;
         Ok(paused.unwrap_or(0) != 0)
-    }
-
-    async fn release_parent_if_ready(
-        &self,
-        conn: &mut ConnectionManager,
-        parent_id: &str,
-        now: DateTime<Utc>,
-    ) -> Result<Option<Job>> {
-        let Some(mut parent) = self.load_job(conn, parent_id).await? else {
-            return Ok(None);
-        };
-        if parent.state != JobState::WaitingChildren {
-            return Ok(Some(parent));
-        }
-
-        let mut child_failure = None;
-        for child_id in &parent.child_ids {
-            let Some(child) = self.load_job(conn, child_id).await? else {
-                continue;
-            };
-            match child.state {
-                JobState::Completed => {}
-                JobState::Failed => {
-                    child_failure = Some((child.id, child.failed_reason));
-                }
-                _ => return Ok(Some(parent)),
-            }
-        }
-
-        if let Some((child_id, reason)) = child_failure {
-            return self
-                .fail_waiting_parent(
-                    conn,
-                    parent_id,
-                    format!(
-                        "child job {child_id} failed: {}",
-                        reason.as_deref().unwrap_or("unknown error")
-                    ),
-                    now,
-                )
-                .await;
-        }
-
-        parent.state = state_after_dependencies(parent.scheduled_at, now);
-        parent.processed_at = None;
-        parent.finished_at = None;
-        parent.worker_id = None;
-        parent.lock_token = None;
-        parent.lease_expires_at = None;
-        parent.failed_reason = None;
-        let released = parent.clone();
-        match parent.state {
-            JobState::Delayed => {
-                self.move_to_state(
-                    conn,
-                    &parent,
-                    JobState::Delayed,
-                    millis(parent.scheduled_at),
-                )
-                .await?;
-            }
-            JobState::Waiting => {
-                let sequence = self.next_sequence(conn).await?;
-                self.move_to_state(
-                    conn,
-                    &parent,
-                    JobState::Waiting,
-                    waiting_score(parent.priority, sequence),
-                )
-                .await?;
-            }
-            _ => {}
-        }
-        Ok(Some(released))
-    }
-
-    async fn fail_waiting_parent(
-        &self,
-        conn: &mut ConnectionManager,
-        parent_id: &str,
-        reason: String,
-        now: DateTime<Utc>,
-    ) -> Result<Option<Job>> {
-        let Some(mut parent) = self.load_job(conn, parent_id).await? else {
-            return Ok(None);
-        };
-        if parent.state.is_terminal() {
-            return Ok(Some(parent));
-        }
-        parent.state = JobState::Failed;
-        parent.finished_at = Some(now);
-        parent.worker_id = None;
-        parent.lock_token = None;
-        parent.lease_expires_at = None;
-        parent.failed_reason = Some(reason);
-        let failed = parent.clone();
-        if parent.options.remove_on_fail {
-            self.remove_job_record(conn, parent_id).await?;
-        } else {
-            self.move_to_state(conn, &parent, JobState::Failed, millis(now))
-                .await?;
-        }
-        Ok(Some(failed))
     }
 }
 
@@ -1541,9 +1484,10 @@ impl JobQueueBackend for RedisJobQueue {
 
     async fn remove_job(&self, job_id: &str) -> Result<Option<Job>> {
         let mut conn = self.connection().await?;
+        let now = Utc::now();
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(REMOVE_JOB_SCRIPT)
-            .arg(8)
+            .arg(9)
             .arg(self.jobs_key())
             .arg(self.lock_key(job_id))
             .arg(self.state_key(JobState::Waiting))
@@ -1552,16 +1496,15 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.state_key(JobState::WaitingChildren))
             .arg(self.state_key(JobState::Completed))
             .arg(self.state_key(JobState::Failed))
+            .arg(self.sequence_key())
             .arg(job_id)
+            .arg(now.to_rfc3339())
+            .arg(millis(now))
+            .arg(WAITING_SCORE_BUCKET)
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
-        let removed = decode_remove_job_result(&result, job_id)?;
-        if let Some(parent_id) = removed.as_ref().and_then(|job| job.parent_id.clone()) {
-            self.release_parent_if_ready(&mut conn, &parent_id, Utc::now())
-                .await?;
-        }
-        Ok(removed)
+        decode_remove_job_result(&result, job_id)
     }
 
     async fn clean_jobs(
@@ -1995,6 +1938,7 @@ fn subtract_duration(at: DateTime<Utc>, duration: Duration) -> DateTime<Utc> {
     }
 }
 
+#[cfg(test)]
 fn waiting_score(priority: JobPriority, sequence: u64) -> f64 {
     (priority as f64 * WAITING_SCORE_BUCKET) + sequence as f64
 }

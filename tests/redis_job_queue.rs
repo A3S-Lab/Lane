@@ -1227,6 +1227,142 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("flow parent should be claimable");
     assert_eq!(claimed_parent.id, flow.parent.id);
 
+    let remove_release_flow = producer
+        .add_flow_at(
+            JobSpec::new(
+                "remove-release-flow-parent",
+                serde_json::json!({ "kind": "aggregate" }),
+            )
+            .with_options(JobOptions::new().with_priority(1)),
+            vec![
+                JobSpec::new("remove-release-flow-child-a", serde_json::json!({ "n": 1 }))
+                    .with_options(JobOptions::new().with_priority(1)),
+                JobSpec::new("remove-release-flow-child-b", serde_json::json!({ "n": 2 }))
+                    .with_options(JobOptions::new().with_priority(2)),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("remove-release flow should be added");
+    let remove_release_child = worker
+        .claim_next(
+            "worker-remove-release-child-a".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("remove-release child claim should return")
+        .expect("remove-release child should be claimable");
+    assert_eq!(remove_release_child.id, remove_release_flow.children[0].id);
+    worker
+        .complete_job(
+            &remove_release_child.id,
+            lock_token(&remove_release_child),
+            serde_json::json!({ "ok": 1 }),
+            Utc::now(),
+        )
+        .await
+        .expect("remove-release child should complete");
+    producer
+        .remove_job(&remove_release_flow.children[1].id)
+        .await
+        .expect("remaining flow child should remove")
+        .expect("remaining flow child should be returned");
+    let remove_released_parent = producer
+        .get_job(&remove_release_flow.parent.id)
+        .await
+        .expect("remove-released parent should load")
+        .expect("remove-released parent should exist");
+    assert_eq!(remove_released_parent.state, JobState::Waiting);
+    let remove_released_parent_waiting_score: Option<f64> = flow_index_conn
+        .zscore(
+            format!("{namespace}:jobs:waiting"),
+            &remove_release_flow.parent.id,
+        )
+        .await?;
+    assert!(remove_released_parent_waiting_score.is_some());
+    let remove_released_parent_waiting_children_score: Option<f64> = flow_index_conn
+        .zscore(
+            format!("{namespace}:jobs:waiting_children"),
+            &remove_release_flow.parent.id,
+        )
+        .await?;
+    assert!(remove_released_parent_waiting_children_score.is_none());
+    let removed_flow_child_hash: Option<String> = flow_index_conn
+        .hget(
+            format!("{namespace}:jobs:jobs"),
+            &remove_release_flow.children[1].id,
+        )
+        .await?;
+    assert!(removed_flow_child_hash.is_none());
+    let claimed_remove_released_parent = worker
+        .claim_next(
+            "worker-remove-released-parent".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("remove-released flow parent claim should return")
+        .expect("remove-released flow parent should be claimable");
+    assert_eq!(
+        claimed_remove_released_parent.id,
+        remove_release_flow.parent.id
+    );
+
+    let remove_delayed_flow = producer
+        .add_flow_at(
+            JobSpec::new(
+                "remove-delayed-flow-parent",
+                serde_json::json!({ "kind": "delayed-aggregate" }),
+            )
+            .with_options(
+                JobOptions::new()
+                    .with_priority(1)
+                    .with_delay(Duration::from_secs(60)),
+            ),
+            vec![
+                JobSpec::new("remove-delayed-flow-child", serde_json::json!({ "n": 1 }))
+                    .with_options(JobOptions::new().with_priority(1)),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("remove-delayed flow should be added");
+    producer
+        .remove_job(&remove_delayed_flow.children[0].id)
+        .await
+        .expect("remove-delayed child should remove")
+        .expect("remove-delayed child should be returned");
+    let remove_delayed_parent = producer
+        .get_job(&remove_delayed_flow.parent.id)
+        .await
+        .expect("remove-delayed parent should load")
+        .expect("remove-delayed parent should exist");
+    assert_eq!(remove_delayed_parent.state, JobState::Delayed);
+    let remove_delayed_parent_delayed_score: Option<f64> = flow_index_conn
+        .zscore(
+            format!("{namespace}:jobs:delayed"),
+            &remove_delayed_flow.parent.id,
+        )
+        .await?;
+    assert!(remove_delayed_parent_delayed_score.is_some());
+    let remove_delayed_parent_waiting_children_score: Option<f64> = flow_index_conn
+        .zscore(
+            format!("{namespace}:jobs:waiting_children"),
+            &remove_delayed_flow.parent.id,
+        )
+        .await?;
+    assert!(remove_delayed_parent_waiting_children_score.is_none());
+    assert!(worker
+        .claim_next(
+            "worker-remove-delayed-flow-parent-early".to_string(),
+            Duration::from_secs(30),
+            Utc::now()
+        )
+        .await
+        .expect("early remove-delayed parent claim should return")
+        .is_none());
+
     let delayed_flow = producer
         .add_flow_at(
             JobSpec::new(

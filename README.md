@@ -445,8 +445,9 @@ paginated `JobListPage` values, `add_jobs()` submits a batch with the same
 idempotency semantics as `add_job()`, `promote_job()` moves delayed jobs to
 waiting, `retry_job()` manually requeues failed jobs, `update_priority()`
 changes non-terminal job priority, `renew_lease()` extends an active worker
-lease with the claim token, `remove_job()` removes non-active jobs, and
-`clean_jobs()` removes old records by state.
+lease with the claim token, `remove_job()` removes non-active jobs and can
+unblock flow parents when a pending child is removed, and `clean_jobs()` removes
+old records by state.
 Set `JobOptions::with_job_id()` when producers need idempotent submission:
 adding the same job id again returns the existing job instead of enqueueing a
 duplicate.
@@ -459,9 +460,9 @@ management API; run stalled recovery first when a worker lease has expired.
 
 Flow jobs create a parent job and one or more child jobs in a single operation.
 The parent starts in `waiting_children`, children are claimed normally, and the
-parent is released to `waiting` only after every child completes. A terminal
-child failure fails the parent; retryable child failures keep the parent blocked
-until the child retries and reaches a terminal outcome.
+parent is released to `waiting` after every remaining child completes or is
+removed. A terminal child failure fails the parent; retryable child failures
+keep the parent blocked until the child retries and reaches a terminal outcome.
 
 ```rust
 use a3s_lane::{InMemoryJobQueue, JobOptions, JobSpec, JobState};
@@ -653,11 +654,13 @@ parent and child job id, then writes the parent, children, and all state indexes
 in one Redis turn. If any job id already exists, no partial parent or child
 records are created.
 
-Flow fan-in is also protected in Redis transitions. When a child job completes
-or reaches terminal failure, the completion/failure Lua script updates the
+Flow fan-in is also protected in Redis transitions. When a child job completes,
+is removed, or reaches terminal failure, the relevant Lua script updates the
 parent in the same Redis turn when the parent can be released to `waiting`,
-parked in `delayed` until its own schedule is due, or failed because a child
-failed.
+parked in `delayed` until its own schedule is due, or failed because a remaining
+child failed. This follows BullMQ's dependency-removal mechanism: removing a
+child also updates the parent dependency state instead of relying on a later
+client-side cleanup pass.
 
 Repeat successors are created during the Redis completion script too. The
 worker computes the next occurrence from `RepeatOptions`, then the Lua script
@@ -685,7 +688,10 @@ the stalled count, and either requeues the job or fails it in the same Redis
 turn.
 
 `remove_job()` uses a Redis script to reject active jobs and remove the job
-hash, lock key, and all state indexes in one Redis turn.
+hash, lock key, and all state indexes in one Redis turn. If the removed job is a
+flow child, the same script rechecks the parent's children and atomically moves
+the parent from `waiting_children` to `waiting`, `delayed`, or `failed` as
+appropriate.
 
 Run the Redis integration test against any reachable Redis server:
 
