@@ -692,4 +692,6 @@ pub struct JobQueueSnapshot {
     pub jobs: Vec<Job>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deduplication_next_jobs: Vec<Job>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub released_deduplication_owners: Vec<(String, JobId)>,
 }

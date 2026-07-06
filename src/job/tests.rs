@@ -181,6 +181,103 @@ async fn simple_deduplication_coalesces_non_terminal_jobs() {
 }
 
 #[tokio::test]
+async fn remove_deduplication_key_allows_a_new_owner() {
+    let queue = InMemoryJobQueue::new("dedup-release");
+    let first = queue
+        .add_at(
+            "sync",
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new().with_deduplication_id("account:42"),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    let duplicate = queue
+        .add_at(
+            "sync-duplicate",
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new().with_deduplication_id("account:42"),
+            ts(1_100),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate.id, first.id);
+
+    assert!(queue.remove_deduplication_key("account:42").await.unwrap());
+    assert!(!queue
+        .remove_deduplication_key("missing-account")
+        .await
+        .unwrap());
+
+    let second = queue
+        .add_at(
+            "sync-after-release",
+            serde_json::json!({ "version": 3 }),
+            JobOptions::new().with_deduplication_id("account:42"),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+    assert_ne!(second.id, first.id);
+
+    let duplicate_second = queue
+        .add_at(
+            "sync-after-release-duplicate",
+            serde_json::json!({ "version": 4 }),
+            JobOptions::new().with_deduplication_id("account:42"),
+            ts(1_300),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate_second.id, second.id);
+    assert_eq!(queue.stats().await.unwrap().waiting, 2);
+}
+
+#[tokio::test]
+async fn removed_released_deduplication_owner_does_not_leave_stale_marker() {
+    let queue = InMemoryJobQueue::new("dedup-release-cleanup");
+    let first = queue
+        .add_at(
+            "sync",
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new()
+                .with_job_id("sync:account:42")
+                .with_deduplication_id("account:42"),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    assert!(queue.remove_deduplication_key("account:42").await.unwrap());
+    let removed = queue.remove_job(&first.id).await.unwrap().unwrap();
+    assert_eq!(removed.id, first.id);
+
+    let reused = queue
+        .add_at(
+            "sync-reused-id",
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new()
+                .with_job_id("sync:account:42")
+                .with_deduplication_id("account:42"),
+            ts(1_100),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reused.id, first.id);
+
+    let duplicate = queue
+        .add_at(
+            "sync-duplicate",
+            serde_json::json!({ "version": 3 }),
+            JobOptions::new().with_deduplication_id("account:42"),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate.id, reused.id);
+}
+
+#[tokio::test]
 async fn deduplication_ttl_allows_new_non_terminal_owner_after_expiration() {
     let queue = InMemoryJobQueue::new("dedup-ttl");
     let first = queue
@@ -1965,6 +2062,50 @@ async fn local_job_queue_persists_priority_updates() {
     let restored = reopened.get_job(&job.id).await.unwrap().unwrap();
     assert_eq!(restored.priority, 5);
     assert_eq!(restored.options.priority, 5);
+}
+
+#[tokio::test]
+async fn local_job_queue_persists_removed_deduplication_keys() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("jobs").join("dedup-release.json");
+    let queue = LocalJobQueue::open("durable-dedup-release", &snapshot_path)
+        .await
+        .unwrap();
+    let first = queue
+        .add_at(
+            "sync",
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new().with_deduplication_id("account:42"),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    assert!(queue.remove_deduplication_key("account:42").await.unwrap());
+
+    let reopened = LocalJobQueue::open("durable-dedup-release", &snapshot_path)
+        .await
+        .unwrap();
+    let second = reopened
+        .add_at(
+            "sync-after-reopen",
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new().with_deduplication_id("account:42"),
+            ts(1_100),
+        )
+        .await
+        .unwrap();
+    assert_ne!(second.id, first.id);
+
+    let duplicate_second = reopened
+        .add_at(
+            "sync-after-reopen-duplicate",
+            serde_json::json!({ "version": 3 }),
+            JobOptions::new().with_deduplication_id("account:42"),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate_second.id, second.id);
 }
 
 #[tokio::test]

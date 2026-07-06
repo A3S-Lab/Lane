@@ -370,9 +370,9 @@ A3S stack and language SDKs.
 | --- | --- | --- |
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
 | Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, debounce TTL extension, delayed-owner replace, and keep-last-if-active requeue, repeat-key ownership, explicit job states, priority ordering, delayed jobs, token-owned worker leases, completion/failure snapshots, retry backoff, rate-limited claims, shared active concurrency limits, stalled-job recovery, pause/resume. |
-| Job management API | In progress | Add/get/remove/remove-repeat/promote/retry/update-priority/pause/resume/drain/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
+| Job management API | In progress | Add/get/remove/remove-repeat/remove-deduplication-key/promote/retry/update-priority/pause/resume/drain/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, and stalled recovery loops. |
-| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, repeat-key ownership and removal, flow submission, delayed promotion, single-job promote, manual retry, priority update, progress update, log append, list/stat snapshots, drain, clean, claim, rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
+| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership and removal, flow submission, delayed promotion, single-job promote, manual retry, priority update, progress update, log append, list/stat snapshots, drain, clean, claim, rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, end timestamps, and repeat-key removal are available across in-memory, local durable, and Redis backends. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
@@ -447,6 +447,7 @@ waiting, `retry_job()` manually requeues failed jobs, `update_priority()`
 changes non-terminal job priority, `renew_lease()` extends an active worker
 lease with the claim token, `remove_job()` removes non-active jobs,
 `remove_repeat()` removes the current non-active owner for a repeat key,
+`remove_deduplication_key()` clears the active owner for a deduplication id,
 `drain_jobs(false)` removes waiting jobs, `drain_jobs(true)` also removes
 ordinary delayed jobs while preserving current delayed repeat owners,
 `clean_jobs()` removes old records by state, and these cleanup paths can
@@ -687,6 +688,11 @@ Flow/repeat keep-last extensions remain planned.
 Retrying a failed deduplicated job reclaims the deduplication id while the job is
 waiting or active again; retry is rejected if another non-terminal job already
 owns that id.
+`remove_deduplication_key()` clears the queue's current owner for a
+deduplication id before that owner reaches a terminal state, matching BullMQ's
+queue-level `removeDeduplicationKey()` behavior of deleting the Redis
+deduplication key. The original job remains in its current state, but later
+submissions with the same deduplication id can become the new owner.
 
 Use `LocalJobQueue` when a process-local runtime needs durable restart
 recovery:
@@ -834,6 +840,11 @@ or removed.
 Manual retry reclaims the key inside the retry script, reapplies the TTL, and
 refuses to move the failed job back to waiting if a newer non-terminal job
 already owns the same deduplication id.
+`remove_deduplication_key()` deletes `deduplication:<id>` directly, so a later
+add can claim the same id even while the old owner remains non-terminal. The
+in-memory and local durable backends persist the same logical release by
+tracking the released owner id in their snapshots instead of relying on a
+client-side scan alone.
 
 Redis flow submission is all-or-nothing: the flow add script first checks every
 parent and child job id, then writes the parent, children, and all state indexes

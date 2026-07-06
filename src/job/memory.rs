@@ -20,6 +20,7 @@ struct InMemoryJobQueueState {
     paused: bool,
     jobs: HashMap<JobId, Job>,
     deduplication_next: HashMap<String, Job>,
+    released_deduplication_owners: HashSet<(String, JobId)>,
 }
 
 /// In-memory implementation of the generic job queue backend.
@@ -61,6 +62,10 @@ impl InMemoryJobQueue {
                         Some((deduplication_id, job))
                     })
                     .collect(),
+                released_deduplication_owners: snapshot
+                    .released_deduplication_owners
+                    .into_iter()
+                    .collect(),
             })),
         }
     }
@@ -86,6 +91,9 @@ impl InMemoryJobQueue {
             paused: inner.paused,
             jobs,
             deduplication_next_jobs,
+            released_deduplication_owners: sorted_released_deduplication_owners(
+                &inner.released_deduplication_owners,
+            ),
         }
     }
 
@@ -113,11 +121,18 @@ impl InMemoryJobQueue {
         if let Some(existing) = inner.jobs.get(&job.id) {
             return Ok(existing.clone());
         }
-        if let Some(existing) = find_active_deduplicated_job(&inner.jobs, &job, now).cloned() {
+        if let Some(existing) = find_active_deduplicated_job(
+            &inner.jobs,
+            &inner.released_deduplication_owners,
+            &job,
+            now,
+        )
+        .cloned()
+        {
             if deduplication_replaces_delayed_owner(&job, &existing) {
                 preserve_replacement_deduplication_expiration(&mut job, &existing);
                 let existing_id = existing.id.clone();
-                inner.jobs.remove(&existing_id);
+                Self::remove_job_record_locked(&mut inner, &existing_id);
             } else {
                 Self::store_deduplicated_next_locked(&mut inner, &job, &existing);
                 Self::extend_deduplication_expiration_locked(
@@ -132,6 +147,7 @@ impl InMemoryJobQueue {
         if let Some(existing) = find_active_repeat_job(&inner.jobs, &job) {
             return Ok(existing.clone());
         }
+        Self::forget_released_deduplication_owner_locked(&mut inner, &job);
         inner.jobs.insert(job.id.clone(), job.clone());
         Ok(job)
     }
@@ -171,11 +187,18 @@ impl InMemoryJobQueue {
                 added.push(existing.clone());
                 continue;
             }
-            if let Some(existing) = find_active_deduplicated_job(&inner.jobs, &job, now).cloned() {
+            if let Some(existing) = find_active_deduplicated_job(
+                &inner.jobs,
+                &inner.released_deduplication_owners,
+                &job,
+                now,
+            )
+            .cloned()
+            {
                 if deduplication_replaces_delayed_owner(&job, &existing) {
                     preserve_replacement_deduplication_expiration(&mut job, &existing);
                     let existing_id = existing.id.clone();
-                    inner.jobs.remove(&existing_id);
+                    Self::remove_job_record_locked(&mut inner, &existing_id);
                 } else {
                     Self::store_deduplicated_next_locked(&mut inner, &job, &existing);
                     Self::extend_deduplication_expiration_locked(
@@ -188,7 +211,9 @@ impl InMemoryJobQueue {
                     continue;
                 }
             }
-            if let Some(existing) = find_active_deduplicated_job(&staged, &job, now).cloned() {
+            if let Some(existing) =
+                find_active_deduplicated_job(&staged, &HashSet::new(), &job, now).cloned()
+            {
                 if deduplication_replaces_delayed_owner(&job, &existing) {
                     preserve_replacement_deduplication_expiration(&mut job, &existing);
                     let existing_id = existing.id.clone();
@@ -214,7 +239,10 @@ impl InMemoryJobQueue {
             added.push(job);
         }
 
-        inner.jobs.extend(staged);
+        for (job_id, job) in staged {
+            Self::forget_released_deduplication_owner_locked(&mut inner, &job);
+            inner.jobs.insert(job_id, job);
+        }
         Ok(added)
     }
 
@@ -274,7 +302,13 @@ impl InMemoryJobQueue {
         let mut flow_deduplication_ids = HashSet::new();
         for job in std::iter::once(&parent_job).chain(child_jobs.iter()) {
             if let Some(deduplication_id) = active_deduplication_id(job, now) {
-                if find_active_deduplication_id(&inner.jobs, deduplication_id, now).is_some()
+                if find_active_deduplication_id(
+                    &inner.jobs,
+                    &inner.released_deduplication_owners,
+                    deduplication_id,
+                    now,
+                )
+                .is_some()
                     || !flow_deduplication_ids.insert(deduplication_id.to_string())
                 {
                     return Err(LaneError::ConfigError(format!(
@@ -295,8 +329,10 @@ impl InMemoryJobQueue {
                 }
             }
         }
+        Self::forget_released_deduplication_owner_locked(&mut inner, &parent_job);
         inner.jobs.insert(parent_job.id.clone(), parent_job.clone());
         for child in &child_jobs {
+            Self::forget_released_deduplication_owner_locked(&mut inner, child);
             inner.jobs.insert(child.id.clone(), child.clone());
         }
 
@@ -312,11 +348,33 @@ impl InMemoryJobQueue {
         if let Some(job) = inner.jobs.get(job_id) {
             require_removable(job)?;
         }
-        let removed = inner.jobs.remove(job_id);
+        let removed = Self::remove_job_record_locked(&mut inner, job_id);
         if let Some(parent_id) = removed.as_ref().and_then(|job| job.parent_id.clone()) {
             Self::release_parent_if_ready_locked(&mut inner, &parent_id, Utc::now());
         }
         Ok(removed)
+    }
+
+    /// Remove the active deduplication owner key, allowing a new owner to be added.
+    pub async fn remove_deduplication_key(&self, deduplication_id: &str) -> Result<bool> {
+        if deduplication_id.is_empty() {
+            return Ok(false);
+        }
+
+        let mut inner = self.inner.lock().await;
+        let Some(owner) = find_active_deduplication_id(
+            &inner.jobs,
+            &inner.released_deduplication_owners,
+            deduplication_id,
+            Utc::now(),
+        ) else {
+            return Ok(false);
+        };
+        let owner_id = owner.id.clone();
+        inner
+            .released_deduplication_owners
+            .insert((deduplication_id.to_string(), owner_id));
+        Ok(true)
     }
 
     /// Remove the current non-terminal occurrence for a repeat series.
@@ -330,7 +388,7 @@ impl InMemoryJobQueue {
         if let Some(job) = inner.jobs.get(&job_id) {
             require_removable(job)?;
         }
-        let removed = inner.jobs.remove(&job_id);
+        let removed = Self::remove_job_record_locked(&mut inner, &job_id);
         if let Some(parent_id) = removed.as_ref().and_then(|job| job.parent_id.clone()) {
             Self::release_parent_if_ready_locked(&mut inner, &parent_id, Utc::now());
         }
@@ -364,28 +422,39 @@ impl InMemoryJobQueue {
                 current.id, current.state
             )));
         }
-        if let Some(deduplication_id) = current
+        let retry_deduplication_id = current
             .options
             .deduplication
             .as_ref()
-            .map(|value| &value.id)
-        {
-            if let Some(existing) =
-                find_active_deduplication_id_except(&inner.jobs, deduplication_id, job_id, now)
-            {
+            .map(|value| value.id.clone());
+        let retry_repeat_key = current.repeat_key.clone();
+
+        if let Some(deduplication_id) = retry_deduplication_id.as_deref() {
+            if let Some(existing) = find_active_deduplication_id_except(
+                &inner.jobs,
+                &inner.released_deduplication_owners,
+                deduplication_id,
+                job_id,
+                now,
+            ) {
                 return Err(LaneError::JobStateConflict(format!(
                     "cannot retry job {job_id}; deduplication id `{deduplication_id}` is active on job {}",
                     existing.id
                 )));
             }
         }
-        if let Some(repeat_key) = current.repeat_key.as_deref() {
+        if let Some(repeat_key) = retry_repeat_key.as_deref() {
             if let Some(existing) = find_active_repeat_key_except(&inner.jobs, repeat_key, job_id) {
                 return Err(LaneError::JobStateConflict(format!(
                     "cannot retry job {job_id}; repeat key `{repeat_key}` is active on job {}",
                     existing.id
                 )));
             }
+        }
+        if let Some(deduplication_id) = retry_deduplication_id {
+            inner
+                .released_deduplication_owners
+                .remove(&(deduplication_id, job_id.to_string()));
         }
 
         let job = inner
@@ -505,7 +574,7 @@ impl InMemoryJobQueue {
             .collect::<Vec<_>>();
 
         for job in &jobs {
-            inner.jobs.remove(&job.id);
+            Self::remove_job_record_locked(&mut inner, &job.id);
         }
         for parent_id in parent_ids {
             Self::release_parent_if_ready_locked(&mut inner, &parent_id, now);
@@ -536,7 +605,7 @@ impl InMemoryJobQueue {
             .collect::<Vec<_>>();
 
         for job in &jobs {
-            inner.jobs.remove(&job.id);
+            Self::remove_job_record_locked(&mut inner, &job.id);
         }
         for parent_id in parent_ids {
             Self::release_parent_if_ready_locked(&mut inner, &parent_id, Utc::now());
@@ -597,6 +666,20 @@ impl InMemoryJobQueue {
         promoted
     }
 
+    fn remove_job_record_locked(inner: &mut InMemoryJobQueueState, job_id: &str) -> Option<Job> {
+        let removed = inner.jobs.remove(job_id)?;
+        Self::forget_released_deduplication_owner_locked(inner, &removed);
+        Some(removed)
+    }
+
+    fn forget_released_deduplication_owner_locked(inner: &mut InMemoryJobQueueState, job: &Job) {
+        if let Some(deduplication_id) = job_deduplication_id(job) {
+            inner
+                .released_deduplication_owners
+                .remove(&(deduplication_id.to_string(), job.id.clone()));
+        }
+    }
+
     fn store_deduplicated_next_locked(
         inner: &mut InMemoryJobQueueState,
         candidate: &Job,
@@ -628,6 +711,7 @@ impl InMemoryJobQueue {
         if inner.jobs.contains_key(&next.id) {
             return None;
         }
+        Self::forget_released_deduplication_owner_locked(inner, &next);
         inner.jobs.insert(next.id.clone(), next.clone());
         Some(next)
     }
@@ -712,8 +796,9 @@ impl InMemoryJobQueue {
         parent.lease_expires_at = None;
         parent.failed_reason = Some(reason);
         let failed = parent.clone();
+        Self::forget_released_deduplication_owner_locked(inner, &failed);
         if failed.options.remove_on_fail {
-            inner.jobs.remove(parent_id);
+            Self::remove_job_record_locked(inner, parent_id);
         }
         Some(failed)
     }
@@ -797,10 +882,12 @@ impl JobQueueBackend for InMemoryJobQueue {
             job.return_value = Some(value);
             job.clone()
         };
+        Self::forget_released_deduplication_owner_locked(&mut inner, &completed);
         if completed.options.remove_on_complete {
-            inner.jobs.remove(job_id);
+            Self::remove_job_record_locked(&mut inner, job_id);
         }
         if let Some(next_job) = next_repeat_job(&completed, now)? {
+            Self::forget_released_deduplication_owner_locked(&mut inner, &next_job);
             inner.jobs.insert(next_job.id.clone(), next_job);
         }
         Self::enqueue_deduplicated_next_locked(&mut inner, &completed, now);
@@ -845,10 +932,11 @@ impl JobQueueBackend for InMemoryJobQueue {
 
             job.clone()
         };
-        if failed.state == JobState::Failed && failed.options.remove_on_fail {
-            inner.jobs.remove(job_id);
-        }
         if failed.state == JobState::Failed {
+            Self::forget_released_deduplication_owner_locked(&mut inner, &failed);
+            if failed.options.remove_on_fail {
+                Self::remove_job_record_locked(&mut inner, job_id);
+            }
             Self::enqueue_deduplicated_next_locked(&mut inner, &failed, now);
             if let Some(parent_id) = &failed.parent_id {
                 Self::fail_waiting_parent_locked(
@@ -894,6 +982,10 @@ impl JobQueueBackend for InMemoryJobQueue {
 
     async fn remove_repeat(&self, repeat_key: &str) -> Result<Option<Job>> {
         InMemoryJobQueue::remove_repeat(self, repeat_key).await
+    }
+
+    async fn remove_deduplication_key(&self, deduplication_id: &str) -> Result<bool> {
+        InMemoryJobQueue::remove_deduplication_key(self, deduplication_id).await
     }
 
     async fn clean_jobs(
@@ -978,9 +1070,10 @@ impl JobQueueBackend for InMemoryJobQueue {
         }
 
         for id in remove_ids {
-            inner.jobs.remove(&id);
+            Self::remove_job_record_locked(&mut inner, &id);
         }
         for failed in terminal_failures {
+            Self::forget_released_deduplication_owner_locked(&mut inner, &failed);
             Self::enqueue_deduplicated_next_locked(&mut inner, &failed, now);
         }
         for (parent_id, child_id, reason) in failed_children {
@@ -1062,6 +1155,14 @@ fn state_rank(state: JobState) -> u8 {
     }
 }
 
+fn sorted_released_deduplication_owners(
+    released_owners: &HashSet<(String, JobId)>,
+) -> Vec<(String, JobId)> {
+    let mut owners = released_owners.iter().cloned().collect::<Vec<_>>();
+    owners.sort();
+    owners
+}
+
 fn active_deduplication_id(job: &Job, now: DateTime<Utc>) -> Option<&str> {
     if job.state.is_terminal() {
         return None;
@@ -1085,31 +1186,46 @@ fn job_deduplication_id(job: &Job) -> Option<&str> {
 
 fn find_active_deduplicated_job<'a>(
     jobs: &'a HashMap<JobId, Job>,
+    released_owners: &HashSet<(String, JobId)>,
     candidate: &Job,
     now: DateTime<Utc>,
 ) -> Option<&'a Job> {
     let deduplication_id = active_deduplication_id(candidate, now)?;
-    find_active_deduplication_id(jobs, deduplication_id, now)
+    find_active_deduplication_id(jobs, released_owners, deduplication_id, now)
 }
 
 fn find_active_deduplication_id<'a>(
     jobs: &'a HashMap<JobId, Job>,
+    released_owners: &HashSet<(String, JobId)>,
     deduplication_id: &str,
     now: DateTime<Utc>,
 ) -> Option<&'a Job> {
-    jobs.values()
-        .find(|job| active_deduplication_id(job, now) == Some(deduplication_id))
+    jobs.values().find(|job| {
+        active_deduplication_id(job, now) == Some(deduplication_id)
+            && !deduplication_owner_released(released_owners, deduplication_id, &job.id)
+    })
 }
 
 fn find_active_deduplication_id_except<'a>(
     jobs: &'a HashMap<JobId, Job>,
+    released_owners: &HashSet<(String, JobId)>,
     deduplication_id: &str,
     excluded_job_id: &str,
     now: DateTime<Utc>,
 ) -> Option<&'a Job> {
     jobs.values().find(|job| {
-        job.id != excluded_job_id && active_deduplication_id(job, now) == Some(deduplication_id)
+        job.id != excluded_job_id
+            && active_deduplication_id(job, now) == Some(deduplication_id)
+            && !deduplication_owner_released(released_owners, deduplication_id, &job.id)
     })
+}
+
+fn deduplication_owner_released(
+    released_owners: &HashSet<(String, JobId)>,
+    deduplication_id: &str,
+    job_id: &str,
+) -> bool {
+    released_owners.contains(&(deduplication_id.to_string(), job_id.to_string()))
 }
 
 fn deduplication_replaces_delayed_owner(candidate: &Job, existing: &Job) -> bool {

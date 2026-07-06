@@ -3512,6 +3512,23 @@ impl JobQueueBackend for RedisJobQueue {
         Ok(removed)
     }
 
+    async fn remove_deduplication_key(&self, deduplication_id: &str) -> Result<bool> {
+        if deduplication_id.is_empty() {
+            return Ok(false);
+        }
+
+        let mut conn = self.connection().await?;
+        let removed: usize = conn
+            .del(format!(
+                "{}{}",
+                self.deduplication_key_prefix(),
+                deduplication_id
+            ))
+            .await
+            .map_err(redis_error)?;
+        Ok(removed > 0)
+    }
+
     async fn clean_jobs(
         &self,
         state: JobState,

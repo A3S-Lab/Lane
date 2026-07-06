@@ -128,6 +128,16 @@ impl LocalJobQueue {
         Ok(job)
     }
 
+    /// Remove the active deduplication owner key.
+    pub async fn remove_deduplication_key(&self, deduplication_id: &str) -> Result<bool> {
+        let removed = self
+            .inner
+            .remove_deduplication_key(deduplication_id)
+            .await?;
+        self.persist().await?;
+        Ok(removed)
+    }
+
     /// Drain waiting jobs and optionally non-repeat delayed jobs.
     pub async fn drain(&self, include_delayed: bool) -> Result<Vec<Job>> {
         let jobs = self.inner.drain(include_delayed).await?;
@@ -237,6 +247,10 @@ impl JobQueueBackend for LocalJobQueue {
 
     async fn remove_repeat(&self, repeat_key: &str) -> Result<Option<Job>> {
         LocalJobQueue::remove_repeat(self, repeat_key).await
+    }
+
+    async fn remove_deduplication_key(&self, deduplication_id: &str) -> Result<bool> {
+        LocalJobQueue::remove_deduplication_key(self, deduplication_id).await
     }
 
     async fn clean_jobs(

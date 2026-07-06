@@ -64,6 +64,8 @@ pub trait JobQueueBackend: Send + Sync {
 
     async fn remove_repeat(&self, repeat_key: &str) -> Result<Option<Job>>;
 
+    async fn remove_deduplication_key(&self, deduplication_id: &str) -> Result<bool>;
+
     async fn clean_jobs(
         &self,
         state: JobState,
