@@ -493,6 +493,13 @@ assert_eq!(queue.get_job(&job.id).await?.map(|job| job.name), Some("send".to_str
 # }
 ```
 
+Run the Redis integration test against any reachable Redis server:
+
+```bash
+A3S_LANE_REDIS_URL=redis://127.0.0.1:6379/ \
+  cargo test --features redis-backend --test redis_job_queue
+```
+
 Use `JobWorker` to run async processors against any backend:
 
 ```rust
