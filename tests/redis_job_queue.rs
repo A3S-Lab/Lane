@@ -1270,6 +1270,13 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect_err("zero active limit should be rejected");
     assert!(matches!(zero_active_limit, LaneError::ConfigError(_)));
+    assert_eq!(
+        active_limit_queue
+            .get_max_active_jobs()
+            .await
+            .expect("unset active limit should load"),
+        None
+    );
     active_limit_queue
         .set_max_active_jobs(1)
         .await
@@ -1282,6 +1289,13 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .hget(&active_limit_meta_key, "concurrency")
         .await?;
     assert_eq!(stored_concurrency, Some(1));
+    assert_eq!(
+        active_limit_queue
+            .get_max_active_jobs()
+            .await
+            .expect("stored active limit should load"),
+        Some(1)
+    );
     let active_first = active_limit_queue
         .add_job(
             "active-first".to_string(),
@@ -1353,6 +1367,13 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .hget(&active_limit_meta_key, "concurrency")
         .await?;
     assert_eq!(cleared_concurrency, None);
+    assert_eq!(
+        active_limit_queue
+            .get_max_active_jobs()
+            .await
+            .expect("cleared active limit should load"),
+        None
+    );
     let active_unlimited_first = active_limit_queue
         .add_job(
             "active-unlimited-first".to_string(),

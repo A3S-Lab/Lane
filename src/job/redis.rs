@@ -3030,6 +3030,17 @@ impl RedisJobQueue {
             .map_err(redis_error)
     }
 
+    /// Read the Redis-backed active job limit.
+    ///
+    /// Redis stores this value in the queue meta hash as `concurrency`, matching
+    /// BullMQ's global concurrency getter.
+    pub async fn get_max_active_jobs(&self) -> Result<Option<usize>> {
+        let mut conn = self.connection().await?;
+        conn.hget(self.meta_key(), "concurrency")
+            .await
+            .map_err(redis_error)
+    }
+
     /// Clear the Redis-backed active job limit.
     pub async fn clear_max_active_jobs(&self) -> Result<()> {
         let mut conn = self.connection().await?;
