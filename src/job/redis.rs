@@ -69,14 +69,42 @@ local function deduplication_ttl_millis(job)
   return duration_millis(deduplication["ttl"])
 end
 
-local function set_deduplication_key(job, job_id, deduplication_prefix)
+local function set_deduplication_key(job, job_id, deduplication_prefix, keep_existing_ttl)
   local ttl = deduplication_ttl_millis(job)
   local id = job["options"]["deduplication"]["id"]
-  if ttl then
+  if keep_existing_ttl and ttl then
+    redis.call('SET', deduplication_prefix .. id, job_id, 'KEEPTTL')
+  elseif ttl then
     redis.call('SET', deduplication_prefix .. id, job_id, 'PX', ttl)
   else
     redis.call('SET', deduplication_prefix .. id, job_id)
   end
+end
+
+local function can_replace_deduplicated_owner(candidate_job, existing_job)
+  if not candidate_job["options"] or candidate_job["options"] == cjson.null then
+    return false
+  end
+  local deduplication = candidate_job["options"]["deduplication"]
+  if not deduplication or deduplication == cjson.null or deduplication["replace"] ~= true then
+    return false
+  end
+  if existing_job["state"] ~= "delayed" then
+    return false
+  end
+  if candidate_job["repeat_key"] and candidate_job["repeat_key"] ~= cjson.null then
+    return false
+  end
+  if existing_job["parent_id"] and existing_job["parent_id"] ~= cjson.null then
+    return false
+  end
+  if existing_job["repeat_key"] and existing_job["repeat_key"] ~= cjson.null then
+    return false
+  end
+  if existing_job["child_ids"] and existing_job["child_ids"] ~= cjson.null and #existing_job["child_ids"] > 0 then
+    return false
+  end
+  return true
 end
 
 local function active_repeat_raw(jobs_key, repeat_prefix, repeat_key)
@@ -111,8 +139,21 @@ if existing then
 end
 
 local deduplicated = active_deduplicated_raw(KEYS[1], ARGV[8], ARGV[7])
+local replaced_deduplicated_owner = false
 if deduplicated then
-  return {'deduplicated', deduplicated}
+  local candidate_job = cjson.decode(ARGV[2])
+  local existing_job = cjson.decode(deduplicated)
+  if can_replace_deduplicated_owner(candidate_job, existing_job) then
+    local removed = redis.call('ZREM', KEYS[3], existing_job["id"])
+    if removed > 0 then
+      redis.call('HDEL', KEYS[1], existing_job["id"])
+      replaced_deduplicated_owner = true
+    else
+      return {'deduplicated', deduplicated}
+    end
+  else
+    return {'deduplicated', deduplicated}
+  end
 end
 
 local repeat_owner = active_repeat_raw(KEYS[1], ARGV[10], ARGV[9])
@@ -141,7 +182,7 @@ elseif state == 'waiting_children' then
 end
 
 if ARGV[7] ~= '' then
-  set_deduplication_key(cjson.decode(ARGV[2]), ARGV[1], ARGV[8])
+  set_deduplication_key(cjson.decode(ARGV[2]), ARGV[1], ARGV[8], replaced_deduplicated_owner)
 end
 if ARGV[9] ~= '' then
   redis.call('SET', ARGV[10] .. ARGV[9], ARGV[1])
@@ -204,14 +245,42 @@ local function deduplication_ttl_millis(job)
   return duration_millis(deduplication["ttl"])
 end
 
-local function set_deduplication_key(job, job_id, deduplication_prefix)
+local function set_deduplication_key(job, job_id, deduplication_prefix, keep_existing_ttl)
   local ttl = deduplication_ttl_millis(job)
   local id = job["options"]["deduplication"]["id"]
-  if ttl then
+  if keep_existing_ttl and ttl then
+    redis.call('SET', deduplication_prefix .. id, job_id, 'KEEPTTL')
+  elseif ttl then
     redis.call('SET', deduplication_prefix .. id, job_id, 'PX', ttl)
   else
     redis.call('SET', deduplication_prefix .. id, job_id)
   end
+end
+
+local function can_replace_deduplicated_owner(candidate_job, existing_job)
+  if not candidate_job["options"] or candidate_job["options"] == cjson.null then
+    return false
+  end
+  local deduplication = candidate_job["options"]["deduplication"]
+  if not deduplication or deduplication == cjson.null or deduplication["replace"] ~= true then
+    return false
+  end
+  if existing_job["state"] ~= "delayed" then
+    return false
+  end
+  if candidate_job["repeat_key"] and candidate_job["repeat_key"] ~= cjson.null then
+    return false
+  end
+  if existing_job["parent_id"] and existing_job["parent_id"] ~= cjson.null then
+    return false
+  end
+  if existing_job["repeat_key"] and existing_job["repeat_key"] ~= cjson.null then
+    return false
+  end
+  if existing_job["child_ids"] and existing_job["child_ids"] ~= cjson.null and #existing_job["child_ids"] > 0 then
+    return false
+  end
+  return true
 end
 
 local function active_repeat_raw(jobs_key, repeat_prefix, repeat_key)
@@ -261,40 +330,59 @@ for index = 1, count do
   if existing then
     added[index] = existing
   else
+    local should_insert = true
+    local replaced_deduplicated_owner = false
     local deduplicated = active_deduplicated_raw(KEYS[1], deduplication_prefix, deduplication_id)
     if deduplicated then
-      added[index] = deduplicated
-    else
+      local candidate_job = cjson.decode(raw)
+      local existing_job = cjson.decode(deduplicated)
+      if can_replace_deduplicated_owner(candidate_job, existing_job) then
+        local removed = redis.call('ZREM', KEYS[3], existing_job["id"])
+        if removed > 0 then
+          redis.call('HDEL', KEYS[1], existing_job["id"])
+          replaced_deduplicated_owner = true
+        else
+          added[index] = deduplicated
+          should_insert = false
+        end
+      else
+        added[index] = deduplicated
+        should_insert = false
+      end
+    end
+    if should_insert then
       local repeat_owner = active_repeat_raw(KEYS[1], repeat_prefix, repeat_key)
       if repeat_owner then
         added[index] = repeat_owner
-      else
-        local inserted = redis.call('HSETNX', KEYS[1], id, raw)
-        if inserted == 0 then
-          local current = redis.call('HGET', KEYS[1], id)
-          if current then
-            added[index] = current
-          else
-            return {'missing', id}
-          end
+        should_insert = false
+      end
+    end
+    if should_insert then
+      local inserted = redis.call('HSETNX', KEYS[1], id, raw)
+      if inserted == 0 then
+        local current = redis.call('HGET', KEYS[1], id)
+        if current then
+          added[index] = current
         else
-          if state == 'waiting' then
-            local sequence = redis.call('INCR', KEYS[5])
-            local waiting_score = (priority * waiting_score_bucket) + sequence
-            redis.call('ZADD', KEYS[2], waiting_score, id)
-          elseif state == 'delayed' then
-            redis.call('ZADD', KEYS[3], scheduled_score, id)
-          elseif state == 'waiting_children' then
-            redis.call('ZADD', KEYS[4], scheduled_score, id)
-          end
-          if deduplication_id ~= '' then
-            set_deduplication_key(cjson.decode(raw), id, deduplication_prefix)
-          end
-          if repeat_key ~= '' then
-            redis.call('SET', repeat_prefix .. repeat_key, id)
-          end
-          added[index] = raw
+          return {'missing', id}
         end
+      else
+        if state == 'waiting' then
+          local sequence = redis.call('INCR', KEYS[5])
+          local waiting_score = (priority * waiting_score_bucket) + sequence
+          redis.call('ZADD', KEYS[2], waiting_score, id)
+        elseif state == 'delayed' then
+          redis.call('ZADD', KEYS[3], scheduled_score, id)
+        elseif state == 'waiting_children' then
+          redis.call('ZADD', KEYS[4], scheduled_score, id)
+        end
+        if deduplication_id ~= '' then
+          set_deduplication_key(cjson.decode(raw), id, deduplication_prefix, replaced_deduplicated_owner)
+        end
+        if repeat_key ~= '' then
+          redis.call('SET', repeat_prefix .. repeat_key, id)
+        end
+        added[index] = raw
       end
     end
   end

@@ -92,13 +92,19 @@ impl InMemoryJobQueue {
         now: DateTime<Utc>,
     ) -> Result<Job> {
         validate_job_options(&options)?;
-        let job = Job::new(self.queue.clone(), name.into(), payload, options, now);
+        let mut job = Job::new(self.queue.clone(), name.into(), payload, options, now);
         let mut inner = self.inner.lock().await;
         if let Some(existing) = inner.jobs.get(&job.id) {
             return Ok(existing.clone());
         }
         if let Some(existing) = find_active_deduplicated_job(&inner.jobs, &job, now) {
-            return Ok(existing.clone());
+            if deduplication_replaces_delayed_owner(&job, existing) {
+                preserve_replacement_deduplication_expiration(&mut job, existing);
+                let existing_id = existing.id.clone();
+                inner.jobs.remove(&existing_id);
+            } else {
+                return Ok(existing.clone());
+            }
         }
         if let Some(existing) = find_active_repeat_job(&inner.jobs, &job) {
             return Ok(existing.clone());
@@ -133,7 +139,7 @@ impl InMemoryJobQueue {
         let mut inner = self.inner.lock().await;
         let mut staged: HashMap<JobId, Job> = HashMap::new();
         let mut added = Vec::with_capacity(created.len());
-        for job in created {
+        for mut job in created {
             if let Some(existing) = inner.jobs.get(&job.id) {
                 added.push(existing.clone());
                 continue;
@@ -142,11 +148,25 @@ impl InMemoryJobQueue {
                 added.push(existing.clone());
                 continue;
             }
-            if let Some(existing) = find_active_deduplicated_job(&inner.jobs, &job, now)
-                .or_else(|| find_active_deduplicated_job(&staged, &job, now))
-            {
-                added.push(existing.clone());
-                continue;
+            if let Some(existing) = find_active_deduplicated_job(&inner.jobs, &job, now) {
+                if deduplication_replaces_delayed_owner(&job, existing) {
+                    preserve_replacement_deduplication_expiration(&mut job, existing);
+                    let existing_id = existing.id.clone();
+                    inner.jobs.remove(&existing_id);
+                } else {
+                    added.push(existing.clone());
+                    continue;
+                }
+            }
+            if let Some(existing) = find_active_deduplicated_job(&staged, &job, now) {
+                if deduplication_replaces_delayed_owner(&job, existing) {
+                    preserve_replacement_deduplication_expiration(&mut job, existing);
+                    let existing_id = existing.id.clone();
+                    staged.remove(&existing_id);
+                } else {
+                    added.push(existing.clone());
+                    continue;
+                }
             }
             if let Some(existing) = find_active_repeat_job(&inner.jobs, &job)
                 .or_else(|| find_active_repeat_job(&staged, &job))
@@ -932,6 +952,33 @@ fn find_active_deduplication_id_except<'a>(
     jobs.values().find(|job| {
         job.id != excluded_job_id && active_deduplication_id(job, now) == Some(deduplication_id)
     })
+}
+
+fn deduplication_replaces_delayed_owner(candidate: &Job, existing: &Job) -> bool {
+    matches!(
+        candidate
+            .options
+            .deduplication
+            .as_ref()
+            .map(|deduplication| deduplication.replace),
+        Some(true)
+    ) && existing.state == JobState::Delayed
+        && candidate.repeat_key.is_none()
+        && existing.parent_id.is_none()
+        && existing.child_ids.is_empty()
+        && existing.repeat_key.is_none()
+}
+
+fn preserve_replacement_deduplication_expiration(candidate: &mut Job, existing: &Job) {
+    let preserves_ttl = candidate
+        .options
+        .deduplication
+        .as_ref()
+        .and_then(|deduplication| deduplication.ttl)
+        .is_some();
+    if preserves_ttl {
+        candidate.deduplication_expires_at = existing.deduplication_expires_at;
+    }
 }
 
 fn active_repeat_key(job: &Job) -> Option<&str> {

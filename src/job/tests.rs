@@ -227,6 +227,92 @@ async fn deduplication_ttl_allows_new_non_terminal_owner_after_expiration() {
 }
 
 #[tokio::test]
+async fn deduplication_replace_swaps_delayed_owner() {
+    let queue = InMemoryJobQueue::new("dedup-replace");
+    let first = queue
+        .add_at(
+            "sync-old",
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new()
+                .with_delay(Duration::from_secs(30))
+                .with_deduplication(
+                    DeduplicationOptions::new("account:replace")
+                        .with_ttl(Duration::from_secs(5))
+                        .replace_delayed(true),
+                ),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.state, JobState::Delayed);
+
+    let replacement = queue
+        .add_at(
+            "sync-new",
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new()
+                .with_delay(Duration::from_secs(60))
+                .with_deduplication(
+                    DeduplicationOptions::new("account:replace")
+                        .with_ttl(Duration::from_secs(60))
+                        .replace_delayed(true),
+                ),
+            ts(1_100),
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(replacement.id, first.id);
+    assert_eq!(replacement.name, "sync-new");
+    assert_eq!(
+        replacement.deduplication_expires_at,
+        first.deduplication_expires_at
+    );
+    assert!(queue.get_job(&first.id).await.unwrap().is_none());
+    assert_eq!(
+        queue
+            .list_jobs(JobListOptions::new().with_state(JobState::Delayed))
+            .await
+            .unwrap()
+            .jobs
+            .iter()
+            .map(|job| job.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![replacement.id.as_str()]
+    );
+}
+
+#[tokio::test]
+async fn deduplication_replace_does_not_swap_waiting_owner() {
+    let queue = InMemoryJobQueue::new("dedup-replace-waiting");
+    let first = queue
+        .add_at(
+            "sync-old",
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("account:replace-waiting").replace_delayed(true),
+            ),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    let duplicate = queue
+        .add_at(
+            "sync-new",
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("account:replace-waiting").replace_delayed(true),
+            ),
+            ts(1_100),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(duplicate.id, first.id);
+    assert_eq!(queue.stats().await.unwrap().waiting, 1);
+}
+
+#[tokio::test]
 async fn retry_resets_deduplication_ttl_owner_window() {
     let queue = InMemoryJobQueue::new("dedup-retry-ttl");
     let first = queue

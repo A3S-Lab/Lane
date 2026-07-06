@@ -315,6 +315,155 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("current ttl owner should be returned");
     let ttl_owner_after_current_remove: Option<String> = dedup_conn.get(&ttl_dedup_key).await?;
     assert!(ttl_owner_after_current_remove.is_none());
+
+    let replace_dedup_key = format!("{namespace}:dedup:deduplication:tenant:replace");
+    let replace_old = dedup_queue
+        .add_job(
+            "dedup-replace-old".to_string(),
+            serde_json::json!({ "version": 9 }),
+            JobOptions::new()
+                .with_delay(Duration::from_secs(30))
+                .with_deduplication(
+                    DeduplicationOptions::new("tenant:replace").replace_delayed(true),
+                ),
+        )
+        .await
+        .expect("replace old dedup job should be added");
+    let replace_old_score: Option<f64> = dedup_conn
+        .zscore(format!("{namespace}:dedup:delayed"), &replace_old.id)
+        .await?;
+    assert!(replace_old_score.is_some());
+    let replace_new = dedup_queue
+        .add_job(
+            "dedup-replace-new".to_string(),
+            serde_json::json!({ "version": 10 }),
+            JobOptions::new()
+                .with_delay(Duration::from_secs(60))
+                .with_deduplication(
+                    DeduplicationOptions::new("tenant:replace").replace_delayed(true),
+                ),
+        )
+        .await
+        .expect("replace should insert a new delayed owner");
+    assert_ne!(replace_new.id, replace_old.id);
+    let replace_owner: Option<String> = dedup_conn.get(&replace_dedup_key).await?;
+    assert_eq!(replace_owner.as_deref(), Some(replace_new.id.as_str()));
+    let replace_old_hash: Option<String> = dedup_conn
+        .hget(format!("{namespace}:dedup:jobs"), &replace_old.id)
+        .await?;
+    assert!(replace_old_hash.is_none());
+    let replace_old_score_after: Option<f64> = dedup_conn
+        .zscore(format!("{namespace}:dedup:delayed"), &replace_old.id)
+        .await?;
+    assert!(replace_old_score_after.is_none());
+    let replace_new_score: Option<f64> = dedup_conn
+        .zscore(format!("{namespace}:dedup:delayed"), &replace_new.id)
+        .await?;
+    assert!(replace_new_score.is_some());
+    dedup_queue
+        .remove_job(&replace_new.id)
+        .await
+        .expect("replace new owner should remove")
+        .expect("replace new owner should be returned");
+    let replace_owner_after_remove: Option<String> = dedup_conn.get(&replace_dedup_key).await?;
+    assert!(replace_owner_after_remove.is_none());
+
+    let replace_ttl_key = format!("{namespace}:dedup:deduplication:tenant:replace-ttl");
+    let _replace_ttl_old = dedup_queue
+        .add_job(
+            "dedup-replace-ttl-old".to_string(),
+            serde_json::json!({ "version": 11 }),
+            JobOptions::new()
+                .with_delay(Duration::from_secs(30))
+                .with_deduplication(
+                    DeduplicationOptions::new("tenant:replace-ttl")
+                        .with_ttl(Duration::from_secs(5))
+                        .replace_delayed(true),
+                ),
+        )
+        .await
+        .expect("replace ttl old dedup job should be added");
+    let ttl_overridden: bool = redis::cmd("PEXPIRE")
+        .arg(&replace_ttl_key)
+        .arg(750)
+        .query_async(&mut dedup_conn)
+        .await?;
+    assert!(ttl_overridden);
+    let replace_ttl_before: i64 = redis::cmd("PTTL")
+        .arg(&replace_ttl_key)
+        .query_async(&mut dedup_conn)
+        .await?;
+    assert!(replace_ttl_before > 0);
+    let replace_ttl_new = dedup_queue
+        .add_job(
+            "dedup-replace-ttl-new".to_string(),
+            serde_json::json!({ "version": 12 }),
+            JobOptions::new()
+                .with_delay(Duration::from_secs(60))
+                .with_deduplication(
+                    DeduplicationOptions::new("tenant:replace-ttl")
+                        .with_ttl(Duration::from_secs(5))
+                        .replace_delayed(true),
+                ),
+        )
+        .await
+        .expect("replace ttl should insert a new delayed owner");
+    let replace_ttl_after: i64 = redis::cmd("PTTL")
+        .arg(&replace_ttl_key)
+        .query_async(&mut dedup_conn)
+        .await?;
+    assert!(replace_ttl_after > 0);
+    assert!(replace_ttl_after <= replace_ttl_before);
+    dedup_queue
+        .remove_job(&replace_ttl_new.id)
+        .await
+        .expect("replace ttl new owner should remove")
+        .expect("replace ttl new owner should be returned");
+
+    let replace_stale_key = format!("{namespace}:dedup:deduplication:tenant:replace-stale");
+    let replace_stale_old = dedup_queue
+        .add_job(
+            "dedup-replace-stale-old".to_string(),
+            serde_json::json!({ "version": 13 }),
+            JobOptions::new()
+                .with_delay(Duration::from_secs(30))
+                .with_deduplication(
+                    DeduplicationOptions::new("tenant:replace-stale").replace_delayed(true),
+                ),
+        )
+        .await
+        .expect("replace stale old dedup job should be added");
+    let stale_removed: usize = dedup_conn
+        .zrem(format!("{namespace}:dedup:delayed"), &replace_stale_old.id)
+        .await?;
+    assert_eq!(stale_removed, 1);
+    let replace_stale_duplicate = dedup_queue
+        .add_job(
+            "dedup-replace-stale-new".to_string(),
+            serde_json::json!({ "version": 14 }),
+            JobOptions::new()
+                .with_delay(Duration::from_secs(60))
+                .with_deduplication(
+                    DeduplicationOptions::new("tenant:replace-stale").replace_delayed(true),
+                ),
+        )
+        .await
+        .expect("stale replace should return the old owner");
+    assert_eq!(replace_stale_duplicate.id, replace_stale_old.id);
+    let replace_stale_owner: Option<String> = dedup_conn.get(&replace_stale_key).await?;
+    assert_eq!(
+        replace_stale_owner.as_deref(),
+        Some(replace_stale_old.id.as_str())
+    );
+    let replace_stale_hash: Option<String> = dedup_conn
+        .hget(format!("{namespace}:dedup:jobs"), &replace_stale_old.id)
+        .await?;
+    assert!(replace_stale_hash.is_some());
+    dedup_queue
+        .remove_job(&replace_stale_old.id)
+        .await
+        .expect("stale old owner should remove")
+        .expect("stale old owner should be returned");
     trace_stage("dedup:done");
 
     let priority_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "priority")

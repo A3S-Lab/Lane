@@ -335,6 +335,9 @@ pub struct DeduplicationOptions {
     /// Optional owner-key TTL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<Duration>,
+    /// Replace an existing delayed owner with the new job.
+    #[serde(default)]
+    pub replace: bool,
 }
 
 impl DeduplicationOptions {
@@ -343,12 +346,22 @@ impl DeduplicationOptions {
         Self {
             id: id.into(),
             ttl: None,
+            replace: false,
         }
     }
 
     /// Set how long this job owns its deduplication id.
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
         self.ttl = Some(ttl);
+        self
+    }
+
+    /// Replace the current delayed owner instead of returning it.
+    ///
+    /// This mirrors BullMQ's replace path for delayed deduplicated jobs. Active
+    /// keep-last-if-active behavior is a separate mode and is not enabled here.
+    pub fn replace_delayed(mut self, replace: bool) -> Self {
+        self.replace = replace;
         self
     }
 
