@@ -16,6 +16,28 @@ use uuid::Uuid;
 const WAITING_SCORE_BUCKET: f64 = 1_000_000_000_000.0;
 
 const CLAIM_SCRIPT: &str = r#"
+local due_ids = redis.call('ZRANGEBYSCORE', KEYS[6], '-inf', ARGV[10], 'LIMIT', 0, ARGV[12])
+for _, due_id in ipairs(due_ids) do
+  local delayed_raw = redis.call('HGET', KEYS[3], due_id)
+  redis.call('ZREM', KEYS[6], due_id)
+  if delayed_raw then
+    local delayed_job = cjson.decode(delayed_raw)
+    if delayed_job["state"] == "delayed" then
+      delayed_job["state"] = "waiting"
+      local priority = tonumber(delayed_job["priority"] or '1000') or 1000
+      local sequence = redis.call('INCR', KEYS[7])
+      local waiting_score = (priority * tonumber(ARGV[11])) + sequence
+      redis.call('ZADD', KEYS[1], waiting_score, due_id)
+      redis.call('HSET', KEYS[3], due_id, cjson.encode(delayed_job))
+    end
+  end
+end
+
+local paused = redis.call('HGET', KEYS[5], 'paused')
+if paused and paused ~= '0' then
+  return nil
+end
+
 local rate_limit_max = tonumber(ARGV[8])
 if rate_limit_max and rate_limit_max > 0 then
   local current_claims = tonumber(redis.call('GET', KEYS[4]) or '0')
@@ -689,11 +711,7 @@ impl JobQueueBackend for RedisJobQueue {
         lease_for: Duration,
         now: DateTime<Utc>,
     ) -> Result<Option<Job>> {
-        self.promote_due_jobs(now).await?;
         let mut conn = self.connection().await?;
-        if self.is_paused(&mut conn).await? {
-            return Ok(None);
-        }
 
         let lease_expires_at = add_duration(now, lease_for);
         let lock_token = Uuid::new_v4().to_string();
@@ -704,12 +722,14 @@ impl JobQueueBackend for RedisJobQueue {
             .unwrap_or((0, 0));
         let raw: Option<String> = redis::cmd("EVAL")
             .arg(CLAIM_SCRIPT)
-            .arg(5)
+            .arg(7)
             .arg(self.state_key(JobState::Waiting))
             .arg(self.state_key(JobState::Active))
             .arg(self.jobs_key())
             .arg(self.claim_rate_limit_key())
             .arg(self.meta_key())
+            .arg(self.state_key(JobState::Delayed))
+            .arg(self.sequence_key())
             .arg(millis(lease_expires_at))
             .arg(now.to_rfc3339())
             .arg(worker_id)
@@ -719,6 +739,9 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.lock_key_prefix())
             .arg(rate_limit_max)
             .arg(rate_limit_window_ms)
+            .arg(millis(now))
+            .arg(WAITING_SCORE_BUCKET)
+            .arg(1_000_u16)
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;

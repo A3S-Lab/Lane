@@ -149,6 +149,106 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect("second rate job should complete");
 
+    let claim_promote_queue =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "claim-promote")
+            .expect("valid Redis URL should build the claim-promote queue");
+    let claim_promoted = claim_promote_queue
+        .add_job(
+            "claim-promoted".to_string(),
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_priority(7)
+                .with_delay(Duration::from_millis(80)),
+        )
+        .await
+        .expect("claim-promoted delayed job should be added");
+    assert!(claim_promote_queue
+        .claim_next(
+            "worker-claim-promote-early".to_string(),
+            Duration::from_secs(30),
+            Utc::now()
+        )
+        .await
+        .expect("early claim-promote claim should return")
+        .is_none());
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let claim_promoted_claim = claim_promote_queue
+        .claim_next(
+            "worker-claim-promote".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("claim-promote claim should return")
+        .expect("due delayed job should be atomically promoted and claimed");
+    assert_eq!(claim_promoted_claim.id, claim_promoted.id);
+    claim_promote_queue
+        .complete_job(
+            &claim_promoted_claim.id,
+            lock_token(&claim_promoted_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("claim-promoted job should complete");
+
+    let paused_promote_queue =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "paused-promote")
+            .expect("valid Redis URL should build the paused-promote queue");
+    paused_promote_queue
+        .pause()
+        .await
+        .expect("paused-promote queue should pause");
+    let paused_promoted = paused_promote_queue
+        .add_job(
+            "paused-promoted".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_delay(Duration::from_millis(80)),
+        )
+        .await
+        .expect("paused-promoted delayed job should be added");
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(paused_promote_queue
+        .claim_next(
+            "worker-paused-promote".to_string(),
+            Duration::from_secs(30),
+            Utc::now()
+        )
+        .await
+        .expect("paused-promote claim should return")
+        .is_none());
+    let waiting_while_paused = paused_promote_queue
+        .list_jobs(JobListOptions::new().with_state(JobState::Waiting))
+        .await
+        .expect("paused-promote waiting jobs should list");
+    assert!(waiting_while_paused
+        .jobs
+        .iter()
+        .any(|job| job.id == paused_promoted.id));
+    paused_promote_queue
+        .resume()
+        .await
+        .expect("paused-promote queue should resume");
+    let paused_promoted_claim = paused_promote_queue
+        .claim_next(
+            "worker-paused-promote-resumed".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("resumed paused-promote claim should return")
+        .expect("paused-promoted job should be claimable after resume");
+    assert_eq!(paused_promoted_claim.id, paused_promoted.id);
+    paused_promote_queue
+        .complete_job(
+            &paused_promoted_claim.id,
+            lock_token(&paused_promoted_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("paused-promoted job should complete");
+
     let active_limit_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "active-limit")
         .expect("valid Redis URL should build the active limit queue");
     let zero_active_limit = active_limit_queue

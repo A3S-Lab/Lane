@@ -372,7 +372,7 @@ A3S stack and language SDKs.
 | Generic job runtime | In progress | JSON jobs, bulk submission, idempotent custom job IDs, explicit job states, priority ordering, delayed jobs, token-owned worker leases, completion/failure snapshots, retry backoff, rate-limited claims, shared active concurrency limits, stalled-job recovery, pause/resume. |
 | Job management API | In progress | Add/get/remove/promote/retry/update-priority/pause/resume/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, timeouts, and stalled recovery loops. |
-| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed claim, rate limit, max-active, complete, fail, renew, and stalled recovery semantics. Postgres/NATS backends remain planned. |
+| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed delayed promotion, claim, rate limit, max-active, complete, fail, renew, and stalled recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, and end timestamps are available across in-memory, local durable, and Redis backends. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
@@ -572,12 +572,13 @@ if let Some(claimed) = claimed {
 
 Use `RedisJobQueue` when multiple workers or processes need to claim from the
 same durable priority queue. It stores jobs as JSON in a Redis hash, indexes
-states with sorted sets, and uses Lua scripts to atomically claim and transition
-leased jobs. The Redis backend follows the core BullMQ locking mechanism: a
-claim creates an independent TTL lock key for the job, and complete, fail, and
-renew operations must prove ownership by matching the lock token before the
-script mutates the active/completed/failed/delayed indexes. Stalled recovery
-checks the TTL lock key, not only the job JSON snapshot:
+states with sorted sets, and uses Lua scripts to atomically promote due delayed
+jobs, claim work, and transition leased jobs. The Redis backend follows the core
+BullMQ locking mechanism: a claim creates an independent TTL lock key for the
+job, and complete, fail, and renew operations must prove ownership by matching
+the lock token before the script mutates the active/completed/failed/delayed
+indexes. Stalled recovery checks the TTL lock key, not only the job JSON
+snapshot:
 
 ```rust
 use a3s_lane::{JobOptions, JobQueueBackend, JobRateLimit, RedisJobQueue, RetryPolicy};
@@ -635,6 +636,11 @@ BullMQ's queue-maxed mechanism. The Lua claim script reads that meta value,
 checks the active sorted set count in the same Redis turn, and returns `None`
 without moving a job or consuming rate-limit capacity when the queue is already
 maxed. `clear_max_active_jobs()` removes the shared ceiling.
+
+Like BullMQ's `moveToActive` script, Redis claims also promote due delayed jobs
+inside the same Lua script before checking pause, rate-limit, max-active, and
+the next claim. A paused or maxed queue can still move due delayed jobs back to
+`waiting`; it simply returns `None` instead of leasing work.
 
 Run the Redis integration test against any reachable Redis server:
 
