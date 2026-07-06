@@ -20,8 +20,9 @@ pub use memory::InMemoryJobQueue;
 #[cfg(feature = "redis-backend")]
 pub use redis::RedisJobQueue;
 pub use types::{
-    Job, JobId, JobListOptions, JobListPage, JobLogEntry, JobOptions, JobPriority,
-    JobQueueSnapshot, JobQueueStats, JobState, JobWorkerId, QueueName, DEFAULT_JOB_PRIORITY,
+    Job, JobFlow, JobId, JobListOptions, JobListPage, JobLogEntry, JobOptions, JobPriority,
+    JobQueueSnapshot, JobQueueStats, JobSpec, JobState, JobWorkerId, QueueName,
+    DEFAULT_JOB_PRIORITY,
 };
 pub use worker::{
     job_processor_fn, JobContext, JobProcessor, JobProcessorFn, JobRunOutcome, JobWorker,

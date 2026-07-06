@@ -365,6 +365,130 @@ async fn management_api_lists_progress_logs_retries_and_cleans_jobs() {
 }
 
 #[tokio::test]
+async fn flow_parent_waits_for_children_before_claiming() {
+    let queue = InMemoryJobQueue::new("flow");
+    let now = ts(1_000);
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({ "kind": "aggregate" }))
+                .with_options(JobOptions::new().with_priority(1)),
+            vec![
+                JobSpec::new("child-a", serde_json::json!({ "n": 1 }))
+                    .with_options(JobOptions::new().with_priority(5)),
+                JobSpec::new("child-b", serde_json::json!({ "n": 2 }))
+                    .with_options(JobOptions::new().with_priority(10)),
+            ],
+            now,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(flow.parent.state, JobState::WaitingChildren);
+    assert_eq!(flow.parent.child_ids.len(), 2);
+    assert!(flow
+        .children
+        .iter()
+        .all(|child| child.parent_id.as_deref() == Some(flow.parent.id.as_str())));
+
+    let stats = queue.stats().await.unwrap();
+    assert_eq!(stats.waiting_children, 1);
+    assert_eq!(stats.waiting, 2);
+
+    let first_child = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(1_100))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_child.id, flow.children[0].id);
+    queue
+        .complete_job(&first_child.id, serde_json::json!({ "ok": 1 }), ts(1_200))
+        .await
+        .unwrap();
+    assert_eq!(
+        queue.get_job(&flow.parent.id).await.unwrap().unwrap().state,
+        JobState::WaitingChildren
+    );
+
+    let second_child = queue
+        .claim_next("worker-b".to_string(), Duration::from_secs(30), ts(1_300))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second_child.id, flow.children[1].id);
+    queue
+        .complete_job(&second_child.id, serde_json::json!({ "ok": 2 }), ts(1_400))
+        .await
+        .unwrap();
+
+    let parent = queue
+        .get_job(&flow.parent.id)
+        .await
+        .unwrap()
+        .expect("parent should remain stored");
+    assert_eq!(parent.state, JobState::Waiting);
+
+    let claimed_parent = queue
+        .claim_next(
+            "worker-parent".to_string(),
+            Duration::from_secs(30),
+            ts(1_500),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed_parent.id, flow.parent.id);
+}
+
+#[tokio::test]
+async fn flow_parent_fails_when_child_terminally_fails() {
+    let queue = InMemoryJobQueue::new("flow-fail");
+    let now = ts(1_000);
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({})),
+            vec![JobSpec::new("child", serde_json::json!({})).with_options(
+                JobOptions::new()
+                    .with_retry_policy(RetryPolicy::fixed(1, Duration::from_millis(100))),
+            )],
+            now,
+        )
+        .await
+        .unwrap();
+
+    let child = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .fail_job(&child.id, "temporary".to_string(), ts(1_100))
+        .await
+        .unwrap();
+    assert_eq!(
+        queue.get_job(&flow.parent.id).await.unwrap().unwrap().state,
+        JobState::WaitingChildren
+    );
+
+    queue.promote_due_jobs(ts(1_200)).await.unwrap();
+    queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(1_200))
+        .await
+        .unwrap();
+    queue
+        .fail_job(&child.id, "terminal".to_string(), ts(1_300))
+        .await
+        .unwrap();
+
+    let parent = queue.get_job(&flow.parent.id).await.unwrap().unwrap();
+    assert_eq!(parent.state, JobState::Failed);
+    assert!(parent
+        .failed_reason
+        .as_deref()
+        .unwrap_or_default()
+        .contains("child job"));
+}
+
+#[tokio::test]
 async fn completing_or_failing_requires_active_job() {
     let queue = InMemoryJobQueue::new("state");
     let now = ts(1_000);
@@ -384,6 +508,41 @@ async fn completing_or_failing_requires_active_job() {
         .await
         .unwrap_err();
     assert!(matches!(fail_error, LaneError::JobStateConflict(_)));
+}
+
+#[tokio::test]
+async fn local_job_queue_persists_flow_relationships() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("jobs").join("flow.json");
+    let queue = LocalJobQueue::open("durable-flow", &snapshot_path)
+        .await
+        .unwrap();
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({})),
+            vec![JobSpec::new("child", serde_json::json!({ "n": 1 }))],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    let reopened = LocalJobQueue::open("durable-flow", &snapshot_path)
+        .await
+        .unwrap();
+    let parent = reopened
+        .get_job(&flow.parent.id)
+        .await
+        .unwrap()
+        .expect("parent should be restored");
+    let child = reopened
+        .get_job(&flow.children[0].id)
+        .await
+        .unwrap()
+        .expect("child should be restored");
+
+    assert_eq!(parent.state, JobState::WaitingChildren);
+    assert_eq!(parent.child_ids, vec![child.id.clone()]);
+    assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
 }
 
 #[tokio::test]

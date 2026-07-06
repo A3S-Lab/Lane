@@ -1,5 +1,6 @@
 use super::types::{
-    Job, JobListOptions, JobListPage, JobOptions, JobQueueStats, JobState, JobWorkerId,
+    Job, JobFlow, JobListOptions, JobListPage, JobOptions, JobQueueStats, JobSpec, JobState,
+    JobWorkerId,
 };
 use crate::error::Result;
 use async_trait::async_trait;
@@ -11,6 +12,13 @@ use std::time::Duration;
 #[async_trait]
 pub trait JobQueueBackend: Send + Sync {
     async fn add_job(&self, name: String, payload: Value, options: JobOptions) -> Result<Job>;
+
+    async fn add_flow(
+        &self,
+        parent: JobSpec,
+        children: Vec<JobSpec>,
+        now: DateTime<Utc>,
+    ) -> Result<JobFlow>;
 
     async fn claim_next(
         &self,

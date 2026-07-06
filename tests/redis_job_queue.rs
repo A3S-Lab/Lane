@@ -1,6 +1,6 @@
 #![cfg(feature = "redis-backend")]
 
-use a3s_lane::{JobOptions, JobQueueBackend, JobState, RedisJobQueue, RetryPolicy};
+use a3s_lane::{JobOptions, JobQueueBackend, JobSpec, JobState, RedisJobQueue, RetryPolicy};
 use chrono::Utc;
 use redis::AsyncCommands;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -158,6 +158,78 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     assert_eq!(stats.completed, 1);
     assert_eq!(stats.failed, 1);
     assert_eq!(stats.active, 1);
+
+    let flow = producer
+        .add_flow_at(
+            JobSpec::new("flow-parent", serde_json::json!({ "kind": "aggregate" }))
+                .with_options(JobOptions::new().with_priority(1)),
+            vec![
+                JobSpec::new("flow-child-a", serde_json::json!({ "n": 1 }))
+                    .with_options(JobOptions::new().with_priority(2)),
+                JobSpec::new("flow-child-b", serde_json::json!({ "n": 2 }))
+                    .with_options(JobOptions::new().with_priority(3)),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("flow should be added");
+    assert_eq!(flow.parent.state, JobState::WaitingChildren);
+
+    let child_a = worker
+        .claim_next(
+            "worker-flow-a".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("first flow child claim should return")
+        .expect("first flow child should be claimable");
+    assert_eq!(child_a.id, flow.children[0].id);
+    worker
+        .complete_job(&child_a.id, serde_json::json!({ "ok": 1 }), Utc::now())
+        .await
+        .expect("first child should complete");
+    assert_eq!(
+        producer
+            .get_job(&flow.parent.id)
+            .await
+            .expect("parent should load")
+            .expect("parent should exist")
+            .state,
+        JobState::WaitingChildren
+    );
+
+    let child_b = worker
+        .claim_next(
+            "worker-flow-b".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("second flow child claim should return")
+        .expect("second flow child should be claimable");
+    assert_eq!(child_b.id, flow.children[1].id);
+    worker
+        .complete_job(&child_b.id, serde_json::json!({ "ok": 2 }), Utc::now())
+        .await
+        .expect("second child should complete");
+
+    let parent = producer
+        .get_job(&flow.parent.id)
+        .await
+        .expect("released parent should load")
+        .expect("released parent should exist");
+    assert_eq!(parent.state, JobState::Waiting);
+    let claimed_parent = worker
+        .claim_next(
+            "worker-flow-parent".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("flow parent claim should return")
+        .expect("flow parent should be claimable");
+    assert_eq!(claimed_parent.id, flow.parent.id);
 
     cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())

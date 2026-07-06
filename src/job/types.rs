@@ -107,6 +107,38 @@ pub struct JobListPage {
     pub limit: usize,
 }
 
+/// Job input used when creating a flow.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobSpec {
+    pub name: String,
+    pub payload: Value,
+    pub options: JobOptions,
+}
+
+impl JobSpec {
+    /// Create a job specification with default options.
+    pub fn new(name: impl Into<String>, payload: Value) -> Self {
+        Self {
+            name: name.into(),
+            payload,
+            options: JobOptions::new(),
+        }
+    }
+
+    /// Attach explicit job options.
+    pub fn with_options(mut self, options: JobOptions) -> Self {
+        self.options = options;
+        self
+    }
+}
+
+/// Jobs created by a parent-child flow submission.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobFlow {
+    pub parent: Job,
+    pub children: Vec<Job>,
+}
+
 /// Options used when adding a generic queue job.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JobOptions {

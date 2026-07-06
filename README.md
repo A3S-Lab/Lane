@@ -373,7 +373,8 @@ A3S stack and language SDKs.
 | Job management API | In progress | Add/get/remove/promote/retry/pause/resume/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, runs async processors, completes/fails jobs, supports processor progress/log updates, timeouts, and stalled recovery loops. |
 | Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` for multi-process distributed claims. Postgres/NATS backends remain planned. |
-| Repeat and flow jobs | Planned | Cron/repeatable jobs, parent-child dependencies, waiting-children state, fan-out/fan-in flows. |
+| Flow jobs | In progress | Parent-child dependencies, waiting-children state, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
+| Repeat jobs | Planned | Cron/repeatable jobs and repeat metadata management. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
 
 The generic job runtime is exposed through the `JobQueueBackend` trait.
@@ -422,6 +423,34 @@ Management APIs are part of the backend contract: `list_jobs()` returns
 paginated `JobListPage` values, `promote_job()` moves delayed jobs to waiting,
 `retry_job()` manually requeues failed jobs, `renew_lease()` extends an active
 worker lease, and `clean_jobs()` removes old records by state.
+
+Flow jobs create a parent job and one or more child jobs in a single operation.
+The parent starts in `waiting_children`, children are claimed normally, and the
+parent is released to `waiting` only after every child completes. A terminal
+child failure fails the parent; retryable child failures keep the parent blocked
+until the child retries and reaches a terminal outcome.
+
+```rust
+use a3s_lane::{InMemoryJobQueue, JobOptions, JobSpec, JobState};
+
+# async fn flow_example() -> a3s_lane::Result<()> {
+let queue = InMemoryJobQueue::new("reports");
+
+let flow = queue
+    .add_flow(
+        JobSpec::new("aggregate", serde_json::json!({ "report": "daily" }))
+            .with_options(JobOptions::new().with_priority(1)),
+        vec![
+            JobSpec::new("fetch-us", serde_json::json!({ "region": "us" })),
+            JobSpec::new("fetch-eu", serde_json::json!({ "region": "eu" })),
+        ],
+    )
+    .await?;
+
+assert_eq!(flow.parent.state, JobState::WaitingChildren);
+# Ok(())
+# }
+```
 
 Use `LocalJobQueue` when a process-local runtime needs durable restart
 recovery:

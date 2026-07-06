@@ -1,7 +1,7 @@
 use super::backend::JobQueueBackend;
 use super::types::{
-    add_duration, Job, JobListOptions, JobListPage, JobLogEntry, JobOptions, JobPriority,
-    JobQueueStats, JobState, JobWorkerId, QueueName,
+    add_duration, Job, JobFlow, JobListOptions, JobListPage, JobLogEntry, JobOptions, JobPriority,
+    JobQueueStats, JobSpec, JobState, JobWorkerId, QueueName,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -84,6 +84,59 @@ impl RedisJobQueue {
         &self.namespace
     }
 
+    /// Add a parent-child flow using the current wall-clock time.
+    pub async fn add_flow(&self, parent: JobSpec, children: Vec<JobSpec>) -> Result<JobFlow> {
+        self.add_flow_at(parent, children, Utc::now()).await
+    }
+
+    /// Add a parent-child flow at an explicit timestamp.
+    pub async fn add_flow_at(
+        &self,
+        parent: JobSpec,
+        children: Vec<JobSpec>,
+        now: DateTime<Utc>,
+    ) -> Result<JobFlow> {
+        let mut parent_job = Job::new(
+            self.queue.clone(),
+            parent.name,
+            parent.payload,
+            parent.options,
+            now,
+        );
+        parent_job.state = if children.is_empty() {
+            state_after_dependencies(parent_job.scheduled_at, now)
+        } else {
+            JobState::WaitingChildren
+        };
+
+        let mut child_jobs = Vec::with_capacity(children.len());
+        for child in children {
+            let mut child_job = Job::new(
+                self.queue.clone(),
+                child.name,
+                child.payload,
+                child.options,
+                now,
+            );
+            child_job.parent_id = Some(parent_job.id.clone());
+            parent_job.child_ids.push(child_job.id.clone());
+            child_jobs.push(child_job);
+        }
+
+        let mut conn = self.connection().await?;
+        self.store_job(&mut conn, &parent_job).await?;
+        self.index_new_job(&mut conn, &parent_job).await?;
+        for child in &child_jobs {
+            self.store_job(&mut conn, child).await?;
+            self.index_new_job(&mut conn, child).await?;
+        }
+
+        Ok(JobFlow {
+            parent: parent_job,
+            children: child_jobs,
+        })
+    }
+
     async fn connection(&self) -> Result<ConnectionManager> {
         self.client
             .get_connection_manager()
@@ -142,6 +195,44 @@ impl RedisJobQueue {
             .map_err(redis_error)
     }
 
+    async fn index_new_job(&self, conn: &mut ConnectionManager, job: &Job) -> Result<()> {
+        match job.state {
+            JobState::Delayed => {
+                let _: usize = conn
+                    .zadd(
+                        self.state_key(JobState::Delayed),
+                        &job.id,
+                        millis(job.scheduled_at),
+                    )
+                    .await
+                    .map_err(redis_error)?;
+            }
+            JobState::Waiting => {
+                let sequence = self.next_sequence(conn).await?;
+                let _: usize = conn
+                    .zadd(
+                        self.state_key(JobState::Waiting),
+                        &job.id,
+                        waiting_score(job.priority, sequence),
+                    )
+                    .await
+                    .map_err(redis_error)?;
+            }
+            JobState::WaitingChildren => {
+                let _: usize = conn
+                    .zadd(
+                        self.state_key(JobState::WaitingChildren),
+                        &job.id,
+                        millis(job.scheduled_at),
+                    )
+                    .await
+                    .map_err(redis_error)?;
+            }
+            JobState::Active | JobState::Completed | JobState::Failed => {}
+        }
+        Ok(())
+    }
+
     async fn load_job(&self, conn: &mut ConnectionManager, job_id: &str) -> Result<Option<Job>> {
         let raw: Option<String> = conn
             .hget(self.jobs_key(), job_id)
@@ -197,6 +288,107 @@ impl RedisJobQueue {
             .map_err(redis_error)?;
         Ok(paused.unwrap_or(0) != 0)
     }
+
+    async fn release_parent_if_ready(
+        &self,
+        conn: &mut ConnectionManager,
+        parent_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Job>> {
+        let Some(mut parent) = self.load_job(conn, parent_id).await? else {
+            return Ok(None);
+        };
+        if parent.state != JobState::WaitingChildren {
+            return Ok(Some(parent));
+        }
+
+        let mut child_failure = None;
+        for child_id in &parent.child_ids {
+            let Some(child) = self.load_job(conn, child_id).await? else {
+                continue;
+            };
+            match child.state {
+                JobState::Completed => {}
+                JobState::Failed => {
+                    child_failure = Some((child.id, child.failed_reason));
+                }
+                _ => return Ok(Some(parent)),
+            }
+        }
+
+        if let Some((child_id, reason)) = child_failure {
+            return self
+                .fail_waiting_parent(
+                    conn,
+                    parent_id,
+                    format!(
+                        "child job {child_id} failed: {}",
+                        reason.as_deref().unwrap_or("unknown error")
+                    ),
+                    now,
+                )
+                .await;
+        }
+
+        parent.state = state_after_dependencies(parent.scheduled_at, now);
+        parent.processed_at = None;
+        parent.finished_at = None;
+        parent.worker_id = None;
+        parent.lease_expires_at = None;
+        parent.failed_reason = None;
+        let released = parent.clone();
+        match parent.state {
+            JobState::Delayed => {
+                self.move_to_state(
+                    conn,
+                    &parent,
+                    JobState::Delayed,
+                    millis(parent.scheduled_at),
+                )
+                .await?;
+            }
+            JobState::Waiting => {
+                let sequence = self.next_sequence(conn).await?;
+                self.move_to_state(
+                    conn,
+                    &parent,
+                    JobState::Waiting,
+                    waiting_score(parent.priority, sequence),
+                )
+                .await?;
+            }
+            _ => {}
+        }
+        Ok(Some(released))
+    }
+
+    async fn fail_waiting_parent(
+        &self,
+        conn: &mut ConnectionManager,
+        parent_id: &str,
+        reason: String,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Job>> {
+        let Some(mut parent) = self.load_job(conn, parent_id).await? else {
+            return Ok(None);
+        };
+        if parent.state.is_terminal() {
+            return Ok(Some(parent));
+        }
+        parent.state = JobState::Failed;
+        parent.finished_at = Some(now);
+        parent.worker_id = None;
+        parent.lease_expires_at = None;
+        parent.failed_reason = Some(reason);
+        let failed = parent.clone();
+        if parent.options.remove_on_fail {
+            self.remove_job_record(conn, parent_id).await?;
+        } else {
+            self.move_to_state(conn, &parent, JobState::Failed, millis(now))
+                .await?;
+        }
+        Ok(Some(failed))
+    }
 }
 
 #[async_trait]
@@ -206,33 +398,18 @@ impl JobQueueBackend for RedisJobQueue {
         let job = Job::new(self.queue.clone(), name, payload, options, now);
         let mut conn = self.connection().await?;
         self.store_job(&mut conn, &job).await?;
-
-        match job.state {
-            JobState::Delayed => {
-                let _: usize = conn
-                    .zadd(
-                        self.state_key(JobState::Delayed),
-                        &job.id,
-                        millis(job.scheduled_at),
-                    )
-                    .await
-                    .map_err(redis_error)?;
-            }
-            JobState::Waiting => {
-                let sequence = self.next_sequence(&mut conn).await?;
-                let _: usize = conn
-                    .zadd(
-                        self.state_key(JobState::Waiting),
-                        &job.id,
-                        waiting_score(job.priority, sequence),
-                    )
-                    .await
-                    .map_err(redis_error)?;
-            }
-            _ => {}
-        }
+        self.index_new_job(&mut conn, &job).await?;
 
         Ok(job)
+    }
+
+    async fn add_flow(
+        &self,
+        parent: JobSpec,
+        children: Vec<JobSpec>,
+        now: DateTime<Utc>,
+    ) -> Result<JobFlow> {
+        self.add_flow_at(parent, children, now).await
     }
 
     async fn claim_next(
@@ -269,6 +446,7 @@ impl JobQueueBackend for RedisJobQueue {
         let mut conn = self.connection().await?;
         let mut job = self.require_job(&mut conn, job_id).await?;
         require_active(&job, "complete")?;
+        let parent_id = job.parent_id.clone();
         job.state = JobState::Completed;
         job.finished_at = Some(now);
         job.worker_id = None;
@@ -281,6 +459,10 @@ impl JobQueueBackend for RedisJobQueue {
             self.move_to_state(&mut conn, &job, JobState::Completed, millis(now))
                 .await?;
         }
+        if let Some(parent_id) = parent_id {
+            self.release_parent_if_ready(&mut conn, &parent_id, now)
+                .await?;
+        }
         Ok(completed)
     }
 
@@ -288,6 +470,7 @@ impl JobQueueBackend for RedisJobQueue {
         let mut conn = self.connection().await?;
         let mut job = self.require_job(&mut conn, job_id).await?;
         require_active(&job, "fail")?;
+        let parent_id = job.parent_id.clone();
         job.worker_id = None;
         job.lease_expires_at = None;
         job.failed_reason = Some(error);
@@ -308,10 +491,36 @@ impl JobQueueBackend for RedisJobQueue {
             if job.options.remove_on_fail {
                 let failed = job.clone();
                 self.remove_job_record(&mut conn, job_id).await?;
+                if let Some(parent_id) = parent_id {
+                    self.fail_waiting_parent(
+                        &mut conn,
+                        &parent_id,
+                        format!(
+                            "child job {} failed: {}",
+                            failed.id,
+                            failed.failed_reason.as_deref().unwrap_or("unknown error")
+                        ),
+                        now,
+                    )
+                    .await?;
+                }
                 return Ok(failed);
             }
             self.move_to_state(&mut conn, &job, JobState::Failed, millis(now))
                 .await?;
+            if let Some(parent_id) = parent_id {
+                self.fail_waiting_parent(
+                    &mut conn,
+                    &parent_id,
+                    format!(
+                        "child job {} failed: {}",
+                        job.id,
+                        job.failed_reason.as_deref().unwrap_or("unknown error")
+                    ),
+                    now,
+                )
+                .await?;
+            }
         }
 
         Ok(job)
@@ -386,7 +595,12 @@ impl JobQueueBackend for RedisJobQueue {
 
     async fn remove_job(&self, job_id: &str) -> Result<Option<Job>> {
         let mut conn = self.connection().await?;
-        self.remove_job_record(&mut conn, job_id).await
+        let removed = self.remove_job_record(&mut conn, job_id).await?;
+        if let Some(parent_id) = removed.as_ref().and_then(|job| job.parent_id.clone()) {
+            self.release_parent_if_ready(&mut conn, &parent_id, Utc::now())
+                .await?;
+        }
+        Ok(removed)
     }
 
     async fn clean_jobs(
@@ -576,11 +790,26 @@ impl JobQueueBackend for RedisJobQueue {
                 if job.stalled_count > job.options.max_stalled_count {
                     job.state = JobState::Failed;
                     job.finished_at = Some(now);
+                    let parent_id = job.parent_id.clone();
+                    let child_id = job.id.clone();
+                    let failed_reason = job.failed_reason.clone();
                     if job.options.remove_on_fail {
                         self.remove_job_record(&mut conn, &job.id).await?;
                     } else {
                         self.move_to_state(&mut conn, &job, JobState::Failed, millis(now))
                             .await?;
+                    }
+                    if let Some(parent_id) = parent_id {
+                        self.fail_waiting_parent(
+                            &mut conn,
+                            &parent_id,
+                            format!(
+                                "child job {child_id} failed: {}",
+                                failed_reason.as_deref().unwrap_or("unknown error")
+                            ),
+                            now,
+                        )
+                        .await?;
                     }
                 } else {
                     job.state = JobState::Waiting;
@@ -777,6 +1006,14 @@ fn state_rank(state: JobState) -> u8 {
         JobState::WaitingChildren => 3,
         JobState::Completed => 4,
         JobState::Failed => 5,
+    }
+}
+
+fn state_after_dependencies(scheduled_at: DateTime<Utc>, now: DateTime<Utc>) -> JobState {
+    if scheduled_at > now {
+        JobState::Delayed
+    } else {
+        JobState::Waiting
     }
 }
 

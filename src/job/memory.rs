@@ -1,7 +1,7 @@
 use super::backend::JobQueueBackend;
 use super::types::{
-    Job, JobId, JobListOptions, JobListPage, JobLogEntry, JobOptions, JobQueueSnapshot,
-    JobQueueStats, JobState, JobWorkerId, QueueName,
+    Job, JobFlow, JobId, JobListOptions, JobListPage, JobLogEntry, JobOptions, JobQueueSnapshot,
+    JobQueueStats, JobSpec, JobState, JobWorkerId, QueueName,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -95,10 +95,66 @@ impl InMemoryJobQueue {
         Ok(job)
     }
 
+    /// Add a parent-child flow. The parent remains blocked until every child is
+    /// completed; a terminal child failure fails the parent.
+    pub async fn add_flow(&self, parent: JobSpec, children: Vec<JobSpec>) -> Result<JobFlow> {
+        self.add_flow_at(parent, children, Utc::now()).await
+    }
+
+    /// Add a parent-child flow at an explicit timestamp.
+    pub async fn add_flow_at(
+        &self,
+        parent: JobSpec,
+        children: Vec<JobSpec>,
+        now: DateTime<Utc>,
+    ) -> Result<JobFlow> {
+        let mut parent_job = Job::new(
+            self.queue.clone(),
+            parent.name,
+            parent.payload,
+            parent.options,
+            now,
+        );
+        parent_job.state = if children.is_empty() {
+            state_after_dependencies(parent_job.scheduled_at, now)
+        } else {
+            JobState::WaitingChildren
+        };
+
+        let mut child_jobs = Vec::with_capacity(children.len());
+        for child in children {
+            let mut child_job = Job::new(
+                self.queue.clone(),
+                child.name,
+                child.payload,
+                child.options,
+                now,
+            );
+            child_job.parent_id = Some(parent_job.id.clone());
+            parent_job.child_ids.push(child_job.id.clone());
+            child_jobs.push(child_job);
+        }
+
+        let mut inner = self.inner.lock().await;
+        inner.jobs.insert(parent_job.id.clone(), parent_job.clone());
+        for child in &child_jobs {
+            inner.jobs.insert(child.id.clone(), child.clone());
+        }
+
+        Ok(JobFlow {
+            parent: parent_job,
+            children: child_jobs,
+        })
+    }
+
     /// Remove a job from the queue.
     pub async fn remove(&self, job_id: &str) -> Result<Option<Job>> {
         let mut inner = self.inner.lock().await;
-        Ok(inner.jobs.remove(job_id))
+        let removed = inner.jobs.remove(job_id);
+        if let Some(parent_id) = removed.as_ref().and_then(|job| job.parent_id.clone()) {
+            Self::release_parent_if_ready_locked(&mut inner, &parent_id, Utc::now());
+        }
+        Ok(removed)
     }
 
     /// Promote a single delayed job to waiting.
@@ -273,11 +329,88 @@ impl InMemoryJobQueue {
         }
         promoted
     }
+
+    fn release_parent_if_ready_locked(
+        inner: &mut InMemoryJobQueueState,
+        parent_id: &str,
+        now: DateTime<Utc>,
+    ) -> Option<Job> {
+        let parent = inner.jobs.get(parent_id)?;
+        if parent.state != JobState::WaitingChildren {
+            return Some(parent.clone());
+        }
+
+        let child_ids = parent.child_ids.clone();
+        let mut child_failure = None;
+        for child_id in &child_ids {
+            let Some(child) = inner.jobs.get(child_id) else {
+                continue;
+            };
+            match child.state {
+                JobState::Completed => {}
+                JobState::Failed => {
+                    child_failure = Some((child.id.clone(), child.failed_reason.clone()))
+                }
+                _ => return Some(parent.clone()),
+            }
+        }
+        if let Some((child_id, reason)) = child_failure {
+            return Self::fail_waiting_parent_locked(
+                inner,
+                parent_id,
+                format!(
+                    "child job {child_id} failed: {}",
+                    reason.as_deref().unwrap_or("unknown error")
+                ),
+                now,
+            );
+        }
+
+        let parent = inner.jobs.get_mut(parent_id)?;
+        parent.state = state_after_dependencies(parent.scheduled_at, now);
+        parent.processed_at = None;
+        parent.finished_at = None;
+        parent.worker_id = None;
+        parent.lease_expires_at = None;
+        parent.failed_reason = None;
+        Some(parent.clone())
+    }
+
+    fn fail_waiting_parent_locked(
+        inner: &mut InMemoryJobQueueState,
+        parent_id: &str,
+        reason: String,
+        now: DateTime<Utc>,
+    ) -> Option<Job> {
+        let parent = inner.jobs.get_mut(parent_id)?;
+        if parent.state.is_terminal() {
+            return Some(parent.clone());
+        }
+        parent.state = JobState::Failed;
+        parent.finished_at = Some(now);
+        parent.worker_id = None;
+        parent.lease_expires_at = None;
+        parent.failed_reason = Some(reason);
+        let failed = parent.clone();
+        if failed.options.remove_on_fail {
+            inner.jobs.remove(parent_id);
+        }
+        Some(failed)
+    }
 }
 #[async_trait]
 impl JobQueueBackend for InMemoryJobQueue {
     async fn add_job(&self, name: String, payload: Value, options: JobOptions) -> Result<Job> {
         self.add(name, payload, options).await
+    }
+
+    async fn add_flow(
+        &self,
+        parent: JobSpec,
+        children: Vec<JobSpec>,
+        now: DateTime<Utc>,
+    ) -> Result<JobFlow> {
+        self.add_flow_at(parent, children, now).await
     }
 
     async fn claim_next(
@@ -318,50 +451,71 @@ impl JobQueueBackend for InMemoryJobQueue {
 
     async fn complete_job(&self, job_id: &str, value: Value, now: DateTime<Utc>) -> Result<Job> {
         let mut inner = self.inner.lock().await;
-        let job = inner
-            .jobs
-            .get_mut(job_id)
-            .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
-        require_active(job, "complete")?;
-        job.state = JobState::Completed;
-        job.finished_at = Some(now);
-        job.worker_id = None;
-        job.lease_expires_at = None;
-        job.return_value = Some(value);
-        let completed = job.clone();
+        let completed = {
+            let job = inner
+                .jobs
+                .get_mut(job_id)
+                .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
+            require_active(job, "complete")?;
+            job.state = JobState::Completed;
+            job.finished_at = Some(now);
+            job.worker_id = None;
+            job.lease_expires_at = None;
+            job.return_value = Some(value);
+            job.clone()
+        };
         if completed.options.remove_on_complete {
             inner.jobs.remove(job_id);
+        }
+        if let Some(parent_id) = &completed.parent_id {
+            Self::release_parent_if_ready_locked(&mut inner, parent_id, now);
         }
         Ok(completed)
     }
 
     async fn fail_job(&self, job_id: &str, error: String, now: DateTime<Utc>) -> Result<Job> {
         let mut inner = self.inner.lock().await;
-        let job = inner
-            .jobs
-            .get_mut(job_id)
-            .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
-        require_active(job, "fail")?;
-        job.worker_id = None;
-        job.lease_expires_at = None;
-        job.failed_reason = Some(error);
+        let failed = {
+            let job = inner
+                .jobs
+                .get_mut(job_id)
+                .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
+            require_active(job, "fail")?;
+            job.worker_id = None;
+            job.lease_expires_at = None;
+            job.failed_reason = Some(error);
 
-        if should_retry(job) {
-            let delay = job
-                .options
-                .retry_policy
-                .delay_for_attempt(job.attempts_made);
-            job.state = JobState::Delayed;
-            job.scheduled_at = add_duration(now, delay);
-            job.finished_at = None;
-        } else {
-            job.state = JobState::Failed;
-            job.finished_at = Some(now);
-        }
+            if should_retry(job) {
+                let delay = job
+                    .options
+                    .retry_policy
+                    .delay_for_attempt(job.attempts_made);
+                job.state = JobState::Delayed;
+                job.scheduled_at = add_duration(now, delay);
+                job.finished_at = None;
+            } else {
+                job.state = JobState::Failed;
+                job.finished_at = Some(now);
+            }
 
-        let failed = job.clone();
+            job.clone()
+        };
         if failed.state == JobState::Failed && failed.options.remove_on_fail {
             inner.jobs.remove(job_id);
+        }
+        if failed.state == JobState::Failed {
+            if let Some(parent_id) = &failed.parent_id {
+                Self::fail_waiting_parent_locked(
+                    &mut inner,
+                    parent_id,
+                    format!(
+                        "child job {} failed: {}",
+                        failed.id,
+                        failed.failed_reason.as_deref().unwrap_or("unknown error")
+                    ),
+                    now,
+                );
+            }
         }
         Ok(failed)
     }
@@ -425,6 +579,7 @@ impl JobQueueBackend for InMemoryJobQueue {
         let mut inner = self.inner.lock().await;
         let mut recovered = 0;
         let mut remove_ids = Vec::new();
+        let mut failed_children = Vec::new();
 
         for job in inner.jobs.values_mut() {
             if job.state != JobState::Active {
@@ -444,6 +599,13 @@ impl JobQueueBackend for InMemoryJobQueue {
             if job.stalled_count > job.options.max_stalled_count {
                 job.state = JobState::Failed;
                 job.finished_at = Some(now);
+                if let Some(parent_id) = &job.parent_id {
+                    failed_children.push((
+                        parent_id.clone(),
+                        job.id.clone(),
+                        job.failed_reason.clone(),
+                    ));
+                }
                 if job.options.remove_on_fail {
                     remove_ids.push(job.id.clone());
                 }
@@ -456,6 +618,17 @@ impl JobQueueBackend for InMemoryJobQueue {
 
         for id in remove_ids {
             inner.jobs.remove(&id);
+        }
+        for (parent_id, child_id, reason) in failed_children {
+            Self::fail_waiting_parent_locked(
+                &mut inner,
+                &parent_id,
+                format!(
+                    "child job {child_id} failed: {}",
+                    reason.as_deref().unwrap_or("unknown error")
+                ),
+                now,
+            );
         }
         Ok(recovered)
     }
@@ -522,6 +695,14 @@ fn state_rank(state: JobState) -> u8 {
         JobState::WaitingChildren => 3,
         JobState::Completed => 4,
         JobState::Failed => 5,
+    }
+}
+
+fn state_after_dependencies(scheduled_at: DateTime<Utc>, now: DateTime<Utc>) -> JobState {
+    if scheduled_at > now {
+        JobState::Delayed
+    } else {
+        JobState::Waiting
     }
 }
 

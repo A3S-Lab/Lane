@@ -1,8 +1,8 @@
 use super::backend::JobQueueBackend;
 use super::memory::InMemoryJobQueue;
 use super::types::{
-    Job, JobListOptions, JobListPage, JobOptions, JobQueueSnapshot, JobQueueStats, JobState,
-    JobWorkerId,
+    Job, JobFlow, JobListOptions, JobListPage, JobOptions, JobQueueSnapshot, JobQueueStats,
+    JobSpec, JobState, JobWorkerId,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -83,6 +83,25 @@ impl LocalJobQueue {
         Ok(job)
     }
 
+    /// Add a parent-child flow using the current wall-clock time.
+    pub async fn add_flow(&self, parent: JobSpec, children: Vec<JobSpec>) -> Result<JobFlow> {
+        let flow = self.inner.add_flow(parent, children).await?;
+        self.persist().await?;
+        Ok(flow)
+    }
+
+    /// Add a parent-child flow at an explicit timestamp.
+    pub async fn add_flow_at(
+        &self,
+        parent: JobSpec,
+        children: Vec<JobSpec>,
+        now: DateTime<Utc>,
+    ) -> Result<JobFlow> {
+        let flow = self.inner.add_flow_at(parent, children, now).await?;
+        self.persist().await?;
+        Ok(flow)
+    }
+
     /// Capture the durable queue snapshot.
     pub async fn snapshot(&self) -> JobQueueSnapshot {
         self.inner.snapshot().await
@@ -96,6 +115,15 @@ impl LocalJobQueue {
 impl JobQueueBackend for LocalJobQueue {
     async fn add_job(&self, name: String, payload: Value, options: JobOptions) -> Result<Job> {
         self.add(name, payload, options).await
+    }
+
+    async fn add_flow(
+        &self,
+        parent: JobSpec,
+        children: Vec<JobSpec>,
+        now: DateTime<Utc>,
+    ) -> Result<JobFlow> {
+        self.add_flow_at(parent, children, now).await
     }
 
     async fn claim_next(
