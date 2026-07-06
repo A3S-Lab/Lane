@@ -365,7 +365,7 @@ A3S stack and language SDKs.
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
 | Generic job runtime | In progress | JSON jobs, explicit job states, priority ordering, delayed jobs, worker leases, completion/failure snapshots, retry backoff, stalled-job recovery, pause/resume. |
 | Job management API | In progress | Add/get/remove/promote/retry/pause/resume/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
-| Durable backend | Planned | Redis/Postgres/NATS backends behind the `JobQueueBackend` contract, atomic claim/complete/fail operations, recovery after process crash. |
+| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; Redis/Postgres/NATS backends remain planned for multi-process distributed claims. |
 | Repeat and flow jobs | Planned | Cron/repeatable jobs, parent-child dependencies, waiting-children state, fan-out/fan-in flows. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
 
@@ -415,6 +415,36 @@ Management APIs are part of the backend contract: `list_jobs()` returns
 paginated `JobListPage` values, `promote_job()` moves delayed jobs to waiting,
 `retry_job()` manually requeues failed jobs, `renew_lease()` extends an active
 worker lease, and `clean_jobs()` removes old records by state.
+
+Use `LocalJobQueue` when a process-local runtime needs durable restart
+recovery:
+
+```rust
+use a3s_lane::{JobOptions, JobQueueBackend, LocalJobQueue};
+use std::path::PathBuf;
+
+# async fn durable_example() -> a3s_lane::Result<()> {
+let queue = LocalJobQueue::open("email", PathBuf::from("./lane-jobs/email.json")).await?;
+let job = queue
+    .add(
+        "send",
+        serde_json::json!({ "to": "ops@example.com" }),
+        JobOptions::new().with_priority(10),
+    )
+    .await?;
+
+let claimed = queue
+    .claim_next("worker-1".to_string(), std::time::Duration::from_secs(30), chrono::Utc::now())
+    .await?;
+
+if claimed.is_some() {
+    queue
+        .complete_job(&job.id, serde_json::json!({ "ok": true }), chrono::Utc::now())
+        .await?;
+}
+# Ok(())
+# }
+```
 
 ## Benchmarks
 

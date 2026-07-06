@@ -88,8 +88,8 @@ pub use error::{LaneError, Result};
 pub use event::{EventEmitter, EventPayload, EventStream, LaneEvent};
 pub use job::{
     InMemoryJobQueue, Job, JobId, JobListOptions, JobListPage, JobLogEntry, JobOptions,
-    JobPriority, JobQueueBackend, JobQueueStats, JobState, JobWorkerId, QueueName,
-    DEFAULT_JOB_PRIORITY,
+    JobPriority, JobQueueBackend, JobQueueSnapshot, JobQueueStats, JobState, JobWorkerId,
+    LocalJobQueue, QueueName, DEFAULT_JOB_PRIORITY,
 };
 pub use manager::{QueueManager, QueueManagerBuilder};
 pub use queue::{
