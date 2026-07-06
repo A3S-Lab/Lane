@@ -19,6 +19,7 @@ use uuid::Uuid;
 struct InMemoryJobQueueState {
     paused: bool,
     jobs: HashMap<JobId, Job>,
+    deduplication_next: HashMap<String, Job>,
 }
 
 /// In-memory implementation of the generic job queue backend.
@@ -52,6 +53,14 @@ impl InMemoryJobQueue {
                     .into_iter()
                     .map(|job| (job.id.clone(), job))
                     .collect(),
+                deduplication_next: snapshot
+                    .deduplication_next_jobs
+                    .into_iter()
+                    .filter_map(|job| {
+                        let deduplication_id = job.options.deduplication.as_ref()?.id.clone();
+                        Some((deduplication_id, job))
+                    })
+                    .collect(),
             })),
         }
     }
@@ -66,10 +75,17 @@ impl InMemoryJobQueue {
         let inner = self.inner.lock().await;
         let mut jobs = inner.jobs.values().cloned().collect::<Vec<_>>();
         jobs.sort_by(compare_list_order);
+        let mut deduplication_next_jobs = inner
+            .deduplication_next
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        deduplication_next_jobs.sort_by(compare_list_order);
         JobQueueSnapshot {
             queue: self.queue.clone(),
             paused: inner.paused,
             jobs,
+            deduplication_next_jobs,
         }
     }
 
@@ -97,13 +113,14 @@ impl InMemoryJobQueue {
         if let Some(existing) = inner.jobs.get(&job.id) {
             return Ok(existing.clone());
         }
-        if let Some(existing) = find_active_deduplicated_job(&inner.jobs, &job, now) {
-            if deduplication_replaces_delayed_owner(&job, existing) {
-                preserve_replacement_deduplication_expiration(&mut job, existing);
+        if let Some(existing) = find_active_deduplicated_job(&inner.jobs, &job, now).cloned() {
+            if deduplication_replaces_delayed_owner(&job, &existing) {
+                preserve_replacement_deduplication_expiration(&mut job, &existing);
                 let existing_id = existing.id.clone();
                 inner.jobs.remove(&existing_id);
             } else {
-                return Ok(existing.clone());
+                Self::store_deduplicated_next_locked(&mut inner, &job, &existing);
+                return Ok(existing);
             }
         }
         if let Some(existing) = find_active_repeat_job(&inner.jobs, &job) {
@@ -148,23 +165,24 @@ impl InMemoryJobQueue {
                 added.push(existing.clone());
                 continue;
             }
-            if let Some(existing) = find_active_deduplicated_job(&inner.jobs, &job, now) {
-                if deduplication_replaces_delayed_owner(&job, existing) {
-                    preserve_replacement_deduplication_expiration(&mut job, existing);
+            if let Some(existing) = find_active_deduplicated_job(&inner.jobs, &job, now).cloned() {
+                if deduplication_replaces_delayed_owner(&job, &existing) {
+                    preserve_replacement_deduplication_expiration(&mut job, &existing);
                     let existing_id = existing.id.clone();
                     inner.jobs.remove(&existing_id);
                 } else {
-                    added.push(existing.clone());
+                    Self::store_deduplicated_next_locked(&mut inner, &job, &existing);
+                    added.push(existing);
                     continue;
                 }
             }
-            if let Some(existing) = find_active_deduplicated_job(&staged, &job, now) {
-                if deduplication_replaces_delayed_owner(&job, existing) {
-                    preserve_replacement_deduplication_expiration(&mut job, existing);
+            if let Some(existing) = find_active_deduplicated_job(&staged, &job, now).cloned() {
+                if deduplication_replaces_delayed_owner(&job, &existing) {
+                    preserve_replacement_deduplication_expiration(&mut job, &existing);
                     let existing_id = existing.id.clone();
                     staged.remove(&existing_id);
                 } else {
-                    added.push(existing.clone());
+                    added.push(existing);
                     continue;
                 }
             }
@@ -512,6 +530,41 @@ impl InMemoryJobQueue {
         promoted
     }
 
+    fn store_deduplicated_next_locked(
+        inner: &mut InMemoryJobQueueState,
+        candidate: &Job,
+        existing: &Job,
+    ) -> bool {
+        if !deduplication_stores_next_if_active(candidate, existing) {
+            return false;
+        }
+        let Some(deduplication_id) = job_deduplication_id(candidate) else {
+            return false;
+        };
+        inner
+            .deduplication_next
+            .insert(deduplication_id.to_string(), candidate.clone());
+        if let Some(owner) = inner.jobs.get_mut(&existing.id) {
+            owner.deduplication_expires_at = None;
+        }
+        true
+    }
+
+    fn enqueue_deduplicated_next_locked(
+        inner: &mut InMemoryJobQueueState,
+        owner: &Job,
+        now: DateTime<Utc>,
+    ) -> Option<Job> {
+        let deduplication_id = job_deduplication_id(owner)?;
+        let mut next = inner.deduplication_next.remove(deduplication_id)?;
+        prepare_deduplicated_next_job(&mut next, now);
+        if inner.jobs.contains_key(&next.id) {
+            return None;
+        }
+        inner.jobs.insert(next.id.clone(), next.clone());
+        Some(next)
+    }
+
     fn release_parent_if_ready_locked(
         inner: &mut InMemoryJobQueueState,
         parent_id: &str,
@@ -667,6 +720,7 @@ impl JobQueueBackend for InMemoryJobQueue {
         if let Some(next_job) = next_repeat_job(&completed, now)? {
             inner.jobs.insert(next_job.id.clone(), next_job);
         }
+        Self::enqueue_deduplicated_next_locked(&mut inner, &completed, now);
         if let Some(parent_id) = &completed.parent_id {
             Self::release_parent_if_ready_locked(&mut inner, parent_id, now);
         }
@@ -712,6 +766,7 @@ impl JobQueueBackend for InMemoryJobQueue {
             inner.jobs.remove(job_id);
         }
         if failed.state == JobState::Failed {
+            Self::enqueue_deduplicated_next_locked(&mut inner, &failed, now);
             if let Some(parent_id) = &failed.parent_id {
                 Self::fail_waiting_parent_locked(
                     &mut inner,
@@ -792,6 +847,7 @@ impl JobQueueBackend for InMemoryJobQueue {
         let mut recovered = 0;
         let mut remove_ids = Vec::new();
         let mut failed_children = Vec::new();
+        let mut terminal_failures = Vec::new();
 
         for job in inner.jobs.values_mut() {
             if job.state != JobState::Active {
@@ -819,6 +875,7 @@ impl JobQueueBackend for InMemoryJobQueue {
                         job.failed_reason.clone(),
                     ));
                 }
+                terminal_failures.push(job.clone());
                 if job.options.remove_on_fail {
                     remove_ids.push(job.id.clone());
                 }
@@ -831,6 +888,9 @@ impl JobQueueBackend for InMemoryJobQueue {
 
         for id in remove_ids {
             inner.jobs.remove(&id);
+        }
+        for failed in terminal_failures {
+            Self::enqueue_deduplicated_next_locked(&mut inner, &failed, now);
         }
         for (parent_id, child_id, reason) in failed_children {
             Self::fail_waiting_parent_locked(
@@ -925,6 +985,13 @@ fn active_deduplication_id(job: &Job, now: DateTime<Utc>) -> Option<&str> {
         .map(|deduplication| deduplication.id.as_str())
 }
 
+fn job_deduplication_id(job: &Job) -> Option<&str> {
+    job.options
+        .deduplication
+        .as_ref()
+        .map(|deduplication| deduplication.id.as_str())
+}
+
 fn find_active_deduplicated_job<'a>(
     jobs: &'a HashMap<JobId, Job>,
     candidate: &Job,
@@ -969,6 +1036,20 @@ fn deduplication_replaces_delayed_owner(candidate: &Job, existing: &Job) -> bool
         && existing.repeat_key.is_none()
 }
 
+fn deduplication_stores_next_if_active(candidate: &Job, existing: &Job) -> bool {
+    matches!(
+        candidate
+            .options
+            .deduplication
+            .as_ref()
+            .map(|deduplication| deduplication.keep_last_if_active),
+        Some(true)
+    ) && existing.state == JobState::Active
+        && candidate.parent_id.is_none()
+        && candidate.child_ids.is_empty()
+        && candidate.repeat_key.is_none()
+}
+
 fn preserve_replacement_deduplication_expiration(candidate: &mut Job, existing: &Job) {
     let preserves_ttl = candidate
         .options
@@ -979,6 +1060,28 @@ fn preserve_replacement_deduplication_expiration(candidate: &mut Job, existing: 
     if preserves_ttl {
         candidate.deduplication_expires_at = existing.deduplication_expires_at;
     }
+}
+
+fn prepare_deduplicated_next_job(job: &mut Job, now: DateTime<Utc>) {
+    job.created_at = now;
+    job.scheduled_at = job
+        .options
+        .delay
+        .map(|delay| add_duration(now, delay))
+        .unwrap_or(now);
+    job.state = state_after_dependencies(job.scheduled_at, now);
+    job.attempts_made = 0;
+    job.stalled_count = 0;
+    job.processed_at = None;
+    job.finished_at = None;
+    job.worker_id = None;
+    job.lock_token = None;
+    job.lease_expires_at = None;
+    job.failed_reason = None;
+    job.return_value = None;
+    job.progress = None;
+    job.logs.clear();
+    job.deduplication_expires_at = deduplication_expiration(&job.options, now);
 }
 
 fn active_repeat_key(job: &Job) -> Option<&str> {

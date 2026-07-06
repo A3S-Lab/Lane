@@ -369,10 +369,10 @@ A3S stack and language SDKs.
 | Phase | Status | Scope |
 | --- | --- | --- |
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
-| Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL and delayed-owner replace, repeat-key ownership, explicit job states, priority ordering, delayed jobs, token-owned worker leases, completion/failure snapshots, retry backoff, rate-limited claims, shared active concurrency limits, stalled-job recovery, pause/resume. |
+| Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, delayed-owner replace, and keep-last-if-active requeue, repeat-key ownership, explicit job states, priority ordering, delayed jobs, token-owned worker leases, completion/failure snapshots, retry backoff, rate-limited claims, shared active concurrency limits, stalled-job recovery, pause/resume. |
 | Job management API | In progress | Add/get/remove/promote/retry/update-priority/pause/resume/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, and stalled recovery loops. |
-| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, simple deduplication with TTL and delayed-owner replace, repeat-key ownership, flow submission, delayed promotion, single-job promote, manual retry, priority update, progress update, log append, list/stat snapshots, clean, claim, rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
+| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, simple deduplication with TTL, delayed-owner replace, keep-last-if-active requeue, repeat-key ownership, flow submission, delayed promotion, single-job promote, manual retry, priority update, progress update, log append, list/stat snapshots, clean, claim, rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, and end timestamps are available across in-memory, local durable, and Redis backends. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
@@ -553,7 +553,8 @@ job is still non-terminal. An optional TTL limits how long a non-terminal job
 owns its deduplication id:
 
 ```rust
-use a3s_lane::{DeduplicationOptions, InMemoryJobQueue, JobOptions};
+use a3s_lane::{DeduplicationOptions, InMemoryJobQueue, JobOptions, JobQueueBackend};
+use chrono::Utc;
 use std::time::Duration;
 
 # async fn dedup_example() -> a3s_lane::Result<()> {
@@ -617,6 +618,42 @@ let replacement = queue
     .await?;
 
 assert_ne!(replacement.id, delayed_owner.id);
+
+let active_owner = queue
+    .add(
+        "sync-account",
+        serde_json::json!({ "account_id": "acct_42", "version": 1 }),
+        JobOptions::new().with_deduplication(
+            DeduplicationOptions::new("account-sync:acct_42")
+                .keep_last_if_active(true),
+        ),
+    )
+    .await?;
+let claimed = queue
+    .claim_next("worker-a".to_string(), Duration::from_secs(30), Utc::now())
+    .await?
+    .expect("job should be claimable");
+
+let duplicate = queue
+    .add(
+        "sync-account",
+        serde_json::json!({ "account_id": "acct_42", "version": 2 }),
+        JobOptions::new().with_deduplication(
+            DeduplicationOptions::new("account-sync:acct_42")
+                .keep_last_if_active(true),
+        ),
+    )
+    .await?;
+
+assert_eq!(duplicate.id, active_owner.id);
+queue
+    .complete_job(
+        &claimed.id,
+        claimed.lock_token.as_deref().expect("claimed jobs have locks"),
+        serde_json::json!({ "ok": true }),
+        Utc::now(),
+    )
+    .await?;
 # Ok(())
 # }
 ```
@@ -628,7 +665,14 @@ terminally, is removed, is cleaned, or its configured TTL expires.
 deduplicated add may remove a delayed standalone owner and insert the new job in
 the same operation when the old owner is still present in the delayed index.
 For TTL-backed deduplication, replacement preserves the existing owner key's
-remaining TTL. Debounce and keep-last-if-active behavior remain planned.
+remaining TTL.
+`keep_last_if_active(true)` covers BullMQ's active-owner keep-last path for
+standalone jobs: duplicates added while the current owner is active return that
+owner, overwrite a queue-local next-job record, and materialize only the latest
+duplicate when the owner completes, terminally fails, or exhausts stalled-job
+recovery. If that latest duplicate has a delay, the delay starts from the owner
+finalization timestamp.
+Debounce behavior and flow/repeat keep-last extensions remain planned.
 Retrying a failed deduplicated job reclaims the deduplication id while the job is
 waiting or active again; retry is rejected if another non-terminal job already
 owns that id.
@@ -756,15 +800,23 @@ For simple deduplication, the same add scripts use an independent
 `deduplication:<id>` key, equivalent to BullMQ's `de:<id>` role, to return the
 currently active job before writing a duplicate. If `DeduplicationOptions` has a
 TTL, the Lua scripts write that owner key with `PX` so Redis expires the
-deduplication window even while the original job remains non-terminal. If
-`replace_delayed(true)` is set and the current owner is a standalone delayed job,
-the add script first removes the old delayed zset member, then removes the old
-job hash and inserts the new owner only if that delayed removal succeeded,
+deduplication window even while the original job remains non-terminal. The
+keep-last-if-active mode intentionally omits that TTL, matching BullMQ's active
+owner behavior so the key cannot expire while work is still leased.
+If `replace_delayed(true)` is set and the current owner is a standalone delayed
+job, the add script first removes the old delayed zset member, then removes the
+old job hash and inserts the new owner only if that delayed removal succeeded,
 mirroring BullMQ's delayed replacement branch. With TTL-backed deduplication, the
 script updates the owner id with Redis `KEEPTTL` so replacement does not extend
-the remaining deduplication window.
+the remaining deduplication window. If `keep_last_if_active(true)` is set and the
+current owner is present in the active sorted set, duplicate adds overwrite a
+`deduplication_next:<id>` proto-job record and `PERSIST` the owner key. Complete,
+terminal fail, and stalled terminal-fail scripts then atomically delete the old
+owner key, materialize that latest proto-job into waiting or delayed state, and
+set the deduplication owner to the new job.
 Completion, terminal failure, remove, clean, and stalled terminal failure scripts
-release that key only when it still points at the job being finalized or removed.
+release deduplication keys only when they still point at the job being finalized
+or removed.
 Manual retry reclaims the key inside the retry script, reapplies the TTL, and
 refuses to move the failed job back to waiting if a newer non-terminal job
 already owns the same deduplication id.

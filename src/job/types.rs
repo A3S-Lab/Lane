@@ -338,6 +338,9 @@ pub struct DeduplicationOptions {
     /// Replace an existing delayed owner with the new job.
     #[serde(default)]
     pub replace: bool,
+    /// Keep the latest duplicate while the current owner is active.
+    #[serde(default)]
+    pub keep_last_if_active: bool,
 }
 
 impl DeduplicationOptions {
@@ -347,6 +350,7 @@ impl DeduplicationOptions {
             id: id.into(),
             ttl: None,
             replace: false,
+            keep_last_if_active: false,
         }
     }
 
@@ -362,6 +366,16 @@ impl DeduplicationOptions {
     /// keep-last-if-active behavior is a separate mode and is not enabled here.
     pub fn replace_delayed(mut self, replace: bool) -> Self {
         self.replace = replace;
+        self
+    }
+
+    /// Store the latest duplicate while the current owner is active.
+    ///
+    /// This mirrors BullMQ's `keepLastIfActive` mechanism for standalone jobs:
+    /// duplicate adds return the active owner, but the latest duplicate is
+    /// materialized as a new job when the owner finishes terminally.
+    pub fn keep_last_if_active(mut self, keep: bool) -> Self {
+        self.keep_last_if_active = keep;
         self
     }
 
@@ -617,6 +631,7 @@ pub(crate) fn deduplication_expiration(
     options
         .deduplication
         .as_ref()
+        .filter(|deduplication| !deduplication.keep_last_if_active)
         .and_then(|deduplication| deduplication.ttl)
         .map(|ttl| add_duration(now, ttl))
 }
@@ -662,4 +677,6 @@ pub struct JobQueueSnapshot {
     pub queue: QueueName,
     pub paused: bool,
     pub jobs: Vec<Job>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deduplication_next_jobs: Vec<Job>,
 }

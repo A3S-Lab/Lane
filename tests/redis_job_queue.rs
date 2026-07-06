@@ -1,7 +1,7 @@
 #![cfg(feature = "redis-backend")]
 
 use a3s_lane::{
-    DeduplicationOptions, JobListOptions, JobOptions, JobQueueBackend, JobRateLimit, JobSpec,
+    DeduplicationOptions, Job, JobListOptions, JobOptions, JobQueueBackend, JobRateLimit, JobSpec,
     JobState, LaneError, RedisJobQueue, RepeatOptions, RetryPolicy,
 };
 use chrono::{DateTime, TimeZone, Utc};
@@ -464,6 +464,119 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect("stale old owner should remove")
         .expect("stale old owner should be returned");
+
+    let keep_last_key = format!("{namespace}:dedup:deduplication:tenant:keep-last");
+    let keep_last_next_key = format!("{namespace}:dedup:deduplication_next:tenant:keep-last");
+    let keep_last_owner = dedup_queue
+        .add_job(
+            "dedup-keep-last-owner".to_string(),
+            serde_json::json!({ "version": 15 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("tenant:keep-last")
+                    .with_ttl(Duration::from_secs(30))
+                    .keep_last_if_active(true),
+            ),
+        )
+        .await
+        .expect("keep-last owner should be added");
+    let keep_last_ttl: i64 = redis::cmd("PTTL")
+        .arg(&keep_last_key)
+        .query_async(&mut dedup_conn)
+        .await?;
+    assert_eq!(keep_last_ttl, -1);
+    let keep_last_claim = dedup_queue
+        .claim_next(
+            "worker-keep-last".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("keep-last owner should be claimable")
+        .expect("keep-last owner should be returned");
+    assert_eq!(keep_last_claim.id, keep_last_owner.id);
+    let keep_last_stale = dedup_queue
+        .add_job(
+            "dedup-keep-last-stale".to_string(),
+            serde_json::json!({ "version": 16 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("tenant:keep-last").keep_last_if_active(true),
+            ),
+        )
+        .await
+        .expect("keep-last stale duplicate should return owner");
+    assert_eq!(keep_last_stale.id, keep_last_owner.id);
+    let keep_last_latest = dedup_queue
+        .add_job(
+            "dedup-keep-last-latest".to_string(),
+            serde_json::json!({ "version": 17 }),
+            JobOptions::new()
+                .with_delay(Duration::from_millis(150))
+                .with_deduplication(
+                    DeduplicationOptions::new("tenant:keep-last").keep_last_if_active(true),
+                ),
+        )
+        .await
+        .expect("keep-last latest duplicate should return owner");
+    assert_eq!(keep_last_latest.id, keep_last_owner.id);
+    let keep_last_next_raw: String = dedup_conn.get(&keep_last_next_key).await?;
+    let keep_last_next: Job =
+        serde_json::from_str(&keep_last_next_raw).expect("stored next job should decode");
+    assert_eq!(keep_last_next.name, "dedup-keep-last-latest");
+
+    let complete_keep_last_at = Utc::now();
+    dedup_queue
+        .complete_job(
+            &keep_last_claim.id,
+            lock_token(&keep_last_claim),
+            serde_json::json!({ "ok": true }),
+            complete_keep_last_at,
+        )
+        .await
+        .expect("keep-last owner should complete");
+    let keep_last_next_after: Option<String> = dedup_conn.get(&keep_last_next_key).await?;
+    assert!(keep_last_next_after.is_none());
+    let keep_last_owner_after: Option<String> = dedup_conn.get(&keep_last_key).await?;
+    assert_eq!(
+        keep_last_owner_after.as_deref(),
+        Some(keep_last_next.id.as_str())
+    );
+    let keep_last_materialized = dedup_queue
+        .get_job(&keep_last_next.id)
+        .await
+        .expect("keep-last materialized job should load")
+        .expect("keep-last materialized job should exist");
+    assert_eq!(keep_last_materialized.name, "dedup-keep-last-latest");
+    assert_eq!(keep_last_materialized.state, JobState::Delayed);
+    assert!(keep_last_materialized.scheduled_at >= complete_keep_last_at);
+    let keep_last_delayed_score: Option<f64> = dedup_conn
+        .zscore(format!("{namespace}:dedup:delayed"), &keep_last_next.id)
+        .await?;
+    assert!(keep_last_delayed_score.is_some());
+    sleep_until_due(keep_last_materialized.scheduled_at).await;
+    let promoted_keep_last = dedup_queue
+        .promote_due_jobs(Utc::now())
+        .await
+        .expect("keep-last delayed next should promote");
+    assert_eq!(promoted_keep_last, 1);
+    let keep_last_next_claim = dedup_queue
+        .claim_next(
+            "worker-keep-last-next".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("keep-last next should be claimable")
+        .expect("keep-last next should be returned");
+    assert_eq!(keep_last_next_claim.id, keep_last_next.id);
+    dedup_queue
+        .complete_job(
+            &keep_last_next_claim.id,
+            lock_token(&keep_last_next_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("keep-last next should complete");
     trace_stage("dedup:done");
 
     let priority_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "priority")
