@@ -1810,6 +1810,225 @@ async fn drain_jobs_releases_flow_parents_after_removing_children() {
     );
 }
 
+#[tokio::test]
+async fn obliterate_pauses_on_active_conflict_and_force_clears_everything() {
+    let queue = InMemoryJobQueue::new("obliterate");
+    let now = ts(1_000);
+
+    let active = queue
+        .add_at(
+            "active",
+            serde_json::json!({ "kind": "active" }),
+            JobOptions::new().with_priority(1),
+            now,
+        )
+        .await
+        .unwrap();
+    let active_claim = queue
+        .claim_next("worker-active".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active_claim.id, active.id);
+
+    let completed = queue
+        .add_at(
+            "completed",
+            serde_json::json!({ "kind": "completed" }),
+            JobOptions::new().with_priority(1),
+            ts(1_100),
+        )
+        .await
+        .unwrap();
+    let completed_claim = queue
+        .claim_next(
+            "worker-completed".to_string(),
+            Duration::from_secs(30),
+            ts(1_100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed_claim.id, completed.id);
+    queue
+        .complete_job(
+            &completed.id,
+            lock_token(&completed_claim),
+            serde_json::json!({ "ok": true }),
+            ts(1_150),
+        )
+        .await
+        .unwrap();
+
+    let failed = queue
+        .add_at(
+            "failed",
+            serde_json::json!({ "kind": "failed" }),
+            JobOptions::new().with_priority(1),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+    let failed_claim = queue
+        .claim_next(
+            "worker-failed".to_string(),
+            Duration::from_secs(30),
+            ts(1_200),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed_claim.id, failed.id);
+    queue
+        .fail_job(
+            &failed.id,
+            lock_token(&failed_claim),
+            "boom".to_string(),
+            ts(1_250),
+        )
+        .await
+        .unwrap();
+
+    let waiting = queue
+        .add_at(
+            "waiting",
+            serde_json::json!({ "kind": "waiting" }),
+            JobOptions::new()
+                .with_priority(50)
+                .with_deduplication_id("tenant:one"),
+            ts(1_300),
+        )
+        .await
+        .unwrap();
+    let duplicate_waiting = queue
+        .add_at(
+            "waiting-duplicate",
+            serde_json::json!({ "kind": "duplicate" }),
+            JobOptions::new().with_deduplication_id("tenant:one"),
+            ts(1_310),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate_waiting.id, waiting.id);
+    queue
+        .add_log(&waiting.id, "queued".to_string(), 10, ts(1_320))
+        .await
+        .unwrap();
+
+    let delayed = queue
+        .add_at(
+            "delayed",
+            serde_json::json!({ "kind": "delayed" }),
+            JobOptions::new().with_delay(Duration::from_secs(60)),
+            ts(1_300),
+        )
+        .await
+        .unwrap();
+
+    let keep_owner = queue
+        .add_at(
+            "keep-owner",
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new().with_priority(2).with_deduplication(
+                DeduplicationOptions::new("tenant:keep").keep_last_if_active(true),
+            ),
+            ts(1_400),
+        )
+        .await
+        .unwrap();
+    let keep_claim = queue
+        .claim_next(
+            "worker-keep".to_string(),
+            Duration::from_secs(30),
+            ts(1_400),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(keep_claim.id, keep_owner.id);
+    let keep_duplicate = queue
+        .add_at(
+            "keep-duplicate",
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("tenant:keep").keep_last_if_active(true),
+            ),
+            ts(1_410),
+        )
+        .await
+        .unwrap();
+    assert_eq!(keep_duplicate.id, keep_owner.id);
+
+    let before = queue.stats().await.unwrap();
+    assert_eq!(before.total, 6);
+    assert_eq!(before.active, 2);
+
+    let error = queue.obliterate(false).await.unwrap_err();
+    assert!(matches!(error, LaneError::JobStateConflict(_)));
+    assert!(queue.is_paused().await.unwrap());
+    assert!(queue
+        .claim_next(
+            "worker-paused".to_string(),
+            Duration::from_secs(30),
+            ts(1_500)
+        )
+        .await
+        .unwrap()
+        .is_none());
+
+    let removed = queue.obliterate(true).await.unwrap();
+    assert_eq!(removed, before.total);
+    assert!(!queue.is_paused().await.unwrap());
+
+    let stats = queue.stats().await.unwrap();
+    assert_eq!(stats.total, 0);
+    assert_eq!(stats.waiting, 0);
+    assert_eq!(stats.delayed, 0);
+    assert_eq!(stats.active, 0);
+    assert_eq!(stats.completed, 0);
+    assert_eq!(stats.failed, 0);
+    assert!(!stats.paused);
+    for job in [
+        &active,
+        &completed,
+        &failed,
+        &waiting,
+        &delayed,
+        &keep_owner,
+    ] {
+        assert!(queue.get_job(&job.id).await.unwrap().is_none());
+    }
+    assert!(queue.list_repeats().await.unwrap().is_empty());
+    assert!(queue
+        .get_deduplication_job_id("tenant:one")
+        .await
+        .unwrap()
+        .is_none());
+    let logs = queue.get_job_logs(&waiting.id, 0, -1, true).await.unwrap();
+    assert_eq!(logs.count, 0);
+    assert!(logs.logs.is_empty());
+
+    let after = queue
+        .add_at(
+            "after",
+            serde_json::json!({ "kind": "after" }),
+            JobOptions::new().with_deduplication_id("tenant:one"),
+            ts(1_600),
+        )
+        .await
+        .unwrap();
+    assert_ne!(after.id, waiting.id);
+    assert!(queue
+        .claim_next(
+            "worker-after".to_string(),
+            Duration::from_secs(30),
+            ts(1_600)
+        )
+        .await
+        .unwrap()
+        .is_some());
+}
+
 #[test]
 fn repeat_options_deserialize_legacy_interval_shape() {
     let repeat: RepeatOptions = serde_json::from_value(serde_json::json!({
@@ -2988,6 +3207,74 @@ async fn local_job_queue_persists_snapshot_across_reopen() {
         restored.return_value,
         Some(serde_json::json!({ "ok": true }))
     );
+}
+
+#[tokio::test]
+async fn local_job_queue_persists_failed_obliterate_pause_and_forced_clear() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("jobs").join("obliterate.json");
+    let now = ts(1_000);
+
+    let queue = LocalJobQueue::open("durable-obliterate", &snapshot_path)
+        .await
+        .unwrap();
+    let job = queue
+        .add_at("active", serde_json::json!({}), JobOptions::new(), now)
+        .await
+        .unwrap();
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, job.id);
+
+    let error = queue.obliterate(false).await.unwrap_err();
+    assert!(matches!(error, LaneError::JobStateConflict(_)));
+
+    let reopened = LocalJobQueue::open("durable-obliterate", &snapshot_path)
+        .await
+        .unwrap();
+    assert!(reopened.is_paused().await.unwrap());
+    let paused_stats = reopened.stats().await.unwrap();
+    assert!(paused_stats.paused);
+    assert_eq!(paused_stats.active, 1);
+    assert!(reopened
+        .claim_next(
+            "worker-paused".to_string(),
+            Duration::from_secs(30),
+            ts(1_100)
+        )
+        .await
+        .unwrap()
+        .is_none());
+
+    let removed = reopened.obliterate(true).await.unwrap();
+    assert_eq!(removed, 1);
+
+    let reopened = LocalJobQueue::open("durable-obliterate", &snapshot_path)
+        .await
+        .unwrap();
+    let stats = reopened.stats().await.unwrap();
+    assert_eq!(stats.total, 0);
+    assert_eq!(stats.active, 0);
+    assert!(!stats.paused);
+    assert!(!reopened.is_paused().await.unwrap());
+
+    let after = reopened
+        .add_at("after", serde_json::json!({}), JobOptions::new(), ts(1_200))
+        .await
+        .unwrap();
+    let claimed_after = reopened
+        .claim_next(
+            "worker-after".to_string(),
+            Duration::from_secs(30),
+            ts(1_200),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed_after.id, after.id);
 }
 
 #[tokio::test]

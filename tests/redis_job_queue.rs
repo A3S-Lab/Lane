@@ -45,6 +45,276 @@ async fn redis_backend_counts_states_against_real_server() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn redis_backend_obliterates_queue_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    tokio::time::timeout(Duration::from_secs(120), run_queue_obliterate(redis_url))
+        .await
+        .expect("Redis queue obliterate integration test timed out")
+        .unwrap();
+}
+
+async fn run_queue_obliterate(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "obliterate")
+        .expect("valid Redis URL should build the obliterate queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let active = queue
+        .add_job(
+            "active".to_string(),
+            serde_json::json!({ "kind": "active" }),
+            JobOptions::new().with_priority(1),
+        )
+        .await
+        .expect("active job should be added");
+    let active_claim = queue
+        .claim_next(
+            "worker-active".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("active claim should return")
+        .expect("active job should be claimable");
+    assert_eq!(active_claim.id, active.id);
+
+    let completed = queue
+        .add_job(
+            "completed".to_string(),
+            serde_json::json!({ "kind": "completed" }),
+            JobOptions::new().with_priority(1),
+        )
+        .await
+        .expect("completed job should be added");
+    let completed_claim = queue
+        .claim_next(
+            "worker-completed".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("completed claim should return")
+        .expect("completed job should be claimable");
+    assert_eq!(completed_claim.id, completed.id);
+    queue
+        .complete_job(
+            &completed.id,
+            lock_token(&completed_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("completed job should complete");
+
+    let failed = queue
+        .add_job(
+            "failed".to_string(),
+            serde_json::json!({ "kind": "failed" }),
+            JobOptions::new().with_priority(1),
+        )
+        .await
+        .expect("failed job should be added");
+    let failed_claim = queue
+        .claim_next(
+            "worker-failed".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("failed claim should return")
+        .expect("failed job should be claimable");
+    assert_eq!(failed_claim.id, failed.id);
+    queue
+        .fail_job(
+            &failed.id,
+            lock_token(&failed_claim),
+            "boom".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("failed job should fail terminally");
+
+    let waiting = queue
+        .add_job(
+            "waiting".to_string(),
+            serde_json::json!({ "kind": "waiting" }),
+            JobOptions::new()
+                .with_priority(50)
+                .with_deduplication_id("tenant:one"),
+        )
+        .await
+        .expect("waiting job should be added");
+    let duplicate_waiting = queue
+        .add_job(
+            "waiting-duplicate".to_string(),
+            serde_json::json!({ "kind": "duplicate" }),
+            JobOptions::new().with_deduplication_id("tenant:one"),
+        )
+        .await
+        .expect("duplicate waiting job should return existing owner");
+    assert_eq!(duplicate_waiting.id, waiting.id);
+    queue
+        .add_log(&waiting.id, "queued".to_string(), 10, Utc::now())
+        .await
+        .expect("waiting job log should be retained");
+
+    let delayed = queue
+        .add_job(
+            "delayed".to_string(),
+            serde_json::json!({ "kind": "delayed" }),
+            JobOptions::new().with_delay(Duration::from_secs(60)),
+        )
+        .await
+        .expect("delayed job should be added");
+
+    let keep_owner = queue
+        .add_job(
+            "keep-owner".to_string(),
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new().with_priority(2).with_deduplication(
+                DeduplicationOptions::new("tenant:keep").keep_last_if_active(true),
+            ),
+        )
+        .await
+        .expect("keep-last owner should be added");
+    let keep_claim = queue
+        .claim_next(
+            "worker-keep".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("keep-last claim should return")
+        .expect("keep-last owner should be claimable");
+    assert_eq!(keep_claim.id, keep_owner.id);
+    let keep_duplicate = queue
+        .add_job(
+            "keep-duplicate".to_string(),
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("tenant:keep").keep_last_if_active(true),
+            ),
+        )
+        .await
+        .expect("keep-last duplicate should return active owner");
+    assert_eq!(keep_duplicate.id, keep_owner.id);
+
+    let before = queue.stats().await.expect("obliterate stats should load");
+    assert_eq!(before.total, 6);
+    assert_eq!(before.active, 2);
+
+    let error = queue
+        .obliterate(false)
+        .await
+        .expect_err("non-forced obliterate should reject active jobs");
+    assert!(matches!(error, LaneError::JobStateConflict(_)));
+    let meta_key = format!("{namespace}:obliterate:meta");
+    let paused_raw: Option<u8> = conn.hget(&meta_key, "paused").await?;
+    assert_eq!(paused_raw, Some(1));
+    assert!(queue
+        .claim_next(
+            "worker-paused".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("paused queue claim should return")
+        .is_none());
+
+    let removed = queue
+        .obliterate(true)
+        .await
+        .expect("forced obliterate should remove queue data");
+    assert_eq!(removed, before.total);
+
+    let mut cursor = 0_u64;
+    let mut remaining_keys = Vec::new();
+    loop {
+        let (next_cursor, mut keys): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(format!("{namespace}:obliterate:*"))
+            .arg("COUNT")
+            .arg(100_u16)
+            .query_async(&mut conn)
+            .await?;
+        remaining_keys.append(&mut keys);
+        if next_cursor == 0 {
+            break;
+        }
+        cursor = next_cursor;
+    }
+    assert!(
+        remaining_keys.is_empty(),
+        "obliterate should delete queue-prefixed keys: {remaining_keys:?}"
+    );
+
+    let stats = queue.stats().await.expect("empty stats should load");
+    assert_eq!(stats.total, 0);
+    assert_eq!(stats.waiting, 0);
+    assert_eq!(stats.delayed, 0);
+    assert_eq!(stats.active, 0);
+    assert_eq!(stats.completed, 0);
+    assert_eq!(stats.failed, 0);
+    assert!(!stats.paused);
+    for job in [
+        &active,
+        &completed,
+        &failed,
+        &waiting,
+        &delayed,
+        &keep_owner,
+    ] {
+        assert!(queue
+            .get_job(&job.id)
+            .await
+            .expect("removed job lookup should return")
+            .is_none());
+    }
+    assert!(queue
+        .get_deduplication_job_id("tenant:one")
+        .await
+        .expect("dedup owner lookup should return")
+        .is_none());
+    let logs = queue
+        .get_job_logs(&waiting.id, 0, -1, true)
+        .await
+        .expect("removed job logs should return empty page");
+    assert_eq!(logs.count, 0);
+    assert!(logs.logs.is_empty());
+
+    let after = queue
+        .add_job(
+            "after".to_string(),
+            serde_json::json!({ "kind": "after" }),
+            JobOptions::new().with_deduplication_id("tenant:one"),
+        )
+        .await
+        .expect("queue should accept jobs after obliterate");
+    assert_ne!(after.id, waiting.id);
+    let claimed_after = queue
+        .claim_next(
+            "worker-after".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("after claim should return")
+        .expect("after job should be claimable");
+    assert_eq!(claimed_after.id, after.id);
+
+    cleanup_namespace_with_conn(&mut conn, &namespace).await?;
+    Ok(())
+}
+
 async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     let namespace = unique_namespace();
     trace_stage("cleanup:start");

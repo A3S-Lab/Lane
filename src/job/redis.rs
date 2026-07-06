@@ -2744,6 +2744,37 @@ end
 return removed
 "#;
 
+const OBLITERATE_SCRIPT: &str = r#"
+redis.call('HSET', KEYS[1], 'paused', 1)
+if redis.call('ZCARD', KEYS[2]) > 0 and ARGV[2] ~= '1' then
+  return -2
+end
+
+local removed_jobs = redis.call('HLEN', KEYS[3])
+local scan_count = tonumber(ARGV[3]) or 1000
+if scan_count <= 0 then
+  scan_count = 1000
+end
+
+local found = true
+while found do
+  found = false
+  local cursor = '0'
+  repeat
+    local page = redis.call('SCAN', cursor, 'MATCH', ARGV[1] .. '*', 'COUNT', scan_count)
+    cursor = page[1]
+    local keys = page[2]
+    if #keys > 0 then
+      found = true
+      for i = 1, #keys, 5000 do
+        redis.call('DEL', unpack(keys, i, math.min(i + 4999, #keys)))
+      end
+    end
+  until cursor == '0'
+end
+return removed_jobs
+"#;
+
 const LIST_JOBS_SCRIPT: &str = r#"
 local function iso_sort_key(value)
   if not value or value == cjson.null then
@@ -3387,6 +3418,10 @@ impl RedisJobQueue {
 
     fn key(&self, suffix: &str) -> String {
         format!("{}:{}:{}", self.namespace, self.queue, suffix)
+    }
+
+    fn queue_key_prefix(&self) -> String {
+        format!("{}:{}:", self.namespace, self.queue)
     }
 
     fn jobs_key(&self) -> String {
@@ -4082,6 +4117,33 @@ impl JobQueueBackend for RedisJobQueue {
             .await
             .map_err(redis_error)?;
         decode_clean_jobs_result(&result)
+    }
+
+    async fn obliterate(&self, force: bool) -> Result<usize> {
+        let mut conn = self.connection().await?;
+        let removed: i64 = redis::cmd("EVAL")
+            .arg(OBLITERATE_SCRIPT)
+            .arg(3)
+            .arg(self.meta_key())
+            .arg(self.state_key(JobState::Active))
+            .arg(self.jobs_key())
+            .arg(self.queue_key_prefix())
+            .arg(if force { "1" } else { "0" })
+            .arg(1000_u16)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        match removed {
+            -2 => Err(LaneError::JobStateConflict(
+                "cannot obliterate queue with active jobs".to_string(),
+            )),
+            value if value < 0 => Err(LaneError::QueueError(format!(
+                "Redis obliterate script returned unexpected code {value}"
+            ))),
+            value => usize::try_from(value).map_err(|error| {
+                LaneError::Other(format!("failed to decode Redis obliterate count: {error}"))
+            }),
+        }
     }
 
     async fn list_jobs(&self, options: JobListOptions) -> Result<JobListPage> {

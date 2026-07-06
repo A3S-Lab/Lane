@@ -771,6 +771,25 @@ impl InMemoryJobQueue {
         Ok(jobs)
     }
 
+    /// Remove every job and queue-owned metadata entry.
+    pub async fn obliterate(&self, force: bool) -> Result<usize> {
+        let mut inner = self.inner.lock().await;
+        inner.paused = true;
+        let active = inner.jobs.values().any(|job| job.state == JobState::Active);
+        if active && !force {
+            return Err(LaneError::JobStateConflict(
+                "cannot obliterate queue with active jobs".to_string(),
+            ));
+        }
+
+        let removed = inner.jobs.len();
+        inner.jobs.clear();
+        inner.deduplication_next.clear();
+        inner.released_deduplication_owners.clear();
+        inner.paused = false;
+        Ok(removed)
+    }
+
     /// Update progress for a non-terminal job.
     pub async fn set_progress(&self, job_id: &str, progress: Value) -> Result<Job> {
         let mut inner = self.inner.lock().await;
@@ -1207,6 +1226,10 @@ impl JobQueueBackend for InMemoryJobQueue {
 
     async fn drain_jobs(&self, include_delayed: bool) -> Result<Vec<Job>> {
         self.drain(include_delayed).await
+    }
+
+    async fn obliterate(&self, force: bool) -> Result<usize> {
+        InMemoryJobQueue::obliterate(self, force).await
     }
 
     async fn list_jobs(&self, options: JobListOptions) -> Result<JobListPage> {

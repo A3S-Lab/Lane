@@ -98,6 +98,13 @@ pub trait JobQueueBackend: Send + Sync {
 
     async fn drain_jobs(&self, include_delayed: bool) -> Result<Vec<Job>>;
 
+    /// Remove all queue data.
+    ///
+    /// This follows BullMQ's `obliterate()` shape: the queue is paused first,
+    /// active jobs are rejected unless `force` is true, and a successful
+    /// obliteration removes the pause marker along with all queue data.
+    async fn obliterate(&self, force: bool) -> Result<usize>;
+
     async fn list_jobs(&self, options: JobListOptions) -> Result<JobListPage>;
 
     /// Return counts for the requested states.

@@ -169,6 +169,13 @@ impl LocalJobQueue {
         Ok(jobs)
     }
 
+    /// Remove every job and queue-owned metadata entry.
+    pub async fn obliterate(&self, force: bool) -> Result<usize> {
+        let result = self.inner.obliterate(force).await;
+        self.persist().await?;
+        result
+    }
+
     async fn persist(&self) -> Result<()> {
         persist_job_snapshot(&self.snapshot_path, &self.inner.snapshot().await).await
     }
@@ -329,6 +336,10 @@ impl JobQueueBackend for LocalJobQueue {
 
     async fn drain_jobs(&self, include_delayed: bool) -> Result<Vec<Job>> {
         LocalJobQueue::drain(self, include_delayed).await
+    }
+
+    async fn obliterate(&self, force: bool) -> Result<usize> {
+        LocalJobQueue::obliterate(self, force).await
     }
 
     async fn list_jobs(&self, options: JobListOptions) -> Result<JobListPage> {
