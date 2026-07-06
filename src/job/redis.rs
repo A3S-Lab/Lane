@@ -2861,6 +2861,28 @@ redis.call('HSET', KEYS[1], ARGV[1], updated)
 return {'ok', updated}
 "#;
 
+const GET_JOB_STATE_SCRIPT: &str = r#"
+if redis.call('ZSCORE', KEYS[1], ARGV[1]) then
+  return 'completed'
+end
+if redis.call('ZSCORE', KEYS[2], ARGV[1]) then
+  return 'failed'
+end
+if redis.call('ZSCORE', KEYS[3], ARGV[1]) then
+  return 'delayed'
+end
+if redis.call('ZSCORE', KEYS[4], ARGV[1]) then
+  return 'active'
+end
+if redis.call('ZSCORE', KEYS[5], ARGV[1]) then
+  return 'waiting'
+end
+if redis.call('ZSCORE', KEYS[6], ARGV[1]) then
+  return 'waiting_children'
+end
+return 'unknown'
+"#;
+
 const STATS_SCRIPT: &str = r#"
 local paused = redis.call('HGET', KEYS[1], 'paused')
 local paused_value = 0
@@ -3968,6 +3990,24 @@ impl JobQueueBackend for RedisJobQueue {
         self.load_job(&mut conn, job_id).await
     }
 
+    async fn get_job_state(&self, job_id: &str) -> Result<Option<JobState>> {
+        let mut conn = self.connection().await?;
+        let state: String = redis::cmd("EVAL")
+            .arg(GET_JOB_STATE_SCRIPT)
+            .arg(6)
+            .arg(self.state_key(JobState::Completed))
+            .arg(self.state_key(JobState::Failed))
+            .arg(self.state_key(JobState::Delayed))
+            .arg(self.state_key(JobState::Active))
+            .arg(self.state_key(JobState::Waiting))
+            .arg(self.state_key(JobState::WaitingChildren))
+            .arg(job_id)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_job_state(&state)
+    }
+
     async fn stats(&self) -> Result<JobQueueStats> {
         let mut conn = self.connection().await?;
         let result: Vec<i64> = redis::cmd("EVAL")
@@ -4182,6 +4222,21 @@ fn decode_flow_dependencies_result(
         ))),
         None => Err(LaneError::Other(format!(
             "Redis flow dependency script returned no status for {parent_id}"
+        ))),
+    }
+}
+
+fn decode_job_state(state: &str) -> Result<Option<JobState>> {
+    match state {
+        "waiting" => Ok(Some(JobState::Waiting)),
+        "delayed" => Ok(Some(JobState::Delayed)),
+        "active" => Ok(Some(JobState::Active)),
+        "waiting_children" => Ok(Some(JobState::WaitingChildren)),
+        "completed" => Ok(Some(JobState::Completed)),
+        "failed" => Ok(Some(JobState::Failed)),
+        "unknown" => Ok(None),
+        other => Err(LaneError::Other(format!(
+            "unexpected Redis job state `{other}`"
         ))),
     }
 }

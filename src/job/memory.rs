@@ -375,6 +375,12 @@ impl InMemoryJobQueue {
         }))
     }
 
+    /// Return the current state for a job id.
+    pub async fn get_state(&self, job_id: &str) -> Result<Option<JobState>> {
+        let inner = self.inner.lock().await;
+        Ok(inner.jobs.get(job_id).map(|job| job.state))
+    }
+
     /// Remove a job from the queue.
     pub async fn remove(&self, job_id: &str) -> Result<Option<Job>> {
         let mut inner = self.inner.lock().await;
@@ -1233,6 +1239,10 @@ impl JobQueueBackend for InMemoryJobQueue {
     async fn get_job(&self, job_id: &str) -> Result<Option<Job>> {
         let inner = self.inner.lock().await;
         Ok(inner.jobs.get(job_id).cloned())
+    }
+
+    async fn get_job_state(&self, job_id: &str) -> Result<Option<JobState>> {
+        self.get_state(job_id).await
     }
 
     async fn stats(&self) -> Result<JobQueueStats> {

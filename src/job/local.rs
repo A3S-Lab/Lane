@@ -124,6 +124,11 @@ impl LocalJobQueue {
         self.inner.get_flow_dependencies(parent_id).await
     }
 
+    /// Return the current state for a job id.
+    pub async fn get_state(&self, job_id: &str) -> Result<Option<JobState>> {
+        self.inner.get_state(job_id).await
+    }
+
     /// Capture the durable queue snapshot.
     pub async fn snapshot(&self) -> JobQueueSnapshot {
         self.inner.snapshot().await
@@ -366,6 +371,10 @@ impl JobQueueBackend for LocalJobQueue {
 
     async fn get_job(&self, job_id: &str) -> Result<Option<Job>> {
         self.inner.get_job(job_id).await
+    }
+
+    async fn get_job_state(&self, job_id: &str) -> Result<Option<JobState>> {
+        self.inner.get_job_state(job_id).await
     }
 
     async fn stats(&self) -> Result<JobQueueStats> {

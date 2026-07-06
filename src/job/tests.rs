@@ -57,6 +57,70 @@ async fn claims_waiting_jobs_by_priority_then_fifo() {
 }
 
 #[tokio::test]
+async fn job_state_queries_follow_lifecycle() {
+    let queue = InMemoryJobQueue::new("states");
+    let now = ts(1_000);
+    let waiting = queue
+        .add_at("waiting", serde_json::json!({}), JobOptions::new(), now)
+        .await
+        .unwrap();
+    let delayed = queue
+        .add_at(
+            "delayed",
+            serde_json::json!({}),
+            JobOptions::new().with_delay(Duration::from_secs(5)),
+            now,
+        )
+        .await
+        .unwrap();
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({})),
+            vec![JobSpec::new("child", serde_json::json!({}))],
+            now,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        queue.get_job_state(&waiting.id).await.unwrap(),
+        Some(JobState::Waiting)
+    );
+    assert_eq!(
+        queue.get_job_state(&delayed.id).await.unwrap(),
+        Some(JobState::Delayed)
+    );
+    assert_eq!(
+        queue.get_job_state(&flow.parent.id).await.unwrap(),
+        Some(JobState::WaitingChildren)
+    );
+
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        queue.get_job_state(&claimed.id).await.unwrap(),
+        Some(JobState::Active)
+    );
+    queue
+        .complete_job(
+            &claimed.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            ts(1_100),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        queue.get_job_state(&claimed.id).await.unwrap(),
+        Some(JobState::Completed)
+    );
+    assert_eq!(queue.get_job_state("missing").await.unwrap(), None);
+}
+
+#[tokio::test]
 async fn delayed_jobs_wait_until_due() {
     let queue = InMemoryJobQueue::new("reports");
     let now = ts(1_000);
@@ -2390,6 +2454,33 @@ async fn local_job_queue_persists_active_jobs_delayed_by_workers() {
     assert!(restored.worker_id.is_none());
     assert!(restored.lock_token.is_none());
     assert!(restored.lease_expires_at.is_none());
+}
+
+#[tokio::test]
+async fn local_job_queue_restores_job_state_queries() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("jobs").join("state.json");
+    let queue = LocalJobQueue::open("durable-state", &snapshot_path)
+        .await
+        .unwrap();
+    let delayed = queue
+        .add_at(
+            "task",
+            serde_json::json!({}),
+            JobOptions::new().with_delay(Duration::from_secs(5)),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    let reopened = LocalJobQueue::open("durable-state", &snapshot_path)
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.get_job_state(&delayed.id).await.unwrap(),
+        Some(JobState::Delayed)
+    );
+    assert_eq!(reopened.get_job_state("missing").await.unwrap(), None);
 }
 
 #[tokio::test]

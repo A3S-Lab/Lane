@@ -1506,6 +1506,149 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     assert!(missing_failed_index_waiting_score.is_none());
     trace_stage("manual-retry:done");
 
+    let state_query_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "state-query")
+        .expect("valid Redis URL should build the state-query queue");
+    let state_waiting = state_query_queue
+        .add_job(
+            "state-waiting".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("state waiting job should add");
+    let state_delayed = state_query_queue
+        .add_job(
+            "state-delayed".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_delay(Duration::from_secs(30)),
+        )
+        .await
+        .expect("state delayed job should add");
+    let state_flow = state_query_queue
+        .add_flow(
+            JobSpec::new("state-parent", serde_json::json!({})),
+            vec![JobSpec::new("state-child", serde_json::json!({}))],
+        )
+        .await
+        .expect("state flow should add");
+    assert_eq!(
+        state_query_queue
+            .get_job_state(&state_waiting.id)
+            .await
+            .expect("waiting state should load"),
+        Some(JobState::Waiting)
+    );
+    assert_eq!(
+        state_query_queue
+            .get_job_state(&state_delayed.id)
+            .await
+            .expect("delayed state should load"),
+        Some(JobState::Delayed)
+    );
+    assert_eq!(
+        state_query_queue
+            .get_job_state(&state_flow.parent.id)
+            .await
+            .expect("waiting-children state should load"),
+        Some(JobState::WaitingChildren)
+    );
+    let state_claim = state_query_queue
+        .claim_next(
+            "worker-state-query".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("state query claim should return")
+        .expect("state query job should be claimable");
+    assert_eq!(
+        state_query_queue
+            .get_job_state(&state_claim.id)
+            .await
+            .expect("active state should load"),
+        Some(JobState::Active)
+    );
+    state_query_queue
+        .complete_job(
+            &state_claim.id,
+            lock_token(&state_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("state query job should complete");
+    assert_eq!(
+        state_query_queue
+            .get_job_state(&state_claim.id)
+            .await
+            .expect("completed state should load"),
+        Some(JobState::Completed)
+    );
+    assert_eq!(
+        state_query_queue
+            .get_job_state("missing-state-job")
+            .await
+            .expect("missing state should load"),
+        None
+    );
+    let state_index_missing = state_query_queue
+        .add_job(
+            "state-index-missing".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("state index-missing job should add");
+    let state_index_conflict = state_query_queue
+        .add_job(
+            "state-index-conflict".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("state index-conflict job should add");
+    let mut state_query_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let removed_waiting_index: usize = state_query_conn
+        .zrem(
+            format!("{namespace}:state-query:waiting"),
+            &state_index_missing.id,
+        )
+        .await?;
+    assert_eq!(removed_waiting_index, 1);
+    assert_eq!(
+        state_query_queue
+            .get_job(&state_index_missing.id)
+            .await
+            .expect("state index-missing job should load")
+            .expect("state index-missing job should exist")
+            .state,
+        JobState::Waiting
+    );
+    assert_eq!(
+        state_query_queue
+            .get_job_state(&state_index_missing.id)
+            .await
+            .expect("missing index state should load"),
+        None
+    );
+    let _: usize = state_query_conn
+        .zadd(
+            format!("{namespace}:state-query:completed"),
+            &state_index_conflict.id,
+            0.0,
+        )
+        .await?;
+    assert_eq!(
+        state_query_queue
+            .get_job_state(&state_index_conflict.id)
+            .await
+            .expect("conflicting index state should load"),
+        Some(JobState::Completed)
+    );
+    trace_stage("state-query:done");
+
     producer.pause().await.expect("pause should succeed");
     let high = producer
         .add_job(

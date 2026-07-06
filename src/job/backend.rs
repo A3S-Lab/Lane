@@ -117,5 +117,7 @@ pub trait JobQueueBackend: Send + Sync {
 
     async fn get_job(&self, job_id: &str) -> Result<Option<Job>>;
 
+    async fn get_job_state(&self, job_id: &str) -> Result<Option<JobState>>;
+
     async fn stats(&self) -> Result<JobQueueStats>;
 }
