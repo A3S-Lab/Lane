@@ -120,6 +120,53 @@ async fn custom_job_ids_make_add_idempotent() {
 }
 
 #[tokio::test]
+async fn add_many_preserves_order_and_idempotent_custom_ids() {
+    let queue = InMemoryJobQueue::new("bulk");
+    let now = ts(1_000);
+    let jobs = queue
+        .add_many_at(
+            vec![
+                JobSpec::new("first", serde_json::json!({ "n": 1 }))
+                    .with_options(JobOptions::new().with_job_id("bulk:first")),
+                JobSpec::new("second", serde_json::json!({ "n": 2 }))
+                    .with_options(JobOptions::new().with_job_id("bulk:second")),
+                JobSpec::new("first-duplicate", serde_json::json!({ "n": 3 }))
+                    .with_options(JobOptions::new().with_job_id("bulk:first")),
+            ],
+            now,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(jobs.len(), 3);
+    assert_eq!(jobs[0].id, "bulk:first");
+    assert_eq!(jobs[1].id, "bulk:second");
+    assert_eq!(jobs[2], jobs[0]);
+    assert_eq!(jobs[2].name, "first");
+    assert_eq!(queue.stats().await.unwrap().waiting, 2);
+}
+
+#[tokio::test]
+async fn add_many_rejects_invalid_jobs_without_partial_insert() {
+    let queue = InMemoryJobQueue::new("bulk-invalid");
+    let error = queue
+        .add_many_at(
+            vec![
+                JobSpec::new("valid", serde_json::json!({}))
+                    .with_options(JobOptions::new().with_job_id("bulk:valid")),
+                JobSpec::new("invalid", serde_json::json!({}))
+                    .with_options(JobOptions::new().with_job_id("  ")),
+            ],
+            ts(1_000),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, LaneError::ConfigError(_)));
+    assert_eq!(queue.stats().await.unwrap().total, 0);
+}
+
+#[tokio::test]
 async fn repeatable_jobs_schedule_next_occurrence_after_completion() {
     let queue = InMemoryJobQueue::new("repeat");
     let now = ts(1_000);
@@ -811,6 +858,35 @@ async fn local_job_queue_persists_flow_relationships() {
     assert_eq!(parent.state, JobState::WaitingChildren);
     assert_eq!(parent.child_ids, vec![child.id.clone()]);
     assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
+}
+
+#[tokio::test]
+async fn local_job_queue_persists_bulk_jobs() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("jobs").join("bulk.json");
+    let queue = LocalJobQueue::open("durable-bulk", &snapshot_path)
+        .await
+        .unwrap();
+    let jobs = queue
+        .add_many_at(
+            vec![
+                JobSpec::new("first", serde_json::json!({}))
+                    .with_options(JobOptions::new().with_job_id("bulk:first")),
+                JobSpec::new("second", serde_json::json!({}))
+                    .with_options(JobOptions::new().with_job_id("bulk:second")),
+            ],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    assert_eq!(jobs.len(), 2);
+
+    let reopened = LocalJobQueue::open("durable-bulk", &snapshot_path)
+        .await
+        .unwrap();
+    assert!(reopened.get_job("bulk:first").await.unwrap().is_some());
+    assert!(reopened.get_job("bulk:second").await.unwrap().is_some());
+    assert_eq!(reopened.stats().await.unwrap().waiting, 2);
 }
 
 #[tokio::test]

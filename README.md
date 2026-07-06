@@ -369,7 +369,7 @@ A3S stack and language SDKs.
 | Phase | Status | Scope |
 | --- | --- | --- |
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
-| Generic job runtime | In progress | JSON jobs, idempotent custom job IDs, explicit job states, priority ordering, delayed jobs, worker leases, completion/failure snapshots, retry backoff, stalled-job recovery, pause/resume. |
+| Generic job runtime | In progress | JSON jobs, bulk submission, idempotent custom job IDs, explicit job states, priority ordering, delayed jobs, worker leases, completion/failure snapshots, retry backoff, stalled-job recovery, pause/resume. |
 | Job management API | In progress | Add/get/remove/promote/retry/pause/resume/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, timeouts, and stalled recovery loops. |
 | Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` for multi-process distributed claims. Postgres/NATS backends remain planned. |
@@ -400,6 +400,17 @@ let job = queue
     )
     .await?;
 
+let bulk = queue
+    .add_jobs(
+        vec![
+            a3s_lane::JobSpec::new("index", serde_json::json!({ "id": 1 })),
+            a3s_lane::JobSpec::new("index", serde_json::json!({ "id": 2 })),
+        ],
+        chrono::Utc::now(),
+    )
+    .await?;
+assert_eq!(bulk.len(), 2);
+
 queue.promote_due_jobs(chrono::Utc::now()).await?;
 let claimed = queue
     .claim_next("worker-1".to_string(), Duration::from_secs(30), chrono::Utc::now())
@@ -421,9 +432,10 @@ if claimed.is_some() {
 ```
 
 Management APIs are part of the backend contract: `list_jobs()` returns
-paginated `JobListPage` values, `promote_job()` moves delayed jobs to waiting,
-`retry_job()` manually requeues failed jobs, `renew_lease()` extends an active
-worker lease, and `clean_jobs()` removes old records by state.
+paginated `JobListPage` values, `add_jobs()` submits a batch with the same
+idempotency semantics as `add_job()`, `promote_job()` moves delayed jobs to
+waiting, `retry_job()` manually requeues failed jobs, `renew_lease()` extends
+an active worker lease, and `clean_jobs()` removes old records by state.
 Set `JobOptions::with_job_id()` when producers need idempotent submission:
 adding the same job id again returns the existing job instead of enqueueing a
 duplicate.

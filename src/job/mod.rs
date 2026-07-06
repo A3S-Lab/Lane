@@ -2,7 +2,7 @@
 //!
 //! The existing lane scheduler executes in-process [`Command`](crate::Command)
 //! values. This module is the durable job-queue foundation: jobs are plain JSON
-//! payloads with explicit lifecycle state, priority ordering, delayed
+//! payloads with bulk submission, explicit lifecycle state, priority ordering, delayed
 //! scheduling, worker leases, retries, stalled-job recovery, management APIs,
 //! and local durable snapshot persistence.
 

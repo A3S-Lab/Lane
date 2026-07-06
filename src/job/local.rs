@@ -83,6 +83,20 @@ impl LocalJobQueue {
         Ok(job)
     }
 
+    /// Add multiple jobs using the current wall-clock time.
+    pub async fn add_many(&self, jobs: Vec<JobSpec>) -> Result<Vec<Job>> {
+        let jobs = self.inner.add_many(jobs).await?;
+        self.persist().await?;
+        Ok(jobs)
+    }
+
+    /// Add multiple jobs at an explicit timestamp.
+    pub async fn add_many_at(&self, jobs: Vec<JobSpec>, now: DateTime<Utc>) -> Result<Vec<Job>> {
+        let jobs = self.inner.add_many_at(jobs, now).await?;
+        self.persist().await?;
+        Ok(jobs)
+    }
+
     /// Add a parent-child flow using the current wall-clock time.
     pub async fn add_flow(&self, parent: JobSpec, children: Vec<JobSpec>) -> Result<JobFlow> {
         let flow = self.inner.add_flow(parent, children).await?;
@@ -115,6 +129,10 @@ impl LocalJobQueue {
 impl JobQueueBackend for LocalJobQueue {
     async fn add_job(&self, name: String, payload: Value, options: JobOptions) -> Result<Job> {
         self.add(name, payload, options).await
+    }
+
+    async fn add_jobs(&self, jobs: Vec<JobSpec>, now: DateTime<Utc>) -> Result<Vec<Job>> {
+        self.add_many_at(jobs, now).await
     }
 
     async fn add_flow(

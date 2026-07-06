@@ -99,6 +99,49 @@ impl InMemoryJobQueue {
         Ok(job)
     }
 
+    /// Add multiple jobs using the current wall-clock time.
+    pub async fn add_many(&self, jobs: Vec<JobSpec>) -> Result<Vec<Job>> {
+        self.add_many_at(jobs, Utc::now()).await
+    }
+
+    /// Add multiple jobs at an explicit timestamp.
+    pub async fn add_many_at(&self, jobs: Vec<JobSpec>, now: DateTime<Utc>) -> Result<Vec<Job>> {
+        for spec in &jobs {
+            validate_job_options(&spec.options)?;
+        }
+        let created = jobs
+            .into_iter()
+            .map(|spec| {
+                Job::new(
+                    self.queue.clone(),
+                    spec.name,
+                    spec.payload,
+                    spec.options,
+                    now,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut inner = self.inner.lock().await;
+        let mut staged: HashMap<JobId, Job> = HashMap::new();
+        let mut added = Vec::with_capacity(created.len());
+        for job in created {
+            if let Some(existing) = inner.jobs.get(&job.id) {
+                added.push(existing.clone());
+                continue;
+            }
+            if let Some(existing) = staged.get(&job.id) {
+                added.push(existing.clone());
+                continue;
+            }
+            staged.insert(job.id.clone(), job.clone());
+            added.push(job);
+        }
+
+        inner.jobs.extend(staged);
+        Ok(added)
+    }
+
     /// Add a parent-child flow. The parent remains blocked until every child is
     /// completed; a terminal child failure fails the parent.
     pub async fn add_flow(&self, parent: JobSpec, children: Vec<JobSpec>) -> Result<JobFlow> {
@@ -418,6 +461,10 @@ impl InMemoryJobQueue {
 impl JobQueueBackend for InMemoryJobQueue {
     async fn add_job(&self, name: String, payload: Value, options: JobOptions) -> Result<Job> {
         self.add(name, payload, options).await
+    }
+
+    async fn add_jobs(&self, jobs: Vec<JobSpec>, now: DateTime<Utc>) -> Result<Vec<Job>> {
+        self.add_many_at(jobs, now).await
     }
 
     async fn add_flow(

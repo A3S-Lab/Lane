@@ -13,6 +13,9 @@ use std::time::Duration;
 pub trait JobQueueBackend: Send + Sync {
     async fn add_job(&self, name: String, payload: Value, options: JobOptions) -> Result<Job>;
 
+    /// Add multiple jobs, preserving input order and `add_job` idempotency semantics.
+    async fn add_jobs(&self, jobs: Vec<JobSpec>, now: DateTime<Utc>) -> Result<Vec<Job>>;
+
     async fn add_flow(
         &self,
         parent: JobSpec,

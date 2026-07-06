@@ -90,6 +90,48 @@ impl RedisJobQueue {
         self.add_flow_at(parent, children, Utc::now()).await
     }
 
+    /// Add multiple jobs using the current wall-clock time.
+    pub async fn add_many(&self, jobs: Vec<JobSpec>) -> Result<Vec<Job>> {
+        self.add_many_at(jobs, Utc::now()).await
+    }
+
+    /// Add multiple jobs at an explicit timestamp.
+    pub async fn add_many_at(&self, jobs: Vec<JobSpec>, now: DateTime<Utc>) -> Result<Vec<Job>> {
+        for spec in &jobs {
+            validate_job_options(&spec.options)?;
+        }
+        let created = jobs
+            .into_iter()
+            .map(|spec| {
+                Job::new(
+                    self.queue.clone(),
+                    spec.name,
+                    spec.payload,
+                    spec.options,
+                    now,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut conn = self.connection().await?;
+        let mut added = Vec::with_capacity(created.len());
+        for job in created {
+            if self.store_new_job(&mut conn, &job).await? {
+                self.index_new_job(&mut conn, &job).await?;
+                added.push(job);
+                continue;
+            }
+
+            let existing = self
+                .load_job(&mut conn, &job.id)
+                .await?
+                .ok_or_else(|| LaneError::JobNotFound(job.id.clone()))?;
+            added.push(existing);
+        }
+
+        Ok(added)
+    }
+
     /// Add a parent-child flow at an explicit timestamp.
     pub async fn add_flow_at(
         &self,
@@ -431,6 +473,10 @@ impl JobQueueBackend for RedisJobQueue {
         self.load_job(&mut conn, &job.id)
             .await?
             .ok_or_else(|| LaneError::JobNotFound(job.id.clone()))
+    }
+
+    async fn add_jobs(&self, jobs: Vec<JobSpec>, now: DateTime<Utc>) -> Result<Vec<Job>> {
+        self.add_many_at(jobs, now).await
     }
 
     async fn add_flow(

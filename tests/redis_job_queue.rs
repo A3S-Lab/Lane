@@ -422,6 +422,37 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         1
     );
 
+    let bulk_first_id = format!("{namespace}:bulk:first");
+    let bulk_second_id = format!("{namespace}:bulk:second");
+    let bulk_jobs = producer
+        .add_jobs(
+            vec![
+                JobSpec::new("bulk-first", serde_json::json!({ "n": 1 }))
+                    .with_options(JobOptions::new().with_job_id(bulk_first_id.clone())),
+                JobSpec::new("bulk-second", serde_json::json!({ "n": 2 }))
+                    .with_options(JobOptions::new().with_job_id(bulk_second_id.clone())),
+                JobSpec::new("bulk-first-duplicate", serde_json::json!({ "n": 3 }))
+                    .with_options(JobOptions::new().with_job_id(bulk_first_id.clone())),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("bulk jobs should be added");
+    assert_eq!(bulk_jobs.len(), 3);
+    assert_eq!(bulk_jobs[2], bulk_jobs[0]);
+    let waiting_after_bulk = producer
+        .list_jobs(JobListOptions::new().with_state(JobState::Waiting))
+        .await
+        .expect("waiting jobs should list after bulk add");
+    assert_eq!(
+        waiting_after_bulk
+            .jobs
+            .iter()
+            .filter(|job| job.id == bulk_first_id || job.id == bulk_second_id)
+            .count(),
+        2
+    );
+
     cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())
 }
