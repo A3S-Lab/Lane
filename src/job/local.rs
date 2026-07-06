@@ -244,6 +244,17 @@ impl JobQueueBackend for LocalJobQueue {
         Ok(job)
     }
 
+    async fn reschedule_job(
+        &self,
+        job_id: &str,
+        delay: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Job> {
+        let job = self.inner.reschedule_job(job_id, delay, now).await?;
+        self.persist().await?;
+        Ok(job)
+    }
+
     async fn retry_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {
         let job = self.inner.retry_job(job_id, now).await?;
         self.persist().await?;

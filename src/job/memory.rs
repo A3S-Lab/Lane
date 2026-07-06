@@ -454,6 +454,36 @@ impl InMemoryJobQueue {
         Ok(job.clone())
     }
 
+    /// Reschedule a delayed job relative to `now`.
+    pub async fn reschedule(
+        &self,
+        job_id: &str,
+        delay: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Job> {
+        if delay.is_zero() {
+            return Err(LaneError::ConfigError(
+                "job delay must be greater than zero".to_string(),
+            ));
+        }
+
+        let mut inner = self.inner.lock().await;
+        let job = inner
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
+        if job.state != JobState::Delayed {
+            return Err(LaneError::JobStateConflict(format!(
+                "cannot reschedule job {} from state {:?}",
+                job.id, job.state
+            )));
+        }
+
+        job.options.delay = Some(delay);
+        job.scheduled_at = add_duration(now, delay);
+        Ok(job.clone())
+    }
+
     /// Manually retry a failed job by moving it back to the waiting state.
     pub async fn retry(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {
         let mut inner = self.inner.lock().await;
@@ -1015,6 +1045,15 @@ impl JobQueueBackend for InMemoryJobQueue {
 
     async fn promote_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {
         self.promote(job_id, now).await
+    }
+
+    async fn reschedule_job(
+        &self,
+        job_id: &str,
+        delay: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Job> {
+        self.reschedule(job_id, delay, now).await
     }
 
     async fn retry_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {

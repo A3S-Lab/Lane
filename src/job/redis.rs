@@ -1725,6 +1725,37 @@ redis.call('HSET', KEYS[1], ARGV[1], updated)
 return {'ok', updated}
 "#;
 
+const RESCHEDULE_JOB_SCRIPT: &str = r#"
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not raw then
+  redis.call('ZREM', KEYS[2], ARGV[1])
+  return {'missing'}
+end
+
+local job = cjson.decode(raw)
+if job["state"] ~= "delayed" then
+  redis.call('ZREM', KEYS[2], ARGV[1])
+  return {'state', job["state"] or 'unknown'}
+end
+
+local removed_from_delayed = redis.call('ZREM', KEYS[2], ARGV[1])
+if removed_from_delayed == 0 then
+  return {'state', 'delayed_index_missing'}
+end
+
+job["scheduled_at"] = ARGV[2]
+if not job["options"] or job["options"] == cjson.null then
+  job["options"] = {}
+end
+job["options"]["delay"] = cjson.decode(ARGV[4])
+
+local updated = cjson.encode(job)
+redis.call('ZADD', KEYS[2], ARGV[3], ARGV[1])
+redis.call('HSET', KEYS[1], ARGV[1], updated)
+
+return {'ok', updated}
+"#;
+
 const RETRY_JOB_SCRIPT: &str = r#"
 local function deduplication_id(job)
   if not job["options"] or job["options"] == cjson.null then
@@ -3528,6 +3559,37 @@ impl JobQueueBackend for RedisJobQueue {
             .await
             .map_err(redis_error)?;
         decode_transition_result(&result, job_id, "promote")
+    }
+
+    async fn reschedule_job(
+        &self,
+        job_id: &str,
+        delay: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Job> {
+        if delay.is_zero() {
+            return Err(LaneError::ConfigError(
+                "job delay must be greater than zero".to_string(),
+            ));
+        }
+
+        let scheduled_at = add_duration(now, delay);
+        let delay = serde_json::to_string(&delay)
+            .map_err(|error| LaneError::Other(format!("failed to encode job delay: {error}")))?;
+        let mut conn = self.connection().await?;
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(RESCHEDULE_JOB_SCRIPT)
+            .arg(2)
+            .arg(self.jobs_key())
+            .arg(self.state_key(JobState::Delayed))
+            .arg(job_id)
+            .arg(scheduled_at.to_rfc3339())
+            .arg(millis(scheduled_at))
+            .arg(delay)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_transition_result(&result, job_id, "reschedule")
     }
 
     async fn retry_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {

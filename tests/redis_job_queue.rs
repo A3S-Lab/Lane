@@ -1638,11 +1638,21 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             serde_json::json!({}),
             JobOptions::new()
                 .with_priority(1)
-                .with_delay(Duration::from_millis(200)),
+                .with_delay(Duration::from_secs(1)),
         )
         .await
         .expect("delayed job should be added");
     assert_eq!(delayed.state, JobState::Delayed);
+    let rescheduled_delayed = producer
+        .reschedule_job(&delayed.id, Duration::from_millis(200), Utc::now())
+        .await
+        .expect("delayed job should reschedule");
+    assert_eq!(rescheduled_delayed.id, delayed.id);
+    assert_eq!(rescheduled_delayed.state, JobState::Delayed);
+    assert_eq!(
+        rescheduled_delayed.options.delay,
+        Some(Duration::from_millis(200))
+    );
     assert!(worker
         .claim_next("worker-d".to_string(), Duration::from_secs(30), Utc::now())
         .await
@@ -1685,6 +1695,27 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         JobState::Active
     );
 
+    let stale_reschedule = producer
+        .add_job(
+            "stale-reschedule".to_string(),
+            serde_json::json!({ "kind": "stale-delayed-index" }),
+            JobOptions::new().with_delay(Duration::from_secs(30)),
+        )
+        .await
+        .expect("stale reschedule job should be added");
+    let stale_removed_from_delayed: usize = remove_index_conn
+        .zrem(format!("{namespace}:jobs:delayed"), &stale_reschedule.id)
+        .await?;
+    assert_eq!(stale_removed_from_delayed, 1);
+    let stale_reschedule_error = producer
+        .reschedule_job(&stale_reschedule.id, Duration::from_millis(200), Utc::now())
+        .await
+        .expect_err("missing delayed zset membership should reject reschedule");
+    assert!(matches!(
+        stale_reschedule_error,
+        LaneError::JobStateConflict(_)
+    ));
+
     let removable = producer
         .add_job(
             "removable".to_string(),
@@ -1693,6 +1724,14 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("removable job should be added");
+    let waiting_reschedule_error = producer
+        .reschedule_job(&removable.id, Duration::from_millis(10), Utc::now())
+        .await
+        .expect_err("waiting jobs should reject reschedule");
+    assert!(matches!(
+        waiting_reschedule_error,
+        LaneError::JobStateConflict(_)
+    ));
     let removed = producer
         .remove_job(&removable.id)
         .await

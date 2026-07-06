@@ -58,6 +58,13 @@ pub trait JobQueueBackend: Send + Sync {
 
     async fn promote_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job>;
 
+    async fn reschedule_job(
+        &self,
+        job_id: &str,
+        delay: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Job>;
+
     async fn retry_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job>;
 
     async fn update_priority(&self, job_id: &str, priority: JobPriority) -> Result<Job>;

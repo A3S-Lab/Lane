@@ -89,6 +89,57 @@ async fn delayed_jobs_wait_until_due() {
 }
 
 #[tokio::test]
+async fn reschedule_delayed_job_changes_due_time() {
+    let queue = InMemoryJobQueue::new("reschedule");
+    let now = ts(1_000);
+    let job = queue
+        .add_at(
+            "generate",
+            serde_json::json!({}),
+            JobOptions::new().with_delay(Duration::from_secs(10)),
+            now,
+        )
+        .await
+        .unwrap();
+
+    let rescheduled = queue
+        .reschedule_job(&job.id, Duration::from_secs(2), now)
+        .await
+        .unwrap();
+    assert_eq!(rescheduled.state, JobState::Delayed);
+    assert_eq!(rescheduled.scheduled_at, ts(3_000));
+    assert_eq!(rescheduled.options.delay, Some(Duration::from_secs(2)));
+
+    assert_eq!(queue.promote_due_jobs(ts(2_999)).await.unwrap(), 0);
+    assert!(queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(2_999))
+        .await
+        .unwrap()
+        .is_none());
+
+    assert_eq!(queue.promote_due_jobs(ts(3_000)).await.unwrap(), 1);
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(3_000))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, job.id);
+
+    let waiting = queue
+        .add_at("waiting", serde_json::json!({}), JobOptions::new(), now)
+        .await
+        .unwrap();
+    let state_error = queue
+        .reschedule_job(&waiting.id, Duration::from_secs(1), now)
+        .await
+        .unwrap_err();
+    assert!(matches!(state_error, LaneError::JobStateConflict(_)));
+
+    let zero_delay_error = queue.reschedule_job(&waiting.id, Duration::ZERO, now).await;
+    assert!(matches!(zero_delay_error, Err(LaneError::ConfigError(_))));
+}
+
+#[tokio::test]
 async fn custom_job_ids_make_add_idempotent() {
     let queue = InMemoryJobQueue::new("idempotent");
     let now = ts(1_000);
@@ -2196,6 +2247,37 @@ async fn local_job_queue_persists_priority_updates() {
     let restored = reopened.get_job(&job.id).await.unwrap().unwrap();
     assert_eq!(restored.priority, 5);
     assert_eq!(restored.options.priority, 5);
+}
+
+#[tokio::test]
+async fn local_job_queue_persists_rescheduled_delayed_jobs() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("jobs").join("reschedule.json");
+    let queue = LocalJobQueue::open("durable-reschedule", &snapshot_path)
+        .await
+        .unwrap();
+    let job = queue
+        .add_at(
+            "task",
+            serde_json::json!({}),
+            JobOptions::new().with_delay(Duration::from_secs(10)),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    queue
+        .reschedule_job(&job.id, Duration::from_secs(2), ts(1_000))
+        .await
+        .unwrap();
+
+    let reopened = LocalJobQueue::open("durable-reschedule", &snapshot_path)
+        .await
+        .unwrap();
+    let restored = reopened.get_job(&job.id).await.unwrap().unwrap();
+    assert_eq!(restored.state, JobState::Delayed);
+    assert_eq!(restored.scheduled_at, ts(3_000));
+    assert_eq!(restored.options.delay, Some(Duration::from_secs(2)));
 }
 
 #[tokio::test]
