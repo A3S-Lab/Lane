@@ -800,6 +800,25 @@ impl InMemoryJobQueue {
 
     /// Update a non-terminal job priority.
     pub async fn set_priority(&self, job_id: &str, priority: JobPriority) -> Result<Job> {
+        self.set_priority_order(job_id, priority, None).await
+    }
+
+    /// Update a non-terminal job priority and waiting reinsert order.
+    pub async fn set_priority_with_lifo(
+        &self,
+        job_id: &str,
+        priority: JobPriority,
+        lifo: bool,
+    ) -> Result<Job> {
+        self.set_priority_order(job_id, priority, Some(lifo)).await
+    }
+
+    async fn set_priority_order(
+        &self,
+        job_id: &str,
+        priority: JobPriority,
+        lifo: Option<bool>,
+    ) -> Result<Job> {
         let mut inner = self.inner.lock().await;
         let should_requeue = {
             let job = inner
@@ -823,6 +842,9 @@ impl InMemoryJobQueue {
         job.options.priority = priority;
         if let Some(enqueued_seq) = enqueued_seq {
             job.enqueued_seq = enqueued_seq;
+        }
+        if let Some(lifo) = lifo {
+            job.options.lifo = lifo;
         }
         Ok(job.clone())
     }
@@ -1442,6 +1464,15 @@ impl JobQueueBackend for InMemoryJobQueue {
 
     async fn update_priority(&self, job_id: &str, priority: JobPriority) -> Result<Job> {
         self.set_priority(job_id, priority).await
+    }
+
+    async fn update_priority_with_lifo(
+        &self,
+        job_id: &str,
+        priority: JobPriority,
+        lifo: bool,
+    ) -> Result<Job> {
+        self.set_priority_with_lifo(job_id, priority, lifo).await
     }
 
     async fn remove_job(&self, job_id: &str) -> Result<Option<Job>> {

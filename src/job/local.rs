@@ -388,6 +388,20 @@ impl JobQueueBackend for LocalJobQueue {
         Ok(job)
     }
 
+    async fn update_priority_with_lifo(
+        &self,
+        job_id: &str,
+        priority: JobPriority,
+        lifo: bool,
+    ) -> Result<Job> {
+        let job = self
+            .inner
+            .update_priority_with_lifo(job_id, priority, lifo)
+            .await?;
+        self.persist().await?;
+        Ok(job)
+    }
+
     async fn remove_job(&self, job_id: &str) -> Result<Option<Job>> {
         let job = self.inner.remove_job(job_id).await?;
         self.persist().await?;

@@ -188,6 +188,59 @@ async fn run_lifo_waiting_order(redis_url: String) -> redis::RedisResult<()> {
         assert_eq!(claimed.id, expected.id);
     }
 
+    let update_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "lifo-update")
+        .expect("valid Redis URL should build the lifo update queue");
+    let update_fifo = update_queue
+        .add_job(
+            "fifo".to_string(),
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_job_id("update-fifo")
+                .with_priority(5),
+        )
+        .await
+        .expect("fifo update job should be added");
+    let update_changed = update_queue
+        .add_job(
+            "changed".to_string(),
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_job_id("update-changed")
+                .with_priority(10),
+        )
+        .await
+        .expect("changed update job should be added");
+    let updated = update_queue
+        .update_priority_with_lifo(&update_changed.id, 5, true)
+        .await
+        .expect("priority update with lifo should succeed");
+    assert_eq!(updated.priority, 5);
+    assert!(updated.options.lifo);
+    assert!(update_fifo.enqueued_seq < updated.enqueued_seq);
+
+    let update_waiting_key = format!("{namespace}:lifo-update:waiting");
+    let update_waiting_ids: Vec<String> = redis::cmd("ZRANGE")
+        .arg(&update_waiting_key)
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut conn)
+        .await?;
+    assert_eq!(
+        update_waiting_ids,
+        vec![update_changed.id.clone(), update_fifo.id.clone()]
+    );
+
+    let update_claim = update_queue
+        .claim_next(
+            "worker-lifo-update".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("lifo update claim should return")
+        .expect("lifo-updated job should be claimable");
+    assert_eq!(update_claim.id, update_changed.id);
+
     cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())
 }

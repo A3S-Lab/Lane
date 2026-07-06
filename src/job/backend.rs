@@ -111,6 +111,20 @@ pub trait JobQueueBackend: Send + Sync {
 
     async fn update_priority(&self, job_id: &str, priority: JobPriority) -> Result<Job>;
 
+    /// Update priority and choose how the job is reinserted within the same-priority group.
+    ///
+    /// This mirrors BullMQ's `changePriority({ priority, lifo })` shape: waiting
+    /// jobs get a fresh waiting index position, and `lifo = true` puts the job in
+    /// the LIFO side of that priority range.
+    async fn update_priority_with_lifo(
+        &self,
+        job_id: &str,
+        priority: JobPriority,
+        _lifo: bool,
+    ) -> Result<Job> {
+        self.update_priority(job_id, priority).await
+    }
+
     async fn remove_job(&self, job_id: &str) -> Result<Option<Job>>;
 
     async fn remove_repeat(&self, repeat_key: &str) -> Result<Option<Job>>;

@@ -2399,6 +2399,11 @@ if not job["options"] or job["options"] == cjson.null then
   job["options"] = {}
 end
 job["options"]["priority"] = priority
+if ARGV[4] == '1' then
+  job["options"]["lifo"] = true
+elseif ARGV[4] == '0' then
+  job["options"]["lifo"] = false
+end
 
 if job["state"] == "waiting" then
   enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[3], job, ARGV[1], priority, ARGV[3])
@@ -4740,6 +4745,33 @@ impl RedisJobQueue {
         Ok(())
     }
 
+    async fn update_priority_order(
+        &self,
+        job_id: &str,
+        priority: JobPriority,
+        lifo: Option<bool>,
+    ) -> Result<Job> {
+        let mut conn = self.connection().await?;
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(UPDATE_PRIORITY_SCRIPT)
+            .arg(3)
+            .arg(self.jobs_key())
+            .arg(self.state_key(JobState::Waiting))
+            .arg(self.sequence_key())
+            .arg(job_id)
+            .arg(priority)
+            .arg(WAITING_SCORE_BUCKET)
+            .arg(match lifo {
+                Some(true) => "1",
+                Some(false) => "0",
+                None => "",
+            })
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_priority_update_result(&result, job_id)
+    }
+
     async fn fail_job_with_retry_control(
         &self,
         job_id: &str,
@@ -5153,20 +5185,17 @@ impl JobQueueBackend for RedisJobQueue {
     }
 
     async fn update_priority(&self, job_id: &str, priority: JobPriority) -> Result<Job> {
-        let mut conn = self.connection().await?;
-        let result: Vec<String> = redis::cmd("EVAL")
-            .arg(UPDATE_PRIORITY_SCRIPT)
-            .arg(3)
-            .arg(self.jobs_key())
-            .arg(self.state_key(JobState::Waiting))
-            .arg(self.sequence_key())
-            .arg(job_id)
-            .arg(priority)
-            .arg(WAITING_SCORE_BUCKET)
-            .query_async(&mut conn)
+        self.update_priority_order(job_id, priority, None).await
+    }
+
+    async fn update_priority_with_lifo(
+        &self,
+        job_id: &str,
+        priority: JobPriority,
+        lifo: bool,
+    ) -> Result<Job> {
+        self.update_priority_order(job_id, priority, Some(lifo))
             .await
-            .map_err(redis_error)?;
-        decode_priority_update_result(&result, job_id)
     }
 
     async fn remove_job(&self, job_id: &str) -> Result<Option<Job>> {

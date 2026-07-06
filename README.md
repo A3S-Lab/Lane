@@ -370,7 +370,7 @@ A3S stack and language SDKs.
 | --- | --- | --- |
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
 | Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, debounce TTL extension, delayed-owner replace, and keep-last-if-active requeue, repeat-key ownership, explicit job states, priority plus FIFO/LIFO same-priority ordering, delayed jobs, token-owned worker leases, active-to-wait/delayed movement, completion/failure snapshots, retry backoff, Redis-shared rate-limit and active-concurrency controls, stalled-job recovery, pause/resume. |
-| Job management API | In progress | Add/get/get-state/get-job-counts/get-job-count/count-pending/remove/remove-repeat/remove-deduplication-key/get-deduplication-job-id/list-repeats/get-flow-dependencies/get-flow-dependency-counts/remove-unprocessed-children/remove-child-dependency/promote/reschedule/delay-active/release-active/retry/update-priority/update-data/pause/resume/is-paused/drain/clean/obliterate APIs, multi-state pagination, ascending/descending listing, waiting priority counts, add-log/get-logs/clear-job-logs, progress updates, lease renewal. |
+| Job management API | In progress | Add/get/get-state/get-job-counts/get-job-count/count-pending/remove/remove-repeat/remove-deduplication-key/get-deduplication-job-id/list-repeats/get-flow-dependencies/get-flow-dependency-counts/remove-unprocessed-children/remove-child-dependency/promote/reschedule/delay-active/release-active/retry/update-priority/update-priority-with-lifo/update-data/pause/resume/is-paused/drain/clean/obliterate APIs, multi-state pagination, ascending/descending listing, waiting priority counts, add-log/get-logs/clear-job-logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, and stalled recovery loops. |
 | Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, FIFO/LIFO waiting score ordering, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership/listing/removal, flow submission, flow dependency inspection, delayed promotion and rescheduling, active-to-wait/delayed movement, single-job promote, state-index queries, job count snapshots, manual retry, priority update, progress update, log append, list/stat snapshots, drain, clean, obliterate, claim, Redis-shared rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, dependency inspection, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
@@ -464,8 +464,9 @@ delayed, `release_active_job()` moves a token-owned active job back to waiting,
 `get_job_state()` returns the current lifecycle state for a job id, `retry_job()`
 manually requeues failed jobs, `fail_job_discarding_retry()` fails an active
 token-owned job without applying remaining automatic retries, `update_priority()`
-changes non-terminal job priority, `renew_lease()` extends an active worker
-lease with the claim token,
+changes non-terminal job priority, `update_priority_with_lifo()` also chooses
+the same-priority waiting reinsert side, `renew_lease()` extends an active
+worker lease with the claim token,
 `remove_job()` removes non-active jobs,
 `remove_repeat()` removes the current non-active owner for a repeat key,
 `remove_deduplication_key()` clears the active owner for a deduplication id,
@@ -1084,11 +1085,13 @@ deduplication/repeat ownership, and updates flow parents atomically.
 rewrites the job hash and, for waiting jobs, replaces the waiting zset score in
 the same script; for jobs that are no longer waiting, it prunes stale waiting
 members while preserving the stored non-terminal state. For waiting jobs, the
-script also refreshes `enqueued_seq` and recomputes the FIFO/LIFO score,
-matching BullMQ's `changePriority` principle that priority changes are index
-rewrites, not just hash-field edits. This is intentionally aligned with BullMQ's
-mechanism of moving job state through Redis scripts instead of coordinating
-several client-side Redis commands.
+script also refreshes `enqueued_seq` and recomputes the FIFO/LIFO score.
+`update_priority_with_lifo()` exposes BullMQ's
+`changePriority({ priority, lifo })` shape directly: the optional LIFO flag is
+stored on `job.options.lifo` before the waiting score is recomputed, so the
+Redis index changes together with the serialized job snapshot. This is
+intentionally aligned with BullMQ's mechanism of moving job state through Redis
+scripts instead of coordinating several client-side Redis commands.
 
 Redis job management mutations are script-backed too. `update_data()` follows
 BullMQ's `updateData` existence check and write shape, adapted to Lane's Redis

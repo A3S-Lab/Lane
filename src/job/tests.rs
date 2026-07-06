@@ -1362,6 +1362,45 @@ async fn priority_updates_reorder_waiting_jobs() {
 }
 
 #[tokio::test]
+async fn priority_updates_can_reinsert_waiting_jobs_as_lifo() {
+    let queue = InMemoryJobQueue::new("priority-update-lifo");
+    let now = ts(1_000);
+    let fifo = queue
+        .add_at(
+            "fifo",
+            serde_json::json!({}),
+            JobOptions::new().with_priority(5),
+            now,
+        )
+        .await
+        .unwrap();
+    let changed = queue
+        .add_at(
+            "changed",
+            serde_json::json!({}),
+            JobOptions::new().with_priority(10),
+            now,
+        )
+        .await
+        .unwrap();
+
+    let updated = queue
+        .update_priority_with_lifo(&changed.id, 5, true)
+        .await
+        .unwrap();
+    assert_eq!(updated.priority, 5);
+    assert!(updated.options.lifo);
+    assert!(fifo.enqueued_seq < updated.enqueued_seq);
+
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, changed.id);
+}
+
+#[tokio::test]
 async fn priority_counts_only_include_waiting_jobs() {
     let queue = InMemoryJobQueue::new("priority-counts");
     let now = ts(1_000);
@@ -3576,6 +3615,53 @@ async fn local_job_queue_persists_priority_updates() {
     let restored = reopened.get_job(&job.id).await.unwrap().unwrap();
     assert_eq!(restored.priority, 5);
     assert_eq!(restored.options.priority, 5);
+}
+
+#[tokio::test]
+async fn local_job_queue_persists_lifo_priority_updates() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("jobs").join("priority-lifo.json");
+    let queue = LocalJobQueue::open("durable-priority-lifo", &snapshot_path)
+        .await
+        .unwrap();
+    let fifo = queue
+        .add_at(
+            "fifo",
+            serde_json::json!({}),
+            JobOptions::new().with_priority(5),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    let changed = queue
+        .add_at(
+            "changed",
+            serde_json::json!({}),
+            JobOptions::new().with_priority(10),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    queue
+        .update_priority_with_lifo(&changed.id, 5, true)
+        .await
+        .unwrap();
+
+    let reopened = LocalJobQueue::open("durable-priority-lifo", &snapshot_path)
+        .await
+        .unwrap();
+    let restored = reopened.get_job(&changed.id).await.unwrap().unwrap();
+    assert_eq!(restored.priority, 5);
+    assert!(restored.options.lifo);
+
+    let claimed = reopened
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(1_000))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, changed.id);
+    assert_ne!(claimed.id, fifo.id);
 }
 
 #[tokio::test]
