@@ -4233,6 +4233,46 @@ async fn worker_context_can_discard_configured_retry() {
 }
 
 #[tokio::test]
+async fn worker_unrecoverable_error_discards_configured_retry() {
+    let backend: Arc<dyn JobQueueBackend> = Arc::new(InMemoryJobQueue::new("worker-unrecoverable"));
+    let job = backend
+        .add_job(
+            "fail-terminal".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_retry_policy(RetryPolicy::fixed(2, Duration::from_secs(30))),
+        )
+        .await
+        .unwrap();
+
+    let processor = Arc::new(job_processor_fn(|_, _| async {
+        Err::<Value, LaneError>(LaneError::unrecoverable_job(
+            "schema is permanently invalid",
+        ))
+    }));
+    let worker = JobWorker::new(
+        Arc::clone(&backend),
+        processor,
+        JobWorkerConfig::new("worker-a").with_lease_renew_interval(Duration::ZERO),
+    );
+
+    let outcome = worker.run_once(ts(1_000)).await.unwrap();
+    let failed = match outcome {
+        JobRunOutcome::Failed(job) => job,
+        other => panic!("expected failed job, got {other:?}"),
+    };
+    assert_eq!(failed.state, JobState::Failed);
+    assert_eq!(
+        failed.failed_reason.as_deref(),
+        Some("schema is permanently invalid")
+    );
+
+    let stored = backend.get_job(&job.id).await.unwrap().unwrap();
+    assert_eq!(stored.state, JobState::Failed);
+    assert_eq!(stored.attempts_made, 1);
+    assert_eq!(backend.stats().await.unwrap().delayed, 0);
+}
+
+#[tokio::test]
 async fn worker_timeout_fails_job() {
     let backend: Arc<dyn JobQueueBackend> = Arc::new(InMemoryJobQueue::new("worker"));
     let job = backend

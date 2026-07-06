@@ -478,18 +478,15 @@ impl JobWorker {
                 Ok(JobRunOutcome::Completed(completed))
             }
             Err(error) => {
-                let failed = if context.should_discard_retry() {
+                let discard_retry = context.should_discard_retry() || error.is_unrecoverable_job();
+                let error = error.to_string();
+                let failed = if discard_retry {
                     self.backend
-                        .fail_job_discarding_retry(
-                            &job_id,
-                            &lock_token,
-                            error.to_string(),
-                            Utc::now(),
-                        )
+                        .fail_job_discarding_retry(&job_id, &lock_token, error, Utc::now())
                         .await?
                 } else {
                     self.backend
-                        .fail_job(&job_id, &lock_token, error.to_string(), Utc::now())
+                        .fail_job(&job_id, &lock_token, error, Utc::now())
                         .await?
                 };
                 Ok(JobRunOutcome::Failed(failed))

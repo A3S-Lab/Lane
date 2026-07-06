@@ -1050,7 +1050,10 @@ failure-path decision rather than stored job metadata: BullMQ sets an in-memory
 `discarded` flag, `shouldRetryJob()` checks that flag before `moveToFailed()`,
 and the Redis transition then uses the terminal failed path instead of delayed
 or immediate retry. Lane exposes that mechanism as
-`fail_job_discarding_retry()` and `JobContext::discard_retry()`. The Redis
+`fail_job_discarding_retry()` and `JobContext::discard_retry()`. Lane also
+mirrors BullMQ's preferred `UnrecoverableError` path with
+`LaneError::unrecoverable_job()`: when a processor returns that error, the worker
+uses the same retry-bypass finalization path as `discard_retry()`. The Redis
 backend reuses the same active-to-failed Lua script as `fail_job()`, but passes
 the retry flag as disabled so the script writes the failed zset, releases
 deduplication/repeat ownership, and updates flow parents atomically.
@@ -1211,7 +1214,9 @@ failed lease renewal. Context progress and log helpers also refuse to write once
 that lease-loss flag is set. `JobContext::discard_retry()` lets a processor mark
 the current failed finalization as terminal even when the job's retry policy still
 has attempts remaining; the marker lives only on the worker context and is not
-stored on the job.
+stored on the job. Returning `LaneError::unrecoverable_job(message)` from a
+processor is the preferred typed-error equivalent for failures that should never
+be automatically retried.
 
 ## Benchmarks
 

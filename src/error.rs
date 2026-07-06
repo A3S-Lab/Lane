@@ -11,6 +11,7 @@
 //! - Command execution errors (timeout, execution failure)
 //! - Generic job runtime errors (job not found)
 //! - Generic job runtime state and lease conflicts
+//! - Generic job processor unrecoverable failures
 //!
 //! # Example
 //!
@@ -46,6 +47,7 @@ use thiserror::Error;
 /// * `JobNotFound` - The specified generic job ID does not exist
 /// * `JobStateConflict` - The requested job transition is invalid for its current state
 /// * `JobLeaseConflict` - A worker attempted to mutate a job it does not own
+/// * `UnrecoverableJob` - A job processor failure that must not be retried
 /// * `Timeout` - Command exceeded its timeout duration
 /// * `ShutdownInProgress` - Queue is shutting down and not accepting new commands
 /// * `Other` - Catch-all for unexpected errors
@@ -79,6 +81,10 @@ pub enum LaneError {
     #[error("Job lease conflict: {0}")]
     JobLeaseConflict(String),
 
+    /// Job processor failure that should bypass automatic job retries.
+    #[error("{0}")]
+    UnrecoverableJob(String),
+
     /// Command timeout
     #[error("Command timed out after {0:?}")]
     Timeout(std::time::Duration),
@@ -97,6 +103,22 @@ pub enum LaneError {
 /// Convenience type alias for `std::result::Result<T, LaneError>`.
 /// Used throughout the library for consistent error handling.
 pub type Result<T> = std::result::Result<T, LaneError>;
+
+impl LaneError {
+    /// Create a generic job processor error that should fail terminally.
+    ///
+    /// Generic job workers treat this like BullMQ's `UnrecoverableError`: the
+    /// failure reason is retained, but automatic job retries are skipped for the
+    /// current failed finalization.
+    pub fn unrecoverable_job(message: impl Into<String>) -> Self {
+        Self::UnrecoverableJob(message.into())
+    }
+
+    /// Whether this error should bypass automatic job retries.
+    pub fn is_unrecoverable_job(&self) -> bool {
+        matches!(self, Self::UnrecoverableJob(_))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -157,6 +179,13 @@ mod tests {
     fn test_job_lease_conflict_error() {
         let error = LaneError::JobLeaseConflict("worker mismatch".to_string());
         assert_eq!(error.to_string(), "Job lease conflict: worker mismatch");
+    }
+
+    #[test]
+    fn test_unrecoverable_job_error() {
+        let error = LaneError::unrecoverable_job("invalid customer state");
+        assert_eq!(error.to_string(), "invalid customer state");
+        assert!(error.is_unrecoverable_job());
     }
 
     #[test]
