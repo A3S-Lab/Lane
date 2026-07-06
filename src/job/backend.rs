@@ -1,6 +1,7 @@
 use super::types::{
     Job, JobFlow, JobFlowDependencies, JobListOptions, JobListPage, JobLogPage, JobOptions,
-    JobPriority, JobPriorityCount, JobQueueStats, JobRepeatEntry, JobSpec, JobState, JobWorkerId,
+    JobPriority, JobPriorityCount, JobQueueStats, JobRepeatEntry, JobSpec, JobState, JobStateCount,
+    JobWorkerId,
 };
 use crate::error::Result;
 use async_trait::async_trait;
@@ -96,6 +97,12 @@ pub trait JobQueueBackend: Send + Sync {
     async fn drain_jobs(&self, include_delayed: bool) -> Result<Vec<Job>>;
 
     async fn list_jobs(&self, options: JobListOptions) -> Result<JobListPage>;
+
+    /// Return counts for the requested states.
+    ///
+    /// Empty input returns all lifecycle states. Duplicate states are counted once,
+    /// preserving the first requested order.
+    async fn get_job_counts(&self, states: &[JobState]) -> Result<Vec<JobStateCount>>;
 
     /// Return waiting-job counts for the requested priorities.
     ///

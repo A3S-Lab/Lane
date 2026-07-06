@@ -2,7 +2,8 @@ use super::backend::JobQueueBackend;
 use super::types::{
     deduplication_expiration, Job, JobFlow, JobFlowDependencies, JobId, JobListOptions,
     JobListPage, JobLogEntry, JobLogPage, JobOptions, JobPriority, JobPriorityCount,
-    JobQueueSnapshot, JobQueueStats, JobRepeatEntry, JobSpec, JobState, JobWorkerId, QueueName,
+    JobQueueSnapshot, JobQueueStats, JobRepeatEntry, JobSpec, JobState, JobStateCount, JobWorkerId,
+    QueueName,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -648,6 +649,19 @@ impl InMemoryJobQueue {
         })
     }
 
+    /// Count jobs for requested lifecycle states.
+    pub async fn counts_by_state(&self, states: &[JobState]) -> Result<Vec<JobStateCount>> {
+        let states = unique_states(states);
+        let inner = self.inner.lock().await;
+        Ok(states
+            .into_iter()
+            .map(|state| {
+                let count = inner.jobs.values().filter(|job| job.state == state).count();
+                JobStateCount { state, count }
+            })
+            .collect())
+    }
+
     /// Count waiting jobs for each requested priority.
     pub async fn counts_per_priority(
         &self,
@@ -1179,6 +1193,10 @@ impl JobQueueBackend for InMemoryJobQueue {
         self.list(options).await
     }
 
+    async fn get_job_counts(&self, states: &[JobState]) -> Result<Vec<JobStateCount>> {
+        self.counts_by_state(states).await
+    }
+
     async fn get_counts_per_priority(
         &self,
         priorities: &[JobPriority],
@@ -1380,6 +1398,21 @@ fn unique_priorities(priorities: &[JobPriority]) -> Vec<JobPriority> {
     for &priority in priorities {
         if !unique.contains(&priority) {
             unique.push(priority);
+        }
+    }
+    unique
+}
+
+fn unique_states(states: &[JobState]) -> Vec<JobState> {
+    let states = if states.is_empty() {
+        JobState::ALL.as_slice()
+    } else {
+        states
+    };
+    let mut unique = Vec::new();
+    for &state in states {
+        if !unique.contains(&state) {
+            unique.push(state);
         }
     }
     unique

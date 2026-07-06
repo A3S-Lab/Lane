@@ -3,7 +3,7 @@ use super::memory::InMemoryJobQueue;
 use super::types::{
     Job, JobFlow, JobFlowDependencies, JobListOptions, JobListPage, JobLogPage, JobOptions,
     JobPriority, JobPriorityCount, JobQueueSnapshot, JobQueueStats, JobRepeatEntry, JobSpec,
-    JobState, JobWorkerId,
+    JobState, JobStateCount, JobWorkerId,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -324,6 +324,10 @@ impl JobQueueBackend for LocalJobQueue {
 
     async fn list_jobs(&self, options: JobListOptions) -> Result<JobListPage> {
         self.inner.list_jobs(options).await
+    }
+
+    async fn get_job_counts(&self, states: &[JobState]) -> Result<Vec<JobStateCount>> {
+        self.inner.get_job_counts(states).await
     }
 
     async fn get_counts_per_priority(

@@ -92,9 +92,9 @@ pub use job::{
     job_processor_fn, DeduplicationOptions, InMemoryJobQueue, Job, JobContext, JobFlow, JobId,
     JobListOptions, JobListPage, JobLockToken, JobLogEntry, JobOptions, JobPriority,
     JobPriorityCount, JobProcessor, JobProcessorFn, JobProcessorRouter, JobQueueBackend,
-    JobQueueSnapshot, JobQueueStats, JobRateLimit, JobRunOutcome, JobSpec, JobState, JobWorker,
-    JobWorkerConfig, JobWorkerHandle, JobWorkerId, LocalJobQueue, QueueName, RepeatOptions,
-    RepeatSchedule, DEFAULT_JOB_PRIORITY,
+    JobQueueSnapshot, JobQueueStats, JobRateLimit, JobRunOutcome, JobSpec, JobState, JobStateCount,
+    JobWorker, JobWorkerConfig, JobWorkerHandle, JobWorkerId, LocalJobQueue, QueueName,
+    RepeatOptions, RepeatSchedule, DEFAULT_JOB_PRIORITY,
 };
 pub use manager::{QueueManager, QueueManagerBuilder};
 pub use queue::{

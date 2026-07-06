@@ -121,6 +121,147 @@ async fn job_state_queries_follow_lifecycle() {
 }
 
 #[tokio::test]
+async fn job_counts_return_selected_and_default_states() {
+    let queue = InMemoryJobQueue::new("state-counts");
+    let now = ts(1_000);
+
+    let active_job = queue
+        .add_at("active", serde_json::json!({}), JobOptions::new(), now)
+        .await
+        .unwrap();
+    let active = queue
+        .claim_next("worker-active".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.id, active_job.id);
+
+    let completed_job = queue
+        .add_at("completed", serde_json::json!({}), JobOptions::new(), now)
+        .await
+        .unwrap();
+    let completed = queue
+        .claim_next("worker-completed".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.id, completed_job.id);
+    queue
+        .complete_job(
+            &completed.id,
+            lock_token(&completed),
+            serde_json::json!({ "ok": true }),
+            now,
+        )
+        .await
+        .unwrap();
+
+    let failed_job = queue
+        .add_at("failed", serde_json::json!({}), JobOptions::new(), now)
+        .await
+        .unwrap();
+    let failed = queue
+        .claim_next("worker-failed".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed.id, failed_job.id);
+    queue
+        .fail_job(
+            &failed.id,
+            lock_token(&failed),
+            "terminal failure".to_string(),
+            now,
+        )
+        .await
+        .unwrap();
+
+    queue
+        .add_at("waiting-a", serde_json::json!({}), JobOptions::new(), now)
+        .await
+        .unwrap();
+    queue
+        .add_at("waiting-b", serde_json::json!({}), JobOptions::new(), now)
+        .await
+        .unwrap();
+    queue
+        .add_at(
+            "delayed",
+            serde_json::json!({}),
+            JobOptions::new().with_delay(Duration::from_secs(30)),
+            now,
+        )
+        .await
+        .unwrap();
+    queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({})),
+            vec![JobSpec::new("child", serde_json::json!({}))],
+            now,
+        )
+        .await
+        .unwrap();
+
+    let selected = queue
+        .get_job_counts(&[
+            JobState::Waiting,
+            JobState::Delayed,
+            JobState::Waiting,
+            JobState::Active,
+        ])
+        .await
+        .unwrap();
+    assert_eq!(
+        selected,
+        vec![
+            JobStateCount {
+                state: JobState::Waiting,
+                count: 3,
+            },
+            JobStateCount {
+                state: JobState::Delayed,
+                count: 1,
+            },
+            JobStateCount {
+                state: JobState::Active,
+                count: 1,
+            },
+        ]
+    );
+
+    let all = queue.get_job_counts(&[]).await.unwrap();
+    assert_eq!(
+        all,
+        vec![
+            JobStateCount {
+                state: JobState::Waiting,
+                count: 3,
+            },
+            JobStateCount {
+                state: JobState::Delayed,
+                count: 1,
+            },
+            JobStateCount {
+                state: JobState::Active,
+                count: 1,
+            },
+            JobStateCount {
+                state: JobState::WaitingChildren,
+                count: 1,
+            },
+            JobStateCount {
+                state: JobState::Completed,
+                count: 1,
+            },
+            JobStateCount {
+                state: JobState::Failed,
+                count: 1,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
 async fn delayed_jobs_wait_until_due() {
     let queue = InMemoryJobQueue::new("reports");
     let now = ts(1_000);

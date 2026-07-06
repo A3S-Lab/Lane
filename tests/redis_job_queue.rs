@@ -2,8 +2,8 @@
 
 use a3s_lane::{
     DeduplicationOptions, Job, JobListOptions, JobLogEntry, JobOptions, JobPriorityCount,
-    JobQueueBackend, JobRateLimit, JobSpec, JobState, LaneError, RedisJobQueue, RepeatOptions,
-    RetryPolicy,
+    JobQueueBackend, JobRateLimit, JobSpec, JobState, JobStateCount, LaneError, RedisJobQueue,
+    RepeatOptions, RetryPolicy,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use redis::AsyncCommands;
@@ -21,10 +21,13 @@ async fn redis_backend_runs_job_lifecycle_against_real_server() {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
         return;
     };
-    tokio::time::timeout(Duration::from_secs(120), run_job_lifecycle(redis_url))
-        .await
-        .expect("Redis integration test timed out")
-        .unwrap();
+    tokio::time::timeout(Duration::from_secs(180), async move {
+        run_job_lifecycle(redis_url.clone()).await?;
+        run_state_count_indexes(redis_url).await
+    })
+    .await
+    .expect("Redis integration test timed out")
+    .unwrap();
 }
 
 async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
@@ -4326,6 +4329,212 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         }
     }
     trace_stage("cleanup:final:done");
+    Ok(())
+}
+
+async fn run_state_count_indexes(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let state_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "state-counts")
+        .expect("valid Redis URL should build the state-count queue");
+    let active_job = state_queue
+        .add_job(
+            "state-active".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("active state-count job should add");
+    let active = state_queue
+        .claim_next(
+            "worker-state-active".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("active state-count claim should return")
+        .expect("active state-count job should be claimable");
+    assert_eq!(active.id, active_job.id);
+
+    let completed_job = state_queue
+        .add_job(
+            "state-completed".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("completed state-count job should add");
+    let completed = state_queue
+        .claim_next(
+            "worker-state-completed".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("completed state-count claim should return")
+        .expect("completed state-count job should be claimable");
+    assert_eq!(completed.id, completed_job.id);
+    state_queue
+        .complete_job(
+            &completed.id,
+            lock_token(&completed),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("completed state-count job should complete");
+
+    let failed_job = state_queue
+        .add_job(
+            "state-failed".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("failed state-count job should add");
+    let failed = state_queue
+        .claim_next(
+            "worker-state-failed".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("failed state-count claim should return")
+        .expect("failed state-count job should be claimable");
+    assert_eq!(failed.id, failed_job.id);
+    state_queue
+        .fail_job(
+            &failed.id,
+            lock_token(&failed),
+            "terminal failure".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("failed state-count job should fail");
+
+    state_queue
+        .add_job(
+            "state-waiting-a".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("first waiting state-count job should add");
+    state_queue
+        .add_job(
+            "state-waiting-b".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("second waiting state-count job should add");
+    state_queue
+        .add_job(
+            "state-delayed".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_delay(Duration::from_secs(30)),
+        )
+        .await
+        .expect("delayed state-count job should add");
+    state_queue
+        .add_flow(
+            JobSpec::new("state-parent", serde_json::json!({})),
+            vec![JobSpec::new("state-child", serde_json::json!({}))],
+        )
+        .await
+        .expect("waiting-children state-count flow should add");
+
+    let selected_state_counts = state_queue
+        .get_job_counts(&[
+            JobState::Waiting,
+            JobState::Delayed,
+            JobState::Waiting,
+            JobState::Active,
+        ])
+        .await
+        .expect("selected state counts should load");
+    assert_eq!(
+        selected_state_counts,
+        vec![
+            JobStateCount {
+                state: JobState::Waiting,
+                count: 3,
+            },
+            JobStateCount {
+                state: JobState::Delayed,
+                count: 1,
+            },
+            JobStateCount {
+                state: JobState::Active,
+                count: 1,
+            },
+        ]
+    );
+
+    let all_state_counts = state_queue
+        .get_job_counts(&[])
+        .await
+        .expect("default state counts should load");
+    assert_eq!(
+        all_state_counts,
+        vec![
+            JobStateCount {
+                state: JobState::Waiting,
+                count: 3,
+            },
+            JobStateCount {
+                state: JobState::Delayed,
+                count: 1,
+            },
+            JobStateCount {
+                state: JobState::Active,
+                count: 1,
+            },
+            JobStateCount {
+                state: JobState::WaitingChildren,
+                count: 1,
+            },
+            JobStateCount {
+                state: JobState::Completed,
+                count: 1,
+            },
+            JobStateCount {
+                state: JobState::Failed,
+                count: 1,
+            },
+        ]
+    );
+
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let waiting_zcard: usize = conn
+        .zcard(format!("{namespace}:state-counts:waiting"))
+        .await?;
+    let delayed_zcard: usize = conn
+        .zcard(format!("{namespace}:state-counts:delayed"))
+        .await?;
+    let active_zcard: usize = conn
+        .zcard(format!("{namespace}:state-counts:active"))
+        .await?;
+    let waiting_children_zcard: usize = conn
+        .zcard(format!("{namespace}:state-counts:waiting_children"))
+        .await?;
+    let completed_zcard: usize = conn
+        .zcard(format!("{namespace}:state-counts:completed"))
+        .await?;
+    let failed_zcard: usize = conn
+        .zcard(format!("{namespace}:state-counts:failed"))
+        .await?;
+    assert_eq!(waiting_zcard, 3);
+    assert_eq!(delayed_zcard, 1);
+    assert_eq!(active_zcard, 1);
+    assert_eq!(waiting_children_zcard, 1);
+    assert_eq!(completed_zcard, 1);
+    assert_eq!(failed_zcard, 1);
+
+    cleanup_namespace_with_conn(&mut conn, &namespace).await?;
     Ok(())
 }
 

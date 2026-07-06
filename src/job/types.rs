@@ -97,10 +97,27 @@ pub enum JobState {
 }
 
 impl JobState {
+    /// All durable lifecycle states in queue-count order.
+    pub const ALL: [Self; 6] = [
+        Self::Waiting,
+        Self::Delayed,
+        Self::Active,
+        Self::WaitingChildren,
+        Self::Completed,
+        Self::Failed,
+    ];
+
     /// Whether this state is terminal and should not be claimed again.
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed)
     }
+}
+
+/// Job count for a lifecycle state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobStateCount {
+    pub state: JobState,
+    pub count: usize,
 }
 
 /// A retained log line for a generic job.

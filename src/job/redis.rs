@@ -2,7 +2,7 @@ use super::backend::JobQueueBackend;
 use super::types::{
     add_duration, deduplication_expiration, Job, JobFlow, JobFlowDependencies, JobListOptions,
     JobListPage, JobLogEntry, JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueStats,
-    JobRateLimit, JobRepeatEntry, JobSpec, JobState, JobWorkerId, QueueName,
+    JobRateLimit, JobRepeatEntry, JobSpec, JobState, JobStateCount, JobWorkerId, QueueName,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -2921,6 +2921,16 @@ return {
 }
 "#;
 
+const JOB_COUNTS_SCRIPT: &str = r#"
+local results = {}
+
+for index = 1, #KEYS do
+  results[#results + 1] = redis.call('ZCARD', KEYS[index])
+end
+
+return results
+"#;
+
 const COUNTS_PER_PRIORITY_SCRIPT: &str = r#"
 local bucket = tonumber(ARGV[1])
 local results = {}
@@ -3931,6 +3941,19 @@ impl JobQueueBackend for RedisJobQueue {
         decode_list_jobs_result(&result, options.offset, options.limit)
     }
 
+    async fn get_job_counts(&self, states: &[JobState]) -> Result<Vec<JobStateCount>> {
+        let states = unique_states(states);
+        let mut conn = self.connection().await?;
+        let mut command = redis::cmd("EVAL");
+        command.arg(JOB_COUNTS_SCRIPT).arg(states.len());
+        for state in &states {
+            command.arg(self.state_key(*state));
+        }
+
+        let result: Vec<i64> = command.query_async(&mut conn).await.map_err(redis_error)?;
+        decode_state_counts(&states, &result)
+    }
+
     async fn get_counts_per_priority(
         &self,
         priorities: &[JobPriority],
@@ -4543,6 +4566,27 @@ fn decode_priority_counts(
         .collect()
 }
 
+fn decode_state_counts(states: &[JobState], result: &[i64]) -> Result<Vec<JobStateCount>> {
+    if result.len() != states.len() {
+        return Err(LaneError::Other(format!(
+            "Redis job count script returned {} values, expected {}",
+            result.len(),
+            states.len()
+        )));
+    }
+
+    states
+        .iter()
+        .zip(result.iter())
+        .map(|(&state, &count)| {
+            Ok(JobStateCount {
+                state,
+                count: decode_stats_count(count, job_state_name(state))?,
+            })
+        })
+        .collect()
+}
+
 fn decode_stats_count(value: i64, field: &str) -> Result<usize> {
     usize::try_from(value).map_err(|_| {
         LaneError::Other(format!(
@@ -4584,6 +4628,21 @@ fn unique_priorities(priorities: &[JobPriority]) -> Vec<JobPriority> {
     for &priority in priorities {
         if !unique.contains(&priority) {
             unique.push(priority);
+        }
+    }
+    unique
+}
+
+fn unique_states(states: &[JobState]) -> Vec<JobState> {
+    let states = if states.is_empty() {
+        JobState::ALL.as_slice()
+    } else {
+        states
+    };
+    let mut unique = Vec::new();
+    for &state in states {
+        if !unique.contains(&state) {
+            unique.push(state);
         }
     }
     unique
