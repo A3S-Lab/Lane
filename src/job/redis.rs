@@ -697,8 +697,21 @@ fn encode_job(job: &Job) -> Result<String> {
 }
 
 fn decode_job(raw: &str) -> Result<Job> {
-    serde_json::from_str(raw)
+    let mut value: Value = serde_json::from_str(raw)
+        .map_err(|error| LaneError::Other(format!("failed to decode Redis job: {error}")))?;
+    normalize_lua_empty_array(&mut value, "logs");
+    normalize_lua_empty_array(&mut value, "child_ids");
+    serde_json::from_value(value)
         .map_err(|error| LaneError::Other(format!("failed to decode Redis job: {error}")))
+}
+
+fn normalize_lua_empty_array(value: &mut Value, field: &str) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    if matches!(object.get(field), Some(Value::Object(map)) if map.is_empty()) {
+        object.insert(field.to_string(), Value::Array(Vec::new()));
+    }
 }
 
 fn redis_error(error: redis::RedisError) -> LaneError {
@@ -805,5 +818,26 @@ mod tests {
             subtract_duration(now, Duration::from_millis(250)),
             Utc.timestamp_millis_opt(9_750).unwrap()
         );
+    }
+
+    #[test]
+    fn decode_job_accepts_lua_empty_arrays_as_empty_sequences() {
+        let job = Job::new(
+            "jobs".to_string(),
+            "high".to_string(),
+            serde_json::json!({ "n": 1 }),
+            JobOptions::new(),
+            Utc.timestamp_millis_opt(10_000).unwrap(),
+        );
+        let raw = encode_job(&job)
+            .unwrap()
+            .replace("\"logs\":[]", "\"logs\":{}")
+            .replace("\"child_ids\":[]", "\"child_ids\":{}");
+
+        let decoded = decode_job(&raw).expect("Lua-shaped JSON should decode");
+
+        assert!(decoded.logs.is_empty());
+        assert!(decoded.child_ids.is_empty());
+        assert_eq!(decoded.payload, serde_json::json!({ "n": 1 }));
     }
 }
