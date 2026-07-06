@@ -370,7 +370,7 @@ A3S stack and language SDKs.
 | --- | --- | --- |
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
 | Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, debounce TTL extension, delayed-owner replace, and keep-last-if-active requeue, repeat-key ownership, explicit job states, priority ordering, delayed jobs, token-owned worker leases, active-to-delayed movement, completion/failure snapshots, retry backoff, rate-limited claims, shared active concurrency limits, stalled-job recovery, pause/resume. |
-| Job management API | In progress | Add/get/get-state/remove/remove-repeat/remove-deduplication-key/list-repeats/get-flow-dependencies/promote/reschedule/delay-active/retry/update-priority/pause/resume/drain/clean APIs, pagination, job logs, progress updates, lease renewal. |
+| Job management API | In progress | Add/get/get-state/remove/remove-repeat/remove-deduplication-key/list-repeats/get-flow-dependencies/promote/reschedule/delay-active/retry/update-priority/pause/resume/drain/clean APIs, pagination, add-log/get-logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, and stalled recovery loops. |
 | Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership/listing/removal, flow submission, flow dependency inspection, delayed promotion and rescheduling, active-to-delayed movement, single-job promote, state-index queries, manual retry, priority update, progress update, log append, list/stat snapshots, drain, clean, claim, rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, dependency inspection, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
@@ -456,8 +456,10 @@ the claim token, `remove_job()` removes non-active jobs,
 and missing child ids,
 `drain_jobs(false)` removes waiting jobs, `drain_jobs(true)` also removes
 ordinary delayed jobs while preserving current delayed repeat owners,
-`clean_jobs()` removes old records by state, and these cleanup paths can
-unblock flow parents when a pending child is removed.
+`clean_jobs()` removes old records by state, `add_log()` appends retained job
+logs, and `get_job_logs()` returns a `JobLogPage` with Redis/BullMQ-style range
+semantics. Cleanup paths can unblock flow parents when a pending child is
+removed.
 Set `JobOptions::with_job_id()` when producers need idempotent submission:
 adding the same job id again returns the existing job instead of enqueueing a
 duplicate.
@@ -749,8 +751,9 @@ if let Some(claimed) = claimed {
 
 Use `RedisJobQueue` when multiple workers or processes need to claim from the
 same durable priority queue. It stores jobs as JSON in a Redis hash, indexes
-states with sorted sets, and uses Lua scripts to atomically add jobs, promote
-due delayed jobs, claim work, and transition leased jobs. The Redis backend
+states with sorted sets, stores retained job logs in per-job Redis lists, and
+uses Lua scripts to atomically add jobs, promote due delayed jobs, claim work,
+and transition leased jobs. The Redis backend
 follows the core BullMQ locking mechanism: a claim creates an independent TTL
 lock key for the job, and complete, fail, and renew operations must prove
 ownership by matching the lock token before the script mutates the
@@ -932,16 +935,20 @@ aligned with BullMQ's mechanism of moving job state through Redis scripts instea
 of coordinating several client-side Redis commands.
 
 Redis job management mutations are script-backed too. `update_progress()` checks
-the current state and writes the progress value in one Redis turn; `add_log()`
-appends and trims retained log entries inside one script; `clean_jobs()` filters
-retained records by the parsed millisecond reference time, removes their lock
-keys, hash entries, and state indexes atomically, updates flow parents for
-removed child jobs, and returns the removed snapshots.
+the current state and writes the progress value in one Redis turn. `add_log()`
+follows BullMQ's `addLog` shape at the key level: the script verifies that the
+job exists, `RPUSH`es a structured JSON entry into `logs:<jobId>`, applies
+`LTRIM` when a retention count is provided, and mirrors the retained entries into
+the job JSON snapshot for Lane compatibility. `clean_jobs()` filters retained
+records by the parsed millisecond reference time, removes their lock keys, hash
+entries, state indexes, dependency sets, and log lists atomically, updates flow
+parents for removed child jobs, and returns the removed snapshots.
 
 Queue draining follows the same rule. `drain_jobs(false)` removes waiting jobs
 and `drain_jobs(true)` also removes ordinary delayed jobs in one Redis turn,
-while leaving active, completed, failed, and waiting-children jobs in place.
-Like BullMQ's `drain` script, Lane protects the current delayed repeat
+while deleting each removed job's retained log list and leaving active,
+completed, failed, and waiting-children jobs in place. Like BullMQ's `drain`
+script, Lane protects the current delayed repeat
 occurrence: BullMQ derives that set from job scheduler records, while Lane
 checks the `repeat:<key>` owner key and skips the delayed job when it is still
 the current series owner. Removed children update their parent dependency set in
@@ -952,13 +959,16 @@ Queue reads use the same Redis-side snapshot approach. `get_job_state()` follows
 BullMQ's `getState` mechanism by checking the Redis state indexes in one script,
 rather than trusting the serialized job JSON state field. Lane checks completed,
 failed, delayed, active, waiting, and waiting-children sorted sets and returns
-`None` when the job id is not present in any state index. `list_jobs()` evaluates
-one Lua script to read state pages and job JSON snapshots in the same Redis turn
-and to prune stale state-index entries it encounters. `stats()` evaluates one
-Lua script that reads the pause flag and all waiting, delayed, active,
-waiting-children, completed, and failed sorted-set counts in a single Redis
-turn, mirroring BullMQ's `getCounts` style instead of stitching together
-several client-side reads.
+`None` when the job id is not present in any state index. `get_job_logs()` reads
+the `logs:<jobId>` list with `LRANGE` and `LLEN`, including BullMQ's descending
+window convention of using negative indexes and reversing the result. Missing or
+already-removed log lists return an empty page. `list_jobs()` evaluates one Lua
+script to read state pages and job JSON snapshots in the same Redis turn and to
+prune stale state-index entries it encounters. `stats()` evaluates one Lua script
+that reads the pause flag and all waiting, delayed, active, waiting-children,
+completed, and failed sorted-set counts in a single Redis turn, mirroring
+BullMQ's `getCounts` style instead of stitching together several client-side
+reads.
 
 Stalled recovery is Lua-backed as well. The recovery script scans expired
 active scores, verifies that the independent lock key is missing, increments
@@ -968,11 +978,12 @@ different state, the same script prunes that stale active index instead of
 treating it as recoverable work.
 
 `remove_job()` uses a Redis script to reject active jobs and remove the job
-hash, lock key, all state indexes, and any child dependency set in one Redis
-turn. A remove request for a missing job still prunes orphaned indexes, locks,
-and dependency sets for that id. If the removed job is a flow child, the same
-script updates the parent's dependency set and atomically moves the parent from
-`waiting_children` to `waiting`, `delayed`, or `failed` as appropriate.
+hash, lock key, all state indexes, retained log list, and any child dependency
+set in one Redis turn. A remove request for a missing job still prunes orphaned
+indexes, locks, dependency sets, and log lists for that id. If the removed job is
+a flow child, the same script updates the parent's dependency set and atomically
+moves the parent from `waiting_children` to `waiting`, `delayed`, or `failed` as
+appropriate.
 
 Run the Redis integration test against any reachable Redis server:
 

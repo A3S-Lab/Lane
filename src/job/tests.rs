@@ -1939,6 +1939,19 @@ async fn management_api_lists_progress_logs_retries_and_cleans_jobs() {
     assert_eq!(logged.logs.len(), 2);
     assert_eq!(logged.logs[0].line, "second");
     assert_eq!(logged.logs[1].line, "third");
+    let ascending_logs = queue.get_job_logs(&slower.id, 0, -1, true).await.unwrap();
+    assert_eq!(ascending_logs.count, 2);
+    assert_eq!(
+        ascending_logs
+            .logs
+            .iter()
+            .map(|entry| entry.line.as_str())
+            .collect::<Vec<_>>(),
+        vec!["second", "third"]
+    );
+    let newest_log = queue.get_job_logs(&slower.id, 0, 0, false).await.unwrap();
+    assert_eq!(newest_log.count, 2);
+    assert_eq!(newest_log.logs[0].line, "third");
 
     let claimed = queue
         .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
@@ -1990,6 +2003,10 @@ async fn management_api_lists_progress_logs_retries_and_cleans_jobs() {
     assert_eq!(cleaned[0].id, faster.id);
     assert!(queue.get_job(&faster.id).await.unwrap().is_none());
     assert!(queue.get_job(&delayed.id).await.unwrap().is_some());
+    queue.remove_job(&slower.id).await.unwrap().unwrap();
+    let removed_logs = queue.get_job_logs(&slower.id, 0, -1, true).await.unwrap();
+    assert_eq!(removed_logs.count, 0);
+    assert!(removed_logs.logs.is_empty());
 }
 
 #[tokio::test]
@@ -2647,6 +2664,9 @@ async fn local_job_queue_persists_snapshot_across_reopen() {
         Some(serde_json::json!({ "percent": 90 }))
     );
     assert_eq!(restored.logs.len(), 1);
+    let restored_logs = reopened.get_job_logs(&job.id, 0, -1, true).await.unwrap();
+    assert_eq!(restored_logs.count, 1);
+    assert_eq!(restored_logs.logs[0].line, "almost done");
     assert_eq!(
         restored.return_value,
         Some(serde_json::json!({ "ok": true }))

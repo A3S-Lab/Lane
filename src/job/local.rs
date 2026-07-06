@@ -1,8 +1,8 @@
 use super::backend::JobQueueBackend;
 use super::memory::InMemoryJobQueue;
 use super::types::{
-    Job, JobFlow, JobFlowDependencies, JobListOptions, JobListPage, JobOptions, JobPriority,
-    JobQueueSnapshot, JobQueueStats, JobRepeatEntry, JobSpec, JobState, JobWorkerId,
+    Job, JobFlow, JobFlowDependencies, JobListOptions, JobListPage, JobLogPage, JobOptions,
+    JobPriority, JobQueueSnapshot, JobQueueStats, JobRepeatEntry, JobSpec, JobState, JobWorkerId,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -341,6 +341,16 @@ impl JobQueueBackend for LocalJobQueue {
         let job = self.inner.add_log(job_id, line, keep, now).await?;
         self.persist().await?;
         Ok(job)
+    }
+
+    async fn get_job_logs(
+        &self,
+        job_id: &str,
+        start: isize,
+        end: isize,
+        ascending: bool,
+    ) -> Result<JobLogPage> {
+        self.inner.get_job_logs(job_id, start, end, ascending).await
     }
 
     async fn promote_due_jobs(&self, now: DateTime<Utc>) -> Result<usize> {

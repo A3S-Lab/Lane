@@ -1,8 +1,8 @@
 use super::backend::JobQueueBackend;
 use super::types::{
     add_duration, deduplication_expiration, Job, JobFlow, JobFlowDependencies, JobListOptions,
-    JobListPage, JobOptions, JobPriority, JobQueueStats, JobRateLimit, JobRepeatEntry, JobSpec,
-    JobState, JobWorkerId, QueueName,
+    JobListPage, JobLogEntry, JobLogPage, JobOptions, JobPriority, JobQueueStats, JobRateLimit,
+    JobRepeatEntry, JobSpec, JobState, JobWorkerId, QueueName,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -201,6 +201,7 @@ if deduplicated then
     local removed = redis.call('ZREM', KEYS[3], existing_job["id"])
     if removed > 0 then
       redis.call('HDEL', KEYS[1], existing_job["id"])
+      redis.call('DEL', ARGV[12] .. existing_job["id"])
       replaced_deduplicated_owner = true
     else
       return {'deduplicated', deduplicated}
@@ -427,6 +428,7 @@ local waiting_score_bucket = tonumber(ARGV[2 + count * per_job_args])
 local deduplication_prefix = ARGV[3 + count * per_job_args]
 local repeat_prefix = ARGV[4 + count * per_job_args]
 local deduplication_next_prefix = ARGV[5 + count * per_job_args]
+local logs_prefix = ARGV[6 + count * per_job_args]
 local added = {}
 
 for index = 1, count do
@@ -452,6 +454,7 @@ for index = 1, count do
         local removed = redis.call('ZREM', KEYS[3], existing_job["id"])
         if removed > 0 then
           redis.call('HDEL', KEYS[1], existing_job["id"])
+          redis.call('DEL', logs_prefix .. existing_job["id"])
           replaced_deduplicated_owner = true
         else
           added[index] = deduplicated
@@ -1031,6 +1034,7 @@ enqueue_deduplicated_next(job, KEYS[1], KEYS[5], KEYS[9], KEYS[7], ARGV[14], ARG
 local updated = cjson.encode(job)
 if ARGV[6] == '1' then
   redis.call('HDEL', KEYS[1], ARGV[1])
+  redis.call('DEL', ARGV[17] .. ARGV[1])
 else
   redis.call('HSET', KEYS[1], ARGV[1], updated)
   redis.call('ZADD', KEYS[3], ARGV[5], ARGV[1])
@@ -1088,6 +1092,7 @@ if parent_id and parent_id ~= cjson.null then
         release_repeat_key(parent, parent_id, ARGV[15])
         if parent["options"] and parent["options"]["remove_on_fail"] == true then
           redis.call('HDEL', KEYS[1], parent_id)
+          redis.call('DEL', ARGV[17] .. parent_id)
         else
           redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
           redis.call('ZADD', KEYS[8], ARGV[5], parent_id)
@@ -1368,6 +1373,7 @@ enqueue_deduplicated_next(job, KEYS[1], KEYS[7], KEYS[3], KEYS[8], ARGV[11], ARG
 local updated = cjson.encode(job)
 if ARGV[9] == '1' then
   redis.call('HDEL', KEYS[1], ARGV[1])
+  redis.call('DEL', ARGV[15] .. ARGV[1])
 else
   redis.call('HSET', KEYS[1], ARGV[1], updated)
   redis.call('ZADD', KEYS[4], ARGV[8], ARGV[1])
@@ -1391,6 +1397,7 @@ if parent_id and parent_id ~= cjson.null then
       release_repeat_key(parent, parent_id, ARGV[12])
       if parent["options"] and parent["options"]["remove_on_fail"] == true then
         redis.call('HDEL', KEYS[1], parent_id)
+        redis.call('DEL', ARGV[15] .. parent_id)
       else
         redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
         redis.call('ZADD', KEYS[4], ARGV[8], parent_id)
@@ -1691,6 +1698,7 @@ for _, id in ipairs(ids) do
 
           if job["options"] and job["options"]["remove_on_fail"] == true then
             redis.call('HDEL', KEYS[1], id)
+            redis.call('DEL', ARGV[10] .. id)
           else
             redis.call('HSET', KEYS[1], id, cjson.encode(job))
             redis.call('ZADD', KEYS[4], ARGV[1], id)
@@ -1714,6 +1722,7 @@ for _, id in ipairs(ids) do
                 release_repeat_key(parent, parent_id, ARGV[8])
                 if parent["options"] and parent["options"]["remove_on_fail"] == true then
                   redis.call('HDEL', KEYS[1], parent_id)
+                  redis.call('DEL', ARGV[10] .. parent_id)
                 else
                   redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
                   redis.call('ZADD', KEYS[4], ARGV[1], parent_id)
@@ -2097,6 +2106,7 @@ if not raw then
     redis.call('ZREM', KEYS[index], ARGV[1])
   end
   redis.call('DEL', ARGV[5] .. ARGV[1])
+  redis.call('DEL', ARGV[8] .. ARGV[1])
   return {'missing'}
 end
 
@@ -2113,6 +2123,7 @@ for index = 3, 8 do
 end
 redis.call('HDEL', KEYS[1], ARGV[1])
 redis.call('DEL', ARGV[5] .. ARGV[1])
+redis.call('DEL', ARGV[8] .. ARGV[1])
 
 local parent_id = job["parent_id"]
 if parent_id and parent_id ~= cjson.null then
@@ -2165,6 +2176,7 @@ if parent_id and parent_id ~= cjson.null then
         release_repeat_key(parent, parent_id, ARGV[7])
         if parent["options"] and parent["options"]["remove_on_fail"] == true then
           redis.call('HDEL', KEYS[1], parent_id)
+          redis.call('DEL', ARGV[8] .. parent_id)
         else
           redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
           redis.call('ZADD', KEYS[8], ARGV[3], parent_id)
@@ -2349,6 +2361,7 @@ local function release_parent_after_removed_child(job, removed_id)
     release_repeat_key(parent, parent_id, ARGV[11])
     if parent["options"] and parent["options"]["remove_on_fail"] == true then
       redis.call('HDEL', KEYS[1], parent_id)
+      redis.call('DEL', ARGV[12] .. parent_id)
     else
       redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
       redis.call('ZADD', KEYS[7], ARGV[6], parent_id)
@@ -2452,6 +2465,7 @@ for index = 1, count do
     redis.call('ZREM', KEYS[key_index], candidate.id)
   end
   redis.call('DEL', ARGV[8] .. candidate.id)
+  redis.call('DEL', ARGV[12] .. candidate.id)
   release_deduplication_key(candidate.job, candidate.id, ARGV[10])
   release_repeat_key(candidate.job, candidate.id, ARGV[11])
   redis.call('HDEL', KEYS[1], candidate.id)
@@ -2618,6 +2632,7 @@ local function release_parent_after_removed_child(job, removed_id)
     release_repeat_key(parent, parent_id, ARGV[8])
     if parent["options"] and parent["options"]["remove_on_fail"] == true then
       redis.call('HDEL', KEYS[1], parent_id)
+      redis.call('DEL', ARGV[9] .. parent_id)
     else
       redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
       redis.call('ZADD', KEYS[7], ARGV[3], parent_id)
@@ -2680,6 +2695,7 @@ for index, candidate in ipairs(candidates) do
     redis.call('ZREM', KEYS[key_index], candidate.id)
   end
   redis.call('DEL', ARGV[6] .. candidate.id)
+  redis.call('DEL', ARGV[9] .. candidate.id)
   release_deduplication_key(candidate.job, candidate.id, ARGV[7])
   release_repeat_key(candidate.job, candidate.id, ARGV[8])
   redis.call('HDEL', KEYS[1], candidate.id)
@@ -2857,6 +2873,10 @@ end
 job["logs"] = logs
 local updated = cjson.encode(job)
 redis.call('HSET', KEYS[1], ARGV[1], updated)
+redis.call('RPUSH', KEYS[2], ARGV[5])
+if keep and keep > 0 then
+  redis.call('LTRIM', KEYS[2], -keep, -1)
+end
 
 return {'ok', updated}
 "#;
@@ -3117,7 +3137,8 @@ impl RedisJobQueue {
             .arg(WAITING_SCORE_BUCKET)
             .arg(self.deduplication_key_prefix())
             .arg(self.repeat_key_prefix())
-            .arg(self.deduplication_next_key_prefix());
+            .arg(self.deduplication_next_key_prefix())
+            .arg(self.logs_key_prefix());
 
         let result: Vec<String> = command.query_async(&mut conn).await.map_err(redis_error)?;
         let added = decode_add_jobs_result(&result, created.len())?;
@@ -3230,6 +3251,14 @@ impl RedisJobQueue {
         format!("{}:{}:dependencies:", self.namespace, self.queue)
     }
 
+    fn logs_key(&self, job_id: &str) -> String {
+        format!("{}:{}:logs:{}", self.namespace, self.queue, job_id)
+    }
+
+    fn logs_key_prefix(&self) -> String {
+        format!("{}:{}:logs:", self.namespace, self.queue)
+    }
+
     fn deduplication_key_prefix(&self) -> String {
         format!("{}:{}:deduplication:", self.namespace, self.queue)
     }
@@ -3279,6 +3308,7 @@ impl RedisJobQueue {
             .arg(job_repeat_key(job).unwrap_or(""))
             .arg(self.repeat_key_prefix())
             .arg(self.deduplication_next_key_prefix())
+            .arg(self.logs_key_prefix())
             .query_async(conn)
             .await
             .map_err(redis_error)?;
@@ -3356,6 +3386,7 @@ impl RedisJobQueue {
             .arg(self.dependencies_key_prefix())
             .arg(self.deduplication_key_prefix())
             .arg(self.repeat_key_prefix())
+            .arg(self.logs_key_prefix())
             .query_async(conn)
             .await
             .map_err(redis_error)?;
@@ -3529,6 +3560,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.deduplication_key_prefix())
             .arg(self.repeat_key_prefix())
             .arg(self.deduplication_next_key_prefix())
+            .arg(self.logs_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -3579,6 +3611,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.repeat_key_prefix())
             .arg(WAITING_SCORE_BUCKET)
             .arg(self.deduplication_next_key_prefix())
+            .arg(self.logs_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -3827,6 +3860,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(millis(cutoff))
             .arg(self.deduplication_key_prefix())
             .arg(self.repeat_key_prefix())
+            .arg(self.logs_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -3855,6 +3889,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.dependencies_key_prefix())
             .arg(self.deduplication_key_prefix())
             .arg(self.repeat_key_prefix())
+            .arg(self.logs_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -3906,18 +3941,57 @@ impl JobQueueBackend for RedisJobQueue {
         now: DateTime<Utc>,
     ) -> Result<Job> {
         let mut conn = self.connection().await?;
+        let entry = JobLogEntry {
+            timestamp: now,
+            line: line.clone(),
+        };
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(ADD_LOG_SCRIPT)
-            .arg(1)
+            .arg(2)
             .arg(self.jobs_key())
+            .arg(self.logs_key(job_id))
             .arg(job_id)
             .arg(now.to_rfc3339())
             .arg(line)
             .arg(keep)
+            .arg(serde_json::to_string(&entry).map_err(|error| {
+                LaneError::Other(format!("failed to encode Redis job log entry: {error}"))
+            })?)
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
         decode_transition_result(&result, job_id, "add log")
+    }
+
+    async fn get_job_logs(
+        &self,
+        job_id: &str,
+        start: isize,
+        end: isize,
+        ascending: bool,
+    ) -> Result<JobLogPage> {
+        let mut conn = self.connection().await?;
+        let logs_key = self.logs_key(job_id);
+        let (range_start, range_end) = if ascending {
+            (start, end)
+        } else {
+            (
+                end.saturating_add(1).saturating_neg(),
+                start.saturating_add(1).saturating_neg(),
+            )
+        };
+        let mut raw_logs: Vec<String> = conn
+            .lrange(&logs_key, range_start, range_end)
+            .await
+            .map_err(redis_error)?;
+        if !ascending {
+            raw_logs.reverse();
+        }
+        let count: usize = conn.llen(&logs_key).await.map_err(redis_error)?;
+        Ok(JobLogPage {
+            logs: decode_log_entries(raw_logs)?,
+            count,
+        })
     }
 
     async fn promote_due_jobs(&self, now: DateTime<Utc>) -> Result<usize> {
@@ -3966,6 +4040,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.deduplication_key_prefix())
             .arg(self.repeat_key_prefix())
             .arg(self.deduplication_next_key_prefix())
+            .arg(self.logs_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)
@@ -4239,6 +4314,17 @@ fn decode_job_state(state: &str) -> Result<Option<JobState>> {
             "unexpected Redis job state `{other}`"
         ))),
     }
+}
+
+fn decode_log_entries(raw_logs: Vec<String>) -> Result<Vec<JobLogEntry>> {
+    raw_logs
+        .into_iter()
+        .map(|raw| {
+            serde_json::from_str(&raw).map_err(|error| {
+                LaneError::Other(format!("failed to decode Redis job log entry: {error}"))
+            })
+        })
+        .collect()
 }
 
 fn decode_transition_result(result: &[String], job_id: &str, action: &str) -> Result<Job> {

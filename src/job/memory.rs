@@ -1,7 +1,7 @@
 use super::backend::JobQueueBackend;
 use super::types::{
     deduplication_expiration, Job, JobFlow, JobFlowDependencies, JobId, JobListOptions,
-    JobListPage, JobLogEntry, JobOptions, JobPriority, JobQueueSnapshot, JobQueueStats,
+    JobListPage, JobLogEntry, JobLogPage, JobOptions, JobPriority, JobQueueSnapshot, JobQueueStats,
     JobRepeatEntry, JobSpec, JobState, JobWorkerId, QueueName,
 };
 use crate::error::{LaneError, Result};
@@ -762,6 +762,25 @@ impl InMemoryJobQueue {
         Ok(job.clone())
     }
 
+    /// Return retained log entries for a job.
+    pub async fn get_logs(
+        &self,
+        job_id: &str,
+        start: isize,
+        end: isize,
+        ascending: bool,
+    ) -> Result<JobLogPage> {
+        let inner = self.inner.lock().await;
+        Ok(inner
+            .jobs
+            .get(job_id)
+            .map(|job| log_page(&job.logs, start, end, ascending))
+            .unwrap_or_else(|| JobLogPage {
+                logs: Vec::new(),
+                count: 0,
+            }))
+    }
+
     fn promote_due_locked(inner: &mut InMemoryJobQueueState, now: DateTime<Utc>) -> usize {
         let mut promoted = 0;
         for job in inner.jobs.values_mut() {
@@ -1154,6 +1173,16 @@ impl JobQueueBackend for InMemoryJobQueue {
         self.log(job_id, line, keep, now).await
     }
 
+    async fn get_job_logs(
+        &self,
+        job_id: &str,
+        start: isize,
+        end: isize,
+        ascending: bool,
+    ) -> Result<JobLogPage> {
+        self.get_logs(job_id, start, end, ascending).await
+    }
+
     async fn promote_due_jobs(&self, now: DateTime<Utc>) -> Result<usize> {
         let mut inner = self.inner.lock().await;
         Ok(Self::promote_due_locked(&mut inner, now))
@@ -1271,6 +1300,52 @@ fn compare_claim_order(a: &&Job, b: &&Job) -> Ordering {
         .then_with(|| a.scheduled_at.cmp(&b.scheduled_at))
         .then_with(|| a.created_at.cmp(&b.created_at))
         .then_with(|| a.id.cmp(&b.id))
+}
+
+fn log_page(logs: &[JobLogEntry], start: isize, end: isize, ascending: bool) -> JobLogPage {
+    let count = logs.len();
+    let selected = if ascending {
+        redis_range(logs, start, end)
+    } else {
+        let reverse_start = end.saturating_add(1).saturating_neg();
+        let reverse_end = start.saturating_add(1).saturating_neg();
+        let mut logs = redis_range(logs, reverse_start, reverse_end);
+        logs.reverse();
+        logs
+    };
+
+    JobLogPage {
+        logs: selected,
+        count,
+    }
+}
+
+fn redis_range<T: Clone>(items: &[T], start: isize, end: isize) -> Vec<T> {
+    let len = items.len();
+    if len == 0 {
+        return Vec::new();
+    }
+
+    let start = normalize_redis_index(start, len);
+    let end = normalize_redis_index(end, len);
+    if start > end || start >= len {
+        return Vec::new();
+    }
+    let end = end.min(len - 1);
+    items[start..=end].to_vec()
+}
+
+fn normalize_redis_index(index: isize, len: usize) -> usize {
+    if index >= 0 {
+        return index as usize;
+    }
+
+    let normalized = len as isize + index;
+    if normalized < 0 {
+        0
+    } else {
+        normalized as usize
+    }
 }
 
 fn compare_list_order(a: &Job, b: &Job) -> Ordering {

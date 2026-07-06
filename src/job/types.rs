@@ -103,6 +103,13 @@ pub struct JobLogEntry {
     pub line: String,
 }
 
+/// A page of retained log entries for a generic job.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobLogPage {
+    pub logs: Vec<JobLogEntry>,
+    pub count: usize,
+}
+
 /// Options for listing jobs from a backend.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JobListOptions {

@@ -1,8 +1,8 @@
 #![cfg(feature = "redis-backend")]
 
 use a3s_lane::{
-    DeduplicationOptions, Job, JobListOptions, JobOptions, JobQueueBackend, JobRateLimit, JobSpec,
-    JobState, LaneError, RedisJobQueue, RepeatOptions, RetryPolicy,
+    DeduplicationOptions, Job, JobListOptions, JobLogEntry, JobOptions, JobQueueBackend,
+    JobRateLimit, JobSpec, JobState, LaneError, RedisJobQueue, RepeatOptions, RetryPolicy,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use redis::AsyncCommands;
@@ -445,6 +445,18 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .zscore(format!("{namespace}:dedup:delayed"), &replace_old.id)
         .await?;
     assert!(replace_old_score.is_some());
+    dedup_queue
+        .add_log(
+            &replace_old.id,
+            "old delayed owner log".to_string(),
+            10,
+            Utc::now(),
+        )
+        .await
+        .expect("replace old owner log should append");
+    let replace_old_logs_key = format!("{namespace}:dedup:logs:{}", replace_old.id);
+    let replace_old_logs_len: usize = dedup_conn.llen(&replace_old_logs_key).await?;
+    assert_eq!(replace_old_logs_len, 1);
     let replace_new = dedup_queue
         .add_job(
             "dedup-replace-new".to_string(),
@@ -464,6 +476,8 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .hget(format!("{namespace}:dedup:jobs"), &replace_old.id)
         .await?;
     assert!(replace_old_hash.is_none());
+    let replace_old_logs_after: usize = dedup_conn.llen(&replace_old_logs_key).await?;
+    assert_eq!(replace_old_logs_after, 0);
     let replace_old_score_after: Option<f64> = dedup_conn
         .zscore(format!("{namespace}:dedup:delayed"), &replace_old.id)
         .await?;
@@ -2003,6 +2017,18 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("removable job should be added");
+    producer
+        .add_log(
+            &removable.id,
+            "queued for removal".to_string(),
+            10,
+            Utc::now(),
+        )
+        .await
+        .expect("removable job log should append");
+    let removable_logs_key = format!("{namespace}:jobs:logs:{}", removable.id);
+    let removable_logs_len: usize = remove_index_conn.llen(&removable_logs_key).await?;
+    assert_eq!(removable_logs_len, 1);
     let waiting_reschedule_error = producer
         .reschedule_job(&removable.id, Duration::from_millis(10), Utc::now())
         .await
@@ -2030,6 +2056,14 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .hget(format!("{namespace}:jobs:jobs"), &removable.id)
         .await?;
     assert!(removed_hash.is_none());
+    let removed_logs_len: usize = remove_index_conn.llen(&removable_logs_key).await?;
+    assert_eq!(removed_logs_len, 0);
+    let removed_logs = producer
+        .get_job_logs(&removable.id, 0, -1, true)
+        .await
+        .expect("removed job logs should return an empty page");
+    assert_eq!(removed_logs.count, 0);
+    assert!(removed_logs.logs.is_empty());
     let missing_job_id = "missing-job";
     for state in [
         "waiting",
@@ -2054,6 +2088,10 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             format!("{namespace}:jobs:dependencies:{missing_job_id}"),
             "stale-child",
         )
+        .await?;
+    let missing_logs_key = format!("{namespace}:jobs:logs:{missing_job_id}");
+    let _: usize = remove_index_conn
+        .rpush(&missing_logs_key, "{\"line\":\"stale\"}")
         .await?;
     assert!(producer
         .remove_job(missing_job_id)
@@ -2084,6 +2122,163 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .exists(format!("{namespace}:jobs:dependencies:{missing_job_id}"))
         .await?;
     assert_eq!(missing_dependencies_exist, 0);
+    let missing_logs_len: usize = remove_index_conn.llen(&missing_logs_key).await?;
+    assert_eq!(missing_logs_len, 0);
+
+    let auto_remove_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "auto-remove")
+        .expect("valid Redis URL should build the auto-remove queue");
+    let mut auto_remove_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let remove_on_complete = auto_remove_queue
+        .add_job(
+            "remove-on-complete".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().remove_on_complete(true),
+        )
+        .await
+        .expect("remove-on-complete job should add");
+    auto_remove_queue
+        .add_log(
+            &remove_on_complete.id,
+            "complete cleanup log".to_string(),
+            10,
+            Utc::now(),
+        )
+        .await
+        .expect("remove-on-complete log should append");
+    let remove_on_complete_claim = auto_remove_queue
+        .claim_next(
+            "worker-auto-complete".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("remove-on-complete claim should return")
+        .expect("remove-on-complete job should be claimable");
+    assert_eq!(remove_on_complete_claim.id, remove_on_complete.id);
+    let remove_on_complete_snapshot = auto_remove_queue
+        .complete_job(
+            &remove_on_complete_claim.id,
+            lock_token(&remove_on_complete_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("remove-on-complete job should complete");
+    assert_eq!(remove_on_complete_snapshot.state, JobState::Completed);
+    assert!(auto_remove_queue
+        .get_job(&remove_on_complete.id)
+        .await
+        .expect("remove-on-complete lookup should return")
+        .is_none());
+    let remove_on_complete_logs_len: usize = auto_remove_conn
+        .llen(format!(
+            "{namespace}:auto-remove:logs:{}",
+            remove_on_complete.id
+        ))
+        .await?;
+    assert_eq!(remove_on_complete_logs_len, 0);
+
+    let remove_on_fail = auto_remove_queue
+        .add_job(
+            "remove-on-fail".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().remove_on_fail(true),
+        )
+        .await
+        .expect("remove-on-fail job should add");
+    auto_remove_queue
+        .add_log(
+            &remove_on_fail.id,
+            "fail cleanup log".to_string(),
+            10,
+            Utc::now(),
+        )
+        .await
+        .expect("remove-on-fail log should append");
+    let remove_on_fail_claim = auto_remove_queue
+        .claim_next(
+            "worker-auto-fail".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("remove-on-fail claim should return")
+        .expect("remove-on-fail job should be claimable");
+    assert_eq!(remove_on_fail_claim.id, remove_on_fail.id);
+    let remove_on_fail_snapshot = auto_remove_queue
+        .fail_job(
+            &remove_on_fail_claim.id,
+            lock_token(&remove_on_fail_claim),
+            "terminal failure".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("remove-on-fail job should fail");
+    assert_eq!(remove_on_fail_snapshot.state, JobState::Failed);
+    assert!(auto_remove_queue
+        .get_job(&remove_on_fail.id)
+        .await
+        .expect("remove-on-fail lookup should return")
+        .is_none());
+    let remove_on_fail_logs_len: usize = auto_remove_conn
+        .llen(format!(
+            "{namespace}:auto-remove:logs:{}",
+            remove_on_fail.id
+        ))
+        .await?;
+    assert_eq!(remove_on_fail_logs_len, 0);
+
+    let remove_on_stalled_fail = auto_remove_queue
+        .add_job(
+            "remove-on-stalled-fail".to_string(),
+            serde_json::json!({}),
+            JobOptions::new()
+                .remove_on_fail(true)
+                .with_max_stalled_count(0),
+        )
+        .await
+        .expect("remove-on-stalled-fail job should add");
+    auto_remove_queue
+        .add_log(
+            &remove_on_stalled_fail.id,
+            "stalled cleanup log".to_string(),
+            10,
+            Utc::now(),
+        )
+        .await
+        .expect("remove-on-stalled-fail log should append");
+    let remove_on_stalled_claim = auto_remove_queue
+        .claim_next(
+            "worker-auto-stalled".to_string(),
+            Duration::from_millis(50),
+            Utc::now(),
+        )
+        .await
+        .expect("remove-on-stalled-fail claim should return")
+        .expect("remove-on-stalled-fail job should be claimable");
+    assert_eq!(remove_on_stalled_claim.id, remove_on_stalled_fail.id);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        auto_remove_queue
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("remove-on-stalled-fail recovery should run"),
+        1
+    );
+    assert!(auto_remove_queue
+        .get_job(&remove_on_stalled_fail.id)
+        .await
+        .expect("remove-on-stalled-fail lookup should return")
+        .is_none());
+    let remove_on_stalled_logs_len: usize = auto_remove_conn
+        .llen(format!(
+            "{namespace}:auto-remove:logs:{}",
+            remove_on_stalled_fail.id
+        ))
+        .await?;
+    assert_eq!(remove_on_stalled_logs_len, 0);
 
     let locked_stalled = producer
         .add_job(
@@ -2266,6 +2461,38 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     assert_eq!(stored_high.logs.len(), 2);
     assert_eq!(stored_high.logs[0].line, "provider accepted");
     assert_eq!(stored_high.logs[1].line, "provider delivered");
+    let high_logs = producer
+        .get_job_logs(&high.id, 0, -1, true)
+        .await
+        .expect("stored high logs should list");
+    assert_eq!(high_logs.count, 2);
+    assert_eq!(
+        high_logs
+            .logs
+            .iter()
+            .map(|entry| entry.line.as_str())
+            .collect::<Vec<_>>(),
+        vec!["provider accepted", "provider delivered"]
+    );
+    let newest_high_log = producer
+        .get_job_logs(&high.id, 0, 0, false)
+        .await
+        .expect("stored high logs should list newest first");
+    assert_eq!(newest_high_log.count, 2);
+    assert_eq!(newest_high_log.logs[0].line, "provider delivered");
+    let high_logs_key = format!("{namespace}:jobs:logs:{}", high.id);
+    let mut logs_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let high_logs_len: usize = logs_conn.llen(&high_logs_key).await?;
+    assert_eq!(high_logs_len, 2);
+    let high_raw_logs: Vec<String> = logs_conn.lrange(&high_logs_key, 0, -1).await?;
+    let high_decoded_logs = high_raw_logs
+        .iter()
+        .map(|raw| serde_json::from_str::<JobLogEntry>(raw).expect("Redis log JSON should decode"))
+        .collect::<Vec<_>>();
+    assert_eq!(high_decoded_logs[0].line, "provider accepted");
+    assert_eq!(high_decoded_logs[1].line, "provider delivered");
 
     let stats = producer.stats().await.expect("stats should load");
     assert_eq!(stats.completed, 5);
@@ -2380,6 +2607,11 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("new clean job should be added");
+    clean_queue
+        .add_log(&clean_old_a.id, "clean me".to_string(), 10, Utc::now())
+        .await
+        .expect("old clean job log should append");
+    let clean_old_a_logs_key = format!("{namespace}:clean-script:logs:{}", clean_old_a.id);
     let clean_claim_a = clean_queue
         .claim_next(
             "worker-clean-a".to_string(),
@@ -2451,6 +2683,8 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .hget(format!("{namespace}:clean-script:jobs"), &clean_old_a.id)
         .await?;
     assert!(cleaned_hash.is_none());
+    let cleaned_logs_len: usize = clean_conn.llen(&clean_old_a_logs_key).await?;
+    assert_eq!(cleaned_logs_len, 0);
     let cleaned_completed_score: Option<f64> = clean_conn
         .zscore(
             format!("{namespace}:clean-script:completed"),
@@ -2671,6 +2905,26 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("drain delayed should add");
+    drain_queue
+        .add_log(
+            &drain_waiting.id,
+            "waiting drain log".to_string(),
+            10,
+            Utc::now(),
+        )
+        .await
+        .expect("drain waiting log should append");
+    drain_queue
+        .add_log(
+            &drain_delayed.id,
+            "delayed drain log".to_string(),
+            10,
+            Utc::now(),
+        )
+        .await
+        .expect("drain delayed log should append");
+    let drain_waiting_logs_key = format!("{namespace}:drain:logs:{}", drain_waiting.id);
+    let drain_delayed_logs_key = format!("{namespace}:drain:logs:{}", drain_delayed.id);
     let drain_flow = drain_queue
         .add_flow_at(
             JobSpec::new("drain-parent", serde_json::json!({ "kind": "parent" })),
@@ -2699,6 +2953,8 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect("drain waiting lookup should return")
         .is_none());
+    let drained_waiting_logs_len: usize = drain_conn.llen(&drain_waiting_logs_key).await?;
+    assert_eq!(drained_waiting_logs_len, 0);
     assert!(drain_queue
         .get_job(&drain_flow.children[0].id)
         .await
@@ -2752,6 +3008,8 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .zscore(format!("{namespace}:drain:delayed"), &drain_delayed.id)
         .await?;
     assert!(drain_delayed_score_after.is_none());
+    let drained_delayed_logs_len: usize = drain_conn.llen(&drain_delayed_logs_key).await?;
+    assert_eq!(drained_delayed_logs_len, 0);
     let drain_repeat_score_after: Option<f64> = drain_conn
         .zscore(
             format!("{namespace}:drain:delayed"),

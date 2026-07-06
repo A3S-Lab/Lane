@@ -1,6 +1,6 @@
 use super::types::{
-    Job, JobFlow, JobFlowDependencies, JobListOptions, JobListPage, JobOptions, JobPriority,
-    JobQueueStats, JobRepeatEntry, JobSpec, JobState, JobWorkerId,
+    Job, JobFlow, JobFlowDependencies, JobListOptions, JobListPage, JobLogPage, JobOptions,
+    JobPriority, JobQueueStats, JobRepeatEntry, JobSpec, JobState, JobWorkerId,
 };
 use crate::error::Result;
 use async_trait::async_trait;
@@ -106,6 +106,14 @@ pub trait JobQueueBackend: Send + Sync {
         keep: usize,
         now: DateTime<Utc>,
     ) -> Result<Job>;
+
+    async fn get_job_logs(
+        &self,
+        job_id: &str,
+        start: isize,
+        end: isize,
+        ascending: bool,
+    ) -> Result<JobLogPage>;
 
     async fn promote_due_jobs(&self, now: DateTime<Utc>) -> Result<usize>;
 
