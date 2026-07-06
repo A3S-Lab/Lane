@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -92,6 +92,9 @@ impl InMemoryJobQueue {
         validate_job_options(&options)?;
         let job = Job::new(self.queue.clone(), name.into(), payload, options, now);
         let mut inner = self.inner.lock().await;
+        if let Some(existing) = inner.jobs.get(&job.id) {
+            return Ok(existing.clone());
+        }
         inner.jobs.insert(job.id.clone(), job.clone());
         Ok(job)
     }
@@ -139,8 +142,16 @@ impl InMemoryJobQueue {
             parent_job.child_ids.push(child_job.id.clone());
             child_jobs.push(child_job);
         }
+        validate_flow_job_ids(&parent_job, &child_jobs)?;
 
         let mut inner = self.inner.lock().await;
+        for id in std::iter::once(&parent_job.id).chain(child_jobs.iter().map(|job| &job.id)) {
+            if inner.jobs.contains_key(id) {
+                return Err(LaneError::ConfigError(format!(
+                    "flow job id `{id}` already exists"
+                )));
+            }
+        }
         inner.jobs.insert(parent_job.id.clone(), parent_job.clone());
         for child in &child_jobs {
             inner.jobs.insert(child.id.clone(), child.clone());
@@ -715,8 +726,17 @@ fn state_after_dependencies(scheduled_at: DateTime<Utc>, now: DateTime<Utc>) -> 
 }
 
 fn validate_job_options(options: &JobOptions) -> Result<()> {
-    if let Some(repeat) = &options.repeat {
-        repeat.validate()?;
+    options.validate()
+}
+
+fn validate_flow_job_ids(parent: &Job, children: &[Job]) -> Result<()> {
+    let mut ids = HashSet::with_capacity(children.len() + 1);
+    for id in std::iter::once(&parent.id).chain(children.iter().map(|job| &job.id)) {
+        if !ids.insert(id) {
+            return Err(LaneError::ConfigError(format!(
+                "flow contains duplicate job id `{id}`"
+            )));
+        }
     }
     Ok(())
 }
@@ -737,11 +757,13 @@ fn next_repeat_job(job: &Job, now: DateTime<Utc>) -> Result<Option<Job>> {
         return Ok(None);
     }
 
+    let mut options = job.options.clone();
+    options.job_id = None;
     let mut next = Job::new(
         job.queue.clone(),
         job.name.clone(),
         job.payload.clone(),
-        job.options.clone(),
+        options,
         now,
     );
     next.scheduled_at = scheduled_at;

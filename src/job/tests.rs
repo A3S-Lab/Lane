@@ -83,6 +83,43 @@ async fn delayed_jobs_wait_until_due() {
 }
 
 #[tokio::test]
+async fn custom_job_ids_make_add_idempotent() {
+    let queue = InMemoryJobQueue::new("idempotent");
+    let now = ts(1_000);
+    let first = queue
+        .add_at(
+            "sync",
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new()
+                .with_job_id("sync:crm:42")
+                .with_priority(10),
+            now,
+        )
+        .await
+        .unwrap();
+    let duplicate = queue
+        .add_at(
+            "sync-duplicate",
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new()
+                .with_job_id("sync:crm:42")
+                .with_priority(1),
+            ts(2_000),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(first.id, "sync:crm:42");
+    assert_eq!(duplicate, first);
+    let waiting = queue
+        .list_jobs(JobListOptions::new().with_state(JobState::Waiting))
+        .await
+        .unwrap();
+    assert_eq!(waiting.total, 1);
+    assert_eq!(waiting.jobs[0].name, "sync");
+}
+
+#[tokio::test]
 async fn repeatable_jobs_schedule_next_occurrence_after_completion() {
     let queue = InMemoryJobQueue::new("repeat");
     let now = ts(1_000);
@@ -210,6 +247,43 @@ fn repeat_options_deserialize_legacy_interval_shape() {
 }
 
 #[tokio::test]
+async fn repeat_successors_do_not_reuse_custom_job_ids() {
+    let queue = InMemoryJobQueue::new("repeat-custom-id");
+    let now = ts(1_000);
+    let job = queue
+        .add_at(
+            "sync",
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_job_id("sync:first")
+                .with_repeat(RepeatOptions::every(Duration::from_secs(5)).with_limit(2)),
+            now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(job.id, "sync:first");
+
+    let first = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .complete_job(&first.id, serde_json::json!({}), ts(1_100))
+        .await
+        .unwrap();
+
+    let delayed = queue
+        .list_jobs(JobListOptions::new().with_state(JobState::Delayed))
+        .await
+        .unwrap();
+    assert_eq!(delayed.total, 1);
+    assert_ne!(delayed.jobs[0].id, "sync:first");
+    assert_eq!(delayed.jobs[0].options.job_id, None);
+    assert_eq!(delayed.jobs[0].repeat_count, 1);
+}
+
+#[tokio::test]
 async fn repeat_options_reject_invalid_schedules() {
     let queue = InMemoryJobQueue::new("repeat-invalid");
     let zero_interval = queue
@@ -245,6 +319,17 @@ async fn repeat_options_reject_invalid_schedules() {
         .await
         .unwrap_err();
     assert!(matches!(invalid_cron, LaneError::ConfigError(_)));
+
+    let empty_job_id = queue
+        .add_at(
+            "sync",
+            serde_json::json!({}),
+            JobOptions::new().with_job_id("  "),
+            ts(1_000),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(empty_job_id, LaneError::ConfigError(_)));
 }
 
 #[tokio::test]
@@ -602,6 +687,24 @@ async fn flow_parent_waits_for_children_before_claiming() {
         .unwrap()
         .unwrap();
     assert_eq!(claimed_parent.id, flow.parent.id);
+}
+
+#[tokio::test]
+async fn flow_rejects_duplicate_custom_job_ids() {
+    let queue = InMemoryJobQueue::new("flow-ids");
+    let error = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({}))
+                .with_options(JobOptions::new().with_job_id("flow:duplicate")),
+            vec![JobSpec::new("child", serde_json::json!({}))
+                .with_options(JobOptions::new().with_job_id("flow:duplicate"))],
+            ts(1_000),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, LaneError::ConfigError(_)));
+    assert_eq!(queue.stats().await.unwrap().total, 0);
 }
 
 #[tokio::test]

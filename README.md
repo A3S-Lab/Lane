@@ -369,7 +369,7 @@ A3S stack and language SDKs.
 | Phase | Status | Scope |
 | --- | --- | --- |
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
-| Generic job runtime | In progress | JSON jobs, explicit job states, priority ordering, delayed jobs, worker leases, completion/failure snapshots, retry backoff, stalled-job recovery, pause/resume. |
+| Generic job runtime | In progress | JSON jobs, idempotent custom job IDs, explicit job states, priority ordering, delayed jobs, worker leases, completion/failure snapshots, retry backoff, stalled-job recovery, pause/resume. |
 | Job management API | In progress | Add/get/remove/promote/retry/pause/resume/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, runs async processors, completes/fails jobs, supports processor progress/log updates, timeouts, and stalled recovery loops. |
 | Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` for multi-process distributed claims. Postgres/NATS backends remain planned. |
@@ -393,6 +393,7 @@ let job = queue
         "send",
         serde_json::json!({ "to": "ops@example.com" }),
         JobOptions::new()
+            .with_job_id("email:ops@example.com:welcome")
             .with_priority(10)
             .with_delay(Duration::from_secs(5))
             .with_retry_policy(RetryPolicy::fixed(3, Duration::from_secs(1))),
@@ -423,6 +424,9 @@ Management APIs are part of the backend contract: `list_jobs()` returns
 paginated `JobListPage` values, `promote_job()` moves delayed jobs to waiting,
 `retry_job()` manually requeues failed jobs, `renew_lease()` extends an active
 worker lease, and `clean_jobs()` removes old records by state.
+Set `JobOptions::with_job_id()` when producers need idempotent submission:
+adding the same job id again returns the existing job instead of enqueueing a
+duplicate.
 
 Flow jobs create a parent job and one or more child jobs in a single operation.
 The parent starts in `waiting_children`, children are claimed normally, and the

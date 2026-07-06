@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::time::Duration;
 
 const WAITING_SCORE_BUCKET: f64 = 1_000_000_000_000.0;
@@ -126,8 +127,16 @@ impl RedisJobQueue {
             parent_job.child_ids.push(child_job.id.clone());
             child_jobs.push(child_job);
         }
+        validate_flow_job_ids(&parent_job, &child_jobs)?;
 
         let mut conn = self.connection().await?;
+        for id in std::iter::once(&parent_job.id).chain(child_jobs.iter().map(|job| &job.id)) {
+            if self.load_job(&mut conn, id).await?.is_some() {
+                return Err(LaneError::ConfigError(format!(
+                    "flow job id `{id}` already exists"
+                )));
+            }
+        }
         self.store_job(&mut conn, &parent_job).await?;
         self.index_new_job(&mut conn, &parent_job).await?;
         for child in &child_jobs {
@@ -197,6 +206,18 @@ impl RedisJobQueue {
         conn.hset(self.jobs_key(), &job.id, encoded)
             .await
             .map_err(redis_error)
+    }
+
+    async fn store_new_job(&self, conn: &mut ConnectionManager, job: &Job) -> Result<bool> {
+        let encoded = encode_job(job)?;
+        let inserted: usize = redis::cmd("HSETNX")
+            .arg(self.jobs_key())
+            .arg(&job.id)
+            .arg(encoded)
+            .query_async(conn)
+            .await
+            .map_err(redis_error)?;
+        Ok(inserted == 1)
     }
 
     async fn index_new_job(&self, conn: &mut ConnectionManager, job: &Job) -> Result<()> {
@@ -402,10 +423,14 @@ impl JobQueueBackend for RedisJobQueue {
         let now = Utc::now();
         let job = Job::new(self.queue.clone(), name, payload, options, now);
         let mut conn = self.connection().await?;
-        self.store_job(&mut conn, &job).await?;
-        self.index_new_job(&mut conn, &job).await?;
+        if self.store_new_job(&mut conn, &job).await? {
+            self.index_new_job(&mut conn, &job).await?;
+            return Ok(job);
+        }
 
-        Ok(job)
+        self.load_job(&mut conn, &job.id)
+            .await?
+            .ok_or_else(|| LaneError::JobNotFound(job.id.clone()))
     }
 
     async fn add_flow(
@@ -1027,8 +1052,17 @@ fn state_after_dependencies(scheduled_at: DateTime<Utc>, now: DateTime<Utc>) -> 
 }
 
 fn validate_job_options(options: &JobOptions) -> Result<()> {
-    if let Some(repeat) = &options.repeat {
-        repeat.validate()?;
+    options.validate()
+}
+
+fn validate_flow_job_ids(parent: &Job, children: &[Job]) -> Result<()> {
+    let mut ids = HashSet::with_capacity(children.len() + 1);
+    for id in std::iter::once(&parent.id).chain(children.iter().map(|job| &job.id)) {
+        if !ids.insert(id) {
+            return Err(LaneError::ConfigError(format!(
+                "flow contains duplicate job id `{id}`"
+            )));
+        }
     }
     Ok(())
 }
@@ -1049,11 +1083,13 @@ fn next_repeat_job(job: &Job, now: DateTime<Utc>) -> Result<Option<Job>> {
         return Ok(None);
     }
 
+    let mut options = job.options.clone();
+    options.job_id = None;
     let mut next = Job::new(
         job.queue.clone(),
         job.name.clone(),
         job.payload.clone(),
-        job.options.clone(),
+        options,
         now,
     );
     next.scheduled_at = scheduled_at;

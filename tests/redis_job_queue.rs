@@ -387,6 +387,41 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .iter()
         .any(|job| job.repeat_key.as_deref() == Some("cron-heartbeat")));
 
+    let idempotent_job_id = format!("{namespace}:invoice:42");
+    let idempotent = producer
+        .add_job(
+            "invoice".to_string(),
+            serde_json::json!({ "id": 42, "attempt": 1 }),
+            JobOptions::new()
+                .with_job_id(idempotent_job_id.clone())
+                .with_priority(30),
+        )
+        .await
+        .expect("idempotent job should be added");
+    let duplicate = worker
+        .add_job(
+            "invoice-duplicate".to_string(),
+            serde_json::json!({ "id": 42, "attempt": 2 }),
+            JobOptions::new()
+                .with_job_id(idempotent_job_id.clone())
+                .with_priority(1),
+        )
+        .await
+        .expect("duplicate idempotent job should return existing");
+    assert_eq!(duplicate, idempotent);
+    let waiting_jobs = producer
+        .list_jobs(JobListOptions::new().with_state(JobState::Waiting))
+        .await
+        .expect("waiting jobs should list after idempotent add");
+    assert_eq!(
+        waiting_jobs
+            .jobs
+            .iter()
+            .filter(|job| job.id == idempotent_job_id)
+            .count(),
+        1
+    );
+
     cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())
 }

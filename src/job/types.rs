@@ -278,6 +278,9 @@ impl RepeatOptions {
 /// Options used when adding a generic queue job.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JobOptions {
+    /// Optional caller-assigned id used for idempotent job submission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<JobId>,
     /// Lower values run before higher values.
     pub priority: JobPriority,
     /// Optional delay before the job becomes claimable.
@@ -292,7 +295,7 @@ pub struct JobOptions {
     pub remove_on_fail: bool,
     /// Number of lease expirations tolerated before terminal failure.
     pub max_stalled_count: u32,
-    /// Optional fixed-interval repeat schedule.
+    /// Optional repeat schedule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat: Option<RepeatOptions>,
 }
@@ -300,6 +303,7 @@ pub struct JobOptions {
 impl Default for JobOptions {
     fn default() -> Self {
         Self {
+            job_id: None,
             priority: DEFAULT_JOB_PRIORITY,
             delay: None,
             retry_policy: RetryPolicy::none(),
@@ -321,6 +325,12 @@ impl JobOptions {
     /// Set job priority. Lower values run first.
     pub fn with_priority(mut self, priority: JobPriority) -> Self {
         self.priority = priority;
+        self
+    }
+
+    /// Set a caller-assigned id for idempotent job submission.
+    pub fn with_job_id(mut self, job_id: impl Into<String>) -> Self {
+        self.job_id = Some(job_id.into());
         self
     }
 
@@ -360,10 +370,24 @@ impl JobOptions {
         self
     }
 
-    /// Configure fixed-interval repeat scheduling.
+    /// Configure repeat scheduling.
     pub fn with_repeat(mut self, repeat: RepeatOptions) -> Self {
         self.repeat = Some(repeat);
         self
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if matches!(self.job_id.as_deref(), Some(job_id) if job_id.trim().is_empty()) {
+            return Err(LaneError::ConfigError(
+                "job id must not be empty".to_string(),
+            ));
+        }
+
+        if let Some(repeat) = &self.repeat {
+            repeat.validate()?;
+        }
+
+        Ok(())
     }
 }
 
@@ -420,9 +444,13 @@ impl Job {
                 .clone()
                 .unwrap_or_else(|| format!("{queue}:{name}"))
         });
+        let id = options
+            .job_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         Self {
-            id: Uuid::new_v4().to_string(),
+            id,
             queue,
             name,
             payload,
