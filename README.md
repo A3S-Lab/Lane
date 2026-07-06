@@ -674,12 +674,13 @@ the same Redis turn.
 
 Manual lifecycle management follows the same Redis-side state movement rule:
 `promote_job()` removes a delayed job from the delayed zset and inserts it into
-waiting inside one script; `retry_job()` clears terminal failure metadata and
-moves failed jobs back to waiting inside one script; `update_priority()` rewrites
-the job hash and, for waiting jobs, replaces the waiting zset score in the same
-script. This is intentionally aligned with BullMQ's mechanism of moving job
-state through Redis scripts instead of coordinating several client-side Redis
-commands.
+waiting inside one script, treats the delayed zset as the Redis movement gate,
+and prunes orphaned or stale delayed members when a job is missing or already in
+another state. `retry_job()` clears terminal failure metadata and moves failed
+jobs back to waiting inside one script; `update_priority()` rewrites the job hash
+and, for waiting jobs, replaces the waiting zset score in the same script. This
+is intentionally aligned with BullMQ's mechanism of moving job state through
+Redis scripts instead of coordinating several client-side Redis commands.
 
 Redis job management mutations are script-backed too. `update_progress()` checks
 the current state and writes the progress value in one Redis turn; `add_log()`

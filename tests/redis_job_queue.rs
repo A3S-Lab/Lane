@@ -358,6 +358,66 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("single-promoted job should complete");
+    let _: usize = single_promote_conn
+        .zadd(
+            format!("{namespace}:single-promote:delayed"),
+            &single_promoted.id,
+            0.0,
+        )
+        .await?;
+    let stale_promoted = single_promote_queue
+        .promote_job(&single_promoted.id, Utc::now())
+        .await
+        .expect("completed job with stale delayed index should load");
+    assert_eq!(stale_promoted.state, JobState::Completed);
+    let stale_completed_delayed_score: Option<f64> = single_promote_conn
+        .zscore(
+            format!("{namespace}:single-promote:delayed"),
+            &single_promoted.id,
+        )
+        .await?;
+    assert!(stale_completed_delayed_score.is_none());
+    let _: usize = single_promote_conn
+        .zadd(
+            format!("{namespace}:single-promote:delayed"),
+            "missing-promote-job",
+            0.0,
+        )
+        .await?;
+    let missing_promote = single_promote_queue
+        .promote_job("missing-promote-job", Utc::now())
+        .await
+        .expect_err("missing job should still be reported as missing");
+    assert!(matches!(missing_promote, LaneError::JobNotFound(_)));
+    let missing_delayed_score: Option<f64> = single_promote_conn
+        .zscore(
+            format!("{namespace}:single-promote:delayed"),
+            "missing-promote-job",
+        )
+        .await?;
+    assert!(missing_delayed_score.is_none());
+    let missing_index_job = single_promote_queue
+        .add_job(
+            "missing-delayed-index".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_delay(Duration::from_secs(60)),
+        )
+        .await
+        .expect("missing-index delayed job should be added");
+    let _: usize = single_promote_conn
+        .zrem(
+            format!("{namespace}:single-promote:delayed"),
+            &missing_index_job.id,
+        )
+        .await?;
+    let missing_index_error = single_promote_queue
+        .promote_job(&missing_index_job.id, Utc::now())
+        .await
+        .expect_err("delayed job without delayed index should reject promote");
+    assert!(matches!(
+        missing_index_error,
+        LaneError::JobStateConflict(_)
+    ));
     trace_stage("single-promote:done");
 
     let active_limit_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "active-limit")

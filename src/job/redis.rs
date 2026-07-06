@@ -583,12 +583,19 @@ return recovered
 const PROMOTE_JOB_SCRIPT: &str = r#"
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
+  redis.call('ZREM', KEYS[3], ARGV[1])
   return {'missing'}
 end
+
+local removed_from_delayed = redis.call('ZREM', KEYS[3], ARGV[1])
 
 local job = cjson.decode(raw)
 if job["state"] ~= "delayed" then
   return {'ok', raw}
+end
+
+if removed_from_delayed == 0 then
+  return {'state', 'delayed_index_missing'}
 end
 
 job["state"] = "waiting"
@@ -598,7 +605,6 @@ local sequence = redis.call('INCR', KEYS[4])
 local waiting_score = (priority * tonumber(ARGV[3])) + sequence
 local updated = cjson.encode(job)
 
-redis.call('ZREM', KEYS[3], ARGV[1])
 redis.call('ZADD', KEYS[2], waiting_score, ARGV[1])
 redis.call('HSET', KEYS[1], ARGV[1], updated)
 
