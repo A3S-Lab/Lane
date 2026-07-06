@@ -1,8 +1,9 @@
 #![cfg(feature = "redis-backend")]
 
 use a3s_lane::{
-    DeduplicationOptions, Job, JobListOptions, JobLogEntry, JobOptions, JobQueueBackend,
-    JobRateLimit, JobSpec, JobState, LaneError, RedisJobQueue, RepeatOptions, RetryPolicy,
+    DeduplicationOptions, Job, JobListOptions, JobLogEntry, JobOptions, JobPriorityCount,
+    JobQueueBackend, JobRateLimit, JobSpec, JobState, LaneError, RedisJobQueue, RepeatOptions,
+    RetryPolicy,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use redis::AsyncCommands;
@@ -776,6 +777,37 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .update_priority(&second_priority.id, 1)
         .await
         .expect("priority should update");
+    let priority_counts = priority_queue
+        .get_counts_per_priority(&[1, 50, 60, 1])
+        .await
+        .expect("priority counts should load");
+    assert_eq!(
+        priority_counts,
+        vec![
+            JobPriorityCount {
+                priority: 1,
+                count: 1,
+            },
+            JobPriorityCount {
+                priority: 50,
+                count: 1,
+            },
+            JobPriorityCount {
+                priority: 60,
+                count: 0,
+            },
+        ]
+    );
+    let mut priority_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let priority_one_zcount: usize = redis::cmd("ZCOUNT")
+        .arg(format!("{namespace}:priority:waiting"))
+        .arg(1_000_000_000_000_f64)
+        .arg(1_999_999_999_999_f64)
+        .query_async(&mut priority_conn)
+        .await?;
+    assert_eq!(priority_one_zcount, 1);
     let priority_claim = priority_queue
         .claim_next(
             "worker-priority".to_string(),
@@ -796,9 +828,6 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("priority job should complete");
-    let mut priority_conn = redis::Client::open(redis_url.as_str())?
-        .get_connection_manager()
-        .await?;
     let _: usize = priority_conn
         .zadd(
             format!("{namespace}:priority:waiting"),
@@ -874,6 +903,23 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await?;
     assert!(delayed_priority_delayed_score.is_some());
+    let counts_after_delayed_update = priority_queue
+        .get_counts_per_priority(&[7, 50])
+        .await
+        .expect("priority counts after delayed update should load");
+    assert_eq!(
+        counts_after_delayed_update,
+        vec![
+            JobPriorityCount {
+                priority: 7,
+                count: 0,
+            },
+            JobPriorityCount {
+                priority: 50,
+                count: 1,
+            },
+        ]
+    );
     trace_stage("priority:done");
 
     let delayed_priority_queue =

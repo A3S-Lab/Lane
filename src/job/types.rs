@@ -26,6 +26,13 @@ pub type JobPriority = u32;
 /// Default priority for jobs that do not specify one.
 pub const DEFAULT_JOB_PRIORITY: JobPriority = 1000;
 
+/// Waiting-job count for a priority value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobPriorityCount {
+    pub priority: JobPriority,
+    pub count: usize,
+}
+
 /// Queue-level rate limit for claiming generic jobs.
 ///
 /// The limit is counted when a job is successfully moved from waiting to

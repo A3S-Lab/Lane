@@ -938,6 +938,28 @@ async fn priority_updates_reorder_waiting_jobs() {
     assert_eq!(updated.priority, 1);
     assert_eq!(updated.options.priority, 1);
 
+    let counts = queue
+        .get_counts_per_priority(&[1, 50, 60, 1])
+        .await
+        .unwrap();
+    assert_eq!(
+        counts,
+        vec![
+            JobPriorityCount {
+                priority: 1,
+                count: 1,
+            },
+            JobPriorityCount {
+                priority: 50,
+                count: 1,
+            },
+            JobPriorityCount {
+                priority: 60,
+                count: 0,
+            },
+        ]
+    );
+
     let claimed = queue
         .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
         .await
@@ -945,6 +967,75 @@ async fn priority_updates_reorder_waiting_jobs() {
         .unwrap();
     assert_eq!(claimed.id, second.id);
     assert_ne!(claimed.id, first.id);
+}
+
+#[tokio::test]
+async fn priority_counts_only_include_waiting_jobs() {
+    let queue = InMemoryJobQueue::new("priority-counts");
+    let now = ts(1_000);
+    queue
+        .add_at(
+            "waiting-a",
+            serde_json::json!({}),
+            JobOptions::new().with_priority(5),
+            now,
+        )
+        .await
+        .unwrap();
+    queue
+        .add_at(
+            "waiting-b",
+            serde_json::json!({}),
+            JobOptions::new().with_priority(5),
+            now,
+        )
+        .await
+        .unwrap();
+    let active = queue
+        .add_at(
+            "active",
+            serde_json::json!({}),
+            JobOptions::new().with_priority(1),
+            now,
+        )
+        .await
+        .unwrap();
+    let _delayed = queue
+        .add_at(
+            "delayed",
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_priority(5)
+                .with_delay(Duration::from_secs(30)),
+            now,
+        )
+        .await
+        .unwrap();
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, active.id);
+
+    let counts = queue.get_counts_per_priority(&[5, 1, 9]).await.unwrap();
+    assert_eq!(
+        counts,
+        vec![
+            JobPriorityCount {
+                priority: 5,
+                count: 2,
+            },
+            JobPriorityCount {
+                priority: 1,
+                count: 0,
+            },
+            JobPriorityCount {
+                priority: 9,
+                count: 0,
+            },
+        ]
+    );
 }
 
 #[tokio::test]

@@ -370,7 +370,7 @@ A3S stack and language SDKs.
 | --- | --- | --- |
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
 | Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, debounce TTL extension, delayed-owner replace, and keep-last-if-active requeue, repeat-key ownership, explicit job states, priority ordering, delayed jobs, token-owned worker leases, active-to-delayed movement, completion/failure snapshots, retry backoff, rate-limited claims, shared active concurrency limits, stalled-job recovery, pause/resume. |
-| Job management API | In progress | Add/get/get-state/remove/remove-repeat/remove-deduplication-key/list-repeats/get-flow-dependencies/promote/reschedule/delay-active/retry/update-priority/pause/resume/drain/clean APIs, pagination, add-log/get-logs, progress updates, lease renewal. |
+| Job management API | In progress | Add/get/get-state/remove/remove-repeat/remove-deduplication-key/list-repeats/get-flow-dependencies/promote/reschedule/delay-active/retry/update-priority/pause/resume/drain/clean APIs, pagination, waiting priority counts, add-log/get-logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, and stalled recovery loops. |
 | Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership/listing/removal, flow submission, flow dependency inspection, delayed promotion and rescheduling, active-to-delayed movement, single-job promote, state-index queries, manual retry, priority update, progress update, log append, list/stat snapshots, drain, clean, claim, rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, dependency inspection, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
@@ -456,7 +456,8 @@ the claim token, `remove_job()` removes non-active jobs,
 and missing child ids,
 `drain_jobs(false)` removes waiting jobs, `drain_jobs(true)` also removes
 ordinary delayed jobs while preserving current delayed repeat owners,
-`clean_jobs()` removes old records by state, `add_log()` appends retained job
+`clean_jobs()` removes old records by state, `get_counts_per_priority()` returns
+waiting-job counts for selected priorities, `add_log()` appends retained job
 logs, and `get_job_logs()` returns a `JobLogPage` with Redis/BullMQ-style range
 semantics. Cleanup paths can unblock flow parents when a pending child is
 removed.
@@ -959,16 +960,20 @@ Queue reads use the same Redis-side snapshot approach. `get_job_state()` follows
 BullMQ's `getState` mechanism by checking the Redis state indexes in one script,
 rather than trusting the serialized job JSON state field. Lane checks completed,
 failed, delayed, active, waiting, and waiting-children sorted sets and returns
-`None` when the job id is not present in any state index. `get_job_logs()` reads
-the `logs:<jobId>` list with `LRANGE` and `LLEN`, including BullMQ's descending
-window convention of using negative indexes and reversing the result. Missing or
-already-removed log lists return an empty page. `list_jobs()` evaluates one Lua
-script to read state pages and job JSON snapshots in the same Redis turn and to
-prune stale state-index entries it encounters. `stats()` evaluates one Lua script
-that reads the pause flag and all waiting, delayed, active, waiting-children,
-completed, and failed sorted-set counts in a single Redis turn, mirroring
-BullMQ's `getCounts` style instead of stitching together several client-side
-reads.
+`None` when the job id is not present in any state index.
+`get_counts_per_priority()` follows BullMQ's `getCountsPerPriority` shape for
+priority queues: duplicate requested priorities are ignored after their first
+occurrence, and Redis counts waiting jobs with `ZCOUNT` over the priority-encoded
+waiting zset score range instead of loading job snapshots client-side.
+`get_job_logs()` reads the `logs:<jobId>` list with `LRANGE` and `LLEN`,
+including BullMQ's descending window convention of using negative indexes and
+reversing the result. Missing or already-removed log lists return an empty page.
+`list_jobs()` evaluates one Lua script to read state pages and job JSON snapshots
+in the same Redis turn and to prune stale state-index entries it encounters.
+`stats()` evaluates one Lua script that reads the pause flag and all waiting,
+delayed, active, waiting-children, completed, and failed sorted-set counts in a
+single Redis turn, mirroring BullMQ's `getCounts` style instead of stitching
+together several client-side reads.
 
 Stalled recovery is Lua-backed as well. The recovery script scans expired
 active scores, verifies that the independent lock key is missing, increments

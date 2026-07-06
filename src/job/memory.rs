@@ -1,8 +1,8 @@
 use super::backend::JobQueueBackend;
 use super::types::{
     deduplication_expiration, Job, JobFlow, JobFlowDependencies, JobId, JobListOptions,
-    JobListPage, JobLogEntry, JobLogPage, JobOptions, JobPriority, JobQueueSnapshot, JobQueueStats,
-    JobRepeatEntry, JobSpec, JobState, JobWorkerId, QueueName,
+    JobListPage, JobLogEntry, JobLogPage, JobOptions, JobPriority, JobPriorityCount,
+    JobQueueSnapshot, JobQueueStats, JobRepeatEntry, JobSpec, JobState, JobWorkerId, QueueName,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -648,6 +648,26 @@ impl InMemoryJobQueue {
         })
     }
 
+    /// Count waiting jobs for each requested priority.
+    pub async fn counts_per_priority(
+        &self,
+        priorities: &[JobPriority],
+    ) -> Result<Vec<JobPriorityCount>> {
+        let priorities = unique_priorities(priorities);
+        let inner = self.inner.lock().await;
+        Ok(priorities
+            .into_iter()
+            .map(|priority| {
+                let count = inner
+                    .jobs
+                    .values()
+                    .filter(|job| job.state == JobState::Waiting && job.priority == priority)
+                    .count();
+                JobPriorityCount { priority, count }
+            })
+            .collect())
+    }
+
     /// Remove old jobs in a specific state and return their snapshots.
     pub async fn clean(
         &self,
@@ -1159,6 +1179,13 @@ impl JobQueueBackend for InMemoryJobQueue {
         self.list(options).await
     }
 
+    async fn get_counts_per_priority(
+        &self,
+        priorities: &[JobPriority],
+    ) -> Result<Vec<JobPriorityCount>> {
+        self.counts_per_priority(priorities).await
+    }
+
     async fn update_progress(&self, job_id: &str, progress: Value) -> Result<Job> {
         self.set_progress(job_id, progress).await
     }
@@ -1346,6 +1373,16 @@ fn normalize_redis_index(index: isize, len: usize) -> usize {
     } else {
         normalized as usize
     }
+}
+
+fn unique_priorities(priorities: &[JobPriority]) -> Vec<JobPriority> {
+    let mut unique = Vec::new();
+    for &priority in priorities {
+        if !unique.contains(&priority) {
+            unique.push(priority);
+        }
+    }
+    unique
 }
 
 fn compare_list_order(a: &Job, b: &Job) -> Ordering {

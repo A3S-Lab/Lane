@@ -1,8 +1,8 @@
 use super::backend::JobQueueBackend;
 use super::types::{
     add_duration, deduplication_expiration, Job, JobFlow, JobFlowDependencies, JobListOptions,
-    JobListPage, JobLogEntry, JobLogPage, JobOptions, JobPriority, JobQueueStats, JobRateLimit,
-    JobRepeatEntry, JobSpec, JobState, JobWorkerId, QueueName,
+    JobListPage, JobLogEntry, JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueStats,
+    JobRateLimit, JobRepeatEntry, JobSpec, JobState, JobWorkerId, QueueName,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -2921,6 +2921,20 @@ return {
 }
 "#;
 
+const COUNTS_PER_PRIORITY_SCRIPT: &str = r#"
+local bucket = tonumber(ARGV[1])
+local results = {}
+
+for index = 2, #ARGV do
+  local priority = tonumber(ARGV[index])
+  local min_score = priority * bucket
+  local max_score = ((priority + 1) * bucket) - 1
+  results[#results + 1] = redis.call('ZCOUNT', KEYS[1], min_score, max_score)
+end
+
+return results
+"#;
+
 const FLOW_DEPENDENCIES_SCRIPT: &str = r#"
 local parent_raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not parent_raw then
@@ -3917,6 +3931,26 @@ impl JobQueueBackend for RedisJobQueue {
         decode_list_jobs_result(&result, options.offset, options.limit)
     }
 
+    async fn get_counts_per_priority(
+        &self,
+        priorities: &[JobPriority],
+    ) -> Result<Vec<JobPriorityCount>> {
+        let priorities = unique_priorities(priorities);
+        let mut conn = self.connection().await?;
+        let mut command = redis::cmd("EVAL");
+        command
+            .arg(COUNTS_PER_PRIORITY_SCRIPT)
+            .arg(1)
+            .arg(self.state_key(JobState::Waiting))
+            .arg(WAITING_SCORE_BUCKET);
+        for priority in &priorities {
+            command.arg(*priority);
+        }
+
+        let result: Vec<i64> = command.query_async(&mut conn).await.map_err(redis_error)?;
+        decode_priority_counts(&priorities, &result)
+    }
+
     async fn update_progress(&self, job_id: &str, progress: Value) -> Result<Job> {
         let mut conn = self.connection().await?;
         let progress = serde_json::to_string(&progress)
@@ -4485,6 +4519,30 @@ fn decode_stats_result(result: &[i64]) -> Result<JobQueueStats> {
     })
 }
 
+fn decode_priority_counts(
+    priorities: &[JobPriority],
+    result: &[i64],
+) -> Result<Vec<JobPriorityCount>> {
+    if result.len() != priorities.len() {
+        return Err(LaneError::Other(format!(
+            "Redis priority count script returned {} values, expected {}",
+            result.len(),
+            priorities.len()
+        )));
+    }
+
+    priorities
+        .iter()
+        .zip(result.iter())
+        .map(|(&priority, &count)| {
+            Ok(JobPriorityCount {
+                priority,
+                count: decode_stats_count(count, "priority")?,
+            })
+        })
+        .collect()
+}
+
 fn decode_stats_count(value: i64, field: &str) -> Result<usize> {
     usize::try_from(value).map_err(|_| {
         LaneError::Other(format!(
@@ -4519,6 +4577,16 @@ fn subtract_duration(at: DateTime<Utc>, duration: Duration) -> DateTime<Utc> {
         Ok(delta) => at.checked_sub_signed(delta).unwrap_or(at),
         Err(_) => at,
     }
+}
+
+fn unique_priorities(priorities: &[JobPriority]) -> Vec<JobPriority> {
+    let mut unique = Vec::new();
+    for &priority in priorities {
+        if !unique.contains(&priority) {
+            unique.push(priority);
+        }
+    }
+    unique
 }
 
 #[cfg(test)]
