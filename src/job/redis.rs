@@ -3098,6 +3098,36 @@ impl RedisJobQueue {
             .map_err(redis_error)
     }
 
+    /// Override the claim rate limiter key for a fixed duration.
+    ///
+    /// This mirrors BullMQ's `rateLimit()` mechanism by setting the limiter key
+    /// to a very large counter value with a millisecond TTL. The limiter blocks
+    /// claims when a worker-local or Redis-shared max is configured.
+    pub async fn rate_limit_claims_for(&self, duration: Duration) -> Result<()> {
+        if duration.is_zero() {
+            return Err(LaneError::ConfigError(
+                "claim rate-limit duration must be greater than zero".to_string(),
+            ));
+        }
+        let mut conn = self.connection().await?;
+        redis::cmd("SET")
+            .arg(self.claim_rate_limit_key())
+            .arg(u64::MAX)
+            .arg("PX")
+            .arg(duration_millis(duration).max(1))
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)
+    }
+
+    /// Remove the claim rate limiter key.
+    pub async fn clear_claim_rate_limit_key(&self) -> Result<()> {
+        let mut conn = self.connection().await?;
+        conn.del(self.claim_rate_limit_key())
+            .await
+            .map_err(redis_error)
+    }
+
     /// Clear the Redis-backed queue-level claim rate limit.
     pub async fn clear_claim_rate_limit(&self) -> Result<()> {
         let mut conn = self.connection().await?;

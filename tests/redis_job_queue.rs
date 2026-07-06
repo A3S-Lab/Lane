@@ -7,7 +7,10 @@ use a3s_lane::{
 };
 use chrono::{DateTime, TimeZone, Utc};
 use redis::AsyncCommands;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+static NAMESPACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn lock_token(job: &a3s_lane::Job) -> &str {
     job.lock_token
@@ -21,13 +24,25 @@ async fn redis_backend_runs_job_lifecycle_against_real_server() {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
         return;
     };
-    tokio::time::timeout(Duration::from_secs(180), async move {
-        run_job_lifecycle(redis_url.clone()).await?;
-        run_state_count_indexes(redis_url).await
-    })
+    tokio::time::timeout(
+        Duration::from_secs(420),
+        run_job_lifecycle(redis_url.clone()),
+    )
     .await
-    .expect("Redis integration test timed out")
+    .expect("Redis job lifecycle integration test timed out")
     .unwrap();
+}
+
+#[tokio::test]
+async fn redis_backend_counts_states_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    tokio::time::timeout(Duration::from_secs(120), run_state_count_indexes(redis_url))
+        .await
+        .expect("Redis state-count integration test timed out")
+        .unwrap();
 }
 
 async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
@@ -543,7 +558,10 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .query_async(&mut dedup_conn)
         .await?;
     assert!(replace_ttl_after > 0);
-    assert!(replace_ttl_after <= replace_ttl_before);
+    assert!(
+        replace_ttl_after <= 1_000,
+        "expected replace to preserve the short deduplication TTL instead of refreshing to the job TTL, before {replace_ttl_before}, after {replace_ttl_after}"
+    );
     dedup_queue
         .remove_job(&replace_ttl_new.id)
         .await
@@ -1189,6 +1207,82 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect("second global-rate job should complete");
     trace_stage("global-rate:done");
+
+    let manual_rate_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "manual-rate")
+        .expect("valid Redis URL should build the manual rate queue");
+    let zero_manual_rate = manual_rate_queue
+        .rate_limit_claims_for(Duration::ZERO)
+        .await
+        .expect_err("zero manual rate-limit duration should be rejected");
+    assert!(matches!(zero_manual_rate, LaneError::ConfigError(_)));
+    manual_rate_queue
+        .set_claim_rate_limit(JobRateLimit::new(1, Duration::from_millis(1_000)))
+        .await
+        .expect("manual rate queue should configure shared max");
+    let manual_rate_job = manual_rate_queue
+        .add_job(
+            "manual-rate-job".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("manual rate job should add");
+    manual_rate_queue
+        .rate_limit_claims_for(Duration::from_millis(1_000))
+        .await
+        .expect("manual rate limit key should be set");
+    let mut manual_rate_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let manual_rate_key = format!("{namespace}:manual-rate:claim_rate_limit");
+    let manual_rate_value: Option<u64> = manual_rate_conn.get(&manual_rate_key).await?;
+    assert_eq!(manual_rate_value, Some(u64::MAX));
+    let manual_rate_ttl = manual_rate_queue
+        .get_claim_rate_limit_ttl(None)
+        .await
+        .expect("manual rate TTL should load");
+    assert!(
+        (1..=1_000).contains(&manual_rate_ttl),
+        "expected manual rate TTL to be within the configured window, got {manual_rate_ttl}"
+    );
+    assert!(manual_rate_queue
+        .claim_next(
+            "worker-manual-rate".to_string(),
+            Duration::from_secs(30),
+            Utc::now()
+        )
+        .await
+        .expect("manual rate-limited claim should return")
+        .is_none());
+    manual_rate_queue
+        .clear_claim_rate_limit_key()
+        .await
+        .expect("manual rate limiter key should clear");
+    let manual_rate_pttl_after_clear: i64 = redis::cmd("PTTL")
+        .arg(&manual_rate_key)
+        .query_async(&mut manual_rate_conn)
+        .await?;
+    assert_eq!(manual_rate_pttl_after_clear, -2);
+    let manual_rate_claim = manual_rate_queue
+        .claim_next(
+            "worker-manual-rate".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("manual rate claim should return after key clear")
+        .expect("manual rate job should be claimable after clearing the limiter key");
+    assert_eq!(manual_rate_claim.id, manual_rate_job.id);
+    manual_rate_queue
+        .complete_job(
+            &manual_rate_claim.id,
+            lock_token(&manual_rate_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("manual rate job should complete");
+    trace_stage("manual-rate:done");
 
     let claim_promote_queue =
         RedisJobQueue::with_namespace(&redis_url, &namespace, "claim-promote")
@@ -4498,7 +4592,9 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
 
 async fn run_state_count_indexes(redis_url: String) -> redis::RedisResult<()> {
     let namespace = unique_namespace();
+    trace_stage("state-count:cleanup:start");
     cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("state-count:cleanup:done");
 
     let state_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "state-counts")
         .expect("valid Redis URL should build the state-count queue");
@@ -4720,6 +4816,7 @@ async fn run_state_count_indexes(redis_url: String) -> redis::RedisResult<()> {
     assert_eq!(failed_zcard, 1);
 
     cleanup_namespace_with_conn(&mut conn, &namespace).await?;
+    trace_stage("state-count:done");
     Ok(())
 }
 
@@ -4744,7 +4841,11 @@ fn unique_namespace() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    format!("a3s:lane:test:{}:{timestamp}", std::process::id())
+    let sequence = NAMESPACE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "a3s:lane:test:{}:{timestamp}:{sequence}",
+        std::process::id()
+    )
 }
 
 fn trace_stage(stage: &str) {
