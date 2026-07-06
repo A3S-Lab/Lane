@@ -662,6 +662,11 @@ worker computes the next occurrence from `RepeatOptions`, then the Lua script
 finishes the current job and writes the next delayed or waiting occurrence in
 the same Redis turn.
 
+Stalled recovery is Lua-backed as well. The recovery script scans expired
+active scores, verifies that the independent lock key is missing, increments
+the stalled count, and either requeues the job or fails it in the same Redis
+turn.
+
 Run the Redis integration test against any reachable Redis server:
 
 ```bash

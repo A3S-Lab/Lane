@@ -553,6 +553,56 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         JobState::Active
     );
 
+    let locked_stalled = producer
+        .add_job(
+            "locked-stalled".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("locked-stalled job should be added");
+    let locked_stalled_claim = worker
+        .claim_next(
+            "worker-locked-stalled".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("locked-stalled claim should return")
+        .expect("locked-stalled job should be claimable");
+    assert_eq!(locked_stalled_claim.id, locked_stalled.id);
+    let mut stalled_index_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let _: usize = stalled_index_conn
+        .zadd(format!("{namespace}:jobs:active"), &locked_stalled.id, 0.0)
+        .await?;
+    assert_eq!(
+        producer
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("locked stalled recovery should run"),
+        0
+    );
+    assert_eq!(
+        producer
+            .get_job(&locked_stalled.id)
+            .await
+            .expect("locked-stalled job should load")
+            .expect("locked-stalled job should still exist")
+            .state,
+        JobState::Active
+    );
+    worker
+        .complete_job(
+            &locked_stalled_claim.id,
+            lock_token(&locked_stalled_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("locked-stalled job should complete with valid token");
+
     let stalled = producer
         .add_job(
             "stalled".to_string(),
@@ -610,6 +660,48 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect("valid reclaimed token should complete");
 
+    let terminal_stalled = producer
+        .add_job(
+            "terminal-stalled".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_max_stalled_count(0),
+        )
+        .await
+        .expect("terminal-stalled job should be added");
+    let terminal_stalled_claim = worker
+        .claim_next(
+            "worker-terminal-stalled".to_string(),
+            Duration::from_millis(50),
+            Utc::now(),
+        )
+        .await
+        .expect("terminal-stalled claim should return")
+        .expect("terminal-stalled job should be claimable");
+    assert_eq!(terminal_stalled_claim.id, terminal_stalled.id);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        producer
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("terminal stalled recovery should run"),
+        1
+    );
+    let terminal_failed = producer
+        .get_job(&terminal_stalled.id)
+        .await
+        .expect("terminal-stalled job should load")
+        .expect("terminal-stalled job should still exist");
+    assert_eq!(terminal_failed.state, JobState::Failed);
+    assert_eq!(terminal_failed.stalled_count, 1);
+    let terminal_failed_score: Option<f64> = stalled_index_conn
+        .zscore(format!("{namespace}:jobs:failed"), &terminal_stalled.id)
+        .await?;
+    assert!(terminal_failed_score.is_some());
+    let terminal_active_score: Option<f64> = stalled_index_conn
+        .zscore(format!("{namespace}:jobs:active"), &terminal_stalled.id)
+        .await?;
+    assert!(terminal_active_score.is_none());
+
     let stored_high = producer
         .get_job(&high.id)
         .await
@@ -623,8 +715,8 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     assert_eq!(stored_high.logs[0].line, "accepted");
 
     let stats = producer.stats().await.expect("stats should load");
-    assert_eq!(stats.completed, 2);
-    assert_eq!(stats.failed, 1);
+    assert_eq!(stats.completed, 3);
+    assert_eq!(stats.failed, 2);
     assert_eq!(stats.active, 1);
 
     let mut flow_index_conn = redis::Client::open(redis_url.as_str())?

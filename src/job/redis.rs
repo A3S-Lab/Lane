@@ -374,6 +374,83 @@ redis.call('ZADD', KEYS[2], ARGV[4], ARGV[1])
 return {'ok', updated}
 "#;
 
+const RECOVER_STALLED_SCRIPT: &str = r#"
+local ids = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1], 'LIMIT', 0, ARGV[5])
+local recovered = 0
+
+for _, id in ipairs(ids) do
+  local raw = redis.call('HGET', KEYS[1], id)
+  if not raw then
+    redis.call('ZREM', KEYS[2], id)
+  else
+    local job = cjson.decode(raw)
+    if job["state"] == "active" then
+      local lock_key = ARGV[3] .. id
+      if redis.call('EXISTS', lock_key) == 0 then
+        job["stalled_count"] = (job["stalled_count"] or 0) + 1
+        job["worker_id"] = cjson.null
+        job["lock_token"] = cjson.null
+        job["lease_expires_at"] = cjson.null
+        job["failed_reason"] = "job stalled after worker lease expired"
+        redis.call('ZREM', KEYS[2], id)
+
+        local max_stalled = 1
+        if job["options"] and job["options"]["max_stalled_count"] ~= nil then
+          max_stalled = tonumber(job["options"]["max_stalled_count"])
+        end
+
+        if job["stalled_count"] > max_stalled then
+          job["state"] = "failed"
+          job["finished_at"] = ARGV[2]
+
+          if job["options"] and job["options"]["remove_on_fail"] == true then
+            redis.call('HDEL', KEYS[1], id)
+          else
+            redis.call('HSET', KEYS[1], id, cjson.encode(job))
+            redis.call('ZADD', KEYS[4], ARGV[1], id)
+          end
+
+          local parent_id = job["parent_id"]
+          if parent_id and parent_id ~= cjson.null then
+            local parent_raw = redis.call('HGET', KEYS[1], parent_id)
+            if parent_raw then
+              local parent = cjson.decode(parent_raw)
+              if parent["state"] == "waiting_children" then
+                redis.call('ZREM', KEYS[6], parent_id)
+                parent["state"] = "failed"
+                parent["finished_at"] = ARGV[2]
+                parent["worker_id"] = cjson.null
+                parent["lock_token"] = cjson.null
+                parent["lease_expires_at"] = cjson.null
+                parent["failed_reason"] = "child job " .. id .. " failed: " .. job["failed_reason"]
+                if parent["options"] and parent["options"]["remove_on_fail"] == true then
+                  redis.call('HDEL', KEYS[1], parent_id)
+                else
+                  redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+                  redis.call('ZADD', KEYS[4], ARGV[1], parent_id)
+                end
+              end
+            end
+          end
+        else
+          job["state"] = "waiting"
+          job["processed_at"] = cjson.null
+          local priority = tonumber(job["priority"] or '1000') or 1000
+          local sequence = redis.call('INCR', KEYS[5])
+          local waiting_score = (priority * tonumber(ARGV[4])) + sequence
+          redis.call('HSET', KEYS[1], id, cjson.encode(job))
+          redis.call('ZADD', KEYS[3], waiting_score, id)
+        end
+
+        recovered = recovered + 1
+      end
+    end
+  end
+end
+
+return recovered
+"#;
+
 /// Redis-backed generic job queue.
 ///
 /// Redis stores each job as JSON in a hash and indexes lifecycle states with
@@ -1314,73 +1391,23 @@ impl JobQueueBackend for RedisJobQueue {
 
     async fn recover_stalled_jobs(&self, now: DateTime<Utc>) -> Result<usize> {
         let mut conn = self.connection().await?;
-        let ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
+        redis::cmd("EVAL")
+            .arg(RECOVER_STALLED_SCRIPT)
+            .arg(6)
+            .arg(self.jobs_key())
             .arg(self.state_key(JobState::Active))
-            .arg("-inf")
+            .arg(self.state_key(JobState::Waiting))
+            .arg(self.state_key(JobState::Failed))
+            .arg(self.sequence_key())
+            .arg(self.state_key(JobState::WaitingChildren))
             .arg(millis(now))
+            .arg(now.to_rfc3339())
+            .arg(self.lock_key_prefix())
+            .arg(WAITING_SCORE_BUCKET)
+            .arg(1_000_u16)
             .query_async(&mut conn)
             .await
-            .map_err(redis_error)?;
-
-        let mut recovered = 0;
-        for id in ids {
-            if let Some(mut job) = self.load_job(&mut conn, &id).await? {
-                if job.state != JobState::Active {
-                    continue;
-                }
-                if matches!(job.lease_expires_at, Some(expires_at) if expires_at > now) {
-                    continue;
-                }
-                let lock_exists: bool =
-                    conn.exists(self.lock_key(&id)).await.map_err(redis_error)?;
-                if lock_exists {
-                    continue;
-                }
-                job.stalled_count = job.stalled_count.saturating_add(1);
-                job.worker_id = None;
-                job.lock_token = None;
-                job.lease_expires_at = None;
-                job.failed_reason = Some("job stalled after worker lease expired".to_string());
-                if job.stalled_count > job.options.max_stalled_count {
-                    job.state = JobState::Failed;
-                    job.finished_at = Some(now);
-                    let parent_id = job.parent_id.clone();
-                    let child_id = job.id.clone();
-                    let failed_reason = job.failed_reason.clone();
-                    if job.options.remove_on_fail {
-                        self.remove_job_record(&mut conn, &job.id).await?;
-                    } else {
-                        self.move_to_state(&mut conn, &job, JobState::Failed, millis(now))
-                            .await?;
-                    }
-                    if let Some(parent_id) = parent_id {
-                        self.fail_waiting_parent(
-                            &mut conn,
-                            &parent_id,
-                            format!(
-                                "child job {child_id} failed: {}",
-                                failed_reason.as_deref().unwrap_or("unknown error")
-                            ),
-                            now,
-                        )
-                        .await?;
-                    }
-                } else {
-                    job.state = JobState::Waiting;
-                    job.processed_at = None;
-                    let sequence = self.next_sequence(&mut conn).await?;
-                    self.move_to_state(
-                        &mut conn,
-                        &job,
-                        JobState::Waiting,
-                        waiting_score(job.priority, sequence),
-                    )
-                    .await?;
-                }
-                recovered += 1;
-            }
-        }
-        Ok(recovered)
+            .map_err(redis_error)
     }
 
     async fn pause(&self) -> Result<()> {
