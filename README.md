@@ -369,10 +369,10 @@ A3S stack and language SDKs.
 | Phase | Status | Scope |
 | --- | --- | --- |
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
-| Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication, explicit job states, priority ordering, delayed jobs, token-owned worker leases, completion/failure snapshots, retry backoff, rate-limited claims, shared active concurrency limits, stalled-job recovery, pause/resume. |
+| Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication, repeat-key ownership, explicit job states, priority ordering, delayed jobs, token-owned worker leases, completion/failure snapshots, retry backoff, rate-limited claims, shared active concurrency limits, stalled-job recovery, pause/resume. |
 | Job management API | In progress | Add/get/remove/promote/retry/update-priority/pause/resume/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, and stalled recovery loops. |
-| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, simple deduplication, flow submission, delayed promotion, single-job promote, manual retry, priority update, progress update, log append, list/stat snapshots, clean, claim, rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
+| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, simple deduplication, repeat-key ownership, flow submission, delayed promotion, single-job promote, manual retry, priority update, progress update, log append, list/stat snapshots, clean, claim, rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, and end timestamps are available across in-memory, local durable, and Redis backends. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
@@ -489,7 +489,9 @@ assert_eq!(flow.parent.state, JobState::WaitingChildren);
 Repeat jobs schedule the next occurrence after a successful completion. Use
 `RepeatOptions::every()` for fixed intervals or `RepeatOptions::cron()` for a
 seven-field UTC cron expression. The repeat `limit` counts total executions,
-including the first job:
+including the first job. A custom repeat key also acts as a series owner: while a
+non-terminal occurrence with the same repeat key exists, duplicate adds return
+that owner instead of creating a parallel repeat chain:
 
 ```rust
 use a3s_lane::{InMemoryJobQueue, JobOptions, RepeatOptions};
@@ -528,6 +530,20 @@ assert_eq!(
     cron_job.repeat_key.as_deref(),
     Some("warehouse-nightly-import")
 );
+
+let duplicate = queue
+    .add(
+        "heartbeat",
+        serde_json::json!({ "target": "crm", "duplicate": true }),
+        JobOptions::new().with_repeat(
+            RepeatOptions::every(Duration::from_secs(60))
+                .with_limit(10)
+                .with_key("crm-heartbeat"),
+        ),
+    )
+    .await?;
+
+assert_eq!(duplicate.id, job.id);
 # Ok(())
 # }
 ```
@@ -714,7 +730,21 @@ pass.
 Repeat successors are created during the Redis completion script too. The
 worker computes the next occurrence from `RepeatOptions`, then the Lua script
 finishes the current job and writes the next delayed or waiting occurrence in
-the same Redis turn.
+the same Redis turn. Redis also keeps a lightweight `repeat:<key>` owner key for
+each active repeat series. The add scripts check that key before inserting a new
+repeat job, the completion script transfers ownership to the successor before
+releasing the completed occurrence, and terminal failure, remove, clean, and
+stalled terminal failure release the key only if it still points at the job being
+finalized or removed. Manual retry reclaims the repeat key inside the retry
+script and rejects retry if another non-terminal occurrence already owns the
+series.
+
+This is intentionally a script-level mechanism, not just API-field parity. It is
+inspired by BullMQ's use of Lua scripts to maintain repeat scheduler records,
+deduplication keys, locks, and state indexes atomically. A3S Lane's current
+repeat support is still a lightweight repeat-series owner and successor enqueue
+model; full BullMQ scheduler management APIs remain a later SDK/runtime parity
+item.
 
 Manual lifecycle management follows the same Redis-side state movement rule:
 `promote_job()` removes a delayed job from the delayed zset and inserts it into
@@ -722,9 +752,9 @@ waiting inside one script, treats the delayed zset as the Redis movement gate,
 and prunes orphaned or stale delayed members when a job is missing or already in
 another state. `retry_job()` clears terminal failure metadata, treats the failed
 zset as the Redis movement gate, prunes orphaned or stale failed members, and
-moves valid failed jobs back to waiting inside one script. For deduplicated jobs,
-that same script reclaims the deduplication key before returning the job to
-waiting. `update_priority()`
+moves valid failed jobs back to waiting inside one script. For deduplicated and
+repeat-keyed jobs, that same script reclaims the owner key before returning the
+job to waiting. `update_priority()`
 rewrites the job hash and, for waiting jobs, replaces the waiting zset score in
 the same script; for jobs that are no longer waiting, it prunes stale waiting
 members while preserving the stored non-terminal state. This is intentionally

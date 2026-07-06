@@ -99,6 +99,9 @@ impl InMemoryJobQueue {
         if let Some(existing) = find_active_deduplicated_job(&inner.jobs, &job) {
             return Ok(existing.clone());
         }
+        if let Some(existing) = find_active_repeat_job(&inner.jobs, &job) {
+            return Ok(existing.clone());
+        }
         inner.jobs.insert(job.id.clone(), job.clone());
         Ok(job)
     }
@@ -140,6 +143,12 @@ impl InMemoryJobQueue {
             }
             if let Some(existing) = find_active_deduplicated_job(&inner.jobs, &job)
                 .or_else(|| find_active_deduplicated_job(&staged, &job))
+            {
+                added.push(existing.clone());
+                continue;
+            }
+            if let Some(existing) = find_active_repeat_job(&inner.jobs, &job)
+                .or_else(|| find_active_repeat_job(&staged, &job))
             {
                 added.push(existing.clone());
                 continue;
@@ -217,6 +226,18 @@ impl InMemoryJobQueue {
                 }
             }
         }
+        let mut flow_repeat_keys = HashSet::new();
+        for job in std::iter::once(&parent_job).chain(child_jobs.iter()) {
+            if let Some(repeat_key) = active_repeat_key(job) {
+                if find_active_repeat_key(&inner.jobs, repeat_key).is_some()
+                    || !flow_repeat_keys.insert(repeat_key.to_string())
+                {
+                    return Err(LaneError::ConfigError(format!(
+                        "flow repeat key `{repeat_key}` already active"
+                    )));
+                }
+            }
+        }
         inner.jobs.insert(parent_job.id.clone(), parent_job.clone());
         for child in &child_jobs {
             inner.jobs.insert(child.id.clone(), child.clone());
@@ -279,6 +300,14 @@ impl InMemoryJobQueue {
             {
                 return Err(LaneError::JobStateConflict(format!(
                     "cannot retry job {job_id}; deduplication id `{deduplication_id}` is active on job {}",
+                    existing.id
+                )));
+            }
+        }
+        if let Some(repeat_key) = current.repeat_key.as_deref() {
+            if let Some(existing) = find_active_repeat_key_except(&inner.jobs, repeat_key, job_id) {
+                return Err(LaneError::JobStateConflict(format!(
+                    "cannot retry job {job_id}; repeat key `{repeat_key}` is active on job {}",
                     existing.id
                 )));
             }
@@ -895,6 +924,33 @@ fn find_active_deduplication_id_except<'a>(
     jobs.values().find(|job| {
         job.id != excluded_job_id && active_deduplication_id(job) == Some(deduplication_id)
     })
+}
+
+fn active_repeat_key(job: &Job) -> Option<&str> {
+    if job.state.is_terminal() {
+        return None;
+    }
+
+    job.repeat_key.as_deref()
+}
+
+fn find_active_repeat_job<'a>(jobs: &'a HashMap<JobId, Job>, candidate: &Job) -> Option<&'a Job> {
+    let repeat_key = active_repeat_key(candidate)?;
+    find_active_repeat_key(jobs, repeat_key)
+}
+
+fn find_active_repeat_key<'a>(jobs: &'a HashMap<JobId, Job>, repeat_key: &str) -> Option<&'a Job> {
+    jobs.values()
+        .find(|job| active_repeat_key(job) == Some(repeat_key))
+}
+
+fn find_active_repeat_key_except<'a>(
+    jobs: &'a HashMap<JobId, Job>,
+    repeat_key: &str,
+    excluded_job_id: &str,
+) -> Option<&'a Job> {
+    jobs.values()
+        .find(|job| job.id != excluded_job_id && active_repeat_key(job) == Some(repeat_key))
 }
 
 fn state_after_dependencies(scheduled_at: DateTime<Utc>, now: DateTime<Utc>) -> JobState {

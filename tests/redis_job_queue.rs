@@ -2284,6 +2284,23 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("repeat job should be added");
+    let repeat_duplicate = worker
+        .add_job(
+            "repeat-duplicate".to_string(),
+            serde_json::json!({ "kind": "heartbeat", "duplicate": true }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_millis(200))
+                    .with_limit(2)
+                    .with_key("heartbeat"),
+            ),
+        )
+        .await
+        .expect("duplicate repeat job should return the active series owner");
+    assert_eq!(repeat_duplicate.id, repeat.id);
+    let repeat_owner: Option<String> = flow_index_conn
+        .get(format!("{namespace}:jobs:repeat:heartbeat"))
+        .await?;
+    assert_eq!(repeat_owner.as_deref(), Some(repeat.id.as_str()));
     let first_repeat = worker
         .claim_next(
             "worker-repeat-a".to_string(),
@@ -2310,9 +2327,30 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     let repeat_successor = delayed_repeats
         .jobs
         .iter()
-        .find(|job| job.repeat_key.as_deref() == Some("heartbeat"))
+        .find(|&job| job.repeat_key.as_deref() == Some("heartbeat"))
+        .cloned()
         .expect("repeat successor should be delayed");
     assert_eq!(repeat_successor.repeat_count, 1);
+    let repeat_successor_owner: Option<String> = flow_index_conn
+        .get(format!("{namespace}:jobs:repeat:heartbeat"))
+        .await?;
+    assert_eq!(
+        repeat_successor_owner.as_deref(),
+        Some(repeat_successor.id.as_str())
+    );
+    let repeat_duplicate_during_delay = producer
+        .add_job(
+            "repeat-duplicate-delayed".to_string(),
+            serde_json::json!({ "kind": "heartbeat", "duplicate": "delayed" }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_millis(200))
+                    .with_limit(2)
+                    .with_key("heartbeat"),
+            ),
+        )
+        .await
+        .expect("duplicate delayed repeat job should return the successor owner");
+    assert_eq!(repeat_duplicate_during_delay.id, repeat_successor.id);
     let repeat_successor_delayed_score: Option<f64> = flow_index_conn
         .zscore(format!("{namespace}:jobs:delayed"), &repeat_successor.id)
         .await?;
@@ -2343,6 +2381,10 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("second repeat should complete");
+    let repeat_owner_after_limit: Option<String> = flow_index_conn
+        .get(format!("{namespace}:jobs:repeat:heartbeat"))
+        .await?;
+    assert!(repeat_owner_after_limit.is_none());
     let delayed_after_limit = producer
         .list_jobs(JobListOptions::new().with_state(JobState::Delayed))
         .await
@@ -2352,6 +2394,141 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .iter()
         .any(|job| job.repeat_key.as_deref() == Some("heartbeat")));
     trace_stage("repeat:done");
+
+    let repeat_retry_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "repeat-retry")
+        .expect("valid Redis URL should build the repeat-retry queue");
+    let mut repeat_retry_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let repeat_retry = repeat_retry_queue
+        .add_job(
+            "repeat-retry".to_string(),
+            serde_json::json!({ "kind": "retry-heartbeat" }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(30))
+                    .with_limit(2)
+                    .with_key("retry-heartbeat"),
+            ),
+        )
+        .await
+        .expect("repeat-retry job should be added");
+    let repeat_retry_claim = repeat_retry_queue
+        .claim_next(
+            "worker-repeat-retry-a".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("repeat-retry claim should return")
+        .expect("repeat-retry job should be claimable");
+    repeat_retry_queue
+        .fail_job(
+            &repeat_retry_claim.id,
+            lock_token(&repeat_retry_claim),
+            "terminal repeat retry failure".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("terminal repeat failure should release owner");
+    let repeat_retry_owner_after_fail: Option<String> = repeat_retry_conn
+        .get(format!("{namespace}:repeat-retry:repeat:retry-heartbeat"))
+        .await?;
+    assert!(repeat_retry_owner_after_fail.is_none());
+    let repeat_retry_requeued = repeat_retry_queue
+        .retry_job(&repeat_retry.id, Utc::now())
+        .await
+        .expect("repeat retry should reclaim owner");
+    assert_eq!(repeat_retry_requeued.state, JobState::Waiting);
+    let repeat_retry_owner_after_retry: Option<String> = repeat_retry_conn
+        .get(format!("{namespace}:repeat-retry:repeat:retry-heartbeat"))
+        .await?;
+    assert_eq!(
+        repeat_retry_owner_after_retry.as_deref(),
+        Some(repeat_retry.id.as_str())
+    );
+    let repeat_retry_duplicate = repeat_retry_queue
+        .add_job(
+            "repeat-retry-duplicate".to_string(),
+            serde_json::json!({ "kind": "retry-heartbeat", "duplicate": true }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(30))
+                    .with_limit(2)
+                    .with_key("retry-heartbeat"),
+            ),
+        )
+        .await
+        .expect("duplicate after repeat retry should return retried job");
+    assert_eq!(repeat_retry_duplicate.id, repeat_retry.id);
+    repeat_retry_queue
+        .remove_job(&repeat_retry.id)
+        .await
+        .expect("retried repeat job should remove")
+        .expect("retried repeat job should be returned");
+    let repeat_retry_owner_after_remove: Option<String> = repeat_retry_conn
+        .get(format!("{namespace}:repeat-retry:repeat:retry-heartbeat"))
+        .await?;
+    assert!(repeat_retry_owner_after_remove.is_none());
+
+    let repeat_retry_conflict_a = repeat_retry_queue
+        .add_job(
+            "repeat-retry-conflict-a".to_string(),
+            serde_json::json!({ "kind": "retry-conflict-a" }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(30))
+                    .with_limit(2)
+                    .with_key("retry-conflict-heartbeat"),
+            ),
+        )
+        .await
+        .expect("repeat retry conflict first job should be added");
+    let repeat_retry_conflict_claim = repeat_retry_queue
+        .claim_next(
+            "worker-repeat-retry-conflict".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("repeat retry conflict claim should return")
+        .expect("repeat retry conflict job should be claimable");
+    assert_eq!(repeat_retry_conflict_claim.id, repeat_retry_conflict_a.id);
+    repeat_retry_queue
+        .fail_job(
+            &repeat_retry_conflict_claim.id,
+            lock_token(&repeat_retry_conflict_claim),
+            "terminal repeat retry conflict".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("terminal repeat conflict failure should release owner");
+    let repeat_retry_conflict_b = repeat_retry_queue
+        .add_job(
+            "repeat-retry-conflict-b".to_string(),
+            serde_json::json!({ "kind": "retry-conflict-b" }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(30))
+                    .with_limit(2)
+                    .with_key("retry-conflict-heartbeat"),
+            ),
+        )
+        .await
+        .expect("repeat retry conflict second job should be added");
+    assert_ne!(repeat_retry_conflict_b.id, repeat_retry_conflict_a.id);
+    let repeat_retry_conflict = repeat_retry_queue
+        .retry_job(&repeat_retry_conflict_a.id, Utc::now())
+        .await
+        .expect_err("repeat retry should reject another active series owner");
+    assert!(matches!(
+        repeat_retry_conflict,
+        LaneError::JobStateConflict(_)
+    ));
+    let repeat_retry_conflict_failed_score: Option<f64> = repeat_retry_conn
+        .zscore(
+            format!("{namespace}:repeat-retry:failed"),
+            &repeat_retry_conflict_a.id,
+        )
+        .await?;
+    assert!(repeat_retry_conflict_failed_score.is_some());
+    trace_stage("repeat-retry:done");
 
     let cron_repeat = producer
         .add_job(
@@ -2481,7 +2658,8 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     let repeat_remove_successor = repeat_remove_delayed
         .jobs
         .iter()
-        .find(|job| job.repeat_key.as_deref() == Some("ephemeral-heartbeat"))
+        .find(|&job| job.repeat_key.as_deref() == Some("ephemeral-heartbeat"))
+        .cloned()
         .expect("repeat-remove successor should be delayed");
     assert_eq!(repeat_remove_successor.repeat_count, 1);
     let mut repeat_remove_conn = redis::Client::open(redis_url.as_str())?
@@ -2494,6 +2672,26 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await?;
     assert!(repeat_remove_delayed_score.is_some());
+    let repeat_remove_owner: Option<String> = repeat_remove_conn
+        .get(format!(
+            "{namespace}:repeat-remove:repeat:ephemeral-heartbeat"
+        ))
+        .await?;
+    assert_eq!(
+        repeat_remove_owner.as_deref(),
+        Some(repeat_remove_successor.id.as_str())
+    );
+    repeat_remove_queue
+        .remove_job(&repeat_remove_successor.id)
+        .await
+        .expect("repeat-remove successor should remove")
+        .expect("repeat-remove successor should be returned");
+    let repeat_remove_owner_after_remove: Option<String> = repeat_remove_conn
+        .get(format!(
+            "{namespace}:repeat-remove:repeat:ephemeral-heartbeat"
+        ))
+        .await?;
+    assert!(repeat_remove_owner_after_remove.is_none());
     trace_stage("repeat-remove:done");
 
     let idempotent_job_id = format!("{namespace}:invoice:42");

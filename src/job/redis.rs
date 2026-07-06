@@ -42,6 +42,32 @@ local function active_deduplicated_raw(jobs_key, deduplication_prefix, deduplica
   return existing_raw
 end
 
+local function active_repeat_raw(jobs_key, repeat_prefix, repeat_key)
+  if not repeat_key or repeat_key == '' then
+    return nil
+  end
+
+  local owner_key = repeat_prefix .. repeat_key
+  local existing_id = redis.call('GET', owner_key)
+  if not existing_id then
+    return nil
+  end
+
+  local existing_raw = redis.call('HGET', jobs_key, existing_id)
+  if not existing_raw then
+    redis.call('DEL', owner_key)
+    return nil
+  end
+
+  local existing_job = cjson.decode(existing_raw)
+  if existing_job["state"] == "completed" or existing_job["state"] == "failed" then
+    redis.call('DEL', owner_key)
+    return nil
+  end
+
+  return existing_raw
+end
+
 local existing = redis.call('HGET', KEYS[1], ARGV[1])
 if existing then
   return {'existing', existing}
@@ -50,6 +76,11 @@ end
 local deduplicated = active_deduplicated_raw(KEYS[1], ARGV[8], ARGV[7])
 if deduplicated then
   return {'deduplicated', deduplicated}
+end
+
+local repeat_owner = active_repeat_raw(KEYS[1], ARGV[10], ARGV[9])
+if repeat_owner then
+  return {'repeat', repeat_owner}
 end
 
 local inserted = redis.call('HSETNX', KEYS[1], ARGV[1], ARGV[2])
@@ -74,6 +105,9 @@ end
 
 if ARGV[7] ~= '' then
   redis.call('SET', ARGV[8] .. ARGV[7], ARGV[1])
+end
+if ARGV[9] ~= '' then
+  redis.call('SET', ARGV[10] .. ARGV[9], ARGV[1])
 end
 
 return {'inserted', ARGV[2]}
@@ -106,11 +140,38 @@ local function active_deduplicated_raw(jobs_key, deduplication_prefix, deduplica
   return existing_raw
 end
 
+local function active_repeat_raw(jobs_key, repeat_prefix, repeat_key)
+  if not repeat_key or repeat_key == '' then
+    return nil
+  end
+
+  local owner_key = repeat_prefix .. repeat_key
+  local existing_id = redis.call('GET', owner_key)
+  if not existing_id then
+    return nil
+  end
+
+  local existing_raw = redis.call('HGET', jobs_key, existing_id)
+  if not existing_raw then
+    redis.call('DEL', owner_key)
+    return nil
+  end
+
+  local existing_job = cjson.decode(existing_raw)
+  if existing_job["state"] == "completed" or existing_job["state"] == "failed" then
+    redis.call('DEL', owner_key)
+    return nil
+  end
+
+  return existing_raw
+end
+
 local count = tonumber(ARGV[1])
 local offset = 2
-local per_job_args = 6
+local per_job_args = 7
 local waiting_score_bucket = tonumber(ARGV[2 + count * per_job_args])
 local deduplication_prefix = ARGV[3 + count * per_job_args]
+local repeat_prefix = ARGV[4 + count * per_job_args]
 local added = {}
 
 for index = 1, count do
@@ -120,6 +181,7 @@ for index = 1, count do
   local scheduled_score = ARGV[offset + 3]
   local priority = tonumber(ARGV[offset + 4])
   local deduplication_id = ARGV[offset + 5]
+  local repeat_key = ARGV[offset + 6]
   local existing = redis.call('HGET', KEYS[1], id)
 
   if existing then
@@ -129,28 +191,36 @@ for index = 1, count do
     if deduplicated then
       added[index] = deduplicated
     else
-      local inserted = redis.call('HSETNX', KEYS[1], id, raw)
-      if inserted == 0 then
-        local current = redis.call('HGET', KEYS[1], id)
-        if current then
-          added[index] = current
-        else
-          return {'missing', id}
-        end
+      local repeat_owner = active_repeat_raw(KEYS[1], repeat_prefix, repeat_key)
+      if repeat_owner then
+        added[index] = repeat_owner
       else
-        if state == 'waiting' then
-          local sequence = redis.call('INCR', KEYS[5])
-          local waiting_score = (priority * waiting_score_bucket) + sequence
-          redis.call('ZADD', KEYS[2], waiting_score, id)
-        elseif state == 'delayed' then
-          redis.call('ZADD', KEYS[3], scheduled_score, id)
-        elseif state == 'waiting_children' then
-          redis.call('ZADD', KEYS[4], scheduled_score, id)
+        local inserted = redis.call('HSETNX', KEYS[1], id, raw)
+        if inserted == 0 then
+          local current = redis.call('HGET', KEYS[1], id)
+          if current then
+            added[index] = current
+          else
+            return {'missing', id}
+          end
+        else
+          if state == 'waiting' then
+            local sequence = redis.call('INCR', KEYS[5])
+            local waiting_score = (priority * waiting_score_bucket) + sequence
+            redis.call('ZADD', KEYS[2], waiting_score, id)
+          elseif state == 'delayed' then
+            redis.call('ZADD', KEYS[3], scheduled_score, id)
+          elseif state == 'waiting_children' then
+            redis.call('ZADD', KEYS[4], scheduled_score, id)
+          end
+          if deduplication_id ~= '' then
+            redis.call('SET', deduplication_prefix .. deduplication_id, id)
+          end
+          if repeat_key ~= '' then
+            redis.call('SET', repeat_prefix .. repeat_key, id)
+          end
+          added[index] = raw
         end
-        if deduplication_id ~= '' then
-          redis.call('SET', deduplication_prefix .. deduplication_id, id)
-        end
-        added[index] = raw
       end
     end
   end
@@ -188,17 +258,46 @@ local function active_deduplication_id(jobs_key, deduplication_prefix, deduplica
   return existing_id
 end
 
+local function active_repeat_id(jobs_key, repeat_prefix, repeat_key)
+  if not repeat_key or repeat_key == '' then
+    return nil
+  end
+
+  local owner_key = repeat_prefix .. repeat_key
+  local existing_id = redis.call('GET', owner_key)
+  if not existing_id then
+    return nil
+  end
+
+  local existing_raw = redis.call('HGET', jobs_key, existing_id)
+  if not existing_raw then
+    redis.call('DEL', owner_key)
+    return nil
+  end
+
+  local existing_job = cjson.decode(existing_raw)
+  if existing_job["state"] == "completed" or existing_job["state"] == "failed" then
+    redis.call('DEL', owner_key)
+    return nil
+  end
+
+  return existing_id
+end
+
 local count = tonumber(ARGV[1])
 local offset = 2
-local per_job_args = 6
+local per_job_args = 7
 local waiting_score_bucket = tonumber(ARGV[2 + count * per_job_args])
 local dependency_prefix = ARGV[3 + count * per_job_args]
 local deduplication_prefix = ARGV[4 + count * per_job_args]
+local repeat_prefix = ARGV[5 + count * per_job_args]
 local staged_deduplication_ids = {}
+local staged_repeat_keys = {}
 
 for index = 1, count do
   local id = ARGV[offset]
   local deduplication_id = ARGV[offset + 5]
+  local repeat_key = ARGV[offset + 6]
   if redis.call('HGET', KEYS[1], id) then
     return {'exists', id}
   end
@@ -212,6 +311,16 @@ for index = 1, count do
     end
     staged_deduplication_ids[deduplication_id] = id
   end
+  local repeat_owner_id = active_repeat_id(KEYS[1], repeat_prefix, repeat_key)
+  if repeat_owner_id then
+    return {'repeat', repeat_owner_id}
+  end
+  if repeat_key ~= '' then
+    if staged_repeat_keys[repeat_key] then
+      return {'repeat', staged_repeat_keys[repeat_key]}
+    end
+    staged_repeat_keys[repeat_key] = id
+  end
   offset = offset + per_job_args
 end
 
@@ -223,6 +332,7 @@ for index = 1, count do
   local scheduled_score = ARGV[offset + 3]
   local priority = tonumber(ARGV[offset + 4])
   local deduplication_id = ARGV[offset + 5]
+  local repeat_key = ARGV[offset + 6]
 
   redis.call('HSET', KEYS[1], id, raw)
   if state == 'waiting' then
@@ -237,6 +347,9 @@ for index = 1, count do
   if deduplication_id ~= '' then
     redis.call('SET', deduplication_prefix .. deduplication_id, id)
   end
+  if repeat_key ~= '' then
+    redis.call('SET', repeat_prefix .. repeat_key, id)
+  end
 
   offset = offset + per_job_args
 end
@@ -246,7 +359,7 @@ if count > 1 and ARGV[4] == 'waiting_children' then
   local dependency_key = dependency_prefix .. parent_id
   redis.call('DEL', dependency_key)
 
-  local child_offset = 8
+  local child_offset = 2 + per_job_args
   for index = 2, count do
     redis.call('SADD', dependency_key, ARGV[child_offset])
     child_offset = child_offset + per_job_args
@@ -412,6 +525,31 @@ local function set_deduplication_key(job, job_id, deduplication_prefix)
   end
 end
 
+local function repeat_key(job)
+  local key = job["repeat_key"]
+  if not key or key == cjson.null or key == '' then
+    return nil
+  end
+  return key
+end
+
+local function release_repeat_key(job, job_id, repeat_prefix)
+  local key = repeat_key(job)
+  if key then
+    local owner_key = repeat_prefix .. key
+    if redis.call('GET', owner_key) == job_id then
+      redis.call('DEL', owner_key)
+    end
+  end
+end
+
+local function set_repeat_key(job, job_id, repeat_prefix)
+  local key = repeat_key(job)
+  if key then
+    redis.call('SET', repeat_prefix .. key, job_id)
+  end
+end
+
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
   return {'missing'}
@@ -497,6 +635,7 @@ if parent_id and parent_id ~= cjson.null then
         parent["lease_expires_at"] = cjson.null
         parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
         release_deduplication_key(parent, parent_id, ARGV[14])
+        release_repeat_key(parent, parent_id, ARGV[15])
         if parent["options"] and parent["options"]["remove_on_fail"] == true then
           redis.call('HDEL', KEYS[1], parent_id)
         else
@@ -537,6 +676,7 @@ if repeat_next_id and repeat_next_id ~= '' then
   if inserted == 1 then
     local repeat_next = cjson.decode(ARGV[9])
     set_deduplication_key(repeat_next, repeat_next_id, ARGV[14])
+    set_repeat_key(repeat_next, repeat_next_id, ARGV[15])
     local repeat_next_state = ARGV[10]
     if repeat_next_state == 'waiting' then
       local repeat_priority = tonumber(ARGV[12])
@@ -550,6 +690,7 @@ if repeat_next_id and repeat_next_id ~= '' then
     end
   end
 end
+release_repeat_key(job, ARGV[1], ARGV[15])
 
 return {'ok', updated}
 "#;
@@ -576,6 +717,24 @@ local function release_deduplication_key(job, job_id, deduplication_prefix)
     local key = deduplication_prefix .. id
     if redis.call('GET', key) == job_id then
       redis.call('DEL', key)
+    end
+  end
+end
+
+local function repeat_key(job)
+  local key = job["repeat_key"]
+  if not key or key == cjson.null or key == '' then
+    return nil
+  end
+  return key
+end
+
+local function release_repeat_key(job, job_id, repeat_prefix)
+  local key = repeat_key(job)
+  if key then
+    local owner_key = repeat_prefix .. key
+    if redis.call('GET', owner_key) == job_id then
+      redis.call('DEL', owner_key)
     end
   end
 end
@@ -618,6 +777,7 @@ end
 job["state"] = "failed"
 job["finished_at"] = ARGV[3]
 release_deduplication_key(job, ARGV[1], ARGV[11])
+release_repeat_key(job, ARGV[1], ARGV[12])
 local updated = cjson.encode(job)
 if ARGV[9] == '1' then
   redis.call('HDEL', KEYS[1], ARGV[1])
@@ -641,6 +801,7 @@ if parent_id and parent_id ~= cjson.null then
       parent["lease_expires_at"] = cjson.null
       parent["failed_reason"] = "child job " .. ARGV[1] .. " failed: " .. ARGV[4]
       release_deduplication_key(parent, parent_id, ARGV[11])
+      release_repeat_key(parent, parent_id, ARGV[12])
       if parent["options"] and parent["options"]["remove_on_fail"] == true then
         redis.call('HDEL', KEYS[1], parent_id)
       else
@@ -707,6 +868,24 @@ local function release_deduplication_key(job, job_id, deduplication_prefix)
   end
 end
 
+local function repeat_key(job)
+  local key = job["repeat_key"]
+  if not key or key == cjson.null or key == '' then
+    return nil
+  end
+  return key
+end
+
+local function release_repeat_key(job, job_id, repeat_prefix)
+  local key = repeat_key(job)
+  if key then
+    local owner_key = repeat_prefix .. key
+    if redis.call('GET', owner_key) == job_id then
+      redis.call('DEL', owner_key)
+    end
+  end
+end
+
 local ids = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1], 'LIMIT', 0, ARGV[5])
 local recovered = 0
 
@@ -736,6 +915,7 @@ for _, id in ipairs(ids) do
           job["finished_at"] = ARGV[2]
           redis.call('DEL', ARGV[6] .. id)
           release_deduplication_key(job, id, ARGV[7])
+          release_repeat_key(job, id, ARGV[8])
 
           if job["options"] and job["options"]["remove_on_fail"] == true then
             redis.call('HDEL', KEYS[1], id)
@@ -759,6 +939,7 @@ for _, id in ipairs(ids) do
                 parent["lease_expires_at"] = cjson.null
                 parent["failed_reason"] = "child job " .. id .. " failed: " .. job["failed_reason"]
                 release_deduplication_key(parent, parent_id, ARGV[7])
+                release_repeat_key(parent, parent_id, ARGV[8])
                 if parent["options"] and parent["options"]["remove_on_fail"] == true then
                   redis.call('HDEL', KEYS[1], parent_id)
                 else
@@ -862,6 +1043,40 @@ local function active_deduplication_owner(jobs_key, deduplication_prefix, dedupl
   return existing_id
 end
 
+local function repeat_key(job)
+  local key = job["repeat_key"]
+  if not key or key == cjson.null or key == '' then
+    return nil
+  end
+  return key
+end
+
+local function active_repeat_owner(jobs_key, repeat_prefix, repeat_key, job_id)
+  if not repeat_key then
+    return nil
+  end
+
+  local owner_key = repeat_prefix .. repeat_key
+  local existing_id = redis.call('GET', owner_key)
+  if not existing_id or existing_id == job_id then
+    return nil
+  end
+
+  local existing_raw = redis.call('HGET', jobs_key, existing_id)
+  if not existing_raw then
+    redis.call('DEL', owner_key)
+    return nil
+  end
+
+  local existing_job = cjson.decode(existing_raw)
+  if existing_job["state"] == "completed" or existing_job["state"] == "failed" then
+    redis.call('DEL', owner_key)
+    return nil
+  end
+
+  return existing_id
+end
+
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
   redis.call('ZREM', KEYS[2], ARGV[1])
@@ -879,6 +1094,11 @@ local deduplication_owner =
   active_deduplication_owner(KEYS[1], ARGV[4], retry_deduplication_id, ARGV[1])
 if deduplication_owner then
   return {'deduplicated', deduplication_owner}
+end
+local retry_repeat_key = repeat_key(job)
+local repeat_owner = active_repeat_owner(KEYS[1], ARGV[5], retry_repeat_key, ARGV[1])
+if repeat_owner then
+  return {'repeat', repeat_owner}
 end
 
 local removed_from_failed = redis.call('ZREM', KEYS[2], ARGV[1])
@@ -904,6 +1124,9 @@ redis.call('ZADD', KEYS[3], waiting_score, ARGV[1])
 redis.call('HSET', KEYS[1], ARGV[1], updated)
 if retry_deduplication_id then
   redis.call('SET', ARGV[4] .. retry_deduplication_id, ARGV[1])
+end
+if retry_repeat_key then
+  redis.call('SET', ARGV[5] .. retry_repeat_key, ARGV[1])
 end
 
 return {'ok', updated}
@@ -1035,6 +1258,24 @@ local function release_deduplication_key(job, job_id, deduplication_prefix)
   end
 end
 
+local function repeat_key(job)
+  local key = job["repeat_key"]
+  if not key or key == cjson.null or key == '' then
+    return nil
+  end
+  return key
+end
+
+local function release_repeat_key(job, job_id, repeat_prefix)
+  local key = repeat_key(job)
+  if key then
+    local owner_key = repeat_prefix .. key
+    if redis.call('GET', owner_key) == job_id then
+      redis.call('DEL', owner_key)
+    end
+  end
+end
+
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
   redis.call('DEL', KEYS[2])
@@ -1052,6 +1293,7 @@ end
 
 redis.call('DEL', KEYS[2])
 release_deduplication_key(job, ARGV[1], ARGV[6])
+release_repeat_key(job, ARGV[1], ARGV[7])
 for index = 3, 8 do
   redis.call('ZREM', KEYS[index], ARGV[1])
 end
@@ -1106,6 +1348,7 @@ if parent_id and parent_id ~= cjson.null then
         parent["lease_expires_at"] = cjson.null
         parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
         release_deduplication_key(parent, parent_id, ARGV[6])
+        release_repeat_key(parent, parent_id, ARGV[7])
         if parent["options"] and parent["options"]["remove_on_fail"] == true then
           redis.call('HDEL', KEYS[1], parent_id)
         else
@@ -1210,6 +1453,24 @@ local function release_deduplication_key(job, job_id, deduplication_prefix)
   end
 end
 
+local function repeat_key(job)
+  local key = job["repeat_key"]
+  if not key or key == cjson.null or key == '' then
+    return nil
+  end
+  return key
+end
+
+local function release_repeat_key(job, job_id, repeat_prefix)
+  local key = repeat_key(job)
+  if key then
+    local owner_key = repeat_prefix .. key
+    if redis.call('GET', owner_key) == job_id then
+      redis.call('DEL', owner_key)
+    end
+  end
+end
+
 local function release_parent_after_removed_child(job, removed_id)
   local parent_id = job["parent_id"]
   if not parent_id or parent_id == cjson.null then
@@ -1271,6 +1532,7 @@ local function release_parent_after_removed_child(job, removed_id)
     parent["lease_expires_at"] = cjson.null
     parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
     release_deduplication_key(parent, parent_id, ARGV[10])
+    release_repeat_key(parent, parent_id, ARGV[11])
     if parent["options"] and parent["options"]["remove_on_fail"] == true then
       redis.call('HDEL', KEYS[1], parent_id)
     else
@@ -1377,6 +1639,7 @@ for index = 1, count do
   end
   redis.call('DEL', ARGV[8] .. candidate.id)
   release_deduplication_key(candidate.job, candidate.id, ARGV[10])
+  release_repeat_key(candidate.job, candidate.id, ARGV[11])
   redis.call('HDEL', KEYS[1], candidate.id)
   release_parent_after_removed_child(candidate.job, candidate.id)
   removed[index] = candidate.raw
@@ -1706,11 +1969,13 @@ impl RedisJobQueue {
                 .arg(job_state_name(job.state))
                 .arg(millis(job.scheduled_at))
                 .arg(job.priority)
-                .arg(job_deduplication_id(job).unwrap_or(""));
+                .arg(job_deduplication_id(job).unwrap_or(""))
+                .arg(job_repeat_key(job).unwrap_or(""));
         }
         command
             .arg(WAITING_SCORE_BUCKET)
-            .arg(self.deduplication_key_prefix());
+            .arg(self.deduplication_key_prefix())
+            .arg(self.repeat_key_prefix());
 
         let result: Vec<String> = command.query_async(&mut conn).await.map_err(redis_error)?;
         let added = decode_add_jobs_result(&result, created.len())?;
@@ -1810,6 +2075,10 @@ impl RedisJobQueue {
         format!("{}:{}:deduplication:", self.namespace, self.queue)
     }
 
+    fn repeat_key_prefix(&self) -> String {
+        format!("{}:{}:repeat:", self.namespace, self.queue)
+    }
+
     fn state_key(&self, state: JobState) -> String {
         self.key(match state {
             JobState::Waiting => "waiting",
@@ -1839,6 +2108,8 @@ impl RedisJobQueue {
             .arg(WAITING_SCORE_BUCKET)
             .arg(job_deduplication_id(job).unwrap_or(""))
             .arg(self.deduplication_key_prefix())
+            .arg(job_repeat_key(job).unwrap_or(""))
+            .arg(self.repeat_key_prefix())
             .query_async(conn)
             .await
             .map_err(redis_error)?;
@@ -1870,12 +2141,14 @@ impl RedisJobQueue {
                 .arg(job_state_name(job.state))
                 .arg(millis(job.scheduled_at))
                 .arg(job.priority)
-                .arg(job_deduplication_id(job).unwrap_or(""));
+                .arg(job_deduplication_id(job).unwrap_or(""))
+                .arg(job_repeat_key(job).unwrap_or(""));
         }
         command
             .arg(WAITING_SCORE_BUCKET)
             .arg(self.dependencies_key_prefix())
-            .arg(self.deduplication_key_prefix());
+            .arg(self.deduplication_key_prefix())
+            .arg(self.repeat_key_prefix());
 
         let result: Vec<String> = command.query_async(conn).await.map_err(redis_error)?;
         decode_add_flow_result(&result)
@@ -2030,6 +2303,7 @@ impl JobQueueBackend for RedisJobQueue {
             )
             .arg(self.dependencies_key_prefix())
             .arg(self.deduplication_key_prefix())
+            .arg(self.repeat_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -2075,6 +2349,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(if job.options.remove_on_fail { "1" } else { "0" })
             .arg(self.dependencies_key_prefix())
             .arg(self.deduplication_key_prefix())
+            .arg(self.repeat_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -2140,6 +2415,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(now.to_rfc3339())
             .arg(WAITING_SCORE_BUCKET)
             .arg(self.deduplication_key_prefix())
+            .arg(self.repeat_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -2184,6 +2460,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(WAITING_SCORE_BUCKET)
             .arg(self.dependencies_key_prefix())
             .arg(self.deduplication_key_prefix())
+            .arg(self.repeat_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -2224,6 +2501,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.dependencies_key_prefix())
             .arg(millis(cutoff))
             .arg(self.deduplication_key_prefix())
+            .arg(self.repeat_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -2332,6 +2610,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(1_000_u16)
             .arg(self.dependencies_key_prefix())
             .arg(self.deduplication_key_prefix())
+            .arg(self.repeat_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)
@@ -2395,6 +2674,10 @@ fn job_deduplication_id(job: &Job) -> Option<&str> {
         .map(|deduplication| deduplication.id.as_str())
 }
 
+fn job_repeat_key(job: &Job) -> Option<&str> {
+    job.repeat_key.as_deref()
+}
+
 fn decode_job(raw: &str) -> Result<Job> {
     let mut value: Value = serde_json::from_str(raw)
         .map_err(|error| LaneError::Other(format!("failed to decode Redis job: {error}")))?;
@@ -2406,7 +2689,7 @@ fn decode_job(raw: &str) -> Result<Job> {
 
 fn decode_add_job_result(result: &[String], job_id: &str) -> Result<Job> {
     match result.first().map(String::as_str) {
-        Some("inserted" | "existing" | "deduplicated") => {
+        Some("inserted" | "existing" | "deduplicated" | "repeat") => {
             let raw = result.get(1).ok_or_else(|| {
                 LaneError::Other(format!(
                     "Redis add job script returned no payload for {job_id}"
@@ -2453,6 +2736,12 @@ fn decode_add_flow_result(result: &[String]) -> Result<()> {
             let id = result.get(1).map(String::as_str).unwrap_or("unknown");
             Err(LaneError::ConfigError(format!(
                 "flow deduplication id is already active for job `{id}`"
+            )))
+        }
+        Some("repeat") => {
+            let id = result.get(1).map(String::as_str).unwrap_or("unknown");
+            Err(LaneError::ConfigError(format!(
+                "flow repeat key is already active for job `{id}`"
             )))
         }
         Some(other) => Err(LaneError::Other(format!(
@@ -2508,6 +2797,10 @@ fn decode_transition_result(result: &[String], job_id: &str, action: &str) -> Re
         ))),
         Some("deduplicated") => Err(LaneError::JobStateConflict(format!(
             "cannot {action} job {job_id}; deduplication id is active on job {}",
+            result.get(1).map(String::as_str).unwrap_or("unknown")
+        ))),
+        Some("repeat") => Err(LaneError::JobStateConflict(format!(
+            "cannot {action} job {job_id}; repeat key is active on job {}",
             result.get(1).map(String::as_str).unwrap_or("unknown")
         ))),
         Some(other) => Err(LaneError::Other(format!(

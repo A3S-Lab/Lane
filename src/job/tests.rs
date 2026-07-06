@@ -494,6 +494,97 @@ async fn cron_repeatable_jobs_schedule_next_matching_occurrence() {
     );
 }
 
+#[tokio::test]
+async fn repeat_key_coalesces_active_series_to_current_owner() {
+    let queue = InMemoryJobQueue::new("repeat-owner");
+    let now = ts(1_000);
+    let first = queue
+        .add_at(
+            "heartbeat",
+            serde_json::json!({ "target": "crm" }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(5))
+                    .with_limit(3)
+                    .with_key("heartbeat-series"),
+            ),
+            now,
+        )
+        .await
+        .unwrap();
+
+    let duplicate = queue
+        .add_at(
+            "heartbeat-duplicate",
+            serde_json::json!({ "target": "crm", "duplicate": true }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(5))
+                    .with_limit(3)
+                    .with_key("heartbeat-series"),
+            ),
+            ts(1_050),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate.id, first.id);
+
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .complete_job(
+            &claimed.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            ts(1_100),
+        )
+        .await
+        .unwrap();
+
+    let delayed = queue
+        .list_jobs(JobListOptions::new().with_state(JobState::Delayed))
+        .await
+        .unwrap();
+    assert_eq!(delayed.total, 1);
+    let successor = &delayed.jobs[0];
+    assert_eq!(successor.repeat_key.as_deref(), Some("heartbeat-series"));
+    assert_eq!(successor.repeat_count, 1);
+
+    let duplicate_during_delay = queue
+        .add_at(
+            "heartbeat-duplicate-delayed",
+            serde_json::json!({ "target": "crm", "duplicate": "delayed" }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(5))
+                    .with_limit(3)
+                    .with_key("heartbeat-series"),
+            ),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate_during_delay.id, successor.id);
+
+    queue.remove_job(&successor.id).await.unwrap().unwrap();
+    let new_series = queue
+        .add_at(
+            "heartbeat-after-remove",
+            serde_json::json!({ "target": "crm", "after": "remove" }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(5))
+                    .with_limit(3)
+                    .with_key("heartbeat-series"),
+            ),
+            ts(1_300),
+        )
+        .await
+        .unwrap();
+    assert_ne!(new_series.id, first.id);
+    assert_ne!(new_series.id, successor.id);
+    assert_eq!(new_series.repeat_count, 0);
+}
+
 #[test]
 fn repeat_options_deserialize_legacy_interval_shape() {
     let repeat: RepeatOptions = serde_json::from_value(serde_json::json!({
