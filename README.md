@@ -374,7 +374,7 @@ A3S stack and language SDKs.
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, runs async processors, completes/fails jobs, supports processor progress/log updates, timeouts, and stalled recovery loops. |
 | Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` for multi-process distributed claims. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
-| Repeat jobs | Planned | Cron/repeatable jobs and repeat metadata management. |
+| Repeat jobs | In progress | Fixed-interval repeatable jobs with repeat keys, limits, and end timestamps are available across in-memory, local durable, and Redis backends. Cron expressions remain planned. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
 
 The generic job runtime is exposed through the `JobQueueBackend` trait.
@@ -448,6 +448,33 @@ let flow = queue
     .await?;
 
 assert_eq!(flow.parent.state, JobState::WaitingChildren);
+# Ok(())
+# }
+```
+
+Repeat jobs schedule the next occurrence after a successful completion. The
+repeat `limit` counts total executions, including the first job:
+
+```rust
+use a3s_lane::{InMemoryJobQueue, JobOptions, RepeatOptions};
+use std::time::Duration;
+
+# async fn repeat_example() -> a3s_lane::Result<()> {
+let queue = InMemoryJobQueue::new("sync");
+
+let job = queue
+    .add(
+        "heartbeat",
+        serde_json::json!({ "target": "crm" }),
+        JobOptions::new().with_repeat(
+            RepeatOptions::every(Duration::from_secs(60))
+                .with_limit(10)
+                .with_key("crm-heartbeat"),
+        ),
+    )
+    .await?;
+
+assert_eq!(job.repeat_key.as_deref(), Some("crm-heartbeat"));
 # Ok(())
 # }
 ```

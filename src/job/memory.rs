@@ -89,6 +89,7 @@ impl InMemoryJobQueue {
         options: JobOptions,
         now: DateTime<Utc>,
     ) -> Result<Job> {
+        validate_job_options(&options)?;
         let job = Job::new(self.queue.clone(), name.into(), payload, options, now);
         let mut inner = self.inner.lock().await;
         inner.jobs.insert(job.id.clone(), job.clone());
@@ -108,6 +109,10 @@ impl InMemoryJobQueue {
         children: Vec<JobSpec>,
         now: DateTime<Utc>,
     ) -> Result<JobFlow> {
+        validate_job_options(&parent.options)?;
+        for child in &children {
+            validate_job_options(&child.options)?;
+        }
         let mut parent_job = Job::new(
             self.queue.clone(),
             parent.name,
@@ -467,6 +472,9 @@ impl JobQueueBackend for InMemoryJobQueue {
         if completed.options.remove_on_complete {
             inner.jobs.remove(job_id);
         }
+        if let Some(next_job) = next_repeat_job(&completed, now) {
+            inner.jobs.insert(next_job.id.clone(), next_job);
+        }
         if let Some(parent_id) = &completed.parent_id {
             Self::release_parent_if_ready_locked(&mut inner, parent_id, now);
         }
@@ -704,6 +712,48 @@ fn state_after_dependencies(scheduled_at: DateTime<Utc>, now: DateTime<Utc>) -> 
     } else {
         JobState::Waiting
     }
+}
+
+fn validate_job_options(options: &JobOptions) -> Result<()> {
+    if let Some(repeat) = &options.repeat {
+        if repeat.interval.is_zero() {
+            return Err(LaneError::ConfigError(
+                "repeat interval must be greater than zero".to_string(),
+            ));
+        }
+        if repeat.limit == Some(0) {
+            return Err(LaneError::ConfigError(
+                "repeat limit must be greater than zero".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn next_repeat_job(job: &Job, now: DateTime<Utc>) -> Option<Job> {
+    let repeat = job.options.repeat.as_ref()?;
+    let next_count = job.repeat_count.saturating_add(1);
+    if matches!(repeat.limit, Some(limit) if next_count >= limit) {
+        return None;
+    }
+
+    let scheduled_at = add_duration(now, repeat.interval);
+    if matches!(repeat.end_at, Some(end_at) if scheduled_at > end_at) {
+        return None;
+    }
+
+    let mut next = Job::new(
+        job.queue.clone(),
+        job.name.clone(),
+        job.payload.clone(),
+        job.options.clone(),
+        now,
+    );
+    next.scheduled_at = scheduled_at;
+    next.state = state_after_dependencies(scheduled_at, now);
+    next.repeat_key = job.repeat_key.clone();
+    next.repeat_count = next_count;
+    Some(next)
 }
 
 fn require_active(job: &Job, action: &str) -> Result<()> {

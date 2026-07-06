@@ -96,6 +96,10 @@ impl RedisJobQueue {
         children: Vec<JobSpec>,
         now: DateTime<Utc>,
     ) -> Result<JobFlow> {
+        validate_job_options(&parent.options)?;
+        for child in &children {
+            validate_job_options(&child.options)?;
+        }
         let mut parent_job = Job::new(
             self.queue.clone(),
             parent.name,
@@ -394,6 +398,7 @@ impl RedisJobQueue {
 #[async_trait]
 impl JobQueueBackend for RedisJobQueue {
     async fn add_job(&self, name: String, payload: Value, options: JobOptions) -> Result<Job> {
+        validate_job_options(&options)?;
         let now = Utc::now();
         let job = Job::new(self.queue.clone(), name, payload, options, now);
         let mut conn = self.connection().await?;
@@ -458,6 +463,10 @@ impl JobQueueBackend for RedisJobQueue {
         } else {
             self.move_to_state(&mut conn, &job, JobState::Completed, millis(now))
                 .await?;
+        }
+        if let Some(next_job) = next_repeat_job(&completed, now) {
+            self.store_job(&mut conn, &next_job).await?;
+            self.index_new_job(&mut conn, &next_job).await?;
         }
         if let Some(parent_id) = parent_id {
             self.release_parent_if_ready(&mut conn, &parent_id, now)
@@ -1015,6 +1024,48 @@ fn state_after_dependencies(scheduled_at: DateTime<Utc>, now: DateTime<Utc>) -> 
     } else {
         JobState::Waiting
     }
+}
+
+fn validate_job_options(options: &JobOptions) -> Result<()> {
+    if let Some(repeat) = &options.repeat {
+        if repeat.interval.is_zero() {
+            return Err(LaneError::ConfigError(
+                "repeat interval must be greater than zero".to_string(),
+            ));
+        }
+        if repeat.limit == Some(0) {
+            return Err(LaneError::ConfigError(
+                "repeat limit must be greater than zero".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn next_repeat_job(job: &Job, now: DateTime<Utc>) -> Option<Job> {
+    let repeat = job.options.repeat.as_ref()?;
+    let next_count = job.repeat_count.saturating_add(1);
+    if matches!(repeat.limit, Some(limit) if next_count >= limit) {
+        return None;
+    }
+
+    let scheduled_at = add_duration(now, repeat.interval);
+    if matches!(repeat.end_at, Some(end_at) if scheduled_at > end_at) {
+        return None;
+    }
+
+    let mut next = Job::new(
+        job.queue.clone(),
+        job.name.clone(),
+        job.payload.clone(),
+        job.options.clone(),
+        now,
+    );
+    next.scheduled_at = scheduled_at;
+    next.state = state_after_dependencies(scheduled_at, now);
+    next.repeat_key = job.repeat_key.clone();
+    next.repeat_count = next_count;
+    Some(next)
 }
 
 fn job_reference_time(job: &Job) -> DateTime<Utc> {

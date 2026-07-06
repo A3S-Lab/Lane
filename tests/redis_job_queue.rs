@@ -1,6 +1,9 @@
 #![cfg(feature = "redis-backend")]
 
-use a3s_lane::{JobOptions, JobQueueBackend, JobSpec, JobState, RedisJobQueue, RetryPolicy};
+use a3s_lane::{
+    JobListOptions, JobOptions, JobQueueBackend, JobSpec, JobState, RedisJobQueue, RepeatOptions,
+    RetryPolicy,
+};
 use chrono::Utc;
 use redis::AsyncCommands;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -230,6 +233,80 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("flow parent claim should return")
         .expect("flow parent should be claimable");
     assert_eq!(claimed_parent.id, flow.parent.id);
+
+    let repeat = producer
+        .add_job(
+            "repeat".to_string(),
+            serde_json::json!({ "kind": "heartbeat" }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_millis(200))
+                    .with_limit(2)
+                    .with_key("heartbeat"),
+            ),
+        )
+        .await
+        .expect("repeat job should be added");
+    let first_repeat = worker
+        .claim_next(
+            "worker-repeat-a".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("repeat claim should return")
+        .expect("repeat job should be claimable");
+    assert_eq!(first_repeat.id, repeat.id);
+    worker
+        .complete_job(
+            &first_repeat.id,
+            serde_json::json!({ "tick": 1 }),
+            Utc::now(),
+        )
+        .await
+        .expect("first repeat should complete");
+    let delayed_repeats = producer
+        .list_jobs(JobListOptions::new().with_state(JobState::Delayed))
+        .await
+        .expect("delayed repeat should list");
+    let repeat_successor = delayed_repeats
+        .jobs
+        .iter()
+        .find(|job| job.repeat_key.as_deref() == Some("heartbeat"))
+        .expect("repeat successor should be delayed");
+    assert_eq!(repeat_successor.repeat_count, 1);
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    producer
+        .promote_due_jobs(Utc::now())
+        .await
+        .expect("repeat successor should promote");
+    let second_repeat = worker
+        .claim_next(
+            "worker-repeat-b".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("second repeat claim should return")
+        .expect("second repeat should be claimable");
+    assert_eq!(second_repeat.repeat_key.as_deref(), Some("heartbeat"));
+    assert_eq!(second_repeat.repeat_count, 1);
+    worker
+        .complete_job(
+            &second_repeat.id,
+            serde_json::json!({ "tick": 2 }),
+            Utc::now(),
+        )
+        .await
+        .expect("second repeat should complete");
+    let delayed_after_limit = producer
+        .list_jobs(JobListOptions::new().with_state(JobState::Delayed))
+        .await
+        .expect("delayed jobs should list after repeat limit");
+    assert!(!delayed_after_limit
+        .jobs
+        .iter()
+        .any(|job| job.repeat_key.as_deref() == Some("heartbeat")));
 
     cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())

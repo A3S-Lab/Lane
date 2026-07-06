@@ -83,6 +83,99 @@ async fn delayed_jobs_wait_until_due() {
 }
 
 #[tokio::test]
+async fn repeatable_jobs_schedule_next_occurrence_after_completion() {
+    let queue = InMemoryJobQueue::new("repeat");
+    let now = ts(1_000);
+    let job = queue
+        .add_at(
+            "sync",
+            serde_json::json!({ "source": "crm" }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(5))
+                    .with_limit(2)
+                    .with_key("crm-sync"),
+            ),
+            now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(job.repeat_key.as_deref(), Some("crm-sync"));
+    assert_eq!(job.repeat_count, 0);
+
+    let first = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.id, job.id);
+    queue
+        .complete_job(&first.id, serde_json::json!({ "ok": true }), ts(1_100))
+        .await
+        .unwrap();
+
+    let delayed = queue
+        .list_jobs(JobListOptions::new().with_state(JobState::Delayed))
+        .await
+        .unwrap();
+    assert_eq!(delayed.total, 1);
+    let next = &delayed.jobs[0];
+    assert_eq!(next.name, "sync");
+    assert_eq!(next.repeat_key.as_deref(), Some("crm-sync"));
+    assert_eq!(next.repeat_count, 1);
+    assert_eq!(next.scheduled_at, ts(6_100));
+
+    assert!(queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(6_000))
+        .await
+        .unwrap()
+        .is_none());
+    queue.promote_due_jobs(ts(6_100)).await.unwrap();
+    let second = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(6_100))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.repeat_count, 1);
+    queue
+        .complete_job(&second.id, serde_json::json!({ "ok": true }), ts(6_200))
+        .await
+        .unwrap();
+
+    let delayed = queue
+        .list_jobs(JobListOptions::new().with_state(JobState::Delayed))
+        .await
+        .unwrap();
+    assert_eq!(delayed.total, 0);
+}
+
+#[tokio::test]
+async fn repeat_options_reject_invalid_schedules() {
+    let queue = InMemoryJobQueue::new("repeat-invalid");
+    let zero_interval = queue
+        .add_at(
+            "sync",
+            serde_json::json!({}),
+            JobOptions::new().with_repeat(RepeatOptions::every(Duration::ZERO)),
+            ts(1_000),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(zero_interval, LaneError::ConfigError(_)));
+
+    let zero_limit = queue
+        .add_at(
+            "sync",
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_repeat(RepeatOptions::every(Duration::from_secs(1)).with_limit(0)),
+            ts(1_000),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(zero_limit, LaneError::ConfigError(_)));
+}
+
+#[tokio::test]
 async fn failed_jobs_retry_with_backoff_then_terminal_failure() {
     let queue = InMemoryJobQueue::new("webhooks");
     let now = ts(1_000);
@@ -543,6 +636,47 @@ async fn local_job_queue_persists_flow_relationships() {
     assert_eq!(parent.state, JobState::WaitingChildren);
     assert_eq!(parent.child_ids, vec![child.id.clone()]);
     assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
+}
+
+#[tokio::test]
+async fn local_job_queue_persists_repeat_successors() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("jobs").join("repeat.json");
+    let queue = LocalJobQueue::open("durable-repeat", &snapshot_path)
+        .await
+        .unwrap();
+    let job = queue
+        .add_at(
+            "sync",
+            serde_json::json!({}),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(10))
+                    .with_limit(2)
+                    .with_key("sync"),
+            ),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(1_000))
+        .await
+        .unwrap();
+    queue
+        .complete_job(&job.id, serde_json::json!({}), ts(1_500))
+        .await
+        .unwrap();
+
+    let reopened = LocalJobQueue::open("durable-repeat", &snapshot_path)
+        .await
+        .unwrap();
+    let delayed = reopened
+        .list_jobs(JobListOptions::new().with_state(JobState::Delayed))
+        .await
+        .unwrap();
+    assert_eq!(delayed.total, 1);
+    assert_eq!(delayed.jobs[0].repeat_key.as_deref(), Some("sync"));
+    assert_eq!(delayed.jobs[0].repeat_count, 1);
 }
 
 #[tokio::test]

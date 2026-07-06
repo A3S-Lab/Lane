@@ -139,6 +139,53 @@ pub struct JobFlow {
     pub children: Vec<Job>,
 }
 
+/// Fixed-interval repeat settings for a generic job.
+///
+/// `limit` counts total executions, including the first job. For example,
+/// `limit = 3` allows the original job plus two automatically scheduled
+/// successors.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RepeatOptions {
+    /// Delay between completed occurrence and the next scheduled occurrence.
+    pub interval: Duration,
+    /// Optional maximum total execution count for this repeat series.
+    pub limit: Option<u32>,
+    /// Optional latest scheduled time for a new occurrence.
+    pub end_at: Option<DateTime<Utc>>,
+    /// Optional stable key that groups occurrences from the same series.
+    pub key: Option<String>,
+}
+
+impl RepeatOptions {
+    /// Repeat at a fixed interval after each successful completion.
+    pub fn every(interval: Duration) -> Self {
+        Self {
+            interval,
+            limit: None,
+            end_at: None,
+            key: None,
+        }
+    }
+
+    /// Limit total executions, including the first occurrence.
+    pub fn with_limit(mut self, limit: u32) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Stop scheduling new occurrences after this timestamp.
+    pub fn until(mut self, end_at: DateTime<Utc>) -> Self {
+        self.end_at = Some(end_at);
+        self
+    }
+
+    /// Set a stable repeat-series key.
+    pub fn with_key(mut self, key: impl Into<String>) -> Self {
+        self.key = Some(key.into());
+        self
+    }
+}
+
 /// Options used when adding a generic queue job.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JobOptions {
@@ -156,6 +203,9 @@ pub struct JobOptions {
     pub remove_on_fail: bool,
     /// Number of lease expirations tolerated before terminal failure.
     pub max_stalled_count: u32,
+    /// Optional fixed-interval repeat schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<RepeatOptions>,
 }
 
 impl Default for JobOptions {
@@ -168,6 +218,7 @@ impl Default for JobOptions {
             remove_on_complete: false,
             remove_on_fail: false,
             max_stalled_count: 1,
+            repeat: None,
         }
     }
 }
@@ -219,6 +270,12 @@ impl JobOptions {
         self.max_stalled_count = count;
         self
     }
+
+    /// Configure fixed-interval repeat scheduling.
+    pub fn with_repeat(mut self, repeat: RepeatOptions) -> Self {
+        self.repeat = Some(repeat);
+        self
+    }
 }
 
 /// Durable generic job record.
@@ -245,6 +302,10 @@ pub struct Job {
     pub logs: Vec<JobLogEntry>,
     pub parent_id: Option<JobId>,
     pub child_ids: Vec<JobId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_key: Option<String>,
+    #[serde(default)]
+    pub repeat_count: u32,
 }
 
 impl Job {
@@ -264,6 +325,12 @@ impl Job {
         } else {
             JobState::Waiting
         };
+        let repeat_key = options.repeat.as_ref().map(|repeat| {
+            repeat
+                .key
+                .clone()
+                .unwrap_or_else(|| format!("{queue}:{name}"))
+        });
 
         Self {
             id: Uuid::new_v4().to_string(),
@@ -287,6 +354,8 @@ impl Job {
             logs: Vec::new(),
             parent_id: None,
             child_ids: Vec::new(),
+            repeat_key,
+            repeat_count: 0,
         }
     }
 }
