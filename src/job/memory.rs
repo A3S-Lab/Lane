@@ -353,8 +353,16 @@ impl InMemoryJobQueue {
         });
         jobs.truncate(limit);
 
+        let parent_ids = jobs
+            .iter()
+            .filter_map(|job| job.parent_id.clone())
+            .collect::<Vec<_>>();
+
         for job in &jobs {
             inner.jobs.remove(&job.id);
+        }
+        for parent_id in parent_ids {
+            Self::release_parent_if_ready_locked(&mut inner, &parent_id, now);
         }
 
         Ok(jobs)

@@ -1309,6 +1309,89 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         remove_release_flow.parent.id
     );
 
+    let clean_release_flow = producer
+        .add_flow_at(
+            JobSpec::new(
+                "clean-release-flow-parent",
+                serde_json::json!({ "kind": "aggregate" }),
+            )
+            .with_options(JobOptions::new().with_priority(1)),
+            vec![
+                JobSpec::new("clean-release-flow-child-a", serde_json::json!({ "n": 1 }))
+                    .with_options(JobOptions::new().with_priority(1)),
+                JobSpec::new("clean-release-flow-child-b", serde_json::json!({ "n": 2 }))
+                    .with_options(JobOptions::new().with_priority(2)),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("clean-release flow should be added");
+    let clean_release_child = worker
+        .claim_next(
+            "worker-clean-release-child-a".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("clean-release child claim should return")
+        .expect("clean-release child should be claimable");
+    assert_eq!(clean_release_child.id, clean_release_flow.children[0].id);
+    worker
+        .complete_job(
+            &clean_release_child.id,
+            lock_token(&clean_release_child),
+            serde_json::json!({ "ok": 1 }),
+            Utc::now(),
+        )
+        .await
+        .expect("clean-release child should complete");
+    let clean_released = producer
+        .clean_jobs(JobState::Waiting, Duration::from_millis(0), 10, Utc::now())
+        .await
+        .expect("waiting flow child should clean");
+    assert_eq!(clean_released.len(), 1);
+    assert_eq!(clean_released[0].id, clean_release_flow.children[1].id);
+    let clean_released_parent = producer
+        .get_job(&clean_release_flow.parent.id)
+        .await
+        .expect("clean-released parent should load")
+        .expect("clean-released parent should exist");
+    assert_eq!(clean_released_parent.state, JobState::Waiting);
+    let clean_released_parent_waiting_score: Option<f64> = flow_index_conn
+        .zscore(
+            format!("{namespace}:jobs:waiting"),
+            &clean_release_flow.parent.id,
+        )
+        .await?;
+    assert!(clean_released_parent_waiting_score.is_some());
+    let clean_released_parent_waiting_children_score: Option<f64> = flow_index_conn
+        .zscore(
+            format!("{namespace}:jobs:waiting_children"),
+            &clean_release_flow.parent.id,
+        )
+        .await?;
+    assert!(clean_released_parent_waiting_children_score.is_none());
+    let cleaned_flow_child_hash: Option<String> = flow_index_conn
+        .hget(
+            format!("{namespace}:jobs:jobs"),
+            &clean_release_flow.children[1].id,
+        )
+        .await?;
+    assert!(cleaned_flow_child_hash.is_none());
+    let claimed_clean_released_parent = worker
+        .claim_next(
+            "worker-clean-released-parent".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("clean-released flow parent claim should return")
+        .expect("clean-released flow parent should be claimable");
+    assert_eq!(
+        claimed_clean_released_parent.id,
+        clean_release_flow.parent.id
+    );
+
     let remove_delayed_flow = producer
         .add_flow_at(
             JobSpec::new(

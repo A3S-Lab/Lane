@@ -445,9 +445,9 @@ paginated `JobListPage` values, `add_jobs()` submits a batch with the same
 idempotency semantics as `add_job()`, `promote_job()` moves delayed jobs to
 waiting, `retry_job()` manually requeues failed jobs, `update_priority()`
 changes non-terminal job priority, `renew_lease()` extends an active worker
-lease with the claim token, `remove_job()` removes non-active jobs and can
-unblock flow parents when a pending child is removed, and `clean_jobs()` removes
-old records by state.
+lease with the claim token, `remove_job()` removes non-active jobs,
+`clean_jobs()` removes old records by state, and both cleanup paths can unblock
+flow parents when a pending child is removed.
 Set `JobOptions::with_job_id()` when producers need idempotent submission:
 adding the same job id again returns the existing job instead of enqueueing a
 duplicate.
@@ -655,12 +655,12 @@ in one Redis turn. If any job id already exists, no partial parent or child
 records are created.
 
 Flow fan-in is also protected in Redis transitions. When a child job completes,
-is removed, or reaches terminal failure, the relevant Lua script updates the
-parent in the same Redis turn when the parent can be released to `waiting`,
-parked in `delayed` until its own schedule is due, or failed because a remaining
-child failed. This follows BullMQ's dependency-removal mechanism: removing a
-child also updates the parent dependency state instead of relying on a later
-client-side cleanup pass.
+is removed, is cleaned, or reaches terminal failure, the relevant Lua script
+updates the parent in the same Redis turn when the parent can be released to
+`waiting`, parked in `delayed` until its own schedule is due, or failed because a
+remaining child failed. This follows BullMQ's dependency-removal mechanism:
+cleanup that removes a child also updates the parent dependency state instead of
+relying on a later client-side cleanup pass.
 
 Repeat successors are created during the Redis completion script too. The
 worker computes the next occurrence from `RepeatOptions`, then the Lua script
@@ -680,7 +680,8 @@ Redis job management mutations are script-backed too. `update_progress()` checks
 the current state and writes the progress value in one Redis turn; `add_log()`
 appends and trims retained log entries inside one script; `clean_jobs()` filters
 retained records by the job reference time, removes their lock keys, hash
-entries, and state indexes atomically, and returns the removed snapshots.
+entries, and state indexes atomically, updates flow parents for removed child
+jobs, and returns the removed snapshots.
 
 Stalled recovery is Lua-backed as well. The recovery script scans expired
 active scores, verifies that the independent lock key is missing, increments

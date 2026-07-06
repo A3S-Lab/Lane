@@ -898,6 +898,66 @@ async fn flow_parent_waits_for_children_before_claiming() {
 }
 
 #[tokio::test]
+async fn flow_parent_releases_when_pending_child_is_cleaned() {
+    let queue = InMemoryJobQueue::new("flow-clean");
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({ "kind": "aggregate" }))
+                .with_options(JobOptions::new().with_priority(1)),
+            vec![
+                JobSpec::new("child-a", serde_json::json!({ "n": 1 }))
+                    .with_options(JobOptions::new().with_priority(5)),
+                JobSpec::new("child-b", serde_json::json!({ "n": 2 }))
+                    .with_options(JobOptions::new().with_priority(10)),
+            ],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    let first_child = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(1_100))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_child.id, flow.children[0].id);
+    queue
+        .complete_job(
+            &first_child.id,
+            lock_token(&first_child),
+            serde_json::json!({ "ok": 1 }),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+
+    let cleaned = queue
+        .clean_jobs(JobState::Waiting, Duration::from_millis(100), 10, ts(1_300))
+        .await
+        .unwrap();
+    assert_eq!(cleaned.len(), 1);
+    assert_eq!(cleaned[0].id, flow.children[1].id);
+    assert!(queue.get_job(&flow.children[1].id).await.unwrap().is_none());
+
+    let parent = queue
+        .get_job(&flow.parent.id)
+        .await
+        .unwrap()
+        .expect("parent should remain stored");
+    assert_eq!(parent.state, JobState::Waiting);
+    let claimed_parent = queue
+        .claim_next(
+            "worker-parent".to_string(),
+            Duration::from_secs(30),
+            ts(1_400),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed_parent.id, flow.parent.id);
+}
+
+#[tokio::test]
 async fn flow_rejects_duplicate_custom_job_ids() {
     let queue = InMemoryJobQueue::new("flow-ids");
     let error = queue

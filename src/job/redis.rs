@@ -787,6 +787,128 @@ return {'ok', raw}
 "#;
 
 const CLEAN_JOBS_SCRIPT: &str = r#"
+local function days_from_civil(year, month, day)
+  if month <= 2 then
+    year = year - 1
+  end
+  local era = math.floor(year / 400)
+  local yoe = year - era * 400
+  local shifted_month = month
+  if month > 2 then
+    shifted_month = month - 3
+  else
+    shifted_month = month + 9
+  end
+  local doy = math.floor((153 * shifted_month + 2) / 5) + day - 1
+  local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+  return era * 146097 + doe - 719468
+end
+
+local function iso_to_millis(value)
+  local year = tonumber(string.sub(value, 1, 4))
+  local month = tonumber(string.sub(value, 6, 7))
+  local day = tonumber(string.sub(value, 9, 10))
+  local hour = tonumber(string.sub(value, 12, 13))
+  local minute = tonumber(string.sub(value, 15, 16))
+  local second = tonumber(string.sub(value, 18, 19))
+  if not year or not month or not day or not hour or not minute or not second then
+    return 0
+  end
+
+  local millis = 0
+  if string.sub(value, 20, 20) == "." then
+    local digits = string.match(string.sub(value, 21), "^(%d+)")
+    if digits then
+      digits = string.sub(digits .. "000", 1, 3)
+      millis = tonumber(digits) or 0
+    end
+  end
+
+  local days = days_from_civil(year, month, day)
+  return (((days * 24 + hour) * 60 + minute) * 60 + second) * 1000 + millis
+end
+
+local function release_parent_after_removed_child(job, removed_id)
+  local parent_id = job["parent_id"]
+  if not parent_id or parent_id == cjson.null then
+    return
+  end
+
+  local parent_raw = redis.call('HGET', KEYS[1], parent_id)
+  if not parent_raw then
+    return
+  end
+
+  local parent = cjson.decode(parent_raw)
+  if parent["state"] ~= "waiting_children" then
+    return
+  end
+
+  local all_done = true
+  local failed_child_id = nil
+  local failed_reason = nil
+
+  for _, child_id in ipairs(parent["child_ids"] or {}) do
+    local child_raw = nil
+    if child_id ~= removed_id then
+      child_raw = redis.call('HGET', KEYS[1], child_id)
+    end
+
+    if child_raw then
+      local child = cjson.decode(child_raw)
+      if child["state"] == "failed" then
+        failed_child_id = child_id
+        failed_reason = child["failed_reason"]
+        if not failed_reason or failed_reason == cjson.null then
+          failed_reason = "unknown error"
+        end
+        break
+      elseif child["state"] ~= "completed" then
+        all_done = false
+        break
+      end
+    end
+  end
+
+  if failed_child_id then
+    redis.call('ZREM', KEYS[5], parent_id)
+    parent["state"] = "failed"
+    parent["finished_at"] = ARGV[5]
+    parent["worker_id"] = cjson.null
+    parent["lock_token"] = cjson.null
+    parent["lease_expires_at"] = cjson.null
+    parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
+    if parent["options"] and parent["options"]["remove_on_fail"] == true then
+      redis.call('HDEL', KEYS[1], parent_id)
+    else
+      redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+      redis.call('ZADD', KEYS[7], ARGV[6], parent_id)
+    end
+  elseif all_done then
+    redis.call('ZREM', KEYS[5], parent_id)
+    parent["processed_at"] = cjson.null
+    parent["finished_at"] = cjson.null
+    parent["worker_id"] = cjson.null
+    parent["lock_token"] = cjson.null
+    parent["lease_expires_at"] = cjson.null
+    parent["failed_reason"] = cjson.null
+
+    local parent_scheduled_millis = iso_to_millis(parent["scheduled_at"])
+    if parent_scheduled_millis <= tonumber(ARGV[6]) then
+      parent["state"] = "waiting"
+      local priority = tonumber(parent["priority"] or '1000') or 1000
+      local sequence = redis.call('INCR', KEYS[8])
+      local waiting_score = (priority * tonumber(ARGV[7])) + sequence
+      redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+      redis.call('ZADD', KEYS[2], waiting_score, parent_id)
+    else
+      parent["state"] = "delayed"
+      redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+      redis.call('ZADD', KEYS[3], parent_scheduled_millis, parent_id)
+    end
+  end
+end
+
 local state = ARGV[1]
 local cutoff = ARGV[2]
 local limit = tonumber(ARGV[3])
@@ -830,7 +952,7 @@ for _, id in ipairs(ids) do
       end
 
       if reference and reference ~= cjson.null and reference <= cutoff then
-        table.insert(candidates, { id = id, reference = reference, raw = raw })
+        table.insert(candidates, { id = id, reference = reference, raw = raw, job = job })
       end
     else
       redis.call('ZREM', state_key, id)
@@ -856,6 +978,7 @@ for index = 1, count do
     redis.call('ZREM', KEYS[key_index], candidate.id)
   end
   redis.call('HDEL', KEYS[1], candidate.id)
+  release_parent_after_removed_child(candidate.job, candidate.id)
   removed[index] = candidate.raw
 end
 
@@ -1522,7 +1645,7 @@ impl JobQueueBackend for RedisJobQueue {
         let mut conn = self.connection().await?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(CLEAN_JOBS_SCRIPT)
-            .arg(7)
+            .arg(8)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Waiting))
             .arg(self.state_key(JobState::Delayed))
@@ -1530,10 +1653,14 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.state_key(JobState::WaitingChildren))
             .arg(self.state_key(JobState::Completed))
             .arg(self.state_key(JobState::Failed))
+            .arg(self.sequence_key())
             .arg(job_state_name(state))
             .arg(cutoff.to_rfc3339())
             .arg(limit)
             .arg(self.lock_key_prefix())
+            .arg(now.to_rfc3339())
+            .arg(millis(now))
+            .arg(WAITING_SCORE_BUCKET)
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
