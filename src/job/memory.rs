@@ -955,6 +955,26 @@ impl InMemoryJobQueue {
             }))
     }
 
+    /// Clear retained log entries for a job. `keep == 0` clears all logs.
+    pub async fn clear_logs(&self, job_id: &str, keep: usize) -> Result<JobLogPage> {
+        let mut inner = self.inner.lock().await;
+        let Some(job) = inner.jobs.get_mut(job_id) else {
+            return Ok(JobLogPage {
+                logs: Vec::new(),
+                count: 0,
+            });
+        };
+
+        if keep == 0 {
+            job.logs.clear();
+        } else if job.logs.len() > keep {
+            let remove_count = job.logs.len() - keep;
+            job.logs.drain(0..remove_count);
+        }
+
+        Ok(log_page(&job.logs, 0, -1, true))
+    }
+
     fn promote_due_locked(inner: &mut InMemoryJobQueueState, now: DateTime<Utc>) -> usize {
         let mut promoted = 0;
         for job in inner.jobs.values_mut() {
@@ -1414,6 +1434,10 @@ impl JobQueueBackend for InMemoryJobQueue {
         ascending: bool,
     ) -> Result<JobLogPage> {
         self.get_logs(job_id, start, end, ascending).await
+    }
+
+    async fn clear_job_logs(&self, job_id: &str, keep: usize) -> Result<JobLogPage> {
+        self.clear_logs(job_id, keep).await
     }
 
     async fn promote_due_jobs(&self, now: DateTime<Utc>) -> Result<usize> {

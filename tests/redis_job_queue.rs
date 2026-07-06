@@ -3487,6 +3487,35 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .collect::<Vec<_>>();
     assert_eq!(high_decoded_logs[0].line, "provider accepted");
     assert_eq!(high_decoded_logs[1].line, "provider delivered");
+    let kept_high_logs = producer
+        .clear_job_logs(&high.id, 1)
+        .await
+        .expect("stored high logs should trim");
+    assert_eq!(kept_high_logs.count, 1);
+    assert_eq!(kept_high_logs.logs[0].line, "provider delivered");
+    let high_logs_len_after_keep: usize = logs_conn.llen(&high_logs_key).await?;
+    assert_eq!(high_logs_len_after_keep, 1);
+    let raw_high_after_keep: String = logs_conn
+        .hget(format!("{namespace}:jobs:jobs"), &high.id)
+        .await?;
+    let decoded_high_after_keep: Job =
+        serde_json::from_str(&raw_high_after_keep).expect("trimmed high job should decode");
+    assert_eq!(decoded_high_after_keep.logs.len(), 1);
+    assert_eq!(decoded_high_after_keep.logs[0].line, "provider delivered");
+    let cleared_high_logs = producer
+        .clear_job_logs(&high.id, 0)
+        .await
+        .expect("stored high logs should clear");
+    assert_eq!(cleared_high_logs.count, 0);
+    assert!(cleared_high_logs.logs.is_empty());
+    let high_logs_len_after_clear: usize = logs_conn.llen(&high_logs_key).await?;
+    assert_eq!(high_logs_len_after_clear, 0);
+    let raw_high_after_clear: String = logs_conn
+        .hget(format!("{namespace}:jobs:jobs"), &high.id)
+        .await?;
+    let decoded_high_after_clear: Job =
+        serde_json::from_str(&raw_high_after_clear).expect("cleared high job should decode");
+    assert!(decoded_high_after_clear.logs.is_empty());
 
     let stats = producer.stats().await.expect("stats should load");
     assert_eq!(stats.completed, 5);

@@ -3179,6 +3179,42 @@ end
 return {'ok', updated}
 "#;
 
+const CLEAR_LOGS_SCRIPT: &str = r#"
+local keep = tonumber(ARGV[2]) or 0
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+if raw then
+  local job = cjson.decode(raw)
+  local logs = job["logs"]
+  if not logs or logs == cjson.null or type(logs) ~= "table" then
+    logs = {}
+  end
+
+  if keep <= 0 then
+    logs = {}
+  else
+    while #logs > keep do
+      table.remove(logs, 1)
+    end
+  end
+
+  job["logs"] = logs
+  redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(job))
+end
+
+if keep > 0 then
+  redis.call('LTRIM', KEYS[2], -keep, -1)
+else
+  redis.call('DEL', KEYS[2])
+end
+
+local retained = redis.call('LRANGE', KEYS[2], 0, -1)
+local result = { tostring(redis.call('LLEN', KEYS[2])) }
+for _, entry in ipairs(retained) do
+  result[#result + 1] = entry
+end
+return result
+"#;
+
 const GET_JOB_STATE_SCRIPT: &str = r#"
 if redis.call('ZSCORE', KEYS[1], ARGV[1]) then
   return 'completed'
@@ -5139,6 +5175,21 @@ impl JobQueueBackend for RedisJobQueue {
         })
     }
 
+    async fn clear_job_logs(&self, job_id: &str, keep: usize) -> Result<JobLogPage> {
+        let mut conn = self.connection().await?;
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(CLEAR_LOGS_SCRIPT)
+            .arg(2)
+            .arg(self.jobs_key())
+            .arg(self.logs_key(job_id))
+            .arg(job_id)
+            .arg(keep)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_clear_logs_result(&result, job_id)
+    }
+
     async fn promote_due_jobs(&self, now: DateTime<Utc>) -> Result<usize> {
         let mut conn = self.connection().await?;
         let mut total = 0;
@@ -5565,6 +5616,24 @@ fn decode_log_entries(raw_logs: Vec<String>) -> Result<Vec<JobLogEntry>> {
             })
         })
         .collect()
+}
+
+fn decode_clear_logs_result(result: &[String], job_id: &str) -> Result<JobLogPage> {
+    let Some(raw_count) = result.first() else {
+        return Err(LaneError::Other(format!(
+            "Redis clear logs script returned no count for {job_id}"
+        )));
+    };
+    let count = decode_usize_field(raw_count, "log", job_id)?;
+    let logs = decode_log_entries(result.get(1..).unwrap_or_default().to_vec())?;
+    if logs.len() > count {
+        return Err(LaneError::Other(format!(
+            "Redis clear logs script returned {} logs but count was {count} for {job_id}",
+            logs.len()
+        )));
+    }
+
+    Ok(JobLogPage { logs, count })
 }
 
 fn decode_transition_result(result: &[String], job_id: &str, action: &str) -> Result<Job> {

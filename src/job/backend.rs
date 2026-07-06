@@ -179,6 +179,13 @@ pub trait JobQueueBackend: Send + Sync {
         ascending: bool,
     ) -> Result<JobLogPage>;
 
+    /// Clear retained job logs, optionally keeping the newest entries.
+    ///
+    /// This mirrors BullMQ's `clearLogs()` storage behavior: `keep == 0`
+    /// removes the log list, while positive values keep the newest `keep`
+    /// entries.
+    async fn clear_job_logs(&self, job_id: &str, keep: usize) -> Result<JobLogPage>;
+
     async fn promote_due_jobs(&self, now: DateTime<Utc>) -> Result<usize>;
 
     async fn recover_stalled_jobs(&self, now: DateTime<Utc>) -> Result<usize>;

@@ -195,6 +195,13 @@ impl LocalJobQueue {
         self.inner.list_repeats().await
     }
 
+    /// Clear retained log entries for a job. `keep == 0` clears all logs.
+    pub async fn clear_logs(&self, job_id: &str, keep: usize) -> Result<JobLogPage> {
+        let logs = self.inner.clear_logs(job_id, keep).await?;
+        self.persist().await?;
+        Ok(logs)
+    }
+
     /// Drain waiting jobs and optionally non-repeat delayed jobs.
     pub async fn drain(&self, include_delayed: bool) -> Result<Vec<Job>> {
         let jobs = self.inner.drain(include_delayed).await?;
@@ -455,6 +462,10 @@ impl JobQueueBackend for LocalJobQueue {
         ascending: bool,
     ) -> Result<JobLogPage> {
         self.inner.get_job_logs(job_id, start, end, ascending).await
+    }
+
+    async fn clear_job_logs(&self, job_id: &str, keep: usize) -> Result<JobLogPage> {
+        self.clear_logs(job_id, keep).await
     }
 
     async fn promote_due_jobs(&self, now: DateTime<Utc>) -> Result<usize> {

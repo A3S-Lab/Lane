@@ -2661,6 +2661,25 @@ async fn management_api_lists_progress_logs_retries_and_cleans_jobs() {
     let newest_log = queue.get_job_logs(&slower.id, 0, 0, false).await.unwrap();
     assert_eq!(newest_log.count, 2);
     assert_eq!(newest_log.logs[0].line, "third");
+    let kept_logs = queue.clear_job_logs(&slower.id, 1).await.unwrap();
+    assert_eq!(kept_logs.count, 1);
+    assert_eq!(kept_logs.logs[0].line, "third");
+    assert_eq!(
+        queue
+            .get_job(&slower.id)
+            .await
+            .unwrap()
+            .expect("slower job should remain stored")
+            .logs
+            .len(),
+        1
+    );
+    let cleared_logs = queue.clear_job_logs(&slower.id, 0).await.unwrap();
+    assert_eq!(cleared_logs.count, 0);
+    assert!(cleared_logs.logs.is_empty());
+    let missing_clear = queue.clear_job_logs("missing-log-job", 10).await.unwrap();
+    assert_eq!(missing_clear.count, 0);
+    assert!(missing_clear.logs.is_empty());
 
     let claimed = queue
         .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
@@ -3801,6 +3820,14 @@ async fn local_job_queue_persists_snapshot_across_reopen() {
     let restored_logs = reopened.get_job_logs(&job.id, 0, -1, true).await.unwrap();
     assert_eq!(restored_logs.count, 1);
     assert_eq!(restored_logs.logs[0].line, "almost done");
+    let cleared_logs = reopened.clear_job_logs(&job.id, 0).await.unwrap();
+    assert_eq!(cleared_logs.count, 0);
+    assert!(cleared_logs.logs.is_empty());
+    let reopened = LocalJobQueue::open("durable", &snapshot_path)
+        .await
+        .unwrap();
+    let restored_after_clear = reopened.get_job(&job.id).await.unwrap().unwrap();
+    assert!(restored_after_clear.logs.is_empty());
     assert_eq!(
         restored.return_value,
         Some(serde_json::json!({ "ok": true }))
