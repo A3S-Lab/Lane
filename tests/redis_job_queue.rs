@@ -1047,6 +1047,121 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("second rate job should complete");
     trace_stage("rate:done");
 
+    let global_rate_admin = RedisJobQueue::with_namespace(&redis_url, &namespace, "global-rate")
+        .expect("valid Redis URL should build the global rate admin queue");
+    let global_rate_worker = RedisJobQueue::with_namespace(&redis_url, &namespace, "global-rate")
+        .expect("valid Redis URL should build the global rate worker queue");
+    let zero_global_rate = global_rate_admin
+        .set_claim_rate_limit(JobRateLimit::new(0, Duration::from_millis(200)))
+        .await
+        .expect_err("zero global rate max should be rejected");
+    assert!(matches!(zero_global_rate, LaneError::ConfigError(_)));
+    assert_eq!(
+        global_rate_worker
+            .get_claim_rate_limit()
+            .await
+            .expect("unset global rate limit should load"),
+        None
+    );
+    global_rate_admin
+        .set_claim_rate_limit(JobRateLimit::new(1, Duration::from_millis(200)))
+        .await
+        .expect("global rate limit should be configured");
+    let global_rate_meta_key = format!("{namespace}:global-rate:meta");
+    let mut global_rate_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let stored_global_rate: (Option<u64>, Option<u64>) = global_rate_conn
+        .hmget(&global_rate_meta_key, &["max", "duration"])
+        .await?;
+    assert_eq!(stored_global_rate, (Some(1), Some(200)));
+    assert_eq!(
+        global_rate_worker
+            .get_claim_rate_limit()
+            .await
+            .expect("stored global rate limit should load"),
+        Some(JobRateLimit::new(1, Duration::from_millis(200)))
+    );
+    let global_rate_first = global_rate_admin
+        .add_job(
+            "global-rate-first".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("first global-rate job should be added");
+    let global_rate_second = global_rate_admin
+        .add_job(
+            "global-rate-second".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("second global-rate job should be added");
+    let global_rate_first_claim = global_rate_worker
+        .claim_next(
+            "worker-global-rate".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("first global-rate claim should return")
+        .expect("first global-rate job should be claimable");
+    assert_eq!(global_rate_first_claim.id, global_rate_first.id);
+    assert!(global_rate_worker
+        .claim_next(
+            "worker-global-rate".to_string(),
+            Duration::from_secs(30),
+            Utc::now()
+        )
+        .await
+        .expect("global rate-limited claim should return")
+        .is_none());
+    global_rate_admin
+        .clear_claim_rate_limit()
+        .await
+        .expect("global rate limit should clear");
+    let cleared_global_rate: (Option<u64>, Option<u64>) = global_rate_conn
+        .hmget(&global_rate_meta_key, &["max", "duration"])
+        .await?;
+    assert_eq!(cleared_global_rate, (None, None));
+    assert_eq!(
+        global_rate_worker
+            .get_claim_rate_limit()
+            .await
+            .expect("cleared global rate limit should load"),
+        None
+    );
+    let global_rate_second_claim = global_rate_worker
+        .claim_next(
+            "worker-global-rate".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("second global-rate claim should return after clear")
+        .expect("second global-rate job should be claimable after clearing the limit");
+    assert_eq!(global_rate_second_claim.id, global_rate_second.id);
+    global_rate_worker
+        .complete_job(
+            &global_rate_first_claim.id,
+            lock_token(&global_rate_first_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("first global-rate job should complete");
+    global_rate_worker
+        .complete_job(
+            &global_rate_second_claim.id,
+            lock_token(&global_rate_second_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("second global-rate job should complete");
+    trace_stage("global-rate:done");
+
     let claim_promote_queue =
         RedisJobQueue::with_namespace(&redis_url, &namespace, "claim-promote")
             .expect("valid Redis URL should build the claim-promote queue");

@@ -715,6 +715,14 @@ if paused and paused ~= '0' then
 end
 
 local rate_limit_max = tonumber(ARGV[8])
+local rate_limit_duration = tonumber(ARGV[9])
+if not rate_limit_max or rate_limit_max <= 0 then
+  rate_limit_max = tonumber(redis.call('HGET', KEYS[5], 'max') or '0')
+  rate_limit_duration = tonumber(redis.call('HGET', KEYS[5], 'duration') or '0')
+end
+if not rate_limit_duration or rate_limit_duration <= 0 then
+  rate_limit_max = 0
+end
 if rate_limit_max and rate_limit_max > 0 then
   local current_claims = tonumber(redis.call('GET', KEYS[4]) or '0')
   if current_claims >= rate_limit_max then
@@ -750,7 +758,7 @@ for _, id in ipairs(ids) do
       if rate_limit_max and rate_limit_max > 0 then
         local counter = redis.call('INCR', KEYS[4])
         if counter == 1 then
-          redis.call('PEXPIRE', KEYS[4], ARGV[9])
+          redis.call('PEXPIRE', KEYS[4], rate_limit_duration)
         end
       end
 
@@ -3001,13 +3009,55 @@ impl RedisJobQueue {
         })
     }
 
-    /// Configure a Redis-backed queue-level claim rate limit.
+    /// Configure a worker-local claim rate limit with a Redis-backed counter.
     ///
-    /// The limit is shared by every worker using the same namespace and queue.
+    /// Every worker that uses the same namespace and queue shares the counter
+    /// key, but each worker must be configured with the same limit. Use
+    /// [`set_claim_rate_limit`](Self::set_claim_rate_limit) for Redis-shared
+    /// limit configuration.
     pub fn with_claim_rate_limit(mut self, rate_limit: JobRateLimit) -> Result<Self> {
         rate_limit.validate()?;
         self.claim_rate_limit = Some(rate_limit);
         Ok(self)
+    }
+
+    /// Set a Redis-backed queue-level claim rate limit.
+    ///
+    /// Redis stores this value in the queue meta hash as `max` and `duration`,
+    /// matching BullMQ's global rate-limit mechanism.
+    pub async fn set_claim_rate_limit(&self, rate_limit: JobRateLimit) -> Result<()> {
+        rate_limit.validate()?;
+        let mut conn = self.connection().await?;
+        let duration = duration_millis(rate_limit.window).max(1);
+        redis::pipe()
+            .hset(self.meta_key(), "max", rate_limit.max_claims)
+            .hset(self.meta_key(), "duration", duration)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)
+    }
+
+    /// Read the Redis-backed queue-level claim rate limit.
+    pub async fn get_claim_rate_limit(&self) -> Result<Option<JobRateLimit>> {
+        let mut conn = self.connection().await?;
+        let values: (Option<u64>, Option<u64>) = conn
+            .hmget(self.meta_key(), &["max", "duration"])
+            .await
+            .map_err(redis_error)?;
+        let (Some(max_claims), Some(duration)) = values else {
+            return Ok(None);
+        };
+        let rate_limit = JobRateLimit::new(max_claims, Duration::from_millis(duration));
+        rate_limit.validate()?;
+        Ok(Some(rate_limit))
+    }
+
+    /// Clear the Redis-backed queue-level claim rate limit.
+    pub async fn clear_claim_rate_limit(&self) -> Result<()> {
+        let mut conn = self.connection().await?;
+        conn.hdel(self.meta_key(), &["max", "duration"])
+            .await
+            .map_err(redis_error)
     }
 
     /// Set a Redis-backed queue-level active job limit.

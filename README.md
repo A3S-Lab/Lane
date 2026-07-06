@@ -369,10 +369,10 @@ A3S stack and language SDKs.
 | Phase | Status | Scope |
 | --- | --- | --- |
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
-| Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, debounce TTL extension, delayed-owner replace, and keep-last-if-active requeue, repeat-key ownership, explicit job states, priority ordering, delayed jobs, token-owned worker leases, active-to-delayed movement, completion/failure snapshots, retry backoff, rate-limited claims, shared active concurrency limits, stalled-job recovery, pause/resume. |
+| Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, debounce TTL extension, delayed-owner replace, and keep-last-if-active requeue, repeat-key ownership, explicit job states, priority ordering, delayed jobs, token-owned worker leases, active-to-delayed movement, completion/failure snapshots, retry backoff, Redis-shared rate-limit and active-concurrency controls, stalled-job recovery, pause/resume. |
 | Job management API | In progress | Add/get/get-state/get-job-counts/get-job-count/count-pending/remove/remove-repeat/remove-deduplication-key/list-repeats/get-flow-dependencies/promote/reschedule/delay-active/retry/update-priority/pause/resume/drain/clean APIs, pagination, waiting priority counts, add-log/get-logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, and stalled recovery loops. |
-| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership/listing/removal, flow submission, flow dependency inspection, delayed promotion and rescheduling, active-to-delayed movement, single-job promote, state-index queries, job count snapshots, manual retry, priority update, progress update, log append, list/stat snapshots, drain, clean, claim, rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
+| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership/listing/removal, flow submission, flow dependency inspection, delayed promotion and rescheduling, active-to-delayed movement, single-job promote, state-index queries, job count snapshots, manual retry, priority update, progress update, log append, list/stat snapshots, drain, clean, claim, Redis-shared rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, dependency inspection, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, end timestamps, and repeat-key removal are available across in-memory, local durable, and Redis backends. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
@@ -772,8 +772,12 @@ let queue = RedisJobQueue::with_namespace(
     "redis://127.0.0.1/",
     "a3s:lane",
     "email",
-)?
-.with_claim_rate_limit(JobRateLimit::new(100, Duration::from_secs(60)))?;
+)?;
+queue.set_claim_rate_limit(JobRateLimit::new(100, Duration::from_secs(60))).await?;
+assert_eq!(
+    queue.get_claim_rate_limit().await?,
+    Some(JobRateLimit::new(100, Duration::from_secs(60)))
+);
 queue.set_max_active_jobs(32).await?;
 assert_eq!(queue.get_max_active_jobs().await?, Some(32));
 
@@ -810,9 +814,15 @@ assert_eq!(queue.get_job(&job.id).await?.map(|job| job.name), Some("send".to_str
 # }
 ```
 
-The claim rate limit is shared through Redis for workers that use the same
-namespace and queue. When the window is exhausted, `claim_next()` returns
-`None` and the job remains waiting for a later poll.
+`with_claim_rate_limit()` configures a worker-local claim rate limit while
+sharing the counter key through Redis for workers that use the same namespace
+and queue. `set_claim_rate_limit()` stores the shared configuration in the queue
+meta hash as `max` and `duration`, matching BullMQ's global rate-limit
+mechanism. `get_claim_rate_limit()` reads those fields with `HMGET`, and
+`clear_claim_rate_limit()` removes them. The Lua claim script prefers an
+explicit worker-local limit and otherwise reads the Redis meta values before
+checking the rate-limit counter. When the window is exhausted, `claim_next()`
+returns `None` and the job remains waiting for a later poll.
 
 `set_max_active_jobs()` configures a Redis-shared active job ceiling for the
 queue. It stores the value in the queue meta hash as `concurrency`, matching
