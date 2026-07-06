@@ -614,12 +614,19 @@ return {'ok', updated}
 const RETRY_JOB_SCRIPT: &str = r#"
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
+  redis.call('ZREM', KEYS[2], ARGV[1])
   return {'missing'}
 end
+
+local removed_from_failed = redis.call('ZREM', KEYS[2], ARGV[1])
 
 local job = cjson.decode(raw)
 if job["state"] ~= "failed" then
   return {'state', job["state"] or ''}
+end
+
+if removed_from_failed == 0 then
+  return {'state', 'failed_index_missing'}
 end
 
 job["state"] = "waiting"
@@ -636,7 +643,6 @@ local sequence = redis.call('INCR', KEYS[4])
 local waiting_score = (priority * tonumber(ARGV[3])) + sequence
 local updated = cjson.encode(job)
 
-redis.call('ZREM', KEYS[2], ARGV[1])
 redis.call('ZADD', KEYS[3], waiting_score, ARGV[1])
 redis.call('HSET', KEYS[1], ARGV[1], updated)
 

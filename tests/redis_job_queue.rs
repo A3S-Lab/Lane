@@ -635,6 +635,95 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("manual retried job should complete");
+    let _: usize = manual_retry_conn
+        .zadd(
+            format!("{namespace}:manual-retry:failed"),
+            &manual_retry.id,
+            0.0,
+        )
+        .await?;
+    let stale_failed_retry = manual_retry_queue
+        .retry_job(&manual_retry.id, Utc::now())
+        .await
+        .expect_err("completed job with stale failed index should reject retry");
+    assert!(matches!(stale_failed_retry, LaneError::JobStateConflict(_)));
+    let stale_failed_score: Option<f64> = manual_retry_conn
+        .zscore(format!("{namespace}:manual-retry:failed"), &manual_retry.id)
+        .await?;
+    assert!(stale_failed_score.is_none());
+    let _: usize = manual_retry_conn
+        .zadd(
+            format!("{namespace}:manual-retry:failed"),
+            "missing-retry-job",
+            0.0,
+        )
+        .await?;
+    let missing_retry = manual_retry_queue
+        .retry_job("missing-retry-job", Utc::now())
+        .await
+        .expect_err("missing job should still be reported as missing");
+    assert!(matches!(missing_retry, LaneError::JobNotFound(_)));
+    let missing_retry_failed_score: Option<f64> = manual_retry_conn
+        .zscore(
+            format!("{namespace}:manual-retry:failed"),
+            "missing-retry-job",
+        )
+        .await?;
+    assert!(missing_retry_failed_score.is_none());
+    let missing_failed_index = manual_retry_queue
+        .add_job(
+            "missing-failed-index".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("missing failed index job should add");
+    let missing_failed_index_claim = manual_retry_queue
+        .claim_next(
+            "worker-manual-retry-missing-index".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("missing failed index claim should return")
+        .expect("missing failed index job should claim");
+    assert_eq!(missing_failed_index_claim.id, missing_failed_index.id);
+    manual_retry_queue
+        .fail_job(
+            &missing_failed_index_claim.id,
+            lock_token(&missing_failed_index_claim),
+            "missing failed index terminal failure".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("missing failed index job should fail");
+    let _: usize = manual_retry_conn
+        .zrem(
+            format!("{namespace}:manual-retry:failed"),
+            &missing_failed_index.id,
+        )
+        .await?;
+    let missing_failed_index_error = manual_retry_queue
+        .retry_job(&missing_failed_index.id, Utc::now())
+        .await
+        .expect_err("failed job without failed index should reject retry");
+    assert!(matches!(
+        missing_failed_index_error,
+        LaneError::JobStateConflict(_)
+    ));
+    let missing_failed_index_after = manual_retry_queue
+        .get_job(&missing_failed_index.id)
+        .await
+        .expect("missing failed index job should load")
+        .expect("missing failed index job should still exist");
+    assert_eq!(missing_failed_index_after.state, JobState::Failed);
+    let missing_failed_index_waiting_score: Option<f64> = manual_retry_conn
+        .zscore(
+            format!("{namespace}:manual-retry:waiting"),
+            &missing_failed_index.id,
+        )
+        .await?;
+    assert!(missing_failed_index_waiting_score.is_none());
     trace_stage("manual-retry:done");
 
     producer.pause().await.expect("pause should succeed");
