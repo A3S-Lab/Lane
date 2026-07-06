@@ -20,7 +20,7 @@ async fn redis_backend_runs_job_lifecycle_against_real_server() {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
         return;
     };
-    tokio::time::timeout(Duration::from_secs(60), run_job_lifecycle(redis_url))
+    tokio::time::timeout(Duration::from_secs(90), run_job_lifecycle(redis_url))
         .await
         .expect("Redis integration test timed out")
         .unwrap();
@@ -3106,17 +3106,84 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         repeat_remove_owner.as_deref(),
         Some(repeat_remove_successor.id.as_str())
     );
-    repeat_remove_queue
-        .remove_job(&repeat_remove_successor.id)
+    let repeat_removed_by_key = repeat_remove_queue
+        .remove_repeat("ephemeral-heartbeat")
         .await
-        .expect("repeat-remove successor should remove")
+        .expect("repeat-remove successor should remove by repeat key")
         .expect("repeat-remove successor should be returned");
+    assert_eq!(repeat_removed_by_key.id, repeat_remove_successor.id);
+    let repeat_remove_delayed_score_after: Option<f64> = repeat_remove_conn
+        .zscore(
+            format!("{namespace}:repeat-remove:delayed"),
+            &repeat_remove_successor.id,
+        )
+        .await?;
+    assert!(repeat_remove_delayed_score_after.is_none());
+    let repeat_remove_hash_after: Option<String> = repeat_remove_conn
+        .hget(
+            format!("{namespace}:repeat-remove:jobs"),
+            &repeat_remove_successor.id,
+        )
+        .await?;
+    assert!(repeat_remove_hash_after.is_none());
     let repeat_remove_owner_after_remove: Option<String> = repeat_remove_conn
         .get(format!(
             "{namespace}:repeat-remove:repeat:ephemeral-heartbeat"
         ))
         .await?;
     assert!(repeat_remove_owner_after_remove.is_none());
+    assert!(repeat_remove_queue
+        .remove_repeat("ephemeral-heartbeat")
+        .await
+        .expect("second repeat-remove by key should return")
+        .is_none());
+    let _: () = repeat_remove_conn
+        .set(
+            format!("{namespace}:repeat-remove:repeat:stale-heartbeat"),
+            "missing-repeat-owner",
+        )
+        .await?;
+    assert!(repeat_remove_queue
+        .remove_repeat("stale-heartbeat")
+        .await
+        .expect("stale repeat owner should return")
+        .is_none());
+    let stale_repeat_owner_after_remove: Option<String> = repeat_remove_conn
+        .get(format!("{namespace}:repeat-remove:repeat:stale-heartbeat"))
+        .await?;
+    assert!(stale_repeat_owner_after_remove.is_none());
+    let repeat_remove_new_series = repeat_remove_queue
+        .add_job(
+            "repeat-remove-after-key".to_string(),
+            serde_json::json!({ "kind": "ephemeral-heartbeat", "after": "remove-key" }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(60))
+                    .with_limit(2)
+                    .with_key("ephemeral-heartbeat"),
+            ),
+        )
+        .await
+        .expect("repeat remove key should allow a new series");
+    assert_ne!(repeat_remove_new_series.id, repeat_remove_successor.id);
+    assert_eq!(repeat_remove_new_series.repeat_count, 0);
+    let repeat_remove_active = repeat_remove_queue
+        .claim_next(
+            "worker-repeat-remove-active".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("repeat remove active claim should return")
+        .expect("repeat remove new series should be claimable");
+    assert_eq!(repeat_remove_active.id, repeat_remove_new_series.id);
+    let repeat_remove_active_error = repeat_remove_queue
+        .remove_repeat("ephemeral-heartbeat")
+        .await
+        .expect_err("active repeat owner should reject remove by key");
+    assert!(matches!(
+        repeat_remove_active_error,
+        LaneError::JobLeaseConflict(_)
+    ));
     trace_stage("repeat-remove:done");
 
     let idempotent_job_id = format!("{namespace}:invoice:42");

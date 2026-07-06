@@ -2819,6 +2819,10 @@ impl RedisJobQueue {
         format!("{}:{}:repeat:", self.namespace, self.queue)
     }
 
+    fn repeat_owner_key(&self, repeat_key: &str) -> String {
+        format!("{}{}", self.repeat_key_prefix(), repeat_key)
+    }
+
     fn state_key(&self, state: JobState) -> String {
         self.key(match state {
             JobState::Waiting => "waiting",
@@ -2902,6 +2906,57 @@ impl RedisJobQueue {
             .await
             .map_err(redis_error)?;
         raw.map(|raw| decode_job(&raw)).transpose()
+    }
+
+    async fn remove_job_with_conn(
+        &self,
+        conn: &mut ConnectionManager,
+        job_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Job>> {
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(REMOVE_JOB_SCRIPT)
+            .arg(9)
+            .arg(self.jobs_key())
+            .arg(self.lock_key(job_id))
+            .arg(self.state_key(JobState::Waiting))
+            .arg(self.state_key(JobState::Delayed))
+            .arg(self.state_key(JobState::Active))
+            .arg(self.state_key(JobState::WaitingChildren))
+            .arg(self.state_key(JobState::Completed))
+            .arg(self.state_key(JobState::Failed))
+            .arg(self.sequence_key())
+            .arg(job_id)
+            .arg(now.to_rfc3339())
+            .arg(millis(now))
+            .arg(WAITING_SCORE_BUCKET)
+            .arg(self.dependencies_key_prefix())
+            .arg(self.deduplication_key_prefix())
+            .arg(self.repeat_key_prefix())
+            .query_async(conn)
+            .await
+            .map_err(redis_error)?;
+        decode_remove_job_result(&result, job_id)
+    }
+
+    async fn clear_repeat_owner_if_stale(
+        &self,
+        conn: &mut ConnectionManager,
+        repeat_key: &str,
+        owner_id: &str,
+    ) -> Result<()> {
+        let _: usize = redis::cmd("EVAL")
+            .arg(
+                "if redis.call('GET', KEYS[1]) == ARGV[1] then \
+                 return redis.call('DEL', KEYS[1]) end return 0",
+            )
+            .arg(1)
+            .arg(self.repeat_owner_key(repeat_key))
+            .arg(owner_id)
+            .query_async(conn)
+            .await
+            .map_err(redis_error)?;
+        Ok(())
     }
 }
 
@@ -3201,30 +3256,32 @@ impl JobQueueBackend for RedisJobQueue {
 
     async fn remove_job(&self, job_id: &str) -> Result<Option<Job>> {
         let mut conn = self.connection().await?;
-        let now = Utc::now();
-        let result: Vec<String> = redis::cmd("EVAL")
-            .arg(REMOVE_JOB_SCRIPT)
-            .arg(9)
-            .arg(self.jobs_key())
-            .arg(self.lock_key(job_id))
-            .arg(self.state_key(JobState::Waiting))
-            .arg(self.state_key(JobState::Delayed))
-            .arg(self.state_key(JobState::Active))
-            .arg(self.state_key(JobState::WaitingChildren))
-            .arg(self.state_key(JobState::Completed))
-            .arg(self.state_key(JobState::Failed))
-            .arg(self.sequence_key())
-            .arg(job_id)
-            .arg(now.to_rfc3339())
-            .arg(millis(now))
-            .arg(WAITING_SCORE_BUCKET)
-            .arg(self.dependencies_key_prefix())
-            .arg(self.deduplication_key_prefix())
-            .arg(self.repeat_key_prefix())
-            .query_async(&mut conn)
+        self.remove_job_with_conn(&mut conn, job_id, Utc::now())
+            .await
+    }
+
+    async fn remove_repeat(&self, repeat_key: &str) -> Result<Option<Job>> {
+        if repeat_key.is_empty() {
+            return Ok(None);
+        }
+
+        let mut conn = self.connection().await?;
+        let owner_id: Option<String> = conn
+            .get(self.repeat_owner_key(repeat_key))
             .await
             .map_err(redis_error)?;
-        decode_remove_job_result(&result, job_id)
+        let Some(owner_id) = owner_id else {
+            return Ok(None);
+        };
+
+        let removed = self
+            .remove_job_with_conn(&mut conn, &owner_id, Utc::now())
+            .await?;
+        if removed.is_none() {
+            self.clear_repeat_owner_if_stale(&mut conn, repeat_key, &owner_id)
+                .await?;
+        }
+        Ok(removed)
     }
 
     async fn clean_jobs(

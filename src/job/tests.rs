@@ -899,6 +899,112 @@ async fn repeat_key_coalesces_active_series_to_current_owner() {
     assert_eq!(new_series.repeat_count, 0);
 }
 
+#[tokio::test]
+async fn remove_repeat_removes_current_series_owner_by_key() {
+    let queue = InMemoryJobQueue::new("repeat-remove-key");
+    let now = ts(1_000);
+    let first = queue
+        .add_at(
+            "heartbeat",
+            serde_json::json!({ "target": "crm" }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(5))
+                    .with_limit(3)
+                    .with_key("heartbeat-series"),
+            ),
+            now,
+        )
+        .await
+        .unwrap();
+
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .complete_job(
+            &claimed.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            ts(1_100),
+        )
+        .await
+        .unwrap();
+
+    let delayed = queue
+        .list_jobs(JobListOptions::new().with_state(JobState::Delayed))
+        .await
+        .unwrap();
+    let successor = delayed
+        .jobs
+        .iter()
+        .find(|job| job.repeat_key.as_deref() == Some("heartbeat-series"))
+        .cloned()
+        .unwrap();
+    assert_eq!(successor.repeat_count, 1);
+
+    let removed = queue
+        .remove_repeat("heartbeat-series")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(removed.id, successor.id);
+    assert!(queue
+        .remove_repeat("heartbeat-series")
+        .await
+        .unwrap()
+        .is_none());
+
+    let new_series = queue
+        .add_at(
+            "heartbeat-after-remove-repeat",
+            serde_json::json!({ "target": "crm", "after": "remove-repeat" }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(5))
+                    .with_limit(3)
+                    .with_key("heartbeat-series"),
+            ),
+            ts(1_300),
+        )
+        .await
+        .unwrap();
+    assert_ne!(new_series.id, first.id);
+    assert_ne!(new_series.id, removed.id);
+    assert_eq!(new_series.repeat_count, 0);
+}
+
+#[tokio::test]
+async fn remove_repeat_rejects_active_leased_owner() {
+    let queue = InMemoryJobQueue::new("repeat-remove-active");
+    let now = ts(1_000);
+    let job = queue
+        .add_at(
+            "heartbeat",
+            serde_json::json!({ "target": "crm" }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(5)).with_key("heartbeat-series"),
+            ),
+            now,
+        )
+        .await
+        .unwrap();
+
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, job.id);
+
+    let error = queue.remove_repeat("heartbeat-series").await.unwrap_err();
+    assert!(matches!(error, LaneError::JobLeaseConflict(_)));
+    assert_eq!(
+        queue.get_job(&job.id).await.unwrap().unwrap().state,
+        JobState::Active
+    );
+}
+
 #[test]
 fn repeat_options_deserialize_legacy_interval_shape() {
     let repeat: RepeatOptions = serde_json::from_value(serde_json::json!({

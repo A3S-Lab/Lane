@@ -319,6 +319,24 @@ impl InMemoryJobQueue {
         Ok(removed)
     }
 
+    /// Remove the current non-terminal occurrence for a repeat series.
+    pub async fn remove_repeat(&self, repeat_key: &str) -> Result<Option<Job>> {
+        let mut inner = self.inner.lock().await;
+        let Some(job_id) =
+            find_active_repeat_key(&inner.jobs, repeat_key).map(|job| job.id.clone())
+        else {
+            return Ok(None);
+        };
+        if let Some(job) = inner.jobs.get(&job_id) {
+            require_removable(job)?;
+        }
+        let removed = inner.jobs.remove(&job_id);
+        if let Some(parent_id) = removed.as_ref().and_then(|job| job.parent_id.clone()) {
+            Self::release_parent_if_ready_locked(&mut inner, &parent_id, Utc::now());
+        }
+        Ok(removed)
+    }
+
     /// Promote a single delayed job to waiting.
     pub async fn promote(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {
         let mut inner = self.inner.lock().await;
@@ -841,6 +859,10 @@ impl JobQueueBackend for InMemoryJobQueue {
 
     async fn remove_job(&self, job_id: &str) -> Result<Option<Job>> {
         self.remove(job_id).await
+    }
+
+    async fn remove_repeat(&self, repeat_key: &str) -> Result<Option<Job>> {
+        InMemoryJobQueue::remove_repeat(self, repeat_key).await
     }
 
     async fn clean_jobs(

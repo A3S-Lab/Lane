@@ -121,6 +121,13 @@ impl LocalJobQueue {
         self.inner.snapshot().await
     }
 
+    /// Remove the current non-terminal occurrence for a repeat series.
+    pub async fn remove_repeat(&self, repeat_key: &str) -> Result<Option<Job>> {
+        let job = self.inner.remove_repeat(repeat_key).await?;
+        self.persist().await?;
+        Ok(job)
+    }
+
     async fn persist(&self) -> Result<()> {
         persist_job_snapshot(&self.snapshot_path, &self.inner.snapshot().await).await
     }
@@ -219,6 +226,10 @@ impl JobQueueBackend for LocalJobQueue {
         let job = self.inner.remove_job(job_id).await?;
         self.persist().await?;
         Ok(job)
+    }
+
+    async fn remove_repeat(&self, repeat_key: &str) -> Result<Option<Job>> {
+        LocalJobQueue::remove_repeat(self, repeat_key).await
     }
 
     async fn clean_jobs(
