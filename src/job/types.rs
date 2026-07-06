@@ -557,6 +557,9 @@ pub struct JobOptions {
     pub job_id: Option<JobId>,
     /// Lower values run before higher values.
     pub priority: JobPriority,
+    /// Insert ready jobs at the front of their same-priority waiting group.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub lifo: bool,
     /// Optional delay before the job becomes claimable.
     pub delay: Option<Duration>,
     /// Retry policy used after processing failure.
@@ -582,6 +585,7 @@ impl Default for JobOptions {
         Self {
             job_id: None,
             priority: DEFAULT_JOB_PRIORITY,
+            lifo: false,
             delay: None,
             retry_policy: RetryPolicy::none(),
             timeout: None,
@@ -603,6 +607,12 @@ impl JobOptions {
     /// Set job priority. Lower values run first.
     pub fn with_priority(mut self, priority: JobPriority) -> Self {
         self.priority = priority;
+        self
+    }
+
+    /// Configure same-priority waiting order. `true` claims newest ready jobs first.
+    pub fn with_lifo(mut self, lifo: bool) -> Self {
+        self.lifo = lifo;
         self
     }
 
@@ -699,6 +709,9 @@ pub struct Job {
     pub stalled_count: u32,
     pub created_at: DateTime<Utc>,
     pub scheduled_at: DateTime<Utc>,
+    /// Monotonic sequence assigned each time the job enters the waiting set.
+    #[serde(default)]
+    pub enqueued_seq: u64,
     pub processed_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
     pub worker_id: Option<JobWorkerId>,
@@ -760,6 +773,7 @@ impl Job {
             stalled_count: 0,
             created_at: now,
             scheduled_at,
+            enqueued_seq: 0,
             processed_at: None,
             finished_at: None,
             worker_id: None,
@@ -776,6 +790,10 @@ impl Job {
             deduplication_expires_at,
         }
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 pub(crate) fn deduplication_expiration(

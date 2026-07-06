@@ -369,10 +369,10 @@ A3S stack and language SDKs.
 | Phase | Status | Scope |
 | --- | --- | --- |
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
-| Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, debounce TTL extension, delayed-owner replace, and keep-last-if-active requeue, repeat-key ownership, explicit job states, priority ordering, delayed jobs, token-owned worker leases, active-to-wait/delayed movement, completion/failure snapshots, retry backoff, Redis-shared rate-limit and active-concurrency controls, stalled-job recovery, pause/resume. |
+| Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, debounce TTL extension, delayed-owner replace, and keep-last-if-active requeue, repeat-key ownership, explicit job states, priority plus FIFO/LIFO same-priority ordering, delayed jobs, token-owned worker leases, active-to-wait/delayed movement, completion/failure snapshots, retry backoff, Redis-shared rate-limit and active-concurrency controls, stalled-job recovery, pause/resume. |
 | Job management API | In progress | Add/get/get-state/get-job-counts/get-job-count/count-pending/remove/remove-repeat/remove-deduplication-key/get-deduplication-job-id/list-repeats/get-flow-dependencies/get-flow-dependency-counts/remove-unprocessed-children/remove-child-dependency/promote/reschedule/delay-active/release-active/retry/update-priority/update-data/pause/resume/is-paused/drain/clean/obliterate APIs, multi-state pagination, ascending/descending listing, waiting priority counts, add-log/get-logs/clear-job-logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, and stalled recovery loops. |
-| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership/listing/removal, flow submission, flow dependency inspection, delayed promotion and rescheduling, active-to-wait/delayed movement, single-job promote, state-index queries, job count snapshots, manual retry, priority update, progress update, log append, list/stat snapshots, drain, clean, obliterate, claim, Redis-shared rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
+| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, FIFO/LIFO waiting score ordering, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership/listing/removal, flow submission, flow dependency inspection, delayed promotion and rescheduling, active-to-wait/delayed movement, single-job promote, state-index queries, job count snapshots, manual retry, priority update, progress update, log append, list/stat snapshots, drain, clean, obliterate, claim, Redis-shared rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, dependency inspection, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, end timestamps, and repeat-key removal are available across in-memory, local durable, and Redis backends. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
@@ -395,6 +395,7 @@ let job = queue
         JobOptions::new()
             .with_job_id("email:ops@example.com:welcome")
             .with_priority(10)
+            .with_lifo(false)
             .with_delay(Duration::from_secs(5))
             .with_retry_policy(RetryPolicy::fixed(3, Duration::from_secs(1))),
     )
@@ -495,6 +496,9 @@ Cleanup paths can unblock flow parents when a pending child is removed.
 Set `JobOptions::with_job_id()` when producers need idempotent submission:
 adding the same job id again returns the existing job instead of enqueueing a
 duplicate.
+`JobOptions::with_lifo(true)` changes the ready-job insertion semantics for
+jobs with the same priority: newer ready jobs are claimed before older ready
+jobs, while lower priority values still run first.
 
 Every claimed job carries an opaque `lock_token`. Workers must pass that token
 to `complete_job()`, `fail_job()`, `fail_job_discarding_retry()`, and
@@ -939,6 +943,22 @@ suppresses the regular repeat successor for that turn. This preserves the
 single-owner repeat invariant while matching BullMQ's keep-last requeue
 mechanism, where the dedup-next record is consumed during job finalization rather
 than by a later client-side pass.
+
+Waiting order is modeled after BullMQ's Redis-level mechanism rather than only
+matching its option names. In BullMQ 5.79.2, standard jobs use a Redis list:
+`opts.lifo` selects `RPUSH`, FIFO uses `LPUSH`, and workers consume from the
+tail with `RPOPLPUSH`; prioritized jobs use a sorted set whose score is
+`priority * 0x100000000 + counter`, and `changePriority(..., lifo: true)` puts
+the job at the front of its same-priority score range. Lane stores all waiting
+jobs in one sorted set, so each Lua script that moves a job into `waiting`
+increments the queue sequence, writes that value to `job.enqueued_seq`, and
+computes a priority-bucketed score. The lower half of each priority bucket is
+reserved for LIFO entries with reversed sequence order, and the upper half is
+reserved for FIFO entries with forward sequence order. This keeps `ZRANGE`
+claiming priority-first, newest LIFO before older LIFO, LIFO before FIFO at the
+same priority, and oldest FIFO before newer FIFO, while preserving
+`get_counts_per_priority()` as a `ZCOUNT` over the same priority bucket.
+
 Completion, terminal failure, remove, clean, and stalled terminal failure scripts
 release deduplication keys only when they still point at the job being finalized
 or removed.
@@ -1040,6 +1060,9 @@ zset member in the same Redis turn. `release_active_job()` follows BullMQ's
 treats the active zset as the movement gate, clears the lock and active lease
 fields, resets `processed_at`, and writes the job back into the waiting zset
 with its priority score in the same Redis turn.
+That waiting write uses the same FIFO/LIFO score helper as initial add, delayed
+promotion, manual retry, stalled recovery, repeat successor enqueue, dedup
+keep-last enqueue, and flow parent release.
 `retry_job()` clears terminal failure metadata, treats the failed zset as the
 Redis movement gate, prunes orphaned or stale failed members, and moves valid
 failed jobs back to waiting inside one script. For deduplicated and repeat-keyed
@@ -1060,9 +1083,12 @@ deduplication/repeat ownership, and updates flow parents atomically.
 `update_priority()`
 rewrites the job hash and, for waiting jobs, replaces the waiting zset score in
 the same script; for jobs that are no longer waiting, it prunes stale waiting
-members while preserving the stored non-terminal state. This is intentionally
-aligned with BullMQ's mechanism of moving job state through Redis scripts instead
-of coordinating several client-side Redis commands.
+members while preserving the stored non-terminal state. For waiting jobs, the
+script also refreshes `enqueued_seq` and recomputes the FIFO/LIFO score,
+matching BullMQ's `changePriority` principle that priority changes are index
+rewrites, not just hash-field edits. This is intentionally aligned with BullMQ's
+mechanism of moving job state through Redis scripts instead of coordinating
+several client-side Redis commands.
 
 Redis job management mutations are script-backed too. `update_data()` follows
 BullMQ's `updateData` existence check and write shape, adapted to Lane's Redis

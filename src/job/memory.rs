@@ -19,6 +19,7 @@ use uuid::Uuid;
 #[derive(Debug, Default)]
 struct InMemoryJobQueueState {
     paused: bool,
+    sequence: u64,
     jobs: HashMap<JobId, Job>,
     deduplication_next: HashMap<String, Job>,
     released_deduplication_owners: HashSet<(String, JobId)>,
@@ -46,10 +47,18 @@ impl InMemoryJobQueue {
 
     /// Restore an in-memory queue from a durable snapshot.
     pub fn from_snapshot(snapshot: JobQueueSnapshot) -> Self {
+        let sequence = snapshot
+            .jobs
+            .iter()
+            .chain(snapshot.deduplication_next_jobs.iter())
+            .map(|job| job.enqueued_seq)
+            .max()
+            .unwrap_or(0);
         Self {
             queue: snapshot.queue,
             inner: Arc::new(Mutex::new(InMemoryJobQueueState {
                 paused: snapshot.paused,
+                sequence,
                 jobs: snapshot
                     .jobs
                     .into_iter()
@@ -207,6 +216,7 @@ impl InMemoryJobQueue {
             return Ok(existing.clone());
         }
         Self::forget_released_deduplication_owner_locked(&mut inner, &job);
+        assign_waiting_order(&mut inner.sequence, &mut job);
         inner.jobs.insert(job.id.clone(), job.clone());
         Ok(job)
     }
@@ -294,6 +304,7 @@ impl InMemoryJobQueue {
                 added.push(existing.clone());
                 continue;
             }
+            assign_waiting_order(&mut inner.sequence, &mut job);
             staged.insert(job.id.clone(), job.clone());
             added.push(job);
         }
@@ -388,9 +399,11 @@ impl InMemoryJobQueue {
                 }
             }
         }
+        assign_waiting_order(&mut inner.sequence, &mut parent_job);
         Self::forget_released_deduplication_owner_locked(&mut inner, &parent_job);
         inner.jobs.insert(parent_job.id.clone(), parent_job.clone());
-        for child in &child_jobs {
+        for child in &mut child_jobs {
+            assign_waiting_order(&mut inner.sequence, child);
             Self::forget_released_deduplication_owner_locked(&mut inner, child);
             inner.jobs.insert(child.id.clone(), child.clone());
         }
@@ -593,13 +606,21 @@ impl InMemoryJobQueue {
     /// Promote a single delayed job to waiting.
     pub async fn promote(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {
         let mut inner = self.inner.lock().await;
+        let should_promote = inner
+            .jobs
+            .get(job_id)
+            .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?
+            .state
+            == JobState::Delayed;
+        let enqueued_seq = should_promote.then(|| next_waiting_sequence(&mut inner.sequence));
         let job = inner
             .jobs
             .get_mut(job_id)
             .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
-        if job.state == JobState::Delayed {
+        if should_promote {
             job.state = JobState::Waiting;
             job.scheduled_at = now;
+            job.enqueued_seq = enqueued_seq.expect("promoted jobs get a waiting sequence");
         }
         Ok(job.clone())
     }
@@ -682,6 +703,7 @@ impl InMemoryJobQueue {
                 .remove(&(deduplication_id, job_id.to_string()));
         }
 
+        let enqueued_seq = next_waiting_sequence(&mut inner.sequence);
         let job = inner
             .jobs
             .get_mut(job_id)
@@ -695,6 +717,7 @@ impl InMemoryJobQueue {
         job.lock_token = None;
         job.lease_expires_at = None;
         job.failed_reason = None;
+        job.enqueued_seq = enqueued_seq;
         Ok(job.clone())
     }
 
@@ -751,12 +774,19 @@ impl InMemoryJobQueue {
         now: DateTime<Utc>,
     ) -> Result<Job> {
         let mut inner = self.inner.lock().await;
+        {
+            let job = inner
+                .jobs
+                .get(job_id)
+                .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
+            require_active(job, "release active")?;
+            require_lock_token(job, lock_token)?;
+        }
+        let enqueued_seq = next_waiting_sequence(&mut inner.sequence);
         let job = inner
             .jobs
             .get_mut(job_id)
             .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
-        require_active(job, "release active")?;
-        require_lock_token(job, lock_token)?;
         job.state = JobState::Waiting;
         job.scheduled_at = now;
         job.processed_at = None;
@@ -764,24 +794,36 @@ impl InMemoryJobQueue {
         job.lock_token = None;
         job.lease_expires_at = None;
         job.failed_reason = None;
+        job.enqueued_seq = enqueued_seq;
         Ok(job.clone())
     }
 
     /// Update a non-terminal job priority.
     pub async fn set_priority(&self, job_id: &str, priority: JobPriority) -> Result<Job> {
         let mut inner = self.inner.lock().await;
+        let should_requeue = {
+            let job = inner
+                .jobs
+                .get(job_id)
+                .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
+            if job.state.is_terminal() {
+                return Err(LaneError::JobStateConflict(format!(
+                    "cannot update priority for terminal job {}",
+                    job.id
+                )));
+            }
+            job.state == JobState::Waiting
+        };
+        let enqueued_seq = should_requeue.then(|| next_waiting_sequence(&mut inner.sequence));
         let job = inner
             .jobs
             .get_mut(job_id)
             .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
-        if job.state.is_terminal() {
-            return Err(LaneError::JobStateConflict(format!(
-                "cannot update priority for terminal job {}",
-                job.id
-            )));
-        }
         job.priority = priority;
         job.options.priority = priority;
+        if let Some(enqueued_seq) = enqueued_seq {
+            job.enqueued_seq = enqueued_seq;
+        }
         Ok(job.clone())
     }
 
@@ -1035,9 +1077,23 @@ impl InMemoryJobQueue {
 
     fn promote_due_locked(inner: &mut InMemoryJobQueueState, now: DateTime<Utc>) -> usize {
         let mut promoted = 0;
-        for job in inner.jobs.values_mut() {
-            if job.state == JobState::Delayed && job.scheduled_at <= now {
+        let mut due_jobs = inner
+            .jobs
+            .values()
+            .filter(|job| job.state == JobState::Delayed && job.scheduled_at <= now)
+            .cloned()
+            .collect::<Vec<_>>();
+        due_jobs.sort_by(|a, b| {
+            a.scheduled_at
+                .cmp(&b.scheduled_at)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        for due_job in due_jobs {
+            let enqueued_seq = next_waiting_sequence(&mut inner.sequence);
+            if let Some(job) = inner.jobs.get_mut(&due_job.id) {
                 job.state = JobState::Waiting;
+                job.enqueued_seq = enqueued_seq;
                 promoted += 1;
             }
         }
@@ -1095,6 +1151,7 @@ impl InMemoryJobQueue {
             return None;
         }
         Self::forget_released_deduplication_owner_locked(inner, &next);
+        assign_waiting_order(&mut inner.sequence, &mut next);
         inner.jobs.insert(next.id.clone(), next.clone());
         Some(next)
     }
@@ -1151,14 +1208,21 @@ impl InMemoryJobQueue {
             );
         }
 
+        let parent_scheduled_at = inner.jobs.get(parent_id)?.scheduled_at;
+        let parent_state = state_after_dependencies(parent_scheduled_at, now);
+        let enqueued_seq =
+            (parent_state == JobState::Waiting).then(|| next_waiting_sequence(&mut inner.sequence));
         let parent = inner.jobs.get_mut(parent_id)?;
-        parent.state = state_after_dependencies(parent.scheduled_at, now);
+        parent.state = parent_state;
         parent.processed_at = None;
         parent.finished_at = None;
         parent.worker_id = None;
         parent.lock_token = None;
         parent.lease_expires_at = None;
         parent.failed_reason = None;
+        if let Some(enqueued_seq) = enqueued_seq {
+            parent.enqueued_seq = enqueued_seq;
+        }
         Some(parent.clone())
     }
 
@@ -1296,7 +1360,9 @@ impl JobQueueBackend for InMemoryJobQueue {
             Self::enqueue_deduplicated_next_locked(&mut inner, &completed, now);
         if enqueued_deduplicated_next.is_none() {
             if let Some(next_job) = next_repeat_job(&completed, now)? {
+                let mut next_job = next_job;
                 Self::forget_released_deduplication_owner_locked(&mut inner, &next_job);
+                assign_waiting_order(&mut inner.sequence, &mut next_job);
                 inner.jobs.insert(next_job.id.clone(), next_job);
             }
         }
@@ -1475,39 +1541,56 @@ impl JobQueueBackend for InMemoryJobQueue {
         let mut failed_children = Vec::new();
         let mut terminal_failures = Vec::new();
 
-        for job in inner.jobs.values_mut() {
-            if job.state != JobState::Active {
-                continue;
-            }
-            let Some(expires_at) = job.lease_expires_at else {
-                continue;
-            };
-            if expires_at > now {
-                continue;
-            }
+        let mut stalled_jobs = inner
+            .jobs
+            .values()
+            .filter(|job| {
+                job.state == JobState::Active
+                    && matches!(job.lease_expires_at, Some(expires_at) if expires_at <= now)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        stalled_jobs.sort_by(|a, b| {
+            a.lease_expires_at
+                .cmp(&b.lease_expires_at)
+                .then_with(|| a.processed_at.cmp(&b.processed_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
 
-            job.stalled_count = job.stalled_count.saturating_add(1);
-            job.worker_id = None;
-            job.lock_token = None;
-            job.lease_expires_at = None;
-            job.failed_reason = Some("job stalled after worker lease expired".to_string());
-            if job.stalled_count > job.options.max_stalled_count {
-                job.state = JobState::Failed;
-                job.finished_at = Some(now);
-                if let Some(parent_id) = &job.parent_id {
-                    failed_children.push((
-                        parent_id.clone(),
-                        job.id.clone(),
-                        job.failed_reason.clone(),
-                    ));
+        for stalled_job in stalled_jobs {
+            let id = stalled_job.id;
+            let mut requeue = false;
+            if let Some(job) = inner.jobs.get_mut(&id) {
+                job.stalled_count = job.stalled_count.saturating_add(1);
+                job.worker_id = None;
+                job.lock_token = None;
+                job.lease_expires_at = None;
+                job.failed_reason = Some("job stalled after worker lease expired".to_string());
+                if job.stalled_count > job.options.max_stalled_count {
+                    job.state = JobState::Failed;
+                    job.finished_at = Some(now);
+                    if let Some(parent_id) = &job.parent_id {
+                        failed_children.push((
+                            parent_id.clone(),
+                            job.id.clone(),
+                            job.failed_reason.clone(),
+                        ));
+                    }
+                    terminal_failures.push(job.clone());
+                    if job.options.remove_on_fail {
+                        remove_ids.push(job.id.clone());
+                    }
+                } else {
+                    job.state = JobState::Waiting;
+                    job.processed_at = None;
+                    requeue = true;
                 }
-                terminal_failures.push(job.clone());
-                if job.options.remove_on_fail {
-                    remove_ids.push(job.id.clone());
+            }
+            if requeue {
+                let enqueued_seq = next_waiting_sequence(&mut inner.sequence);
+                if let Some(job) = inner.jobs.get_mut(&id) {
+                    job.enqueued_seq = enqueued_seq;
                 }
-            } else {
-                job.state = JobState::Waiting;
-                job.processed_at = None;
             }
             recovered += 1;
         }
@@ -1582,9 +1665,30 @@ impl JobQueueBackend for InMemoryJobQueue {
 fn compare_claim_order(a: &&Job, b: &&Job) -> Ordering {
     a.priority
         .cmp(&b.priority)
+        .then_with(|| compare_waiting_order(a, b))
         .then_with(|| a.scheduled_at.cmp(&b.scheduled_at))
         .then_with(|| a.created_at.cmp(&b.created_at))
         .then_with(|| a.id.cmp(&b.id))
+}
+
+fn assign_waiting_order(sequence: &mut u64, job: &mut Job) {
+    if job.state == JobState::Waiting {
+        job.enqueued_seq = next_waiting_sequence(sequence);
+    }
+}
+
+fn next_waiting_sequence(sequence: &mut u64) -> u64 {
+    *sequence = sequence.saturating_add(1);
+    *sequence
+}
+
+fn compare_waiting_order(a: &Job, b: &Job) -> Ordering {
+    match (a.options.lifo, b.options.lifo) {
+        (true, true) => b.enqueued_seq.cmp(&a.enqueued_seq),
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => a.enqueued_seq.cmp(&b.enqueued_seq),
+    }
 }
 
 fn log_page(logs: &[JobLogEntry], start: isize, end: isize, ascending: bool) -> JobLogPage {

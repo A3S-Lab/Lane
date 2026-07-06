@@ -93,6 +93,105 @@ async fn redis_backend_keeps_latest_repeat_duplicate_against_real_server() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn redis_backend_orders_lifo_waiting_jobs_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    tokio::time::timeout(Duration::from_secs(120), run_lifo_waiting_order(redis_url))
+        .await
+        .expect("Redis lifo waiting-order integration test timed out")
+        .unwrap();
+}
+
+async fn run_lifo_waiting_order(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "lifo-priority")
+        .expect("valid Redis URL should build the lifo priority queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let fifo = queue
+        .add_job(
+            "fifo".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_job_id("fifo").with_priority(5),
+        )
+        .await
+        .expect("fifo job should be added");
+    let lifo_old = queue
+        .add_job(
+            "lifo-old".to_string(),
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_job_id("lifo-old")
+                .with_priority(5)
+                .with_lifo(true),
+        )
+        .await
+        .expect("old lifo job should be added");
+    let lifo_new = queue
+        .add_job(
+            "lifo-new".to_string(),
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_job_id("lifo-new")
+                .with_priority(5)
+                .with_lifo(true),
+        )
+        .await
+        .expect("new lifo job should be added");
+    let urgent = queue
+        .add_job(
+            "urgent".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_job_id("urgent").with_priority(1),
+        )
+        .await
+        .expect("urgent job should be added");
+
+    assert!(fifo.enqueued_seq < lifo_old.enqueued_seq);
+    assert!(lifo_old.enqueued_seq < lifo_new.enqueued_seq);
+    assert!(lifo_new.enqueued_seq < urgent.enqueued_seq);
+
+    let waiting_key = format!("{namespace}:lifo-priority:waiting");
+    let waiting_ids: Vec<String> = redis::cmd("ZRANGE")
+        .arg(&waiting_key)
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut conn)
+        .await?;
+    assert_eq!(
+        waiting_ids,
+        vec![
+            urgent.id.clone(),
+            lifo_new.id.clone(),
+            lifo_old.id.clone(),
+            fifo.id.clone()
+        ]
+    );
+
+    for expected in [&urgent, &lifo_new, &lifo_old, &fifo] {
+        let claimed = queue
+            .claim_next(
+                "worker-lifo-priority".to_string(),
+                Duration::from_secs(30),
+                Utc::now(),
+            )
+            .await
+            .expect("claim should succeed")
+            .expect("job should be claimable");
+        assert_eq!(claimed.id, expected.id);
+    }
+
+    cleanup_namespace(&redis_url, &namespace).await?;
+    Ok(())
+}
+
 async fn run_repeat_keep_last(redis_url: String) -> redis::RedisResult<()> {
     let namespace = unique_namespace();
     trace_stage("repeat-keep-last:cleanup:start");
