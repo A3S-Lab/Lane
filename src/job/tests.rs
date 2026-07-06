@@ -918,6 +918,90 @@ async fn deduplication_keep_last_requeues_latest_after_active_owner_finishes() {
 }
 
 #[tokio::test]
+async fn repeat_deduplication_keep_last_replaces_regular_successor() {
+    let queue = InMemoryJobQueue::new("repeat-dedup-keep-last");
+    let repeat = RepeatOptions::every(Duration::from_secs(60))
+        .with_limit(3)
+        .with_key("account-sync");
+    let deduplication =
+        DeduplicationOptions::new("account:repeat-keep-last").keep_last_if_active(true);
+    let owner = queue
+        .add_at(
+            "sync-owner",
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new()
+                .with_repeat(repeat.clone())
+                .with_deduplication(deduplication.clone()),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    assert_eq!(owner.repeat_key.as_deref(), Some("account-sync"));
+
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(2_000))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, owner.id);
+
+    let stale_duplicate = queue
+        .add_at(
+            "sync-stale",
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new()
+                .with_repeat(repeat.clone())
+                .with_deduplication(deduplication.clone()),
+            ts(3_000),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale_duplicate.id, owner.id);
+
+    let latest_duplicate = queue
+        .add_at(
+            "sync-latest",
+            serde_json::json!({ "version": 3 }),
+            JobOptions::new()
+                .with_delay(Duration::from_secs(5))
+                .with_repeat(repeat)
+                .with_deduplication(deduplication),
+            ts(4_000),
+        )
+        .await
+        .unwrap();
+    assert_eq!(latest_duplicate.id, owner.id);
+
+    queue
+        .complete_job(
+            &claimed.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            ts(6_000),
+        )
+        .await
+        .unwrap();
+
+    let delayed = queue
+        .list_jobs(JobListOptions::new().with_state(JobState::Delayed))
+        .await
+        .unwrap();
+    assert_eq!(delayed.total, 1);
+    let next = &delayed.jobs[0];
+    assert_eq!(next.name, "sync-latest");
+    assert_eq!(next.payload, serde_json::json!({ "version": 3 }));
+    assert_eq!(next.repeat_key.as_deref(), Some("account-sync"));
+    assert_eq!(next.repeat_count, 1);
+    assert_eq!(next.scheduled_at, ts(11_000));
+
+    let repeats = queue.list_repeats().await.unwrap();
+    assert_eq!(repeats.len(), 1);
+    assert_eq!(repeats[0].key, "account-sync");
+    assert_eq!(repeats[0].job_id, next.id);
+    assert_eq!(repeats[0].repeat_count, 1);
+}
+
+#[tokio::test]
 async fn retry_resets_deduplication_ttl_owner_window() {
     let queue = InMemoryJobQueue::new("dedup-retry-ttl");
     let first = queue

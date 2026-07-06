@@ -130,7 +130,14 @@ local function can_store_deduplicated_next(candidate_job, existing_job, active_k
   if candidate_job["parent_id"] and candidate_job["parent_id"] ~= cjson.null then
     return false
   end
-  if candidate_job["repeat_key"] and candidate_job["repeat_key"] ~= cjson.null then
+  local candidate_repeat_key = candidate_job["repeat_key"]
+  local existing_repeat_key = existing_job["repeat_key"]
+  local candidate_has_repeat = candidate_repeat_key ~= nil and candidate_repeat_key ~= cjson.null
+  local existing_has_repeat = existing_repeat_key ~= nil and existing_repeat_key ~= cjson.null
+  if candidate_has_repeat ~= existing_has_repeat then
+    return false
+  end
+  if candidate_has_repeat and candidate_repeat_key ~= existing_repeat_key then
     return false
   end
   if candidate_job["child_ids"] and candidate_job["child_ids"] ~= cjson.null and #candidate_job["child_ids"] > 0 then
@@ -364,7 +371,14 @@ local function can_store_deduplicated_next(candidate_job, existing_job, active_k
   if candidate_job["parent_id"] and candidate_job["parent_id"] ~= cjson.null then
     return false
   end
-  if candidate_job["repeat_key"] and candidate_job["repeat_key"] ~= cjson.null then
+  local candidate_repeat_key = candidate_job["repeat_key"]
+  local existing_repeat_key = existing_job["repeat_key"]
+  local candidate_has_repeat = candidate_repeat_key ~= nil and candidate_repeat_key ~= cjson.null
+  local existing_has_repeat = existing_repeat_key ~= nil and existing_repeat_key ~= cjson.null
+  if candidate_has_repeat ~= existing_has_repeat then
+    return false
+  end
+  if candidate_has_repeat and candidate_repeat_key ~= existing_repeat_key then
     return false
   end
   if candidate_job["child_ids"] and candidate_job["child_ids"] ~= cjson.null and #candidate_job["child_ids"] > 0 then
@@ -982,20 +996,53 @@ local function set_repeat_key(job, job_id, repeat_prefix)
   end
 end
 
-local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delayed_key, sequence_key, deduplication_prefix, deduplication_next_prefix, now_iso, now_millis, waiting_score_bucket)
+local function repeat_keep_last_next_count(owner_job, next_job)
+  local next_repeat_key = repeat_key(next_job)
+  local owner_repeat_key = repeat_key(owner_job)
+  if not next_repeat_key then
+    if owner_repeat_key then
+      return false
+    end
+    return nil
+  end
+  if not owner_repeat_key or owner_repeat_key ~= next_repeat_key then
+    return false
+  end
+
+  local next_count = (tonumber(owner_job["repeat_count"] or '0') or 0) + 1
+  local repeat_options = nil
+  if owner_job["options"] and owner_job["options"] ~= cjson.null then
+    repeat_options = owner_job["options"]["repeat"]
+  end
+  if repeat_options and repeat_options ~= cjson.null then
+    local limit = tonumber(repeat_options["limit"] or '0') or 0
+    if limit > 0 and next_count >= limit then
+      return false
+    end
+  end
+  return next_count
+end
+
+local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delayed_key, sequence_key, deduplication_prefix, deduplication_next_prefix, repeat_prefix, now_iso, now_millis, waiting_score_bucket)
   local id = deduplication_id(owner_job)
   if not id then
-    return
+    return false
   end
   local next_key = deduplication_next_prefix .. id
   local next_raw = redis.call('GET', next_key)
   if not next_raw then
-    return
+    return false
   end
   local next_job = cjson.decode(next_raw)
   if redis.call('HEXISTS', jobs_key, next_job["id"]) == 1 then
     redis.call('DEL', next_key)
-    return
+    return false
+  end
+
+  local repeat_next_count = repeat_keep_last_next_count(owner_job, next_job)
+  if repeat_next_count == false then
+    redis.call('DEL', next_key)
+    return false
   end
 
   local delay = nil
@@ -1013,6 +1060,10 @@ local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delay
   else
     next_job["state"] = "waiting"
   end
+  if repeat_next_count then
+    next_job["repeat_key"] = owner_job["repeat_key"]
+    next_job["repeat_count"] = repeat_next_count
+  end
   next_job["attempts_made"] = 0
   next_job["stalled_count"] = 0
   next_job["processed_at"] = cjson.null
@@ -1029,6 +1080,9 @@ local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delay
   local encoded = cjson.encode(next_job)
   redis.call('HSET', jobs_key, next_job["id"], encoded)
   set_deduplication_key(next_job, next_job["id"], deduplication_prefix)
+  if repeat_next_count then
+    set_repeat_key(next_job, next_job["id"], repeat_prefix)
+  end
   if next_job["state"] == "waiting" then
     local priority = tonumber(next_job["priority"] or '1000') or 1000
     local sequence = redis.call('INCR', sequence_key)
@@ -1038,6 +1092,7 @@ local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delay
     redis.call('ZADD', delayed_key, scheduled_millis, next_job["id"])
   end
   redis.call('DEL', next_key)
+  return true
 end
 
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
@@ -1067,7 +1122,7 @@ job["worker_id"] = cjson.null
 job["lease_expires_at"] = cjson.null
 job["return_value"] = cjson.decode(ARGV[4])
 release_deduplication_key(job, ARGV[1], ARGV[14])
-enqueue_deduplicated_next(job, KEYS[1], KEYS[5], KEYS[9], KEYS[7], ARGV[14], ARGV[16], ARGV[3], ARGV[5], ARGV[7])
+local enqueued_deduplicated_next = enqueue_deduplicated_next(job, KEYS[1], KEYS[5], KEYS[9], KEYS[7], ARGV[14], ARGV[16], ARGV[15], ARGV[3], ARGV[5], ARGV[7])
 
 local updated = cjson.encode(job)
 if ARGV[6] == '1' then
@@ -1164,7 +1219,7 @@ if parent_id and parent_id ~= cjson.null then
 end
 
 local repeat_next_id = ARGV[8]
-if repeat_next_id and repeat_next_id ~= '' then
+if not enqueued_deduplicated_next and repeat_next_id and repeat_next_id ~= '' then
   local inserted = redis.call('HSETNX', KEYS[1], repeat_next_id, ARGV[9])
   if inserted == 1 then
     local repeat_next = cjson.decode(ARGV[9])
@@ -1311,20 +1366,60 @@ local function release_repeat_key(job, job_id, repeat_prefix)
   end
 end
 
-local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delayed_key, sequence_key, deduplication_prefix, deduplication_next_prefix, now_iso, now_millis, waiting_score_bucket)
+local function set_repeat_key(job, job_id, repeat_prefix)
+  local key = repeat_key(job)
+  if key then
+    redis.call('SET', repeat_prefix .. key, job_id)
+  end
+end
+
+local function repeat_keep_last_next_count(owner_job, next_job)
+  local next_repeat_key = repeat_key(next_job)
+  local owner_repeat_key = repeat_key(owner_job)
+  if not next_repeat_key then
+    if owner_repeat_key then
+      return false
+    end
+    return nil
+  end
+  if not owner_repeat_key or owner_repeat_key ~= next_repeat_key then
+    return false
+  end
+
+  local next_count = (tonumber(owner_job["repeat_count"] or '0') or 0) + 1
+  local repeat_options = nil
+  if owner_job["options"] and owner_job["options"] ~= cjson.null then
+    repeat_options = owner_job["options"]["repeat"]
+  end
+  if repeat_options and repeat_options ~= cjson.null then
+    local limit = tonumber(repeat_options["limit"] or '0') or 0
+    if limit > 0 and next_count >= limit then
+      return false
+    end
+  end
+  return next_count
+end
+
+local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delayed_key, sequence_key, deduplication_prefix, deduplication_next_prefix, repeat_prefix, now_iso, now_millis, waiting_score_bucket)
   local id = deduplication_id(owner_job)
   if not id then
-    return
+    return false
   end
   local next_key = deduplication_next_prefix .. id
   local next_raw = redis.call('GET', next_key)
   if not next_raw then
-    return
+    return false
   end
   local next_job = cjson.decode(next_raw)
   if redis.call('HEXISTS', jobs_key, next_job["id"]) == 1 then
     redis.call('DEL', next_key)
-    return
+    return false
+  end
+
+  local repeat_next_count = repeat_keep_last_next_count(owner_job, next_job)
+  if repeat_next_count == false then
+    redis.call('DEL', next_key)
+    return false
   end
 
   local delay = nil
@@ -1342,6 +1437,10 @@ local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delay
   else
     next_job["state"] = "waiting"
   end
+  if repeat_next_count then
+    next_job["repeat_key"] = owner_job["repeat_key"]
+    next_job["repeat_count"] = repeat_next_count
+  end
   next_job["attempts_made"] = 0
   next_job["stalled_count"] = 0
   next_job["processed_at"] = cjson.null
@@ -1357,6 +1456,9 @@ local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delay
 
   redis.call('HSET', jobs_key, next_job["id"], cjson.encode(next_job))
   set_deduplication_key(next_job, next_job["id"], deduplication_prefix)
+  if repeat_next_count then
+    set_repeat_key(next_job, next_job["id"], repeat_prefix)
+  end
   if next_job["state"] == "waiting" then
     local priority = tonumber(next_job["priority"] or '1000') or 1000
     local sequence = redis.call('INCR', sequence_key)
@@ -1366,6 +1468,7 @@ local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delay
     redis.call('ZADD', delayed_key, scheduled_millis, next_job["id"])
   end
   redis.call('DEL', next_key)
+  return true
 end
 
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
@@ -1407,7 +1510,7 @@ job["state"] = "failed"
 job["finished_at"] = ARGV[3]
 release_deduplication_key(job, ARGV[1], ARGV[11])
 release_repeat_key(job, ARGV[1], ARGV[12])
-enqueue_deduplicated_next(job, KEYS[1], KEYS[7], KEYS[3], KEYS[8], ARGV[11], ARGV[14], ARGV[3], ARGV[8], ARGV[13])
+enqueue_deduplicated_next(job, KEYS[1], KEYS[7], KEYS[3], KEYS[8], ARGV[11], ARGV[14], ARGV[12], ARGV[3], ARGV[8], ARGV[13])
 local updated = cjson.encode(job)
 if ARGV[9] == '1' then
   redis.call('HDEL', KEYS[1], ARGV[1])
@@ -1645,20 +1748,60 @@ local function release_repeat_key(job, job_id, repeat_prefix)
   end
 end
 
-local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delayed_key, sequence_key, deduplication_prefix, deduplication_next_prefix, now_iso, now_millis, waiting_score_bucket)
+local function set_repeat_key(job, job_id, repeat_prefix)
+  local key = repeat_key(job)
+  if key then
+    redis.call('SET', repeat_prefix .. key, job_id)
+  end
+end
+
+local function repeat_keep_last_next_count(owner_job, next_job)
+  local next_repeat_key = repeat_key(next_job)
+  local owner_repeat_key = repeat_key(owner_job)
+  if not next_repeat_key then
+    if owner_repeat_key then
+      return false
+    end
+    return nil
+  end
+  if not owner_repeat_key or owner_repeat_key ~= next_repeat_key then
+    return false
+  end
+
+  local next_count = (tonumber(owner_job["repeat_count"] or '0') or 0) + 1
+  local repeat_options = nil
+  if owner_job["options"] and owner_job["options"] ~= cjson.null then
+    repeat_options = owner_job["options"]["repeat"]
+  end
+  if repeat_options and repeat_options ~= cjson.null then
+    local limit = tonumber(repeat_options["limit"] or '0') or 0
+    if limit > 0 and next_count >= limit then
+      return false
+    end
+  end
+  return next_count
+end
+
+local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delayed_key, sequence_key, deduplication_prefix, deduplication_next_prefix, repeat_prefix, now_iso, now_millis, waiting_score_bucket)
   local id = deduplication_id(owner_job)
   if not id then
-    return
+    return false
   end
   local next_key = deduplication_next_prefix .. id
   local next_raw = redis.call('GET', next_key)
   if not next_raw then
-    return
+    return false
   end
   local next_job = cjson.decode(next_raw)
   if redis.call('HEXISTS', jobs_key, next_job["id"]) == 1 then
     redis.call('DEL', next_key)
-    return
+    return false
+  end
+
+  local repeat_next_count = repeat_keep_last_next_count(owner_job, next_job)
+  if repeat_next_count == false then
+    redis.call('DEL', next_key)
+    return false
   end
 
   local delay = nil
@@ -1676,6 +1819,10 @@ local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delay
   else
     next_job["state"] = "waiting"
   end
+  if repeat_next_count then
+    next_job["repeat_key"] = owner_job["repeat_key"]
+    next_job["repeat_count"] = repeat_next_count
+  end
   next_job["attempts_made"] = 0
   next_job["stalled_count"] = 0
   next_job["processed_at"] = cjson.null
@@ -1691,6 +1838,9 @@ local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delay
 
   redis.call('HSET', jobs_key, next_job["id"], cjson.encode(next_job))
   set_deduplication_key(next_job, next_job["id"], deduplication_prefix)
+  if repeat_next_count then
+    set_repeat_key(next_job, next_job["id"], repeat_prefix)
+  end
   if next_job["state"] == "waiting" then
     local priority = tonumber(next_job["priority"] or '1000') or 1000
     local sequence = redis.call('INCR', sequence_key)
@@ -1700,6 +1850,7 @@ local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delay
     redis.call('ZADD', delayed_key, scheduled_millis, next_job["id"])
   end
   redis.call('DEL', next_key)
+  return true
 end
 
 local ids = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1], 'LIMIT', 0, ARGV[5])
@@ -1732,7 +1883,7 @@ for _, id in ipairs(ids) do
           redis.call('DEL', ARGV[6] .. id)
           release_deduplication_key(job, id, ARGV[7])
           release_repeat_key(job, id, ARGV[8])
-          enqueue_deduplicated_next(job, KEYS[1], KEYS[3], KEYS[7], KEYS[5], ARGV[7], ARGV[9], ARGV[2], ARGV[1], ARGV[4])
+          enqueue_deduplicated_next(job, KEYS[1], KEYS[3], KEYS[7], KEYS[5], ARGV[7], ARGV[9], ARGV[8], ARGV[2], ARGV[1], ARGV[4])
 
           if job["options"] and job["options"]["remove_on_fail"] == true then
             redis.call('HDEL', KEYS[1], id)

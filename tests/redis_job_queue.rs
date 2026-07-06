@@ -57,6 +57,161 @@ async fn redis_backend_obliterates_queue_against_real_server() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn redis_backend_keeps_latest_repeat_duplicate_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    tokio::time::timeout(Duration::from_secs(120), run_repeat_keep_last(redis_url))
+        .await
+        .expect("Redis repeat keep-last integration test timed out")
+        .unwrap();
+}
+
+async fn run_repeat_keep_last(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    trace_stage("repeat-keep-last:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("repeat-keep-last:cleanup:done");
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "repeat-keep-last")
+        .expect("valid Redis URL should build the repeat keep-last queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    trace_stage("repeat-keep-last:queue-created");
+    let repeat = RepeatOptions::every(Duration::from_secs(60))
+        .with_limit(3)
+        .with_key("account-sync");
+    let deduplication =
+        DeduplicationOptions::new("tenant:repeat-keep-last").keep_last_if_active(true);
+
+    let owner = queue
+        .add_job(
+            "repeat-owner".to_string(),
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new()
+                .with_repeat(repeat.clone())
+                .with_deduplication(deduplication.clone()),
+        )
+        .await
+        .expect("repeat owner should be added");
+    trace_stage("repeat-keep-last:owner-added");
+    assert_eq!(owner.repeat_key.as_deref(), Some("account-sync"));
+    let owner_id: Option<String> = conn
+        .get(format!("{namespace}:repeat-keep-last:repeat:account-sync"))
+        .await?;
+    assert_eq!(owner_id.as_deref(), Some(owner.id.as_str()));
+
+    let claimed = queue
+        .claim_next(
+            "worker-repeat-keep-last".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("repeat owner claim should return")
+        .expect("repeat owner should be claimable");
+    trace_stage("repeat-keep-last:owner-claimed");
+    assert_eq!(claimed.id, owner.id);
+
+    let stale_duplicate = queue
+        .add_job(
+            "repeat-stale".to_string(),
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new()
+                .with_repeat(repeat.clone())
+                .with_deduplication(deduplication.clone()),
+        )
+        .await
+        .expect("stale repeat duplicate should return owner");
+    trace_stage("repeat-keep-last:stale-duplicate-added");
+    assert_eq!(stale_duplicate.id, owner.id);
+
+    let latest_duplicate = queue
+        .add_job(
+            "repeat-latest".to_string(),
+            serde_json::json!({ "version": 3 }),
+            JobOptions::new()
+                .with_delay(Duration::from_millis(150))
+                .with_repeat(repeat)
+                .with_deduplication(deduplication),
+        )
+        .await
+        .expect("latest repeat duplicate should return owner");
+    trace_stage("repeat-keep-last:latest-duplicate-added");
+    assert_eq!(latest_duplicate.id, owner.id);
+
+    let next_key =
+        format!("{namespace}:repeat-keep-last:deduplication_next:tenant:repeat-keep-last");
+    let next_raw: String = conn.get(&next_key).await?;
+    trace_stage("repeat-keep-last:next-record-read");
+    let next_proto: Job = serde_json::from_str(&next_raw).expect("stored next job should decode");
+    assert_eq!(next_proto.name, "repeat-latest");
+    assert_eq!(next_proto.repeat_key.as_deref(), Some("account-sync"));
+
+    let complete_at = Utc::now();
+    queue
+        .complete_job(
+            &claimed.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            complete_at,
+        )
+        .await
+        .expect("repeat owner should complete");
+    trace_stage("repeat-keep-last:owner-completed");
+    let next_after: Option<String> = conn.get(&next_key).await?;
+    assert!(next_after.is_none());
+
+    let repeat_owner_after: Option<String> = conn
+        .get(format!("{namespace}:repeat-keep-last:repeat:account-sync"))
+        .await?;
+    assert_eq!(repeat_owner_after.as_deref(), Some(next_proto.id.as_str()));
+
+    let delayed = queue
+        .list_jobs(JobListOptions::new().with_state(JobState::Delayed))
+        .await
+        .expect("delayed repeat keep-last jobs should list");
+    trace_stage("repeat-keep-last:delayed-listed");
+    assert_eq!(delayed.total, 1);
+    assert_eq!(delayed.jobs[0].id, next_proto.id);
+    assert_eq!(delayed.jobs[0].name, "repeat-latest");
+    assert_eq!(delayed.jobs[0].payload, serde_json::json!({ "version": 3 }));
+    assert_eq!(delayed.jobs[0].repeat_key.as_deref(), Some("account-sync"));
+    assert_eq!(delayed.jobs[0].repeat_count, 1);
+
+    let repeats = queue
+        .list_repeats()
+        .await
+        .expect("repeat keep-last owners should list");
+    trace_stage("repeat-keep-last:repeats-listed");
+    assert_eq!(repeats.len(), 1);
+    assert_eq!(repeats[0].key, "account-sync");
+    assert_eq!(repeats[0].job_id, next_proto.id);
+    assert_eq!(repeats[0].repeat_count, 1);
+
+    sleep_until_due(delayed.jobs[0].scheduled_at).await;
+    trace_stage("repeat-keep-last:due-sleep-finished");
+    let next_claim = queue
+        .claim_next(
+            "worker-repeat-keep-last-next".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("repeat keep-last next claim should return")
+        .expect("repeat keep-last next job should be claimable");
+    trace_stage("repeat-keep-last:next-claimed");
+    assert_eq!(next_claim.id, next_proto.id);
+    assert_eq!(next_claim.name, "repeat-latest");
+
+    cleanup_namespace_with_conn(&mut conn, &namespace).await?;
+    trace_stage("repeat-keep-last:cleanup-final:done");
+    Ok(())
+}
+
 async fn run_queue_obliterate(redis_url: String) -> redis::RedisResult<()> {
     let namespace = unique_namespace();
     cleanup_namespace(&redis_url, &namespace).await?;

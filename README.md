@@ -703,12 +703,14 @@ For TTL-backed delayed replacement, replacement preserves the existing owner
 key's remaining TTL by default; when `extend_ttl(true)` is also set, replacement
 refreshes the TTL instead.
 `keep_last_if_active(true)` covers BullMQ's active-owner keep-last path for
-standalone jobs: duplicates added while the current owner is active return that
-owner, overwrite a queue-local next-job record, and materialize only the latest
-duplicate when the owner completes, terminally fails, or exhausts stalled-job
-recovery. If that latest duplicate has a delay, the delay starts from the owner
-finalization timestamp.
-Flow/repeat keep-last extensions remain planned.
+standalone and repeat-series jobs: duplicates added while the current owner is
+active return that owner, overwrite a queue-local next-job record, and
+materialize only the latest duplicate when the owner completes, terminally fails,
+or exhausts stalled-job recovery. If that latest duplicate has a delay, the delay
+starts from the owner finalization timestamp. For repeat series, the latest
+duplicate becomes the next occurrence for the same repeat key and replaces the
+regular successor for that finalization turn. Flow keep-last extensions remain
+planned.
 Retrying a failed deduplicated job reclaims the deduplication id while the job is
 waiting or active again; retry is rejected if another non-terminal job already
 owns that id.
@@ -883,7 +885,13 @@ active sorted set, duplicate adds overwrite a
 `deduplication_next:<id>` proto-job record and `PERSIST` the owner key. Complete,
 terminal fail, and stalled terminal-fail scripts then atomically delete the old
 owner key, materialize that latest proto-job into waiting or delayed state, and
-set the deduplication owner to the new job.
+set the deduplication owner to the new job. When the owner and latest duplicate
+share the same repeat key, the finalization script also increments
+`repeat_count`, sets the `repeat:<key>` owner to the materialized latest job, and
+suppresses the regular repeat successor for that turn. This preserves the
+single-owner repeat invariant while matching BullMQ's keep-last requeue
+mechanism, where the dedup-next record is consumed during job finalization rather
+than by a later client-side pass.
 Completion, terminal failure, remove, clean, and stalled terminal failure scripts
 release deduplication keys only when they still point at the job being finalized
 or removed.

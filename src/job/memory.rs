@@ -902,7 +902,12 @@ impl InMemoryJobQueue {
     ) -> Option<Job> {
         let deduplication_id = job_deduplication_id(owner)?;
         let mut next = inner.deduplication_next.remove(deduplication_id)?;
+        let repeat_next_count = repeat_keep_last_next_count(owner, &next)?;
         prepare_deduplicated_next_job(&mut next, now);
+        if let Some(next_count) = repeat_next_count {
+            next.repeat_key = owner.repeat_key.clone();
+            next.repeat_count = next_count;
+        }
         if inner.jobs.contains_key(&next.id) {
             return None;
         }
@@ -1085,11 +1090,14 @@ impl JobQueueBackend for InMemoryJobQueue {
         if completed.options.remove_on_complete {
             Self::remove_job_record_locked(&mut inner, job_id);
         }
-        if let Some(next_job) = next_repeat_job(&completed, now)? {
-            Self::forget_released_deduplication_owner_locked(&mut inner, &next_job);
-            inner.jobs.insert(next_job.id.clone(), next_job);
+        let enqueued_deduplicated_next =
+            Self::enqueue_deduplicated_next_locked(&mut inner, &completed, now);
+        if enqueued_deduplicated_next.is_none() {
+            if let Some(next_job) = next_repeat_job(&completed, now)? {
+                Self::forget_released_deduplication_owner_locked(&mut inner, &next_job);
+                inner.jobs.insert(next_job.id.clone(), next_job);
+            }
         }
-        Self::enqueue_deduplicated_next_locked(&mut inner, &completed, now);
         if let Some(parent_id) = &completed.parent_id {
             Self::release_parent_if_ready_locked(&mut inner, parent_id, now);
         }
@@ -1585,7 +1593,7 @@ fn deduplication_stores_next_if_active(candidate: &Job, existing: &Job) -> bool 
     ) && existing.state == JobState::Active
         && candidate.parent_id.is_none()
         && candidate.child_ids.is_empty()
-        && candidate.repeat_key.is_none()
+        && candidate.repeat_key.as_deref() == existing.repeat_key.as_deref()
 }
 
 fn deduplication_extends_ttl(candidate: &Job) -> bool {
@@ -1630,6 +1638,25 @@ fn prepare_deduplicated_next_job(job: &mut Job, now: DateTime<Utc>) {
     job.progress = None;
     job.logs.clear();
     job.deduplication_expires_at = deduplication_expiration(&job.options, now);
+}
+
+fn repeat_keep_last_next_count(owner: &Job, candidate: &Job) -> Option<Option<u32>> {
+    let Some(owner_repeat_key) = owner.repeat_key.as_deref() else {
+        return Some(None);
+    };
+    if candidate.repeat_key.as_deref() != Some(owner_repeat_key) {
+        return None;
+    }
+
+    let next_count = owner.repeat_count.saturating_add(1);
+    if matches!(
+        owner.options.repeat.as_ref().and_then(|repeat| repeat.limit),
+        Some(limit) if next_count >= limit
+    ) {
+        return None;
+    }
+
+    Some(Some(next_count))
 }
 
 fn active_repeat_key(job: &Job) -> Option<&str> {
