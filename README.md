@@ -680,9 +680,10 @@ another state. `retry_job()` clears terminal failure metadata, treats the failed
 zset as the Redis movement gate, prunes orphaned or stale failed members, and
 moves valid failed jobs back to waiting inside one script. `update_priority()`
 rewrites the job hash and, for waiting jobs, replaces the waiting zset score in
-the same script. This is intentionally aligned with BullMQ's mechanism of moving
-job state through Redis scripts instead of coordinating several client-side
-Redis commands.
+the same script; for jobs that are no longer waiting, it prunes stale waiting
+members while preserving the stored non-terminal state. This is intentionally
+aligned with BullMQ's mechanism of moving job state through Redis scripts instead
+of coordinating several client-side Redis commands.
 
 Redis job management mutations are script-backed too. `update_progress()` checks
 the current state and writes the progress value in one Redis turn; `add_log()`

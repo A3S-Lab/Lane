@@ -654,10 +654,15 @@ return {'ok', updated}
 const UPDATE_PRIORITY_SCRIPT: &str = r#"
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
+  redis.call('ZREM', KEYS[2], ARGV[1])
   return {'missing'}
 end
 
 local job = cjson.decode(raw)
+if job["state"] ~= "waiting" then
+  redis.call('ZREM', KEYS[2], ARGV[1])
+end
+
 if job["state"] == "completed" or job["state"] == "failed" then
   return {'terminal'}
 end

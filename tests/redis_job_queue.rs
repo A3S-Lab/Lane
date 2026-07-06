@@ -80,6 +80,84 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("priority job should complete");
+    let mut priority_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let _: usize = priority_conn
+        .zadd(
+            format!("{namespace}:priority:waiting"),
+            &second_priority.id,
+            0.0,
+        )
+        .await?;
+    let terminal_priority_update = priority_queue
+        .update_priority(&second_priority.id, 5)
+        .await
+        .expect_err("terminal job with stale waiting index should reject priority update");
+    assert!(matches!(
+        terminal_priority_update,
+        LaneError::JobStateConflict(_)
+    ));
+    let stale_terminal_waiting_score: Option<f64> = priority_conn
+        .zscore(format!("{namespace}:priority:waiting"), &second_priority.id)
+        .await?;
+    assert!(stale_terminal_waiting_score.is_none());
+    let _: usize = priority_conn
+        .zadd(
+            format!("{namespace}:priority:waiting"),
+            "missing-priority-job",
+            0.0,
+        )
+        .await?;
+    let missing_priority_update = priority_queue
+        .update_priority("missing-priority-job", 5)
+        .await
+        .expect_err("missing job should still be reported as missing");
+    assert!(matches!(missing_priority_update, LaneError::JobNotFound(_)));
+    let missing_priority_waiting_score: Option<f64> = priority_conn
+        .zscore(
+            format!("{namespace}:priority:waiting"),
+            "missing-priority-job",
+        )
+        .await?;
+    assert!(missing_priority_waiting_score.is_none());
+    let delayed_priority_index = priority_queue
+        .add_job(
+            "priority-stale-delayed".to_string(),
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_priority(90)
+                .with_delay(Duration::from_secs(60)),
+        )
+        .await
+        .expect("delayed priority stale-index job should add");
+    let _: usize = priority_conn
+        .zadd(
+            format!("{namespace}:priority:waiting"),
+            &delayed_priority_index.id,
+            0.0,
+        )
+        .await?;
+    let updated_delayed_priority = priority_queue
+        .update_priority(&delayed_priority_index.id, 7)
+        .await
+        .expect("delayed priority update should update hash and prune stale waiting index");
+    assert_eq!(updated_delayed_priority.state, JobState::Delayed);
+    assert_eq!(updated_delayed_priority.priority, 7);
+    let delayed_priority_waiting_score: Option<f64> = priority_conn
+        .zscore(
+            format!("{namespace}:priority:waiting"),
+            &delayed_priority_index.id,
+        )
+        .await?;
+    assert!(delayed_priority_waiting_score.is_none());
+    let delayed_priority_delayed_score: Option<f64> = priority_conn
+        .zscore(
+            format!("{namespace}:priority:delayed"),
+            &delayed_priority_index.id,
+        )
+        .await?;
+    assert!(delayed_priority_delayed_score.is_some());
     trace_stage("priority:done");
 
     let delayed_priority_queue =
