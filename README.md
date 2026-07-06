@@ -372,7 +372,7 @@ A3S stack and language SDKs.
 | Generic job runtime | In progress | JSON jobs, bulk submission, idempotent custom job IDs, explicit job states, priority ordering, delayed jobs, token-owned worker leases, completion/failure snapshots, retry backoff, rate-limited claims, shared active concurrency limits, stalled-job recovery, pause/resume. |
 | Job management API | In progress | Add/get/remove/promote/retry/update-priority/pause/resume/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, timeouts, and stalled recovery loops. |
-| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, flow submission, delayed promotion, claim, rate limit, max-active, flow parent release/failure, complete, fail, renew, and stalled recovery semantics. Postgres/NATS backends remain planned. |
+| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, flow submission, delayed promotion, claim, rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, and stalled recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, and end timestamps are available across in-memory, local durable, and Redis backends. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
@@ -656,6 +656,11 @@ Flow fan-in is also protected in Redis transitions. When a child job completes
 or reaches terminal failure, the completion/failure Lua script updates the
 parent in the same Redis turn when the parent can be released to `waiting` or
 failed because a child failed.
+
+Repeat successors are created during the Redis completion script too. The
+worker computes the next occurrence from `RepeatOptions`, then the Lua script
+finishes the current job and writes the next delayed or waiting occurrence in
+the same Redis turn.
 
 Run the Redis integration test against any reachable Redis server:
 

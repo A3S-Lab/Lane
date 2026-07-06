@@ -254,6 +254,24 @@ if parent_id and parent_id ~= cjson.null then
   end
 end
 
+local repeat_next_id = ARGV[8]
+if repeat_next_id and repeat_next_id ~= '' then
+  local inserted = redis.call('HSETNX', KEYS[1], repeat_next_id, ARGV[9])
+  if inserted == 1 then
+    local repeat_next_state = ARGV[10]
+    if repeat_next_state == 'waiting' then
+      local repeat_priority = tonumber(ARGV[12])
+      local sequence = redis.call('INCR', KEYS[7])
+      local waiting_score = (repeat_priority * tonumber(ARGV[7])) + sequence
+      redis.call('ZADD', KEYS[5], waiting_score, repeat_next_id)
+    elseif repeat_next_state == 'delayed' then
+      redis.call('ZADD', KEYS[9], ARGV[11], repeat_next_id)
+    elseif repeat_next_state == 'waiting_children' then
+      redis.call('ZADD', KEYS[6], ARGV[11], repeat_next_id)
+    end
+  end
+end
+
 return {'ok', updated}
 "#;
 
@@ -648,44 +666,6 @@ impl RedisJobQueue {
         decode_add_flow_result(&result)
     }
 
-    async fn index_new_job(&self, conn: &mut ConnectionManager, job: &Job) -> Result<()> {
-        match job.state {
-            JobState::Delayed => {
-                let _: usize = conn
-                    .zadd(
-                        self.state_key(JobState::Delayed),
-                        &job.id,
-                        millis(job.scheduled_at),
-                    )
-                    .await
-                    .map_err(redis_error)?;
-            }
-            JobState::Waiting => {
-                let sequence = self.next_sequence(conn).await?;
-                let _: usize = conn
-                    .zadd(
-                        self.state_key(JobState::Waiting),
-                        &job.id,
-                        waiting_score(job.priority, sequence),
-                    )
-                    .await
-                    .map_err(redis_error)?;
-            }
-            JobState::WaitingChildren => {
-                let _: usize = conn
-                    .zadd(
-                        self.state_key(JobState::WaitingChildren),
-                        &job.id,
-                        millis(job.scheduled_at),
-                    )
-                    .await
-                    .map_err(redis_error)?;
-            }
-            JobState::Active | JobState::Completed | JobState::Failed => {}
-        }
-        Ok(())
-    }
-
     async fn load_job(&self, conn: &mut ConnectionManager, job_id: &str) -> Result<Option<Job>> {
         let raw: Option<String> = conn
             .hget(self.jobs_key(), job_id)
@@ -927,13 +907,12 @@ impl JobQueueBackend for RedisJobQueue {
         now: DateTime<Utc>,
     ) -> Result<Job> {
         let mut conn = self.connection().await?;
-        let remove_on_complete = self
-            .load_job(&mut conn, job_id)
-            .await?
-            .is_some_and(|job| job.options.remove_on_complete);
+        let active_job = self.require_job(&mut conn, job_id).await?;
+        let remove_on_complete = active_job.options.remove_on_complete;
+        let next_repeat = next_repeat_job(&active_job, now)?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(COMPLETE_SCRIPT)
-            .arg(8)
+            .arg(9)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.state_key(JobState::Completed))
@@ -942,6 +921,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.state_key(JobState::WaitingChildren))
             .arg(self.sequence_key())
             .arg(self.state_key(JobState::Failed))
+            .arg(self.state_key(JobState::Delayed))
             .arg(job_id)
             .arg(lock_token)
             .arg(now.to_rfc3339())
@@ -953,15 +933,42 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(millis(now))
             .arg(if remove_on_complete { "1" } else { "0" })
             .arg(WAITING_SCORE_BUCKET)
+            .arg(
+                next_repeat
+                    .as_ref()
+                    .map(|job| job.id.as_str())
+                    .unwrap_or(""),
+            )
+            .arg(
+                next_repeat
+                    .as_ref()
+                    .map(encode_job)
+                    .transpose()?
+                    .unwrap_or_default(),
+            )
+            .arg(
+                next_repeat
+                    .as_ref()
+                    .map(|job| job_state_name(job.state))
+                    .unwrap_or(""),
+            )
+            .arg(
+                next_repeat
+                    .as_ref()
+                    .map(|job| millis(job.scheduled_at))
+                    .unwrap_or_default(),
+            )
+            .arg(
+                next_repeat
+                    .as_ref()
+                    .map(|job| job.priority)
+                    .unwrap_or_default(),
+            )
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
         let completed = decode_transition_result(&result, job_id, "complete")?;
         let parent_id = completed.parent_id.clone();
-        if let Some(next_job) = next_repeat_job(&completed, now)? {
-            self.store_job(&mut conn, &next_job).await?;
-            self.index_new_job(&mut conn, &next_job).await?;
-        }
         if let Some(parent_id) = parent_id {
             self.release_parent_if_ready(&mut conn, &parent_id, now)
                 .await?;

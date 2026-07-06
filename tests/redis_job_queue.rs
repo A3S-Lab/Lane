@@ -881,6 +881,10 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .find(|job| job.repeat_key.as_deref() == Some("heartbeat"))
         .expect("repeat successor should be delayed");
     assert_eq!(repeat_successor.repeat_count, 1);
+    let repeat_successor_delayed_score: Option<f64> = flow_index_conn
+        .zscore(format!("{namespace}:jobs:delayed"), &repeat_successor.id)
+        .await?;
+    assert!(repeat_successor_delayed_score.is_some());
 
     tokio::time::sleep(Duration::from_millis(250)).await;
     producer
@@ -996,6 +1000,66 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .jobs
         .iter()
         .any(|job| job.repeat_key.as_deref() == Some("cron-heartbeat")));
+
+    let repeat_remove_queue =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "repeat-remove")
+            .expect("valid Redis URL should build the repeat-remove queue");
+    let repeat_remove = repeat_remove_queue
+        .add_job(
+            "repeat-remove".to_string(),
+            serde_json::json!({ "kind": "ephemeral-heartbeat" }),
+            JobOptions::new().remove_on_complete(true).with_repeat(
+                RepeatOptions::every(Duration::from_secs(60))
+                    .with_limit(2)
+                    .with_key("ephemeral-heartbeat"),
+            ),
+        )
+        .await
+        .expect("repeat-remove job should be added");
+    let repeat_remove_claim = repeat_remove_queue
+        .claim_next(
+            "worker-repeat-remove".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("repeat-remove claim should return")
+        .expect("repeat-remove job should be claimable");
+    assert_eq!(repeat_remove_claim.id, repeat_remove.id);
+    repeat_remove_queue
+        .complete_job(
+            &repeat_remove_claim.id,
+            lock_token(&repeat_remove_claim),
+            serde_json::json!({ "tick": 1 }),
+            Utc::now(),
+        )
+        .await
+        .expect("repeat-remove job should complete");
+    assert!(repeat_remove_queue
+        .get_job(&repeat_remove.id)
+        .await
+        .expect("removed repeat job lookup should return")
+        .is_none());
+    let repeat_remove_delayed = repeat_remove_queue
+        .list_jobs(JobListOptions::new().with_state(JobState::Delayed))
+        .await
+        .expect("repeat-remove delayed jobs should list");
+    let repeat_remove_successor = repeat_remove_delayed
+        .jobs
+        .iter()
+        .find(|job| job.repeat_key.as_deref() == Some("ephemeral-heartbeat"))
+        .expect("repeat-remove successor should be delayed");
+    assert_eq!(repeat_remove_successor.repeat_count, 1);
+    let mut repeat_remove_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let repeat_remove_delayed_score: Option<f64> = repeat_remove_conn
+        .zscore(
+            format!("{namespace}:repeat-remove:delayed"),
+            &repeat_remove_successor.id,
+        )
+        .await?;
+    assert!(repeat_remove_delayed_score.is_some());
 
     let idempotent_job_id = format!("{namespace}:invoice:42");
     let idempotent = producer
