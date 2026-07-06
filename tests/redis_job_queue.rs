@@ -1426,7 +1426,17 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect("paused-promote pause state should load after resume"));
     let resumed_raw: Option<u8> = paused_promote_conn.hget(&paused_meta_key, "paused").await?;
-    assert_eq!(resumed_raw, Some(0));
+    assert!(resumed_raw.is_none());
+    let _: usize = paused_promote_conn
+        .hset(&paused_meta_key, "paused", 0_u8)
+        .await?;
+    assert!(!paused_promote_queue
+        .is_paused()
+        .await
+        .expect("legacy paused=0 value should load as resumed"));
+    let legacy_resumed_raw: Option<u8> =
+        paused_promote_conn.hget(&paused_meta_key, "paused").await?;
+    assert!(legacy_resumed_raw.is_none());
     let paused_promoted_claim = paused_promote_queue
         .claim_next(
             "worker-paused-promote-resumed".to_string(),

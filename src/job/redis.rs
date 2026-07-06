@@ -711,7 +711,9 @@ for _, due_id in ipairs(due_ids) do
 end
 
 local paused = redis.call('HGET', KEYS[5], 'paused')
-if paused and paused ~= '0' then
+if paused == '0' then
+  redis.call('HDEL', KEYS[5], 'paused')
+elseif paused then
   return nil
 end
 
@@ -2940,9 +2942,11 @@ return 'unknown'
 "#;
 
 const STATS_SCRIPT: &str = r#"
-local paused = redis.call('HGET', KEYS[1], 'paused')
 local paused_value = 0
-if paused and paused ~= '0' then
+local paused = redis.call('HGET', KEYS[1], 'paused')
+if paused == '0' then
+  redis.call('HDEL', KEYS[1], 'paused')
+elseif paused then
   paused_value = 1
 end
 
@@ -4272,7 +4276,7 @@ impl JobQueueBackend for RedisJobQueue {
 
     async fn resume(&self) -> Result<()> {
         let mut conn = self.connection().await?;
-        conn.hset(self.meta_key(), "paused", 0_u8)
+        conn.hdel(self.meta_key(), "paused")
             .await
             .map_err(redis_error)
     }
@@ -4283,7 +4287,14 @@ impl JobQueueBackend for RedisJobQueue {
             .hget(self.meta_key(), "paused")
             .await
             .map_err(redis_error)?;
-        Ok(paused.as_deref().is_some_and(|value| value != "0"))
+        if paused.as_deref() == Some("0") {
+            let _: usize = conn
+                .hdel(self.meta_key(), "paused")
+                .await
+                .map_err(redis_error)?;
+            return Ok(false);
+        }
+        Ok(paused.is_some())
     }
 
     async fn get_job(&self, job_id: &str) -> Result<Option<Job>> {

@@ -1017,9 +1017,10 @@ in the same Redis turn and to prune stale state-index entries it encounters.
 `stats()` evaluates one Lua script that reads the pause flag and all waiting,
 delayed, active, waiting-children, completed, and failed sorted-set counts in a
 single Redis turn, mirroring BullMQ's `getCounts` style instead of stitching
-together several client-side reads. `is_paused()` reads the same Redis
-`meta.paused` field used by the claim script, treating any non-zero value as
-paused.
+together several client-side reads. Redis pause state follows BullMQ's
+`meta.paused` mechanism: `pause()` writes the field, `resume()` deletes it, and
+`is_paused()` reads that same field. A legacy `paused = 0` value is treated as
+resumed and cleaned up.
 
 Stalled recovery is Lua-backed as well. The recovery script scans expired
 active scores, verifies that the independent lock key is missing, increments
