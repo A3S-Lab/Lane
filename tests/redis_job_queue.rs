@@ -4505,6 +4505,27 @@ async fn run_state_count_indexes(redis_url: String) -> redis::RedisResult<()> {
             },
         ]
     );
+    assert_eq!(
+        state_queue
+            .get_job_count(&[JobState::Waiting, JobState::Delayed, JobState::Waiting])
+            .await
+            .expect("selected aggregate state count should load"),
+        4
+    );
+    assert_eq!(
+        state_queue
+            .get_job_count(&[])
+            .await
+            .expect("default aggregate state count should load"),
+        8
+    );
+    assert_eq!(
+        state_queue
+            .count_pending_jobs()
+            .await
+            .expect("pending state count should load"),
+        5
+    );
 
     let mut conn = redis::Client::open(redis_url.as_str())?
         .get_connection_manager()

@@ -259,6 +259,15 @@ async fn job_counts_return_selected_and_default_states() {
             },
         ]
     );
+    assert_eq!(
+        queue
+            .get_job_count(&[JobState::Waiting, JobState::Delayed, JobState::Waiting])
+            .await
+            .unwrap(),
+        4
+    );
+    assert_eq!(queue.get_job_count(&[]).await.unwrap(), 8);
+    assert_eq!(queue.count_pending_jobs().await.unwrap(), 5);
 }
 
 #[tokio::test]

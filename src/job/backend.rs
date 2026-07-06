@@ -104,6 +104,24 @@ pub trait JobQueueBackend: Send + Sync {
     /// preserving the first requested order.
     async fn get_job_counts(&self, states: &[JobState]) -> Result<Vec<JobStateCount>>;
 
+    /// Return the aggregate count for the requested states.
+    ///
+    /// This mirrors BullMQ's `getJobCountByTypes()` shape: it reuses per-state
+    /// counts, so empty input means all states and duplicate states are counted
+    /// once.
+    async fn get_job_count(&self, states: &[JobState]) -> Result<usize> {
+        let counts = self.get_job_counts(states).await?;
+        Ok(counts.into_iter().map(|count| count.count).sum())
+    }
+
+    /// Return jobs that are waiting to be processed.
+    ///
+    /// This follows BullMQ's queue `count()` meaning: waiting, delayed, and
+    /// waiting-children jobs are included; active and terminal jobs are not.
+    async fn count_pending_jobs(&self) -> Result<usize> {
+        self.get_job_count(JobState::PENDING.as_slice()).await
+    }
+
     /// Return waiting-job counts for the requested priorities.
     ///
     /// Duplicate priorities are counted once, preserving the first requested order.

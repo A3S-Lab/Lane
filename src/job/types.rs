@@ -107,6 +107,9 @@ impl JobState {
         Self::Failed,
     ];
 
+    /// States counted as pending work, matching BullMQ's queue `count()` shape.
+    pub const PENDING: [Self; 3] = [Self::Waiting, Self::Delayed, Self::WaitingChildren];
+
     /// Whether this state is terminal and should not be claimed again.
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed)
