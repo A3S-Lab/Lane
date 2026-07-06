@@ -1,5 +1,5 @@
 use super::types::{
-    Job, JobFlow, JobFlowDependencies, JobListOptions, JobListPage, JobLogPage, JobOptions,
+    Job, JobFlow, JobFlowDependencies, JobId, JobListOptions, JobListPage, JobLogPage, JobOptions,
     JobPriority, JobPriorityCount, JobQueueStats, JobRepeatEntry, JobSpec, JobState, JobStateCount,
     JobWorkerId,
 };
@@ -83,6 +83,8 @@ pub trait JobQueueBackend: Send + Sync {
     async fn remove_repeat(&self, repeat_key: &str) -> Result<Option<Job>>;
 
     async fn remove_deduplication_key(&self, deduplication_id: &str) -> Result<bool>;
+
+    async fn get_deduplication_job_id(&self, deduplication_id: &str) -> Result<Option<JobId>>;
 
     async fn list_repeats(&self) -> Result<Vec<JobRepeatEntry>>;
 

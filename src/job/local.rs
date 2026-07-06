@@ -1,7 +1,7 @@
 use super::backend::JobQueueBackend;
 use super::memory::InMemoryJobQueue;
 use super::types::{
-    Job, JobFlow, JobFlowDependencies, JobListOptions, JobListPage, JobLogPage, JobOptions,
+    Job, JobFlow, JobFlowDependencies, JobId, JobListOptions, JobListPage, JobLogPage, JobOptions,
     JobPriority, JobPriorityCount, JobQueueSnapshot, JobQueueStats, JobRepeatEntry, JobSpec,
     JobState, JobStateCount, JobWorkerId,
 };
@@ -152,6 +152,11 @@ impl LocalJobQueue {
         Ok(removed)
     }
 
+    /// Return the current active job id for a deduplication id.
+    pub async fn get_deduplication_job_id(&self, deduplication_id: &str) -> Result<Option<JobId>> {
+        self.inner.get_deduplication_job_id(deduplication_id).await
+    }
+
     /// List current non-terminal repeat series owners.
     pub async fn list_repeats(&self) -> Result<Vec<JobRepeatEntry>> {
         self.inner.list_repeats().await
@@ -300,6 +305,10 @@ impl JobQueueBackend for LocalJobQueue {
 
     async fn remove_deduplication_key(&self, deduplication_id: &str) -> Result<bool> {
         LocalJobQueue::remove_deduplication_key(self, deduplication_id).await
+    }
+
+    async fn get_deduplication_job_id(&self, deduplication_id: &str) -> Result<Option<JobId>> {
+        LocalJobQueue::get_deduplication_job_id(self, deduplication_id).await
     }
 
     async fn list_repeats(&self) -> Result<Vec<JobRepeatEntry>> {

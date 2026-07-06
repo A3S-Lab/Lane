@@ -152,10 +152,33 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         manual_release_owner.as_deref(),
         Some(manual_release_dedup.id.as_str())
     );
+    assert_eq!(
+        dedup_queue
+            .get_deduplication_job_id("tenant:manual-release")
+            .await
+            .expect("manual-release dedup owner should load")
+            .as_deref(),
+        Some(manual_release_dedup.id.as_str())
+    );
+    assert!(dedup_queue
+        .get_deduplication_job_id("tenant:missing-manual-release")
+        .await
+        .expect("missing dedup owner should load")
+        .is_none());
+    assert!(dedup_queue
+        .get_deduplication_job_id("")
+        .await
+        .expect("empty dedup owner should load")
+        .is_none());
     assert!(dedup_queue
         .remove_deduplication_key("tenant:manual-release")
         .await
         .expect("manual-release dedup key removal should return"));
+    assert!(dedup_queue
+        .get_deduplication_job_id("tenant:manual-release")
+        .await
+        .expect("manual-release owner should be absent after removal")
+        .is_none());
     assert!(!dedup_queue
         .remove_deduplication_key("tenant:missing-manual-release")
         .await
@@ -184,6 +207,14 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         manual_release_new_owner_key.as_deref(),
         Some(manual_release_new_owner.id.as_str())
     );
+    assert_eq!(
+        dedup_queue
+            .get_deduplication_job_id("tenant:manual-release")
+            .await
+            .expect("manual-release new owner should load")
+            .as_deref(),
+        Some(manual_release_new_owner.id.as_str())
+    );
     dedup_queue
         .remove_job(&manual_release_dedup.id)
         .await
@@ -194,6 +225,17 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect("manual-release new owner should remove")
         .expect("manual-release new owner should be returned");
+    let manual_release_key = format!("{namespace}:dedup:deduplication:tenant:manual-release");
+    let _: () = dedup_conn
+        .set(&manual_release_key, &manual_release_new_owner.id)
+        .await?;
+    assert!(dedup_queue
+        .get_deduplication_job_id("tenant:manual-release")
+        .await
+        .expect("stale manual-release owner should load")
+        .is_none());
+    let stale_manual_release_key: Option<String> = dedup_conn.get(&manual_release_key).await?;
+    assert!(stale_manual_release_key.is_none());
 
     let fail_dedup = dedup_queue
         .add_job(

@@ -540,8 +540,27 @@ async fn remove_deduplication_key_allows_a_new_owner() {
         .await
         .unwrap();
     assert_eq!(duplicate.id, first.id);
+    assert_eq!(
+        queue
+            .get_deduplication_job_id("account:42")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(first.id.as_str())
+    );
+    assert!(queue
+        .get_deduplication_job_id("missing-account")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(queue.get_deduplication_job_id("").await.unwrap().is_none());
 
     assert!(queue.remove_deduplication_key("account:42").await.unwrap());
+    assert!(queue
+        .get_deduplication_job_id("account:42")
+        .await
+        .unwrap()
+        .is_none());
     assert!(!queue
         .remove_deduplication_key("missing-account")
         .await
@@ -557,6 +576,14 @@ async fn remove_deduplication_key_allows_a_new_owner() {
         .await
         .unwrap();
     assert_ne!(second.id, first.id);
+    assert_eq!(
+        queue
+            .get_deduplication_job_id("account:42")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(second.id.as_str())
+    );
 
     let duplicate_second = queue
         .add_at(
@@ -568,6 +595,14 @@ async fn remove_deduplication_key_allows_a_new_owner() {
         .await
         .unwrap();
     assert_eq!(duplicate_second.id, second.id);
+    assert_eq!(
+        queue
+            .get_deduplication_job_id("account:42")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(second.id.as_str())
+    );
     assert_eq!(queue.stats().await.unwrap().waiting, 2);
 }
 
@@ -2760,11 +2795,29 @@ async fn local_job_queue_persists_removed_deduplication_keys() {
         )
         .await
         .unwrap();
+    assert_eq!(
+        queue
+            .get_deduplication_job_id("account:42")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(first.id.as_str())
+    );
     assert!(queue.remove_deduplication_key("account:42").await.unwrap());
+    assert!(queue
+        .get_deduplication_job_id("account:42")
+        .await
+        .unwrap()
+        .is_none());
 
     let reopened = LocalJobQueue::open("durable-dedup-release", &snapshot_path)
         .await
         .unwrap();
+    assert!(reopened
+        .get_deduplication_job_id("account:42")
+        .await
+        .unwrap()
+        .is_none());
     let second = reopened
         .add_at(
             "sync-after-reopen",
@@ -2775,6 +2828,14 @@ async fn local_job_queue_persists_removed_deduplication_keys() {
         .await
         .unwrap();
     assert_ne!(second.id, first.id);
+    assert_eq!(
+        reopened
+            .get_deduplication_job_id("account:42")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(second.id.as_str())
+    );
 
     let duplicate_second = reopened
         .add_at(
@@ -2786,6 +2847,14 @@ async fn local_job_queue_persists_removed_deduplication_keys() {
         .await
         .unwrap();
     assert_eq!(duplicate_second.id, second.id);
+    assert_eq!(
+        reopened
+            .get_deduplication_job_id("account:42")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(second.id.as_str())
+    );
 }
 
 #[tokio::test]

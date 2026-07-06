@@ -417,6 +417,22 @@ impl InMemoryJobQueue {
         Ok(true)
     }
 
+    /// Return the current active job id for a deduplication id.
+    pub async fn get_deduplication_job_id(&self, deduplication_id: &str) -> Result<Option<JobId>> {
+        if deduplication_id.is_empty() {
+            return Ok(None);
+        }
+
+        let inner = self.inner.lock().await;
+        Ok(find_active_deduplication_id(
+            &inner.jobs,
+            &inner.released_deduplication_owners,
+            deduplication_id,
+            Utc::now(),
+        )
+        .map(|job| job.id.clone()))
+    }
+
     /// List current non-terminal repeat series owners.
     pub async fn list_repeats(&self) -> Result<Vec<JobRepeatEntry>> {
         let inner = self.inner.lock().await;
@@ -1169,6 +1185,10 @@ impl JobQueueBackend for InMemoryJobQueue {
 
     async fn remove_deduplication_key(&self, deduplication_id: &str) -> Result<bool> {
         InMemoryJobQueue::remove_deduplication_key(self, deduplication_id).await
+    }
+
+    async fn get_deduplication_job_id(&self, deduplication_id: &str) -> Result<Option<JobId>> {
+        InMemoryJobQueue::get_deduplication_job_id(self, deduplication_id).await
     }
 
     async fn list_repeats(&self) -> Result<Vec<JobRepeatEntry>> {

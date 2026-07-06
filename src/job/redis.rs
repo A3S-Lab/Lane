@@ -1,8 +1,9 @@
 use super::backend::JobQueueBackend;
 use super::types::{
-    add_duration, deduplication_expiration, Job, JobFlow, JobFlowDependencies, JobListOptions,
-    JobListPage, JobLogEntry, JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueStats,
-    JobRateLimit, JobRepeatEntry, JobSpec, JobState, JobStateCount, JobWorkerId, QueueName,
+    add_duration, deduplication_expiration, Job, JobFlow, JobFlowDependencies, JobId,
+    JobListOptions, JobListPage, JobLogEntry, JobLogPage, JobOptions, JobPriority,
+    JobPriorityCount, JobQueueStats, JobRateLimit, JobRepeatEntry, JobSpec, JobState,
+    JobStateCount, JobWorkerId, QueueName,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -3424,6 +3425,10 @@ impl RedisJobQueue {
         format!("{}:{}:deduplication:", self.namespace, self.queue)
     }
 
+    fn deduplication_key(&self, deduplication_id: &str) -> String {
+        format!("{}{}", self.deduplication_key_prefix(), deduplication_id)
+    }
+
     fn deduplication_next_key_prefix(&self) -> String {
         format!("{}:{}:deduplication_next:", self.namespace, self.queue)
     }
@@ -3972,14 +3977,32 @@ impl JobQueueBackend for RedisJobQueue {
 
         let mut conn = self.connection().await?;
         let removed: usize = conn
-            .del(format!(
-                "{}{}",
-                self.deduplication_key_prefix(),
-                deduplication_id
-            ))
+            .del(self.deduplication_key(deduplication_id))
             .await
             .map_err(redis_error)?;
         Ok(removed > 0)
+    }
+
+    async fn get_deduplication_job_id(&self, deduplication_id: &str) -> Result<Option<JobId>> {
+        if deduplication_id.is_empty() {
+            return Ok(None);
+        }
+
+        let mut conn = self.connection().await?;
+        let key = self.deduplication_key(deduplication_id);
+        let Some(job_id): Option<JobId> = conn.get(&key).await.map_err(redis_error)? else {
+            return Ok(None);
+        };
+
+        let Some(job) = self.load_job(&mut conn, &job_id).await? else {
+            let _: usize = conn.del(&key).await.map_err(redis_error)?;
+            return Ok(None);
+        };
+        if job.state.is_terminal() || job_deduplication_id(&job) != Some(deduplication_id) {
+            let _: usize = conn.del(&key).await.map_err(redis_error)?;
+            return Ok(None);
+        }
+        Ok(Some(job_id))
     }
 
     async fn list_repeats(&self) -> Result<Vec<JobRepeatEntry>> {
