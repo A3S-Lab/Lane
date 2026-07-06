@@ -2,8 +2,8 @@ use super::backend::JobQueueBackend;
 use super::types::{
     deduplication_expiration, Job, JobEvent, JobFlow, JobFlowDependencies, JobFlowDependencyCounts,
     JobId, JobListOptions, JobListPage, JobLogEntry, JobLogPage, JobOptions, JobPriority,
-    JobPriorityCount, JobQueueSnapshot, JobQueueStats, JobRepeatEntry, JobSpec, JobState,
-    JobStateCount, JobWorkerId, QueueName, DEFAULT_JOB_EVENT_RETENTION,
+    JobPriorityCount, JobQueueSnapshot, JobQueueStats, JobRepeatEntry, JobRetention, JobSpec,
+    JobState, JobStateCount, JobWorkerId, QueueName, DEFAULT_JOB_EVENT_RETENTION,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -169,8 +169,10 @@ impl InMemoryJobQueue {
         };
         if failed.state == JobState::Failed {
             Self::forget_released_deduplication_owner_locked(&mut inner, &failed);
-            if failed.options.remove_on_fail {
+            if failed.options.removes_failed_immediately() {
                 Self::remove_job_record_locked(&mut inner, job_id);
+            } else if let Some(retention) = failed.options.failed_retention() {
+                Self::apply_finished_retention_locked(&mut inner, JobState::Failed, retention, now);
             }
             Self::enqueue_deduplicated_next_locked(&mut inner, &failed, now);
             if let Some(parent_id) = &failed.parent_id {
@@ -1223,6 +1225,54 @@ impl InMemoryJobQueue {
         Some(removed)
     }
 
+    fn apply_finished_retention_locked(
+        inner: &mut InMemoryJobQueueState,
+        state: JobState,
+        retention: &JobRetention,
+        now: DateTime<Utc>,
+    ) {
+        if let Some(age) = retention.age {
+            let cutoff = subtract_duration(now, age);
+            let limit = retention.limit.unwrap_or(1_000);
+            let mut expired = inner
+                .jobs
+                .values()
+                .filter(|job| job.state == state)
+                .filter_map(|job| Some((job.id.clone(), job.finished_at?)))
+                .filter(|(_, finished_at)| *finished_at <= cutoff)
+                .collect::<Vec<_>>();
+            expired.sort_by(
+                |(left_id, left_finished_at), (right_id, right_finished_at)| {
+                    right_finished_at
+                        .cmp(left_finished_at)
+                        .then_with(|| right_id.cmp(left_id))
+                },
+            );
+            for (job_id, _) in expired.into_iter().take(limit) {
+                Self::remove_job_record_locked(inner, &job_id);
+            }
+        }
+
+        if let Some(count) = retention.count {
+            let mut retained = inner
+                .jobs
+                .values()
+                .filter(|job| job.state == state)
+                .filter_map(|job| Some((job.id.clone(), job.finished_at?)))
+                .collect::<Vec<_>>();
+            retained.sort_by(
+                |(left_id, left_finished_at), (right_id, right_finished_at)| {
+                    right_finished_at
+                        .cmp(left_finished_at)
+                        .then_with(|| right_id.cmp(left_id))
+                },
+            );
+            for (job_id, _) in retained.into_iter().skip(count) {
+                Self::remove_job_record_locked(inner, &job_id);
+            }
+        }
+    }
+
     fn forget_released_deduplication_owner_locked(inner: &mut InMemoryJobQueueState, job: &Job) {
         if let Some(deduplication_id) = job_deduplication_id(job) {
             inner
@@ -1371,8 +1421,10 @@ impl InMemoryJobQueue {
         parent.failed_reason = Some(reason);
         let failed = parent.clone();
         Self::forget_released_deduplication_owner_locked(inner, &failed);
-        if failed.options.remove_on_fail {
+        if failed.options.removes_failed_immediately() {
             Self::remove_job_record_locked(inner, parent_id);
+        } else if let Some(retention) = failed.options.failed_retention() {
+            Self::apply_finished_retention_locked(inner, JobState::Failed, retention, now);
         }
         let mut fields = BTreeMap::new();
         if let Some(reason) = &failed.failed_reason {
@@ -1503,8 +1555,10 @@ impl JobQueueBackend for InMemoryJobQueue {
             job.clone()
         };
         Self::forget_released_deduplication_owner_locked(&mut inner, &completed);
-        if completed.options.remove_on_complete {
+        if completed.options.removes_completed_immediately() {
             Self::remove_job_record_locked(&mut inner, job_id);
+        } else if let Some(retention) = completed.options.completed_retention() {
+            Self::apply_finished_retention_locked(&mut inner, JobState::Completed, retention, now);
         }
         let enqueued_deduplicated_next =
             Self::enqueue_deduplicated_next_locked(&mut inner, &completed, now);
@@ -1771,7 +1825,7 @@ impl JobQueueBackend for InMemoryJobQueue {
                     let failed = job.clone();
                     terminal_failures.push(failed.clone());
                     recovered_events.push(failed);
-                    if job.options.remove_on_fail {
+                    if job.options.removes_failed_immediately() {
                         remove_ids.push(job.id.clone());
                     }
                 } else {
@@ -1796,6 +1850,9 @@ impl JobQueueBackend for InMemoryJobQueue {
         for failed in terminal_failures {
             Self::forget_released_deduplication_owner_locked(&mut inner, &failed);
             Self::enqueue_deduplicated_next_locked(&mut inner, &failed, now);
+            if let Some(retention) = failed.options.failed_retention() {
+                Self::apply_finished_retention_locked(&mut inner, JobState::Failed, retention, now);
+            }
         }
         for (parent_id, child_id, reason) in failed_children {
             Self::fail_waiting_parent_locked(

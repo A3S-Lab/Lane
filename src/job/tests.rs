@@ -2573,6 +2573,153 @@ async fn remove_on_complete_deletes_record_after_returning_snapshot() {
 }
 
 #[tokio::test]
+async fn completed_job_retention_keeps_newest_count() {
+    let queue = InMemoryJobQueue::new("completion-retention-count");
+    let mut ids = Vec::new();
+
+    for index in 0..3 {
+        let now = ts(1_000 + index * 100);
+        let job = queue
+            .add_at(
+                format!("task-{index}"),
+                serde_json::json!({ "index": index }),
+                JobOptions::new().with_completion_retention(JobRetention::count(2)),
+                now,
+            )
+            .await
+            .unwrap();
+        ids.push(job.id.clone());
+        let claimed = queue
+            .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+            .await
+            .unwrap()
+            .unwrap();
+        queue
+            .complete_job(
+                &claimed.id,
+                lock_token(&claimed),
+                serde_json::json!({ "ok": true }),
+                ts(1_100 + index * 100),
+            )
+            .await
+            .unwrap();
+    }
+
+    assert!(queue.get_job(&ids[0]).await.unwrap().is_none());
+    assert_eq!(
+        queue.get_job(&ids[1]).await.unwrap().unwrap().state,
+        JobState::Completed
+    );
+    assert_eq!(
+        queue.get_job(&ids[2]).await.unwrap().unwrap().state,
+        JobState::Completed
+    );
+    assert_eq!(queue.stats().await.unwrap().completed, 2);
+}
+
+#[tokio::test]
+async fn completed_job_retention_applies_age_when_another_job_finishes() {
+    let queue = InMemoryJobQueue::new("completion-retention-age");
+    let first = queue
+        .add_at(
+            "first",
+            serde_json::json!({}),
+            JobOptions::new().with_completion_retention(JobRetention::age(Duration::from_secs(1))),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(1_000))
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .complete_job(
+            &claimed.id,
+            lock_token(&claimed),
+            serde_json::json!({}),
+            ts(1_100),
+        )
+        .await
+        .unwrap();
+
+    assert!(queue.get_job(&first.id).await.unwrap().is_some());
+
+    let second = queue
+        .add_at(
+            "second",
+            serde_json::json!({}),
+            JobOptions::new().with_completion_retention(JobRetention::age(Duration::from_secs(1))),
+            ts(2_500),
+        )
+        .await
+        .unwrap();
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(2_500))
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .complete_job(
+            &claimed.id,
+            lock_token(&claimed),
+            serde_json::json!({}),
+            ts(2_500),
+        )
+        .await
+        .unwrap();
+
+    assert!(queue.get_job(&first.id).await.unwrap().is_none());
+    assert_eq!(
+        queue.get_job(&second.id).await.unwrap().unwrap().state,
+        JobState::Completed
+    );
+}
+
+#[tokio::test]
+async fn failed_job_retention_keeps_newest_count() {
+    let queue = InMemoryJobQueue::new("failure-retention-count");
+    let mut ids = Vec::new();
+
+    for index in 0..3 {
+        let now = ts(1_000 + index * 100);
+        let job = queue
+            .add_at(
+                format!("task-{index}"),
+                serde_json::json!({ "index": index }),
+                JobOptions::new().with_failure_retention(JobRetention::count(1)),
+                now,
+            )
+            .await
+            .unwrap();
+        ids.push(job.id.clone());
+        let claimed = queue
+            .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+            .await
+            .unwrap()
+            .unwrap();
+        queue
+            .fail_job(
+                &claimed.id,
+                lock_token(&claimed),
+                "boom".to_string(),
+                ts(1_100 + index * 100),
+            )
+            .await
+            .unwrap();
+    }
+
+    assert!(queue.get_job(&ids[0]).await.unwrap().is_none());
+    assert!(queue.get_job(&ids[1]).await.unwrap().is_none());
+    assert_eq!(
+        queue.get_job(&ids[2]).await.unwrap().unwrap().state,
+        JobState::Failed
+    );
+    assert_eq!(queue.stats().await.unwrap().failed, 1);
+}
+
+#[tokio::test]
 async fn remove_rejects_active_leased_jobs() {
     let queue = InMemoryJobQueue::new("remove-active");
     let now = ts(1_000);
@@ -4686,5 +4833,52 @@ async fn local_job_queue_persists_event_stream() {
     assert_eq!(
         events[2].fields.get("data"),
         Some(&serde_json::json!({ "percent": 25 }))
+    );
+}
+
+#[tokio::test]
+async fn local_job_queue_persists_finished_retention_cleanup() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("jobs").join("retention.json");
+    let queue = LocalJobQueue::open("durable-retention", &snapshot_path)
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+
+    for index in 0..2 {
+        let now = ts(1_000 + index * 100);
+        let job = queue
+            .add_at(
+                format!("task-{index}"),
+                serde_json::json!({}),
+                JobOptions::new().with_completion_retention(JobRetention::count(1)),
+                now,
+            )
+            .await
+            .unwrap();
+        ids.push(job.id.clone());
+        let claimed = queue
+            .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+            .await
+            .unwrap()
+            .unwrap();
+        queue
+            .complete_job(
+                &claimed.id,
+                lock_token(&claimed),
+                serde_json::json!({ "ok": true }),
+                ts(1_100 + index * 100),
+            )
+            .await
+            .unwrap();
+    }
+
+    let reopened = LocalJobQueue::open("durable-retention", &snapshot_path)
+        .await
+        .unwrap();
+    assert!(reopened.get_job(&ids[0]).await.unwrap().is_none());
+    assert_eq!(
+        reopened.get_job(&ids[1]).await.unwrap().unwrap().state,
+        JobState::Completed
     );
 }

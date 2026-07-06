@@ -576,6 +576,96 @@ impl DeduplicationOptions {
     }
 }
 
+/// Retention policy for finished jobs.
+///
+/// This mirrors BullMQ's `KeepJobs` shape for `removeOnComplete` and
+/// `removeOnFail`: `count` keeps the newest N jobs in a terminal set, `age`
+/// keeps jobs younger than the configured duration, and `limit` bounds how many
+/// aged jobs are removed per terminal transition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobRetention {
+    /// Maximum age of jobs to keep in a terminal set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age: Option<Duration>,
+    /// Maximum number of jobs to keep in a terminal set. `0` removes the
+    /// currently finished job immediately, matching BullMQ's `{ count: 0 }`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<usize>,
+    /// Maximum number of aged jobs removed per terminal transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+impl JobRetention {
+    /// Keep at most `count` newest finished jobs.
+    pub fn count(count: usize) -> Self {
+        Self {
+            age: None,
+            count: Some(count),
+            limit: None,
+        }
+    }
+
+    /// Keep finished jobs younger than `age`.
+    pub fn age(age: Duration) -> Self {
+        Self {
+            age: Some(age),
+            count: None,
+            limit: None,
+        }
+    }
+
+    /// Keep finished jobs that satisfy both `age` and `count`.
+    pub fn age_and_count(age: Duration, count: usize) -> Self {
+        Self {
+            age: Some(age),
+            count: Some(count),
+            limit: None,
+        }
+    }
+
+    /// Set or replace the maximum age.
+    pub fn with_age(mut self, age: Duration) -> Self {
+        self.age = Some(age);
+        self
+    }
+
+    /// Set or replace the maximum count.
+    pub fn with_count(mut self, count: usize) -> Self {
+        self.count = Some(count);
+        self
+    }
+
+    /// Limit how many aged jobs are removed per terminal transition.
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    pub(crate) fn removes_current(&self) -> bool {
+        self.count == Some(0)
+    }
+
+    pub(crate) fn validate(&self, field: &str) -> Result<()> {
+        if self.age.is_none() && self.count.is_none() {
+            return Err(LaneError::ConfigError(format!(
+                "{field} must specify an age or count"
+            )));
+        }
+        if matches!(self.age, Some(age) if age.is_zero()) {
+            return Err(LaneError::ConfigError(format!(
+                "{field} age must be greater than zero"
+            )));
+        }
+        if self.limit == Some(0) {
+            return Err(LaneError::ConfigError(format!(
+                "{field} limit must be greater than zero"
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Options used when adding a generic queue job.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JobOptions {
@@ -595,8 +685,16 @@ pub struct JobOptions {
     pub timeout: Option<Duration>,
     /// Remove the job record after successful completion.
     pub remove_on_complete: bool,
+    /// BullMQ-style completed-job retention policy. The legacy
+    /// `remove_on_complete` bool takes precedence when set to `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_retention: Option<JobRetention>,
     /// Remove the job record after terminal failure.
     pub remove_on_fail: bool,
+    /// BullMQ-style failed-job retention policy. The legacy `remove_on_fail`
+    /// bool takes precedence when set to `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_retention: Option<JobRetention>,
     /// Number of lease expirations tolerated before terminal failure.
     pub max_stalled_count: u32,
     /// Optional repeat schedule.
@@ -617,7 +715,9 @@ impl Default for JobOptions {
             retry_policy: RetryPolicy::none(),
             timeout: None,
             remove_on_complete: false,
+            completion_retention: None,
             remove_on_fail: false,
+            failure_retention: None,
             max_stalled_count: 1,
             repeat: None,
             deduplication: None,
@@ -670,12 +770,28 @@ impl JobOptions {
     /// Configure whether completed jobs are retained.
     pub fn remove_on_complete(mut self, remove: bool) -> Self {
         self.remove_on_complete = remove;
+        self.completion_retention = None;
+        self
+    }
+
+    /// Configure completed-job retention by age and/or count.
+    pub fn with_completion_retention(mut self, retention: JobRetention) -> Self {
+        self.remove_on_complete = false;
+        self.completion_retention = Some(retention);
         self
     }
 
     /// Configure whether failed jobs are retained.
     pub fn remove_on_fail(mut self, remove: bool) -> Self {
         self.remove_on_fail = remove;
+        self.failure_retention = None;
+        self
+    }
+
+    /// Configure failed-job retention by age and/or count.
+    pub fn with_failure_retention(mut self, retention: JobRetention) -> Self {
+        self.remove_on_fail = false;
+        self.failure_retention = Some(retention);
         self
     }
 
@@ -718,7 +834,49 @@ impl JobOptions {
             deduplication.validate()?;
         }
 
+        if let Some(retention) = &self.completion_retention {
+            retention.validate("completion retention")?;
+        }
+
+        if let Some(retention) = &self.failure_retention {
+            retention.validate("failure retention")?;
+        }
+
         Ok(())
+    }
+
+    pub(crate) fn removes_completed_immediately(&self) -> bool {
+        self.remove_on_complete
+            || self
+                .completion_retention
+                .as_ref()
+                .is_some_and(JobRetention::removes_current)
+    }
+
+    pub(crate) fn completed_retention(&self) -> Option<&JobRetention> {
+        if self.remove_on_complete {
+            return None;
+        }
+        self.completion_retention
+            .as_ref()
+            .filter(|retention| !retention.removes_current())
+    }
+
+    pub(crate) fn removes_failed_immediately(&self) -> bool {
+        self.remove_on_fail
+            || self
+                .failure_retention
+                .as_ref()
+                .is_some_and(JobRetention::removes_current)
+    }
+
+    pub(crate) fn failed_retention(&self) -> Option<&JobRetention> {
+        if self.remove_on_fail {
+            return None;
+        }
+        self.failure_retention
+            .as_ref()
+            .filter(|retention| !retention.removes_current())
     }
 }
 

@@ -2,8 +2,8 @@
 
 use a3s_lane::{
     DeduplicationOptions, Job, JobListOptions, JobLogEntry, JobOptions, JobPriorityCount,
-    JobQueueBackend, JobRateLimit, JobSpec, JobState, JobStateCount, LaneError, RedisJobQueue,
-    RepeatOptions, RetryPolicy,
+    JobQueueBackend, JobRateLimit, JobRetention, JobSpec, JobState, JobStateCount, LaneError,
+    RedisJobQueue, RepeatOptions, RetryPolicy,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use redis::AsyncCommands;
@@ -115,6 +115,185 @@ async fn redis_backend_records_queue_events_against_real_server() {
         .await
         .expect("Redis queue-events integration test timed out")
         .unwrap();
+}
+
+#[tokio::test]
+async fn redis_backend_applies_finished_retention_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    tokio::time::timeout(Duration::from_secs(120), run_finished_retention(redis_url))
+        .await
+        .expect("Redis finished-retention integration test timed out")
+        .unwrap();
+}
+
+async fn run_finished_retention(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "retention")
+        .expect("valid Redis URL should build the retention queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let completed_first = queue
+        .add_job(
+            "completed-first".to_string(),
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_job_id("retention:completed:first")
+                .with_completion_retention(JobRetention::count(1)),
+        )
+        .await
+        .expect("first completed job should add");
+    queue
+        .add_log(
+            &completed_first.id,
+            "first completed log".to_string(),
+            10,
+            Utc::now(),
+        )
+        .await
+        .expect("first completed log should append");
+    let completed_claim = queue
+        .claim_next(
+            "worker-retention-complete".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("first completed job claim should return")
+        .expect("first completed job should be claimable");
+    queue
+        .complete_job(
+            &completed_claim.id,
+            lock_token(&completed_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("first completed job should complete");
+
+    let completed_second = queue
+        .add_job(
+            "completed-second".to_string(),
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_job_id("retention:completed:second")
+                .with_completion_retention(JobRetention::count(1)),
+        )
+        .await
+        .expect("second completed job should add");
+    let completed_claim = queue
+        .claim_next(
+            "worker-retention-complete".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("second completed job claim should return")
+        .expect("second completed job should be claimable");
+    queue
+        .complete_job(
+            &completed_claim.id,
+            lock_token(&completed_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("second completed job should complete");
+
+    let completed_first_exists: bool = conn
+        .hexists(format!("{namespace}:retention:jobs"), &completed_first.id)
+        .await?;
+    assert!(!completed_first_exists);
+    let completed_second_exists: bool = conn
+        .hexists(format!("{namespace}:retention:jobs"), &completed_second.id)
+        .await?;
+    assert!(completed_second_exists);
+    let completed_count: usize = conn
+        .zcard(format!("{namespace}:retention:completed"))
+        .await?;
+    assert_eq!(completed_count, 1);
+    let completed_first_logs: usize = conn
+        .llen(format!("{namespace}:retention:logs:{}", completed_first.id))
+        .await?;
+    assert_eq!(completed_first_logs, 0);
+
+    let failed_first = queue
+        .add_job(
+            "failed-first".to_string(),
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_job_id("retention:failed:first")
+                .with_failure_retention(JobRetention::count(1)),
+        )
+        .await
+        .expect("first failed job should add");
+    let failed_claim = queue
+        .claim_next(
+            "worker-retention-fail".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("first failed job claim should return")
+        .expect("first failed job should be claimable");
+    queue
+        .fail_job(
+            &failed_claim.id,
+            lock_token(&failed_claim),
+            "boom".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("first failed job should fail");
+
+    let failed_second = queue
+        .add_job(
+            "failed-second".to_string(),
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_job_id("retention:failed:second")
+                .with_failure_retention(JobRetention::count(1)),
+        )
+        .await
+        .expect("second failed job should add");
+    let failed_claim = queue
+        .claim_next(
+            "worker-retention-fail".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("second failed job claim should return")
+        .expect("second failed job should be claimable");
+    queue
+        .fail_job(
+            &failed_claim.id,
+            lock_token(&failed_claim),
+            "boom".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("second failed job should fail");
+
+    let failed_first_exists: bool = conn
+        .hexists(format!("{namespace}:retention:jobs"), &failed_first.id)
+        .await?;
+    assert!(!failed_first_exists);
+    let failed_second_exists: bool = conn
+        .hexists(format!("{namespace}:retention:jobs"), &failed_second.id)
+        .await?;
+    assert!(failed_second_exists);
+    let failed_count: usize = conn.zcard(format!("{namespace}:retention:failed")).await?;
+    assert_eq!(failed_count, 1);
+
+    cleanup_namespace_with_conn(&mut conn, &namespace).await?;
+    Ok(())
 }
 
 async fn run_queue_events(redis_url: String) -> redis::RedisResult<()> {
