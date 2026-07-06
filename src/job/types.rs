@@ -1,0 +1,288 @@
+use crate::retry::RetryPolicy;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::time::Duration;
+use uuid::Uuid;
+
+/// Unique identifier for a generic queue job.
+pub type JobId = String;
+
+/// Queue name for a generic job queue.
+pub type QueueName = String;
+
+/// Worker identifier used for leased processing.
+pub type JobWorkerId = String;
+
+/// Job priority. Lower values run first.
+pub type JobPriority = u32;
+
+/// Default priority for jobs that do not specify one.
+pub const DEFAULT_JOB_PRIORITY: JobPriority = 1000;
+
+/// Lifecycle state for a durable job.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum JobState {
+    /// Ready to be claimed by a worker.
+    Waiting,
+    /// Scheduled for the future.
+    Delayed,
+    /// Leased to a worker and currently processing.
+    Active,
+    /// Parent job waiting for children to finish.
+    WaitingChildren,
+    /// Finished successfully.
+    Completed,
+    /// Finished with a terminal failure.
+    Failed,
+}
+
+impl JobState {
+    /// Whether this state is terminal and should not be claimed again.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed)
+    }
+}
+
+/// A retained log line for a generic job.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobLogEntry {
+    pub timestamp: DateTime<Utc>,
+    pub line: String,
+}
+
+/// Options for listing jobs from a backend.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobListOptions {
+    /// Optional state filter. `None` lists jobs from all states.
+    pub state: Option<JobState>,
+    /// Number of matching jobs to skip.
+    pub offset: usize,
+    /// Maximum number of jobs to return.
+    pub limit: usize,
+}
+
+impl Default for JobListOptions {
+    fn default() -> Self {
+        Self {
+            state: None,
+            offset: 0,
+            limit: 100,
+        }
+    }
+}
+
+impl JobListOptions {
+    /// Create default list options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Restrict results to a single state.
+    pub fn with_state(mut self, state: JobState) -> Self {
+        self.state = Some(state);
+        self
+    }
+
+    /// Set the pagination offset.
+    pub fn with_offset(mut self, offset: usize) -> Self {
+        self.offset = offset;
+        self
+    }
+
+    /// Set the maximum result count.
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
+    }
+}
+
+/// A page of jobs returned by a backend list operation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobListPage {
+    pub jobs: Vec<Job>,
+    pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+/// Options used when adding a generic queue job.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobOptions {
+    /// Lower values run before higher values.
+    pub priority: JobPriority,
+    /// Optional delay before the job becomes claimable.
+    pub delay: Option<Duration>,
+    /// Retry policy used after processing failure.
+    pub retry_policy: RetryPolicy,
+    /// Optional execution timeout hint for workers.
+    pub timeout: Option<Duration>,
+    /// Remove the job record after successful completion.
+    pub remove_on_complete: bool,
+    /// Remove the job record after terminal failure.
+    pub remove_on_fail: bool,
+    /// Number of lease expirations tolerated before terminal failure.
+    pub max_stalled_count: u32,
+}
+
+impl Default for JobOptions {
+    fn default() -> Self {
+        Self {
+            priority: DEFAULT_JOB_PRIORITY,
+            delay: None,
+            retry_policy: RetryPolicy::none(),
+            timeout: None,
+            remove_on_complete: false,
+            remove_on_fail: false,
+            max_stalled_count: 1,
+        }
+    }
+}
+
+impl JobOptions {
+    /// Create default job options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set job priority. Lower values run first.
+    pub fn with_priority(mut self, priority: JobPriority) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    /// Delay the job before it can be claimed.
+    pub fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = Some(delay);
+        self
+    }
+
+    /// Set retry behavior for processing failures.
+    pub fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
+        self
+    }
+
+    /// Set an execution timeout hint for workers.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Configure whether completed jobs are retained.
+    pub fn remove_on_complete(mut self, remove: bool) -> Self {
+        self.remove_on_complete = remove;
+        self
+    }
+
+    /// Configure whether failed jobs are retained.
+    pub fn remove_on_fail(mut self, remove: bool) -> Self {
+        self.remove_on_fail = remove;
+        self
+    }
+
+    /// Configure stalled-job tolerance.
+    pub fn with_max_stalled_count(mut self, count: u32) -> Self {
+        self.max_stalled_count = count;
+        self
+    }
+}
+
+/// Durable generic job record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Job {
+    pub id: JobId,
+    pub queue: QueueName,
+    pub name: String,
+    pub payload: Value,
+    pub options: JobOptions,
+    pub priority: JobPriority,
+    pub state: JobState,
+    pub attempts_made: u32,
+    pub stalled_count: u32,
+    pub created_at: DateTime<Utc>,
+    pub scheduled_at: DateTime<Utc>,
+    pub processed_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub worker_id: Option<JobWorkerId>,
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    pub failed_reason: Option<String>,
+    pub return_value: Option<Value>,
+    pub progress: Option<Value>,
+    pub logs: Vec<JobLogEntry>,
+    pub parent_id: Option<JobId>,
+    pub child_ids: Vec<JobId>,
+}
+
+impl Job {
+    pub(crate) fn new(
+        queue: QueueName,
+        name: String,
+        payload: Value,
+        options: JobOptions,
+        now: DateTime<Utc>,
+    ) -> Self {
+        let scheduled_at = options
+            .delay
+            .map(|delay| add_duration(now, delay))
+            .unwrap_or(now);
+        let state = if scheduled_at > now {
+            JobState::Delayed
+        } else {
+            JobState::Waiting
+        };
+
+        Self {
+            id: Uuid::new_v4().to_string(),
+            queue,
+            name,
+            payload,
+            priority: options.priority,
+            options,
+            state,
+            attempts_made: 0,
+            stalled_count: 0,
+            created_at: now,
+            scheduled_at,
+            processed_at: None,
+            finished_at: None,
+            worker_id: None,
+            lease_expires_at: None,
+            failed_reason: None,
+            return_value: None,
+            progress: None,
+            logs: Vec::new(),
+            parent_id: None,
+            child_ids: Vec::new(),
+        }
+    }
+}
+
+pub(crate) fn add_duration(at: DateTime<Utc>, duration: Duration) -> DateTime<Utc> {
+    match chrono::Duration::from_std(duration) {
+        Ok(delta) => at.checked_add_signed(delta).unwrap_or(at),
+        Err(_) => at,
+    }
+}
+
+/// Queue state counts for generic jobs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobQueueStats {
+    pub total: usize,
+    pub waiting: usize,
+    pub delayed: usize,
+    pub active: usize,
+    pub waiting_children: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub paused: bool,
+}
+
+/// Serializable snapshot used by durable job backends.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobQueueSnapshot {
+    pub queue: QueueName,
+    pub paused: bool,
+    pub jobs: Vec<Job>,
+}
