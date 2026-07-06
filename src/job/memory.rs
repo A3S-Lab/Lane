@@ -730,16 +730,17 @@ impl InMemoryJobQueue {
     /// List jobs with deterministic pagination.
     pub async fn list(&self, options: JobListOptions) -> Result<JobListPage> {
         let inner = self.inner.lock().await;
+        let states = options.selected_states();
         let mut jobs = inner
             .jobs
             .values()
-            .filter(|job| match options.state {
-                Some(state) => job.state == state,
-                None => true,
-            })
+            .filter(|job| states.contains(&job.state))
             .cloned()
             .collect::<Vec<_>>();
         jobs.sort_by(compare_list_order);
+        if !options.ascending {
+            jobs.reverse();
+        }
 
         let total = jobs.len();
         let start = options.offset.min(total);

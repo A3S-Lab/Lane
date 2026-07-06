@@ -140,20 +140,28 @@ pub struct JobLogPage {
 /// Options for listing jobs from a backend.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JobListOptions {
-    /// Optional state filter. `None` lists jobs from all states.
+    /// Optional legacy single-state filter. `None` lists jobs from all states.
     pub state: Option<JobState>,
+    /// Optional multi-state filter. When non-empty, this takes precedence over `state`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub states: Vec<JobState>,
     /// Number of matching jobs to skip.
     pub offset: usize,
     /// Maximum number of jobs to return.
     pub limit: usize,
+    /// Return jobs in ascending order when true, descending order when false.
+    #[serde(default = "default_list_ascending")]
+    pub ascending: bool,
 }
 
 impl Default for JobListOptions {
     fn default() -> Self {
         Self {
             state: None,
+            states: Vec::new(),
             offset: 0,
             limit: 100,
+            ascending: true,
         }
     }
 }
@@ -167,6 +175,22 @@ impl JobListOptions {
     /// Restrict results to a single state.
     pub fn with_state(mut self, state: JobState) -> Self {
         self.state = Some(state);
+        self.states.clear();
+        self
+    }
+
+    /// Restrict results to one or more states.
+    ///
+    /// Empty input lists all lifecycle states. Duplicate states are removed while
+    /// preserving the caller's order.
+    pub fn with_states(mut self, states: impl IntoIterator<Item = JobState>) -> Self {
+        self.state = None;
+        self.states.clear();
+        for state in states {
+            if !self.states.contains(&state) {
+                self.states.push(state);
+            }
+        }
         self
     }
 
@@ -181,6 +205,44 @@ impl JobListOptions {
         self.limit = limit;
         self
     }
+
+    /// Return jobs in ascending order.
+    pub fn ascending(mut self) -> Self {
+        self.ascending = true;
+        self
+    }
+
+    /// Return jobs in descending order.
+    pub fn descending(mut self) -> Self {
+        self.ascending = false;
+        self
+    }
+
+    /// Configure result direction explicitly.
+    pub fn with_ascending(mut self, ascending: bool) -> Self {
+        self.ascending = ascending;
+        self
+    }
+
+    pub(crate) fn selected_states(&self) -> Vec<JobState> {
+        let mut states = Vec::new();
+        if !self.states.is_empty() {
+            for &state in &self.states {
+                if !states.contains(&state) {
+                    states.push(state);
+                }
+            }
+        } else if let Some(state) = self.state {
+            states.push(state);
+        } else {
+            states.extend_from_slice(JobState::ALL.as_slice());
+        }
+        states
+    }
+}
+
+fn default_list_ascending() -> bool {
+    true
 }
 
 /// A page of jobs returned by a backend list operation.

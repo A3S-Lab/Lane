@@ -3008,35 +3008,44 @@ end
 
 local offset = tonumber(ARGV[1])
 local limit = tonumber(ARGV[2])
-local state = ARGV[3]
+local ascending = ARGV[3] == '1'
 local result = {}
 
-if state ~= '' then
-  local state_key = nil
+local function state_key_for(state)
   if state == 'waiting' then
-    state_key = KEYS[2]
+    return KEYS[2]
   elseif state == 'delayed' then
-    state_key = KEYS[3]
+    return KEYS[3]
   elseif state == 'active' then
-    state_key = KEYS[4]
+    return KEYS[4]
   elseif state == 'waiting_children' then
-    state_key = KEYS[5]
+    return KEYS[5]
   elseif state == 'completed' then
-    state_key = KEYS[6]
+    return KEYS[6]
   elseif state == 'failed' then
-    state_key = KEYS[7]
-  else
-    return {'bad_state'}
+    return KEYS[7]
   end
+  return nil
+end
 
+local function collect_state_jobs(state, state_key, jobs, seen_jobs)
   local ids = redis.call('ZRANGE', state_key, 0, -1)
-  local raws = {}
   for _, id in ipairs(ids) do
     local raw = redis.call('HGET', KEYS[1], id)
     if raw then
       local job = cjson.decode(raw)
       if job["state"] == state then
-        table.insert(raws, raw)
+        if not seen_jobs[id] then
+          seen_jobs[id] = true
+          table.insert(jobs, {
+            raw = raw,
+            state_rank = state_rank(job["state"]),
+            priority = tonumber(job["priority"] or '1000') or 1000,
+            scheduled_at = iso_sort_key(job["scheduled_at"]),
+            created_at = iso_sort_key(job["created_at"]),
+            id = job["id"] or ''
+          })
+        end
       else
         redis.call('ZREM', state_key, id)
       end
@@ -3044,32 +3053,30 @@ if state ~= '' then
       redis.call('ZREM', state_key, id)
     end
   end
-
-  result[1] = #raws
-  if limit > 0 then
-    local first = offset + 1
-    local last = math.min(offset + limit, #raws)
-    local out = 2
-    for index = first, last do
-      result[out] = raws[index]
-      out = out + 1
-    end
-  end
-  return result
 end
 
-local raw_jobs = redis.call('HVALS', KEYS[1])
+local requested_states = {}
+local seen_states = {}
+if #ARGV > 3 then
+  for index = 4, #ARGV do
+    local state = ARGV[index]
+    local state_key = state_key_for(state)
+    if not state_key then
+      return {'bad_state'}
+    end
+    if not seen_states[state] then
+      seen_states[state] = true
+      requested_states[#requested_states + 1] = state
+    end
+  end
+else
+  requested_states = {'waiting', 'delayed', 'active', 'waiting_children', 'completed', 'failed'}
+end
+
 local jobs = {}
-for _, raw in ipairs(raw_jobs) do
-  local job = cjson.decode(raw)
-  table.insert(jobs, {
-    raw = raw,
-    state_rank = state_rank(job["state"]),
-    priority = tonumber(job["priority"] or '1000') or 1000,
-    scheduled_at = iso_sort_key(job["scheduled_at"]),
-    created_at = iso_sort_key(job["created_at"]),
-    id = job["id"] or ''
-  })
+local seen_jobs = {}
+for _, state in ipairs(requested_states) do
+  collect_state_jobs(state, state_key_for(state), jobs, seen_jobs)
 end
 
 table.sort(jobs, function(left, right)
@@ -3087,12 +3094,21 @@ end)
 
 result[1] = #jobs
 if limit > 0 then
-  local first = offset + 1
-  local last = math.min(offset + limit, #jobs)
   local out = 2
-  for index = first, last do
-    result[out] = jobs[index].raw
-    out = out + 1
+  if ascending then
+    local first = offset + 1
+    local last = math.min(offset + limit, #jobs)
+    for index = first, last do
+      result[out] = jobs[index].raw
+      out = out + 1
+    end
+  else
+    local first = #jobs - offset
+    local last = math.max(first - limit + 1, 1)
+    for index = first, last, -1 do
+      result[out] = jobs[index].raw
+      out = out + 1
+    end
   end
 end
 
@@ -4973,7 +4989,9 @@ impl JobQueueBackend for RedisJobQueue {
 
     async fn list_jobs(&self, options: JobListOptions) -> Result<JobListPage> {
         let mut conn = self.connection().await?;
-        let result: Vec<redis::Value> = redis::cmd("EVAL")
+        let states = options.selected_states();
+        let mut command = redis::cmd("EVAL");
+        command
             .arg(LIST_JOBS_SCRIPT)
             .arg(7)
             .arg(self.jobs_key())
@@ -4985,10 +5003,13 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.state_key(JobState::Failed))
             .arg(options.offset)
             .arg(options.limit)
-            .arg(options.state.map(job_state_name).unwrap_or(""))
-            .query_async(&mut conn)
-            .await
-            .map_err(redis_error)?;
+            .arg(if options.ascending { "1" } else { "0" });
+        for state in states {
+            command.arg(job_state_name(state));
+        }
+
+        let result: Vec<redis::Value> =
+            command.query_async(&mut conn).await.map_err(redis_error)?;
         decode_list_jobs_result(&result, options.offset, options.limit)
     }
 

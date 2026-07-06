@@ -2467,6 +2467,74 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     );
     trace_stage("state-query:done");
 
+    let list_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "list-ranges")
+        .expect("valid Redis URL should build the list-ranges queue");
+    let list_slow = list_queue
+        .add_job(
+            "list-slow".to_string(),
+            serde_json::json!({ "n": 1 }),
+            JobOptions::new().with_priority(20),
+        )
+        .await
+        .expect("slow list job should add");
+    let list_fast = list_queue
+        .add_job(
+            "list-fast".to_string(),
+            serde_json::json!({ "n": 2 }),
+            JobOptions::new().with_priority(5),
+        )
+        .await
+        .expect("fast list job should add");
+    let list_delayed = list_queue
+        .add_job(
+            "list-delayed".to_string(),
+            serde_json::json!({ "n": 3 }),
+            JobOptions::new().with_delay(Duration::from_secs(30)),
+        )
+        .await
+        .expect("delayed list job should add");
+    let list_ascending = list_queue
+        .list_jobs(
+            JobListOptions::new()
+                .with_states([JobState::Waiting, JobState::Delayed, JobState::Waiting])
+                .with_limit(3),
+        )
+        .await
+        .expect("multi-state ascending list should load");
+    assert_eq!(list_ascending.total, 3);
+    assert_eq!(
+        list_ascending
+            .jobs
+            .iter()
+            .map(|job| job.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            list_fast.id.as_str(),
+            list_slow.id.as_str(),
+            list_delayed.id.as_str()
+        ]
+    );
+    let list_descending = list_queue
+        .list_jobs(
+            JobListOptions::new()
+                .with_states([JobState::Waiting, JobState::Delayed])
+                .descending()
+                .with_offset(1)
+                .with_limit(2),
+        )
+        .await
+        .expect("multi-state descending list should load");
+    assert_eq!(list_descending.total, 3);
+    assert_eq!(
+        list_descending
+            .jobs
+            .iter()
+            .map(|job| job.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![list_slow.id.as_str(), list_fast.id.as_str()]
+    );
+    trace_stage("list-ranges:done");
+
     producer.pause().await.expect("pause should succeed");
     let high = producer
         .add_job(

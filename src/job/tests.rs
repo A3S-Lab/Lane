@@ -2565,6 +2565,44 @@ async fn management_api_lists_progress_logs_retries_and_cleans_jobs() {
         .unwrap();
     assert_eq!(second_page.jobs[0].id, slower.id);
 
+    let multi_state_page = queue
+        .list_jobs(
+            JobListOptions::new()
+                .with_states([JobState::Waiting, JobState::Delayed, JobState::Waiting])
+                .with_limit(3),
+        )
+        .await
+        .unwrap();
+    assert_eq!(multi_state_page.total, 3);
+    assert_eq!(
+        multi_state_page
+            .jobs
+            .iter()
+            .map(|job| job.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![faster.id.as_str(), slower.id.as_str(), delayed.id.as_str()]
+    );
+
+    let descending_page = queue
+        .list_jobs(
+            JobListOptions::new()
+                .with_states([JobState::Waiting, JobState::Delayed])
+                .descending()
+                .with_offset(1)
+                .with_limit(2),
+        )
+        .await
+        .unwrap();
+    assert_eq!(descending_page.total, 3);
+    assert_eq!(
+        descending_page
+            .jobs
+            .iter()
+            .map(|job| job.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![slower.id.as_str(), faster.id.as_str()]
+    );
+
     let updated_data = queue
         .update_data(
             &slower.id,
