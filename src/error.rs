@@ -10,6 +10,7 @@
 //! - Queue operation errors (capacity exceeded, shutdown in progress)
 //! - Command execution errors (timeout, execution failure)
 //! - Generic job runtime errors (job not found)
+//! - Generic job runtime state and lease conflicts
 //!
 //! # Example
 //!
@@ -43,6 +44,8 @@ use thiserror::Error;
 /// * `ConfigError` - Invalid configuration (e.g., min > max concurrency)
 /// * `CommandError` - Command execution failed
 /// * `JobNotFound` - The specified generic job ID does not exist
+/// * `JobStateConflict` - The requested job transition is invalid for its current state
+/// * `JobLeaseConflict` - A worker attempted to mutate a job it does not own
 /// * `Timeout` - Command exceeded its timeout duration
 /// * `ShutdownInProgress` - Queue is shutting down and not accepting new commands
 /// * `Other` - Catch-all for unexpected errors
@@ -67,6 +70,14 @@ pub enum LaneError {
     /// Job not found
     #[error("Job not found: {0}")]
     JobNotFound(String),
+
+    /// Job state conflict
+    #[error("Job state conflict: {0}")]
+    JobStateConflict(String),
+
+    /// Job lease conflict
+    #[error("Job lease conflict: {0}")]
+    JobLeaseConflict(String),
 
     /// Command timeout
     #[error("Command timed out after {0:?}")]
@@ -131,6 +142,21 @@ mod tests {
     fn test_job_not_found_error() {
         let error = LaneError::JobNotFound("job-1".to_string());
         assert_eq!(error.to_string(), "Job not found: job-1");
+    }
+
+    #[test]
+    fn test_job_state_conflict_error() {
+        let error = LaneError::JobStateConflict("cannot complete waiting job".to_string());
+        assert_eq!(
+            error.to_string(),
+            "Job state conflict: cannot complete waiting job"
+        );
+    }
+
+    #[test]
+    fn test_job_lease_conflict_error() {
+        let error = LaneError::JobLeaseConflict("worker mismatch".to_string());
+        assert_eq!(error.to_string(), "Job lease conflict: worker mismatch");
     }
 
     #[test]

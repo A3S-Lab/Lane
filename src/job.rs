@@ -60,6 +60,68 @@ impl JobState {
     }
 }
 
+/// A retained log line for a generic job.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobLogEntry {
+    pub timestamp: DateTime<Utc>,
+    pub line: String,
+}
+
+/// Options for listing jobs from a backend.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobListOptions {
+    /// Optional state filter. `None` lists jobs from all states.
+    pub state: Option<JobState>,
+    /// Number of matching jobs to skip.
+    pub offset: usize,
+    /// Maximum number of jobs to return.
+    pub limit: usize,
+}
+
+impl Default for JobListOptions {
+    fn default() -> Self {
+        Self {
+            state: None,
+            offset: 0,
+            limit: 100,
+        }
+    }
+}
+
+impl JobListOptions {
+    /// Create default list options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Restrict results to a single state.
+    pub fn with_state(mut self, state: JobState) -> Self {
+        self.state = Some(state);
+        self
+    }
+
+    /// Set the pagination offset.
+    pub fn with_offset(mut self, offset: usize) -> Self {
+        self.offset = offset;
+        self
+    }
+
+    /// Set the maximum result count.
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
+    }
+}
+
+/// A page of jobs returned by a backend list operation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobListPage {
+    pub jobs: Vec<Job>,
+    pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
+}
+
 /// Options used when adding a generic queue job.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JobOptions {
@@ -162,6 +224,8 @@ pub struct Job {
     pub lease_expires_at: Option<DateTime<Utc>>,
     pub failed_reason: Option<String>,
     pub return_value: Option<Value>,
+    pub progress: Option<Value>,
+    pub logs: Vec<JobLogEntry>,
     pub parent_id: Option<JobId>,
     pub child_ids: Vec<JobId>,
 }
@@ -202,6 +266,8 @@ impl Job {
             lease_expires_at: None,
             failed_reason: None,
             return_value: None,
+            progress: None,
+            logs: Vec::new(),
             parent_id: None,
             child_ids: Vec::new(),
         }
@@ -236,6 +302,40 @@ pub trait JobQueueBackend: Send + Sync {
     async fn complete_job(&self, job_id: &str, value: Value, now: DateTime<Utc>) -> Result<Job>;
 
     async fn fail_job(&self, job_id: &str, error: String, now: DateTime<Utc>) -> Result<Job>;
+
+    async fn renew_lease(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        lease_for: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Job>;
+
+    async fn promote_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job>;
+
+    async fn retry_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job>;
+
+    async fn remove_job(&self, job_id: &str) -> Result<Option<Job>>;
+
+    async fn clean_jobs(
+        &self,
+        state: JobState,
+        grace: Duration,
+        limit: usize,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Job>>;
+
+    async fn list_jobs(&self, options: JobListOptions) -> Result<JobListPage>;
+
+    async fn update_progress(&self, job_id: &str, progress: Value) -> Result<Job>;
+
+    async fn add_log(
+        &self,
+        job_id: &str,
+        line: String,
+        keep: usize,
+        now: DateTime<Utc>,
+    ) -> Result<Job>;
 
     async fn promote_due_jobs(&self, now: DateTime<Utc>) -> Result<usize>;
 
@@ -325,6 +425,151 @@ impl InMemoryJobQueue {
         Ok(job.clone())
     }
 
+    /// Manually retry a failed job by moving it back to the waiting state.
+    pub async fn retry(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {
+        let mut inner = self.inner.lock().await;
+        let job = inner
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
+        if job.state != JobState::Failed {
+            return Err(LaneError::JobStateConflict(format!(
+                "cannot retry job {} from state {:?}",
+                job.id, job.state
+            )));
+        }
+        job.state = JobState::Waiting;
+        job.scheduled_at = now;
+        job.processed_at = None;
+        job.finished_at = None;
+        job.worker_id = None;
+        job.lease_expires_at = None;
+        job.failed_reason = None;
+        Ok(job.clone())
+    }
+
+    /// Renew the active worker lease for a job.
+    pub async fn renew(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        lease_for: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Job> {
+        let mut inner = self.inner.lock().await;
+        let job = inner
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
+        require_active(job, "renew lease")?;
+        require_worker(job, worker_id)?;
+        job.lease_expires_at = Some(add_duration(now, lease_for));
+        Ok(job.clone())
+    }
+
+    /// List jobs with deterministic pagination.
+    pub async fn list(&self, options: JobListOptions) -> Result<JobListPage> {
+        let inner = self.inner.lock().await;
+        let mut jobs = inner
+            .jobs
+            .values()
+            .filter(|job| options.state.map_or(true, |state| job.state == state))
+            .cloned()
+            .collect::<Vec<_>>();
+        jobs.sort_by(compare_list_order);
+
+        let total = jobs.len();
+        let start = options.offset.min(total);
+        let end = start.saturating_add(options.limit).min(total);
+        let jobs = if options.limit == 0 {
+            Vec::new()
+        } else {
+            jobs[start..end].to_vec()
+        };
+
+        Ok(JobListPage {
+            jobs,
+            total,
+            offset: options.offset,
+            limit: options.limit,
+        })
+    }
+
+    /// Remove old jobs in a specific state and return their snapshots.
+    pub async fn clean(
+        &self,
+        state: JobState,
+        grace: Duration,
+        limit: usize,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Job>> {
+        if state == JobState::Active || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let cutoff = subtract_duration(now, grace);
+        let mut inner = self.inner.lock().await;
+        let mut jobs = inner
+            .jobs
+            .values()
+            .filter(|job| job.state == state && job_reference_time(job) <= cutoff)
+            .cloned()
+            .collect::<Vec<_>>();
+        jobs.sort_by(|a, b| {
+            job_reference_time(a)
+                .cmp(&job_reference_time(b))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        jobs.truncate(limit);
+
+        for job in &jobs {
+            inner.jobs.remove(&job.id);
+        }
+
+        Ok(jobs)
+    }
+
+    /// Update progress for a non-terminal job.
+    pub async fn set_progress(&self, job_id: &str, progress: Value) -> Result<Job> {
+        let mut inner = self.inner.lock().await;
+        let job = inner
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
+        if job.state.is_terminal() {
+            return Err(LaneError::JobStateConflict(format!(
+                "cannot update progress for terminal job {}",
+                job.id
+            )));
+        }
+        job.progress = Some(progress);
+        Ok(job.clone())
+    }
+
+    /// Append a log line. `keep == 0` retains all log lines.
+    pub async fn log(
+        &self,
+        job_id: &str,
+        line: String,
+        keep: usize,
+        now: DateTime<Utc>,
+    ) -> Result<Job> {
+        let mut inner = self.inner.lock().await;
+        let job = inner
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
+        job.logs.push(JobLogEntry {
+            timestamp: now,
+            line,
+        });
+        if keep > 0 && job.logs.len() > keep {
+            let remove_count = job.logs.len() - keep;
+            job.logs.drain(0..remove_count);
+        }
+        Ok(job.clone())
+    }
+
     fn promote_due_locked(inner: &mut InMemoryJobQueueState, now: DateTime<Utc>) -> usize {
         let mut promoted = 0;
         for job in inner.jobs.values_mut() {
@@ -375,6 +620,7 @@ impl JobQueueBackend for InMemoryJobQueue {
         job.processed_at = Some(now);
         job.worker_id = Some(worker_id);
         job.lease_expires_at = Some(add_duration(now, lease_for));
+        job.failed_reason = None;
         Ok(Some(job.clone()))
     }
 
@@ -384,6 +630,7 @@ impl JobQueueBackend for InMemoryJobQueue {
             .jobs
             .get_mut(job_id)
             .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
+        require_active(job, "complete")?;
         job.state = JobState::Completed;
         job.finished_at = Some(now);
         job.worker_id = None;
@@ -402,6 +649,7 @@ impl JobQueueBackend for InMemoryJobQueue {
             .jobs
             .get_mut(job_id)
             .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
+        require_active(job, "fail")?;
         job.worker_id = None;
         job.lease_expires_at = None;
         job.failed_reason = Some(error);
@@ -424,6 +672,56 @@ impl JobQueueBackend for InMemoryJobQueue {
             inner.jobs.remove(job_id);
         }
         Ok(failed)
+    }
+
+    async fn renew_lease(
+        &self,
+        job_id: &str,
+        worker_id: &str,
+        lease_for: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Job> {
+        self.renew(job_id, worker_id, lease_for, now).await
+    }
+
+    async fn promote_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {
+        self.promote(job_id, now).await
+    }
+
+    async fn retry_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {
+        self.retry(job_id, now).await
+    }
+
+    async fn remove_job(&self, job_id: &str) -> Result<Option<Job>> {
+        self.remove(job_id).await
+    }
+
+    async fn clean_jobs(
+        &self,
+        state: JobState,
+        grace: Duration,
+        limit: usize,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Job>> {
+        self.clean(state, grace, limit, now).await
+    }
+
+    async fn list_jobs(&self, options: JobListOptions) -> Result<JobListPage> {
+        self.list(options).await
+    }
+
+    async fn update_progress(&self, job_id: &str, progress: Value) -> Result<Job> {
+        self.set_progress(job_id, progress).await
+    }
+
+    async fn add_log(
+        &self,
+        job_id: &str,
+        line: String,
+        keep: usize,
+        now: DateTime<Utc>,
+    ) -> Result<Job> {
+        self.log(job_id, line, keep, now).await
     }
 
     async fn promote_due_jobs(&self, now: DateTime<Utc>) -> Result<usize> {
@@ -516,6 +814,54 @@ fn compare_claim_order(a: &&Job, b: &&Job) -> Ordering {
         .then_with(|| a.id.cmp(&b.id))
 }
 
+fn compare_list_order(a: &Job, b: &Job) -> Ordering {
+    state_rank(a.state)
+        .cmp(&state_rank(b.state))
+        .then_with(|| a.priority.cmp(&b.priority))
+        .then_with(|| a.scheduled_at.cmp(&b.scheduled_at))
+        .then_with(|| a.created_at.cmp(&b.created_at))
+        .then_with(|| a.id.cmp(&b.id))
+}
+
+fn state_rank(state: JobState) -> u8 {
+    match state {
+        JobState::Waiting => 0,
+        JobState::Delayed => 1,
+        JobState::Active => 2,
+        JobState::WaitingChildren => 3,
+        JobState::Completed => 4,
+        JobState::Failed => 5,
+    }
+}
+
+fn require_active(job: &Job, action: &str) -> Result<()> {
+    if job.state == JobState::Active {
+        Ok(())
+    } else {
+        Err(LaneError::JobStateConflict(format!(
+            "cannot {action} job {} from state {:?}",
+            job.id, job.state
+        )))
+    }
+}
+
+fn require_worker(job: &Job, worker_id: &str) -> Result<()> {
+    if job.worker_id.as_deref() == Some(worker_id) {
+        Ok(())
+    } else {
+        Err(LaneError::JobLeaseConflict(format!(
+            "worker {worker_id} does not own job {}",
+            job.id
+        )))
+    }
+}
+
+fn job_reference_time(job: &Job) -> DateTime<Utc> {
+    job.finished_at
+        .or(job.processed_at)
+        .unwrap_or(job.scheduled_at)
+}
+
 fn should_retry(job: &Job) -> bool {
     job.options.retry_policy.max_retries > 0
         && job.attempts_made <= job.options.retry_policy.max_retries
@@ -524,6 +870,13 @@ fn should_retry(job: &Job) -> bool {
 fn add_duration(at: DateTime<Utc>, duration: Duration) -> DateTime<Utc> {
     match chrono::Duration::from_std(duration) {
         Ok(delta) => at.checked_add_signed(delta).unwrap_or(at),
+        Err(_) => at,
+    }
+}
+
+fn subtract_duration(at: DateTime<Utc>, duration: Duration) -> DateTime<Utc> {
+    match chrono::Duration::from_std(duration) {
+        Ok(delta) => at.checked_sub_signed(delta).unwrap_or(at),
         Err(_) => at,
     }
 }
@@ -736,5 +1089,180 @@ mod tests {
             .unwrap();
         assert_eq!(completed.state, JobState::Completed);
         assert!(queue.get_job(&job.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn lease_renewal_requires_active_owner() {
+        let queue = InMemoryJobQueue::new("leases");
+        let now = ts(1_000);
+        let job = queue
+            .add_at("task", serde_json::json!({}), JobOptions::new(), now)
+            .await
+            .unwrap();
+
+        let waiting_error = queue
+            .renew_lease(&job.id, "worker-a", Duration::from_secs(1), now)
+            .await
+            .unwrap_err();
+        assert!(matches!(waiting_error, LaneError::JobStateConflict(_)));
+
+        queue
+            .claim_next("worker-a".to_string(), Duration::from_secs(1), now)
+            .await
+            .unwrap();
+
+        let wrong_worker = queue
+            .renew_lease(&job.id, "worker-b", Duration::from_secs(1), ts(1_500))
+            .await
+            .unwrap_err();
+        assert!(matches!(wrong_worker, LaneError::JobLeaseConflict(_)));
+
+        let renewed = queue
+            .renew_lease(&job.id, "worker-a", Duration::from_secs(3), ts(1_500))
+            .await
+            .unwrap();
+        assert_eq!(renewed.lease_expires_at, Some(ts(4_500)));
+    }
+
+    #[tokio::test]
+    async fn management_api_lists_progress_logs_retries_and_cleans_jobs() {
+        let queue = InMemoryJobQueue::new("ops");
+        let now = ts(1_000);
+        let slower = queue
+            .add_at(
+                "slow",
+                serde_json::json!({}),
+                JobOptions::new().with_priority(20),
+                now,
+            )
+            .await
+            .unwrap();
+        let faster = queue
+            .add_at(
+                "fast",
+                serde_json::json!({}),
+                JobOptions::new().with_priority(5),
+                now,
+            )
+            .await
+            .unwrap();
+        let delayed = queue
+            .add_at(
+                "later",
+                serde_json::json!({}),
+                JobOptions::new().with_delay(Duration::from_secs(10)),
+                now,
+            )
+            .await
+            .unwrap();
+
+        let first_page = queue
+            .list_jobs(
+                JobListOptions::new()
+                    .with_state(JobState::Waiting)
+                    .with_limit(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_page.total, 2);
+        assert_eq!(first_page.jobs[0].id, faster.id);
+
+        let second_page = queue
+            .list_jobs(
+                JobListOptions::new()
+                    .with_state(JobState::Waiting)
+                    .with_offset(1)
+                    .with_limit(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second_page.jobs[0].id, slower.id);
+
+        let progress = queue
+            .update_progress(&slower.id, serde_json::json!({ "percent": 50 }))
+            .await
+            .unwrap();
+        assert_eq!(
+            progress.progress,
+            Some(serde_json::json!({ "percent": 50 }))
+        );
+
+        queue
+            .add_log(&slower.id, "first".to_string(), 2, ts(1_100))
+            .await
+            .unwrap();
+        queue
+            .add_log(&slower.id, "second".to_string(), 2, ts(1_200))
+            .await
+            .unwrap();
+        let logged = queue
+            .add_log(&slower.id, "third".to_string(), 2, ts(1_300))
+            .await
+            .unwrap();
+        assert_eq!(logged.logs.len(), 2);
+        assert_eq!(logged.logs[0].line, "second");
+        assert_eq!(logged.logs[1].line, "third");
+
+        let claimed = queue
+            .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, faster.id);
+
+        let failed = queue
+            .fail_job(&faster.id, "boom".to_string(), ts(1_400))
+            .await
+            .unwrap();
+        assert_eq!(failed.state, JobState::Failed);
+
+        let retried = queue.retry_job(&faster.id, ts(1_500)).await.unwrap();
+        assert_eq!(retried.state, JobState::Waiting);
+        assert!(retried.failed_reason.is_none());
+
+        queue
+            .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(1_500))
+            .await
+            .unwrap();
+        queue
+            .complete_job(&faster.id, serde_json::json!({ "ok": true }), ts(1_600))
+            .await
+            .unwrap();
+
+        let cleaned = queue
+            .clean_jobs(
+                JobState::Completed,
+                Duration::from_millis(100),
+                10,
+                ts(1_800),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleaned.len(), 1);
+        assert_eq!(cleaned[0].id, faster.id);
+        assert!(queue.get_job(&faster.id).await.unwrap().is_none());
+        assert!(queue.get_job(&delayed.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn completing_or_failing_requires_active_job() {
+        let queue = InMemoryJobQueue::new("state");
+        let now = ts(1_000);
+        let job = queue
+            .add_at("task", serde_json::json!({}), JobOptions::new(), now)
+            .await
+            .unwrap();
+
+        let complete_error = queue
+            .complete_job(&job.id, serde_json::json!({}), now)
+            .await
+            .unwrap_err();
+        assert!(matches!(complete_error, LaneError::JobStateConflict(_)));
+
+        let fail_error = queue
+            .fail_job(&job.id, "boom".to_string(), now)
+            .await
+            .unwrap_err();
+        assert!(matches!(fail_error, LaneError::JobStateConflict(_)));
     }
 }
