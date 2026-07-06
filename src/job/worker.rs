@@ -126,6 +126,7 @@ pub struct JobContext {
     lease_duration: Duration,
     log_retention: usize,
     lease_lost: Arc<AtomicBool>,
+    discard_retry: Arc<AtomicBool>,
 }
 
 impl JobContext {
@@ -146,6 +147,7 @@ impl JobContext {
             lease_duration,
             log_retention,
             lease_lost,
+            discard_retry: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -179,6 +181,18 @@ impl JobContext {
         } else {
             Ok(())
         }
+    }
+
+    /// Mark the current failure path as terminal even if retry attempts remain.
+    ///
+    /// This mirrors BullMQ's runtime `discard()` flag: it is not stored on the job
+    /// and only affects the worker's next failed finalization for this context.
+    pub fn discard_retry(&self) {
+        self.discard_retry.store(true, Ordering::Relaxed);
+    }
+
+    fn should_discard_retry(&self) -> bool {
+        self.discard_retry.load(Ordering::Relaxed)
     }
 
     /// Replace the payload for the current job.
@@ -464,10 +478,20 @@ impl JobWorker {
                 Ok(JobRunOutcome::Completed(completed))
             }
             Err(error) => {
-                let failed = self
-                    .backend
-                    .fail_job(&job_id, &lock_token, error.to_string(), Utc::now())
-                    .await?;
+                let failed = if context.should_discard_retry() {
+                    self.backend
+                        .fail_job_discarding_retry(
+                            &job_id,
+                            &lock_token,
+                            error.to_string(),
+                            Utc::now(),
+                        )
+                        .await?
+                } else {
+                    self.backend
+                        .fail_job(&job_id, &lock_token, error.to_string(), Utc::now())
+                        .await?
+                };
                 Ok(JobRunOutcome::Failed(failed))
             }
         }

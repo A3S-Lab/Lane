@@ -18,19 +18,43 @@ fn lock_token(job: &a3s_lane::Job) -> &str {
         .expect("claimed job should carry a lock token")
 }
 
-#[tokio::test]
-async fn redis_backend_runs_job_lifecycle_against_real_server() {
+#[test]
+fn redis_backend_runs_job_lifecycle_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
         return;
     };
-    tokio::time::timeout(
-        Duration::from_secs(420),
-        run_job_lifecycle(redis_url.clone()),
-    )
-    .await
-    .expect("Redis job lifecycle integration test timed out")
-    .unwrap();
+
+    std::thread::Builder::new()
+        .name("redis-job-lifecycle".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Redis lifecycle runtime should build");
+            runtime.block_on(async move {
+                tokio::time::timeout(Duration::from_secs(420), run_job_lifecycle(redis_url))
+                    .await
+                    .expect("Redis job lifecycle integration test timed out")
+                    .unwrap();
+            });
+        })
+        .expect("Redis lifecycle test thread should spawn")
+        .join()
+        .expect("Redis lifecycle test thread should finish");
+}
+
+#[tokio::test]
+async fn redis_backend_discards_configured_retry_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    tokio::time::timeout(Duration::from_secs(120), run_discard_retry(redis_url))
+        .await
+        .expect("Redis discard retry integration test timed out")
+        .unwrap();
 }
 
 #[tokio::test]
@@ -209,6 +233,62 @@ async fn run_repeat_keep_last(redis_url: String) -> redis::RedisResult<()> {
 
     cleanup_namespace_with_conn(&mut conn, &namespace).await?;
     trace_stage("repeat-keep-last:cleanup-final:done");
+    Ok(())
+}
+
+async fn run_discard_retry(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    trace_stage("discard-retry:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("discard-retry:cleanup:done");
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "discard-retry")
+        .expect("valid Redis URL should build the discard retry queue");
+    let job = queue
+        .add_job(
+            "discard-retry".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_retry_policy(RetryPolicy::fixed(1, Duration::from_secs(30))),
+        )
+        .await
+        .expect("discard retry job should be added");
+    let claimed = queue
+        .claim_next(
+            "worker-discard-retry".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("discard retry claim should return")
+        .expect("discard retry job should be claimable");
+    assert_eq!(claimed.id, job.id);
+
+    let failed = queue
+        .fail_job_discarding_retry(
+            &claimed.id,
+            lock_token(&claimed),
+            "unrecoverable".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("discard retry job should fail terminally");
+    assert_eq!(failed.state, JobState::Failed);
+    assert!(failed.finished_at.is_some());
+
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let delayed_score: Option<f64> = conn
+        .zscore(format!("{namespace}:discard-retry:delayed"), &job.id)
+        .await?;
+    assert!(delayed_score.is_none());
+    let failed_score: Option<f64> = conn
+        .zscore(format!("{namespace}:discard-retry:failed"), &job.id)
+        .await?;
+    assert!(failed_score.is_some());
+
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("discard-retry:done");
     Ok(())
 }
 

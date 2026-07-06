@@ -461,8 +461,10 @@ waiting, `reschedule_job()` changes a delayed job's due time relative to the
 current clock, `delay_active_job()` moves a token-owned active job back to
 delayed, `release_active_job()` moves a token-owned active job back to waiting,
 `get_job_state()` returns the current lifecycle state for a job id, `retry_job()`
-manually requeues failed jobs, `update_priority()` changes non-terminal job
-priority, `renew_lease()` extends an active worker lease with the claim token,
+manually requeues failed jobs, `fail_job_discarding_retry()` fails an active
+token-owned job without applying remaining automatic retries, `update_priority()`
+changes non-terminal job priority, `renew_lease()` extends an active worker
+lease with the claim token,
 `remove_job()` removes non-active jobs,
 `remove_repeat()` removes the current non-active owner for a repeat key,
 `remove_deduplication_key()` clears the active owner for a deduplication id,
@@ -495,10 +497,11 @@ adding the same job id again returns the existing job instead of enqueueing a
 duplicate.
 
 Every claimed job carries an opaque `lock_token`. Workers must pass that token
-to `complete_job()`, `fail_job()`, and `renew_lease()`. This prevents a stale
-worker from completing a job after its lease expired and another worker
-reclaimed it. Active leased jobs cannot be removed through the normal
-management API; run stalled recovery first when a worker lease has expired.
+to `complete_job()`, `fail_job()`, `fail_job_discarding_retry()`, and
+`renew_lease()`. This prevents a stale worker from completing or failing a job
+after its lease expired and another worker reclaimed it. Active leased jobs
+cannot be removed through the normal management API; run stalled recovery first
+when a worker lease has expired.
 
 Flow jobs create a parent job and one or more child jobs in a single operation.
 The parent starts in `waiting_children`, children are claimed normally, and the
@@ -1042,6 +1045,15 @@ Redis movement gate, prunes orphaned or stale failed members, and moves valid
 failed jobs back to waiting inside one script. For deduplicated and repeat-keyed
 jobs, that same script reclaims the owner key before returning the job to
 waiting; deduplication TTL is re-applied during that same retry script.
+BullMQ's deprecated `job.discard()` is intentionally modeled as a current
+failure-path decision rather than stored job metadata: BullMQ sets an in-memory
+`discarded` flag, `shouldRetryJob()` checks that flag before `moveToFailed()`,
+and the Redis transition then uses the terminal failed path instead of delayed
+or immediate retry. Lane exposes that mechanism as
+`fail_job_discarding_retry()` and `JobContext::discard_retry()`. The Redis
+backend reuses the same active-to-failed Lua script as `fail_job()`, but passes
+the retry flag as disabled so the script writes the failed zset, releases
+deduplication/repeat ownership, and updates flow parents atomically.
 `update_priority()`
 rewrites the job hash and, for waiting jobs, replaces the waiting zset score in
 the same script; for jobs that are no longer waiting, it prunes stale waiting
@@ -1196,7 +1208,10 @@ worker.run_until_idle(100).await?;
 `JobContext::has_lost_lease()` and `JobContext::ensure_lease()` let long-running
 processors stop before doing more external work after the worker observes a
 failed lease renewal. Context progress and log helpers also refuse to write once
-that lease-loss flag is set.
+that lease-loss flag is set. `JobContext::discard_retry()` lets a processor mark
+the current failed finalization as terminal even when the job's retry policy still
+has attempts remaining; the marker lives only on the worker context and is not
+stored on the job.
 
 ## Benchmarks
 

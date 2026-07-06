@@ -2344,6 +2344,46 @@ async fn failed_jobs_retry_with_backoff_then_terminal_failure() {
 }
 
 #[tokio::test]
+async fn failed_jobs_can_discard_configured_retry() {
+    let queue = InMemoryJobQueue::new("webhooks-discard");
+    let now = ts(1_000);
+    let job = queue
+        .add_at(
+            "deliver",
+            serde_json::json!({}),
+            JobOptions::new().with_retry_policy(RetryPolicy::fixed(3, Duration::from_secs(2))),
+            now,
+        )
+        .await
+        .unwrap();
+
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let failed = queue
+        .fail_job_discarding_retry(
+            &job.id,
+            lock_token(&claimed),
+            "unrecoverable".to_string(),
+            ts(1_100),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(failed.state, JobState::Failed);
+    assert_eq!(failed.attempts_made, 1);
+    assert_eq!(failed.finished_at, Some(ts(1_100)));
+    assert_eq!(failed.scheduled_at, now);
+    assert_eq!(failed.failed_reason.as_deref(), Some("unrecoverable"));
+    let stats = queue.stats().await.unwrap();
+    assert_eq!(stats.delayed, 0);
+    assert_eq!(stats.failed, 1);
+}
+
+#[tokio::test]
 async fn stalled_jobs_are_recovered_until_limit() {
     let queue = InMemoryJobQueue::new("video");
     let now = ts(1_000);
@@ -3589,6 +3629,48 @@ async fn local_job_queue_persists_active_jobs_released_by_workers() {
 }
 
 #[tokio::test]
+async fn local_job_queue_persists_discarded_retry_failures() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("jobs").join("discard-retry.json");
+    let queue = LocalJobQueue::open("durable-discard-retry", &snapshot_path)
+        .await
+        .unwrap();
+    let job = queue
+        .add_at(
+            "task",
+            serde_json::json!({}),
+            JobOptions::new().with_retry_policy(RetryPolicy::fixed(2, Duration::from_secs(10))),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(1_100))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let failed = queue
+        .fail_job_discarding_retry(
+            &claimed.id,
+            lock_token(&claimed),
+            "do not retry".to_string(),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed.state, JobState::Failed);
+
+    let reopened = LocalJobQueue::open("durable-discard-retry", &snapshot_path)
+        .await
+        .unwrap();
+    let restored = reopened.get_job(&job.id).await.unwrap().unwrap();
+    assert_eq!(restored.state, JobState::Failed);
+    assert_eq!(restored.finished_at, Some(ts(1_200)));
+    assert_eq!(restored.failed_reason.as_deref(), Some("do not retry"));
+}
+
+#[tokio::test]
 async fn local_job_queue_restores_job_state_queries() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let snapshot_path = temp_dir.path().join("jobs").join("state.json");
@@ -4112,6 +4194,42 @@ async fn worker_failure_marks_job_failed() {
             .as_deref(),
         Some("processor failed")
     );
+}
+
+#[tokio::test]
+async fn worker_context_can_discard_configured_retry() {
+    let backend: Arc<dyn JobQueueBackend> = Arc::new(InMemoryJobQueue::new("worker-discard"));
+    let job = backend
+        .add_job(
+            "fail-once".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_retry_policy(RetryPolicy::fixed(1, Duration::from_secs(30))),
+        )
+        .await
+        .unwrap();
+
+    let processor = Arc::new(job_processor_fn(|_, context: JobContext| async move {
+        context.discard_retry();
+        Err::<Value, LaneError>(LaneError::Other("unrecoverable".to_string()))
+    }));
+    let worker = JobWorker::new(
+        Arc::clone(&backend),
+        processor,
+        JobWorkerConfig::new("worker-a").with_lease_renew_interval(Duration::ZERO),
+    );
+
+    let outcome = worker.run_once(ts(1_000)).await.unwrap();
+    let failed = match outcome {
+        JobRunOutcome::Failed(job) => job,
+        other => panic!("expected failed job, got {other:?}"),
+    };
+    assert_eq!(failed.state, JobState::Failed);
+    assert_eq!(failed.failed_reason.as_deref(), Some("unrecoverable"));
+
+    let stored = backend.get_job(&job.id).await.unwrap().unwrap();
+    assert_eq!(stored.state, JobState::Failed);
+    assert_eq!(stored.finished_at, failed.finished_at);
+    assert_eq!(backend.stats().await.unwrap().delayed, 0);
 }
 
 #[tokio::test]

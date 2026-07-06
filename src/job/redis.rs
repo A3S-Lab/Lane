@@ -4449,6 +4449,58 @@ impl RedisJobQueue {
             .map_err(redis_error)?;
         Ok(())
     }
+
+    async fn fail_job_with_retry_control(
+        &self,
+        job_id: &str,
+        lock_token: &str,
+        error: String,
+        now: DateTime<Utc>,
+        allow_retry: bool,
+    ) -> Result<Job> {
+        let mut conn = self.connection().await?;
+        let job = self.require_job(&mut conn, job_id).await?;
+        let retry_at = if allow_retry && should_retry(&job) {
+            let delay = job
+                .options
+                .retry_policy
+                .delay_for_attempt(job.attempts_made);
+            Some(add_duration(now, delay))
+        } else {
+            None
+        };
+        let scheduled_at = retry_at.unwrap_or(now);
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(FAIL_SCRIPT)
+            .arg(8)
+            .arg(self.jobs_key())
+            .arg(self.state_key(JobState::Active))
+            .arg(self.state_key(JobState::Delayed))
+            .arg(self.state_key(JobState::Failed))
+            .arg(self.lock_key(job_id))
+            .arg(self.state_key(JobState::WaitingChildren))
+            .arg(self.state_key(JobState::Waiting))
+            .arg(self.sequence_key())
+            .arg(job_id)
+            .arg(lock_token)
+            .arg(now.to_rfc3339())
+            .arg(error)
+            .arg(if retry_at.is_some() { "1" } else { "0" })
+            .arg(scheduled_at.to_rfc3339())
+            .arg(millis(scheduled_at))
+            .arg(millis(now))
+            .arg(if job.options.remove_on_fail { "1" } else { "0" })
+            .arg(self.dependencies_key_prefix())
+            .arg(self.deduplication_key_prefix())
+            .arg(self.repeat_key_prefix())
+            .arg(WAITING_SCORE_BUCKET)
+            .arg(self.deduplication_next_key_prefix())
+            .arg(self.logs_key_prefix())
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_transition_result(&result, job_id, "fail")
+    }
 }
 
 #[async_trait]
@@ -4630,48 +4682,19 @@ impl JobQueueBackend for RedisJobQueue {
         error: String,
         now: DateTime<Utc>,
     ) -> Result<Job> {
-        let mut conn = self.connection().await?;
-        let job = self.require_job(&mut conn, job_id).await?;
-        let retry_at = if should_retry(&job) {
-            let delay = job
-                .options
-                .retry_policy
-                .delay_for_attempt(job.attempts_made);
-            Some(add_duration(now, delay))
-        } else {
-            None
-        };
-        let scheduled_at = retry_at.unwrap_or(now);
-        let result: Vec<String> = redis::cmd("EVAL")
-            .arg(FAIL_SCRIPT)
-            .arg(8)
-            .arg(self.jobs_key())
-            .arg(self.state_key(JobState::Active))
-            .arg(self.state_key(JobState::Delayed))
-            .arg(self.state_key(JobState::Failed))
-            .arg(self.lock_key(job_id))
-            .arg(self.state_key(JobState::WaitingChildren))
-            .arg(self.state_key(JobState::Waiting))
-            .arg(self.sequence_key())
-            .arg(job_id)
-            .arg(lock_token)
-            .arg(now.to_rfc3339())
-            .arg(error)
-            .arg(if retry_at.is_some() { "1" } else { "0" })
-            .arg(scheduled_at.to_rfc3339())
-            .arg(millis(scheduled_at))
-            .arg(millis(now))
-            .arg(if job.options.remove_on_fail { "1" } else { "0" })
-            .arg(self.dependencies_key_prefix())
-            .arg(self.deduplication_key_prefix())
-            .arg(self.repeat_key_prefix())
-            .arg(WAITING_SCORE_BUCKET)
-            .arg(self.deduplication_next_key_prefix())
-            .arg(self.logs_key_prefix())
-            .query_async(&mut conn)
+        self.fail_job_with_retry_control(job_id, lock_token, error, now, true)
             .await
-            .map_err(redis_error)?;
-        decode_transition_result(&result, job_id, "fail")
+    }
+
+    async fn fail_job_discarding_retry(
+        &self,
+        job_id: &str,
+        lock_token: &str,
+        error: String,
+        now: DateTime<Utc>,
+    ) -> Result<Job> {
+        self.fail_job_with_retry_control(job_id, lock_token, error, now, false)
+            .await
     }
 
     async fn renew_lease(

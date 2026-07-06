@@ -300,6 +300,21 @@ impl JobQueueBackend for LocalJobQueue {
         Ok(job)
     }
 
+    async fn fail_job_discarding_retry(
+        &self,
+        job_id: &str,
+        lock_token: &str,
+        error: String,
+        now: DateTime<Utc>,
+    ) -> Result<Job> {
+        let job = self
+            .inner
+            .fail_job_discarding_retry(job_id, lock_token, error, now)
+            .await?;
+        self.persist().await?;
+        Ok(job)
+    }
+
     async fn renew_lease(
         &self,
         job_id: &str,

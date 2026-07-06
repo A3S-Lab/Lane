@@ -98,6 +98,64 @@ impl InMemoryJobQueue {
         }
     }
 
+    async fn fail_active_job(
+        &self,
+        job_id: &str,
+        lock_token: &str,
+        error: String,
+        now: DateTime<Utc>,
+        allow_retry: bool,
+    ) -> Result<Job> {
+        let mut inner = self.inner.lock().await;
+        let failed = {
+            let job = inner
+                .jobs
+                .get_mut(job_id)
+                .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
+            require_active(job, "fail")?;
+            require_lock_token(job, lock_token)?;
+            job.worker_id = None;
+            job.lock_token = None;
+            job.lease_expires_at = None;
+            job.failed_reason = Some(error);
+
+            if allow_retry && should_retry(job) {
+                let delay = job
+                    .options
+                    .retry_policy
+                    .delay_for_attempt(job.attempts_made);
+                job.state = JobState::Delayed;
+                job.scheduled_at = add_duration(now, delay);
+                job.finished_at = None;
+            } else {
+                job.state = JobState::Failed;
+                job.finished_at = Some(now);
+            }
+
+            job.clone()
+        };
+        if failed.state == JobState::Failed {
+            Self::forget_released_deduplication_owner_locked(&mut inner, &failed);
+            if failed.options.remove_on_fail {
+                Self::remove_job_record_locked(&mut inner, job_id);
+            }
+            Self::enqueue_deduplicated_next_locked(&mut inner, &failed, now);
+            if let Some(parent_id) = &failed.parent_id {
+                Self::fail_waiting_parent_locked(
+                    &mut inner,
+                    parent_id,
+                    format!(
+                        "child job {} failed: {}",
+                        failed.id,
+                        failed.failed_reason.as_deref().unwrap_or("unknown error")
+                    ),
+                    now,
+                );
+            }
+        }
+        Ok(failed)
+    }
+
     /// Add a job using the current wall-clock time.
     pub async fn add(
         &self,
@@ -1255,54 +1313,19 @@ impl JobQueueBackend for InMemoryJobQueue {
         error: String,
         now: DateTime<Utc>,
     ) -> Result<Job> {
-        let mut inner = self.inner.lock().await;
-        let failed = {
-            let job = inner
-                .jobs
-                .get_mut(job_id)
-                .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
-            require_active(job, "fail")?;
-            require_lock_token(job, lock_token)?;
-            job.worker_id = None;
-            job.lock_token = None;
-            job.lease_expires_at = None;
-            job.failed_reason = Some(error);
+        self.fail_active_job(job_id, lock_token, error, now, true)
+            .await
+    }
 
-            if should_retry(job) {
-                let delay = job
-                    .options
-                    .retry_policy
-                    .delay_for_attempt(job.attempts_made);
-                job.state = JobState::Delayed;
-                job.scheduled_at = add_duration(now, delay);
-                job.finished_at = None;
-            } else {
-                job.state = JobState::Failed;
-                job.finished_at = Some(now);
-            }
-
-            job.clone()
-        };
-        if failed.state == JobState::Failed {
-            Self::forget_released_deduplication_owner_locked(&mut inner, &failed);
-            if failed.options.remove_on_fail {
-                Self::remove_job_record_locked(&mut inner, job_id);
-            }
-            Self::enqueue_deduplicated_next_locked(&mut inner, &failed, now);
-            if let Some(parent_id) = &failed.parent_id {
-                Self::fail_waiting_parent_locked(
-                    &mut inner,
-                    parent_id,
-                    format!(
-                        "child job {} failed: {}",
-                        failed.id,
-                        failed.failed_reason.as_deref().unwrap_or("unknown error")
-                    ),
-                    now,
-                );
-            }
-        }
-        Ok(failed)
+    async fn fail_job_discarding_retry(
+        &self,
+        job_id: &str,
+        lock_token: &str,
+        error: String,
+        now: DateTime<Utc>,
+    ) -> Result<Job> {
+        self.fail_active_job(job_id, lock_token, error, now, false)
+            .await
     }
 
     async fn renew_lease(

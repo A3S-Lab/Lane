@@ -62,6 +62,19 @@ pub trait JobQueueBackend: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<Job>;
 
+    /// Fail an active job without applying its automatic retry policy.
+    ///
+    /// This mirrors BullMQ's runtime `discard()` behavior for the current failure
+    /// path: the job still must be active and token-owned, but the failure is
+    /// terminal even when retries remain.
+    async fn fail_job_discarding_retry(
+        &self,
+        job_id: &str,
+        lock_token: &str,
+        error: String,
+        now: DateTime<Utc>,
+    ) -> Result<Job>;
+
     async fn renew_lease(
         &self,
         job_id: &str,
