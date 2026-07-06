@@ -1031,6 +1031,24 @@ redis.call('HSET', KEYS[1], ARGV[1], updated)
 return {'ok', updated}
 "#;
 
+const STATS_SCRIPT: &str = r#"
+local paused = redis.call('HGET', KEYS[1], 'paused')
+local paused_value = 0
+if paused and paused ~= '0' then
+  paused_value = 1
+end
+
+return {
+  redis.call('ZCARD', KEYS[2]),
+  redis.call('ZCARD', KEYS[3]),
+  redis.call('ZCARD', KEYS[4]),
+  redis.call('ZCARD', KEYS[5]),
+  redis.call('ZCARD', KEYS[6]),
+  redis.call('ZCARD', KEYS[7]),
+  paused_value
+}
+"#;
+
 /// Redis-backed generic job queue.
 ///
 /// Redis stores each job as JSON in a hash and indexes lifecycle states with
@@ -1327,14 +1345,6 @@ impl RedisJobQueue {
             .await
             .map_err(redis_error)?;
         raw.map(|raw| decode_job(&raw)).transpose()
-    }
-
-    async fn is_paused(&self, conn: &mut ConnectionManager) -> Result<bool> {
-        let paused: Option<u8> = conn
-            .hget(self.meta_key(), "paused")
-            .await
-            .map_err(redis_error)?;
-        Ok(paused.unwrap_or(0) != 0)
     }
 }
 
@@ -1833,41 +1843,20 @@ impl JobQueueBackend for RedisJobQueue {
 
     async fn stats(&self) -> Result<JobQueueStats> {
         let mut conn = self.connection().await?;
-        let waiting: usize = conn
-            .zcard(self.state_key(JobState::Waiting))
+        let result: Vec<i64> = redis::cmd("EVAL")
+            .arg(STATS_SCRIPT)
+            .arg(7)
+            .arg(self.meta_key())
+            .arg(self.state_key(JobState::Waiting))
+            .arg(self.state_key(JobState::Delayed))
+            .arg(self.state_key(JobState::Active))
+            .arg(self.state_key(JobState::WaitingChildren))
+            .arg(self.state_key(JobState::Completed))
+            .arg(self.state_key(JobState::Failed))
+            .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
-        let delayed: usize = conn
-            .zcard(self.state_key(JobState::Delayed))
-            .await
-            .map_err(redis_error)?;
-        let active: usize = conn
-            .zcard(self.state_key(JobState::Active))
-            .await
-            .map_err(redis_error)?;
-        let waiting_children: usize = conn
-            .zcard(self.state_key(JobState::WaitingChildren))
-            .await
-            .map_err(redis_error)?;
-        let completed: usize = conn
-            .zcard(self.state_key(JobState::Completed))
-            .await
-            .map_err(redis_error)?;
-        let failed: usize = conn
-            .zcard(self.state_key(JobState::Failed))
-            .await
-            .map_err(redis_error)?;
-        let paused = self.is_paused(&mut conn).await?;
-        Ok(JobQueueStats {
-            total: waiting + delayed + active + waiting_children + completed + failed,
-            waiting,
-            delayed,
-            active,
-            waiting_children,
-            completed,
-            failed,
-            paused,
-        })
+        decode_stats_result(&result)
     }
 }
 
@@ -2039,6 +2028,62 @@ fn decode_clean_jobs_result(result: &[String]) -> Result<Vec<Job>> {
     }
 
     result.iter().map(|raw| decode_job(raw)).collect()
+}
+
+fn decode_stats_result(result: &[i64]) -> Result<JobQueueStats> {
+    if result.len() != 7 {
+        return Err(LaneError::Other(format!(
+            "Redis stats script returned {} values, expected 7",
+            result.len()
+        )));
+    }
+
+    let waiting = decode_stats_count(result[0], "waiting")?;
+    let delayed = decode_stats_count(result[1], "delayed")?;
+    let active = decode_stats_count(result[2], "active")?;
+    let waiting_children = decode_stats_count(result[3], "waiting_children")?;
+    let completed = decode_stats_count(result[4], "completed")?;
+    let failed = decode_stats_count(result[5], "failed")?;
+    let paused_flag = result[6];
+    if paused_flag < 0 {
+        return Err(LaneError::Other(format!(
+            "Redis stats script returned negative paused flag: {paused_flag}"
+        )));
+    }
+
+    let total = [
+        waiting,
+        delayed,
+        active,
+        waiting_children,
+        completed,
+        failed,
+    ]
+    .into_iter()
+    .try_fold(0usize, |total, count| {
+        total.checked_add(count).ok_or_else(|| {
+            LaneError::Other("Redis stats script returned counts that overflow usize".to_string())
+        })
+    })?;
+
+    Ok(JobQueueStats {
+        total,
+        waiting,
+        delayed,
+        active,
+        waiting_children,
+        completed,
+        failed,
+        paused: paused_flag != 0,
+    })
+}
+
+fn decode_stats_count(value: i64, field: &str) -> Result<usize> {
+    usize::try_from(value).map_err(|_| {
+        LaneError::Other(format!(
+            "Redis stats script returned negative {field} count: {value}"
+        ))
+    })
 }
 
 fn normalize_lua_empty_array(value: &mut Value, field: &str) {
@@ -2242,5 +2287,56 @@ mod tests {
         assert!(decoded.logs.is_empty());
         assert!(decoded.child_ids.is_empty());
         assert_eq!(decoded.payload, serde_json::json!({ "n": 1 }));
+    }
+
+    #[test]
+    fn decode_stats_result_builds_queue_stats() {
+        let stats = decode_stats_result(&[2, 3, 5, 7, 11, 13, 1])
+            .expect("valid Redis stats payload should decode");
+
+        assert_eq!(
+            stats,
+            JobQueueStats {
+                total: 41,
+                waiting: 2,
+                delayed: 3,
+                active: 5,
+                waiting_children: 7,
+                completed: 11,
+                failed: 13,
+                paused: true,
+            }
+        );
+    }
+
+    #[test]
+    fn decode_stats_result_rejects_unexpected_shape() {
+        let error =
+            decode_stats_result(&[1, 2]).expect_err("short Redis stats payload should be rejected");
+
+        assert!(matches!(
+            error,
+            LaneError::Other(message)
+                if message == "Redis stats script returned 2 values, expected 7"
+        ));
+    }
+
+    #[test]
+    fn decode_stats_result_rejects_negative_values() {
+        let count_error = decode_stats_result(&[1, -1, 0, 0, 0, 0, 0])
+            .expect_err("negative counts should be rejected");
+        assert!(matches!(
+            count_error,
+            LaneError::Other(message)
+                if message == "Redis stats script returned negative delayed count: -1"
+        ));
+
+        let flag_error = decode_stats_result(&[1, 0, 0, 0, 0, 0, -1])
+            .expect_err("negative paused flag should be rejected");
+        assert!(matches!(
+            flag_error,
+            LaneError::Other(message)
+                if message == "Redis stats script returned negative paused flag: -1"
+        ));
     }
 }
