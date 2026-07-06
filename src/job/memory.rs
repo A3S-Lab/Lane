@@ -567,6 +567,32 @@ impl InMemoryJobQueue {
         Ok(job.clone())
     }
 
+    /// Move an active leased job back to delayed state.
+    pub async fn delay_active(
+        &self,
+        job_id: &str,
+        lock_token: &str,
+        delay: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Job> {
+        let mut inner = self.inner.lock().await;
+        let job = inner
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
+        require_active(job, "delay active")?;
+        require_lock_token(job, lock_token)?;
+        job.state = JobState::Delayed;
+        job.options.delay = Some(delay);
+        job.scheduled_at = add_duration(now, delay);
+        job.processed_at = None;
+        job.worker_id = None;
+        job.lock_token = None;
+        job.lease_expires_at = None;
+        job.failed_reason = None;
+        Ok(job.clone())
+    }
+
     /// Update a non-terminal job priority.
     pub async fn set_priority(&self, job_id: &str, priority: JobPriority) -> Result<Job> {
         let mut inner = self.inner.lock().await;
@@ -1041,6 +1067,16 @@ impl JobQueueBackend for InMemoryJobQueue {
         now: DateTime<Utc>,
     ) -> Result<Job> {
         self.renew(job_id, lock_token, lease_for, now).await
+    }
+
+    async fn delay_active_job(
+        &self,
+        job_id: &str,
+        lock_token: &str,
+        delay: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Job> {
+        self.delay_active(job_id, lock_token, delay, now).await
     }
 
     async fn promote_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {

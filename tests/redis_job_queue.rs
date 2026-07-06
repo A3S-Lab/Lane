@@ -1694,6 +1694,142 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             .state,
         JobState::Active
     );
+    let wrong_delay_token = producer
+        .delay_active_job(
+            &claimed_delayed.id,
+            "wrong-token",
+            Duration::from_millis(200),
+            Utc::now(),
+        )
+        .await
+        .expect_err("wrong token must not delay an active job");
+    assert!(matches!(wrong_delay_token, LaneError::JobLeaseConflict(_)));
+    let delayed_again = producer
+        .delay_active_job(
+            &claimed_delayed.id,
+            lock_token(&claimed_delayed),
+            Duration::from_millis(750),
+            Utc::now(),
+        )
+        .await
+        .expect("active job should move back to delayed");
+    assert_eq!(delayed_again.state, JobState::Delayed);
+    assert_eq!(
+        delayed_again.options.delay,
+        Some(Duration::from_millis(750))
+    );
+    assert!(delayed_again.worker_id.is_none());
+    assert!(delayed_again.lease_expires_at.is_none());
+    let active_after_delay: Option<f64> = remove_index_conn
+        .zscore(format!("{namespace}:jobs:active"), &claimed_delayed.id)
+        .await?;
+    assert!(active_after_delay.is_none());
+    let delayed_after_delay: Option<f64> = remove_index_conn
+        .zscore(format!("{namespace}:jobs:delayed"), &claimed_delayed.id)
+        .await?;
+    assert!(delayed_after_delay.is_some());
+    let lock_after_delay_exists: usize = remove_index_conn
+        .exists(format!("{namespace}:jobs:locks:{}", claimed_delayed.id))
+        .await?;
+    assert_eq!(lock_after_delay_exists, 0);
+    let complete_after_delay = producer
+        .complete_job(
+            &claimed_delayed.id,
+            lock_token(&claimed_delayed),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect_err("delayed job must not complete with the old active token");
+    assert!(matches!(
+        complete_after_delay,
+        LaneError::JobStateConflict(_)
+    ));
+    assert!(worker
+        .claim_next(
+            "worker-delayed-again-early".to_string(),
+            Duration::from_secs(30),
+            Utc::now()
+        )
+        .await
+        .expect("early delayed-again claim should return")
+        .is_none());
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        producer
+            .promote_due_jobs(Utc::now())
+            .await
+            .expect("delayed-again job should promote"),
+        1
+    );
+    let reclaimed_delayed = worker
+        .claim_next(
+            "worker-delayed-again".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("delayed-again claim should return")
+        .expect("delayed-again job should be claimable");
+    assert_eq!(reclaimed_delayed.id, claimed_delayed.id);
+    worker
+        .complete_job(
+            &reclaimed_delayed.id,
+            lock_token(&reclaimed_delayed),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("delayed-again job should complete");
+
+    let stale_active_delay = producer
+        .add_job(
+            "stale-active-delay".to_string(),
+            serde_json::json!({ "kind": "stale-active-index" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("stale active delay job should be added");
+    let stale_active_claim = worker
+        .claim_next(
+            "worker-stale-active-delay".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("stale active delay claim should return")
+        .expect("stale active delay job should be claimable");
+    assert_eq!(stale_active_claim.id, stale_active_delay.id);
+    let stale_removed_from_active: usize = remove_index_conn
+        .zrem(format!("{namespace}:jobs:active"), &stale_active_claim.id)
+        .await?;
+    assert_eq!(stale_removed_from_active, 1);
+    let stale_active_delay_error = producer
+        .delay_active_job(
+            &stale_active_claim.id,
+            lock_token(&stale_active_claim),
+            Duration::from_millis(200),
+            Utc::now(),
+        )
+        .await
+        .expect_err("missing active zset membership should reject active delay");
+    assert!(matches!(
+        stale_active_delay_error,
+        LaneError::JobStateConflict(_)
+    ));
+    let stale_active_lock_exists: usize = remove_index_conn
+        .exists(format!("{namespace}:jobs:locks:{}", stale_active_claim.id))
+        .await?;
+    assert_eq!(stale_active_lock_exists, 1);
+    worker
+        .complete_job(
+            &stale_active_claim.id,
+            lock_token(&stale_active_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("stale active delay job should still complete with valid lock");
 
     let stale_reschedule = producer
         .add_job(
@@ -1989,9 +2125,9 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     assert_eq!(stored_high.logs[1].line, "provider delivered");
 
     let stats = producer.stats().await.expect("stats should load");
-    assert_eq!(stats.completed, 3);
+    assert_eq!(stats.completed, 5);
     assert_eq!(stats.failed, 2);
-    assert_eq!(stats.active, 1);
+    assert_eq!(stats.active, 0);
     trace_stage("main-lifecycle:done");
 
     let stale_claim_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "claim-stale")

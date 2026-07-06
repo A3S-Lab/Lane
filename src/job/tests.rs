@@ -140,6 +140,79 @@ async fn reschedule_delayed_job_changes_due_time() {
 }
 
 #[tokio::test]
+async fn active_jobs_can_be_moved_back_to_delayed_with_lock() {
+    let queue = InMemoryJobQueue::new("active-delay");
+    let now = ts(1_000);
+    let job = queue
+        .add_at(
+            "rate-limited",
+            serde_json::json!({}),
+            JobOptions::new().with_priority(5),
+            now,
+        )
+        .await
+        .unwrap();
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let wrong_token = queue
+        .delay_active_job(&job.id, "wrong-token", Duration::from_secs(1), now)
+        .await
+        .unwrap_err();
+    assert!(matches!(wrong_token, LaneError::JobLeaseConflict(_)));
+
+    let delayed = queue
+        .delay_active_job(&job.id, lock_token(&claimed), Duration::from_secs(2), now)
+        .await
+        .unwrap();
+    assert_eq!(delayed.state, JobState::Delayed);
+    assert_eq!(delayed.scheduled_at, ts(3_000));
+    assert_eq!(delayed.options.delay, Some(Duration::from_secs(2)));
+    assert_eq!(delayed.attempts_made, 1);
+    assert!(delayed.worker_id.is_none());
+    assert!(delayed.lock_token.is_none());
+    assert!(delayed.lease_expires_at.is_none());
+
+    let complete_error = queue
+        .complete_job(
+            &job.id,
+            lock_token(&claimed),
+            serde_json::json!({}),
+            ts(1_100),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(complete_error, LaneError::JobStateConflict(_)));
+    assert!(queue
+        .claim_next("worker-b".to_string(), Duration::from_secs(30), ts(2_999))
+        .await
+        .unwrap()
+        .is_none());
+
+    assert_eq!(queue.promote_due_jobs(ts(3_000)).await.unwrap(), 1);
+    let reclaimed = queue
+        .claim_next("worker-b".to_string(), Duration::from_secs(30), ts(3_000))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reclaimed.id, job.id);
+    assert_eq!(reclaimed.attempts_made, 2);
+
+    let waiting = queue
+        .add_at("waiting", serde_json::json!({}), JobOptions::new(), now)
+        .await
+        .unwrap();
+    let state_error = queue
+        .delay_active_job(&waiting.id, "missing-token", Duration::ZERO, now)
+        .await
+        .unwrap_err();
+    assert!(matches!(state_error, LaneError::JobStateConflict(_)));
+}
+
+#[tokio::test]
 async fn custom_job_ids_make_add_idempotent() {
     let queue = InMemoryJobQueue::new("idempotent");
     let now = ts(1_000);
@@ -2278,6 +2351,45 @@ async fn local_job_queue_persists_rescheduled_delayed_jobs() {
     assert_eq!(restored.state, JobState::Delayed);
     assert_eq!(restored.scheduled_at, ts(3_000));
     assert_eq!(restored.options.delay, Some(Duration::from_secs(2)));
+}
+
+#[tokio::test]
+async fn local_job_queue_persists_active_jobs_delayed_by_workers() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("jobs").join("active-delay.json");
+    let queue = LocalJobQueue::open("durable-active-delay", &snapshot_path)
+        .await
+        .unwrap();
+    let job = queue
+        .add_at("task", serde_json::json!({}), JobOptions::new(), ts(1_000))
+        .await
+        .unwrap();
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(1_000))
+        .await
+        .unwrap()
+        .unwrap();
+
+    queue
+        .delay_active_job(
+            &job.id,
+            lock_token(&claimed),
+            Duration::from_secs(2),
+            ts(1_500),
+        )
+        .await
+        .unwrap();
+
+    let reopened = LocalJobQueue::open("durable-active-delay", &snapshot_path)
+        .await
+        .unwrap();
+    let restored = reopened.get_job(&job.id).await.unwrap().unwrap();
+    assert_eq!(restored.state, JobState::Delayed);
+    assert_eq!(restored.scheduled_at, ts(3_500));
+    assert_eq!(restored.options.delay, Some(Duration::from_secs(2)));
+    assert!(restored.worker_id.is_none());
+    assert!(restored.lock_token.is_none());
+    assert!(restored.lease_expires_at.is_none());
 }
 
 #[tokio::test]

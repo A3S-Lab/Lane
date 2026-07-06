@@ -369,10 +369,10 @@ A3S stack and language SDKs.
 | Phase | Status | Scope |
 | --- | --- | --- |
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
-| Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, debounce TTL extension, delayed-owner replace, and keep-last-if-active requeue, repeat-key ownership, explicit job states, priority ordering, delayed jobs, token-owned worker leases, completion/failure snapshots, retry backoff, rate-limited claims, shared active concurrency limits, stalled-job recovery, pause/resume. |
-| Job management API | In progress | Add/get/remove/remove-repeat/remove-deduplication-key/list-repeats/get-flow-dependencies/promote/reschedule/retry/update-priority/pause/resume/drain/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
+| Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, debounce TTL extension, delayed-owner replace, and keep-last-if-active requeue, repeat-key ownership, explicit job states, priority ordering, delayed jobs, token-owned worker leases, active-to-delayed movement, completion/failure snapshots, retry backoff, rate-limited claims, shared active concurrency limits, stalled-job recovery, pause/resume. |
+| Job management API | In progress | Add/get/remove/remove-repeat/remove-deduplication-key/list-repeats/get-flow-dependencies/promote/reschedule/delay-active/retry/update-priority/pause/resume/drain/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, and stalled recovery loops. |
-| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership/listing/removal, flow submission, flow dependency inspection, delayed promotion and rescheduling, single-job promote, manual retry, priority update, progress update, log append, list/stat snapshots, drain, clean, claim, rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
+| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership/listing/removal, flow submission, flow dependency inspection, delayed promotion and rescheduling, active-to-delayed movement, single-job promote, manual retry, priority update, progress update, log append, list/stat snapshots, drain, clean, claim, rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, dependency inspection, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, end timestamps, and repeat-key removal are available across in-memory, local durable, and Redis backends. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
@@ -444,7 +444,8 @@ Management APIs are part of the backend contract: `list_jobs()` returns
 paginated `JobListPage` values, `add_jobs()` submits a batch with the same
 idempotency semantics as `add_job()`, `promote_job()` moves delayed jobs to
 waiting, `reschedule_job()` changes a delayed job's due time relative to the
-current clock, `retry_job()` manually requeues failed jobs, `update_priority()`
+current clock, `delay_active_job()` moves a token-owned active job back to
+delayed, `retry_job()` manually requeues failed jobs, `update_priority()`
 changes non-terminal job priority, `renew_lease()` extends an active worker
 lease with the claim token, `remove_job()` removes non-active jobs,
 `remove_repeat()` removes the current non-active owner for a repeat key,
@@ -912,6 +913,11 @@ another state. `reschedule_job()` follows BullMQ's `changeDelay` mechanism: the
 script removes the job from the delayed zset, rejects the change if that zset
 membership is missing, updates the stored delay and scheduled timestamp, and
 adds the job back to the delayed zset with the new score in the same Redis turn.
+`delay_active_job()` follows BullMQ's `moveToDelayed` mechanism for leased
+jobs: the script verifies the lock token, treats the active zset as the movement
+gate, rejects the move if that active index membership is missing, clears the
+lock, updates the stored delay and scheduled timestamp, and writes the delayed
+zset member in the same Redis turn.
 `retry_job()` clears terminal failure metadata, treats the failed zset as the
 Redis movement gate, prunes orphaned or stale failed members, and moves valid
 failed jobs back to waiting inside one script. For deduplicated and repeat-keyed

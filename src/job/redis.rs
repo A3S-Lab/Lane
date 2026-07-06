@@ -1429,6 +1429,54 @@ redis.call('ZADD', KEYS[2], ARGV[4], ARGV[1])
 return {'ok', updated}
 "#;
 
+const DELAY_ACTIVE_JOB_SCRIPT: &str = r#"
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not raw then
+  redis.call('ZREM', KEYS[2], ARGV[1])
+  redis.call('DEL', KEYS[4])
+  return {'missing'}
+end
+
+local job = cjson.decode(raw)
+if job["state"] ~= "active" then
+  redis.call('ZREM', KEYS[2], ARGV[1])
+  return {'state', job["state"] or ''}
+end
+
+local lock_token = redis.call('GET', KEYS[4])
+if not lock_token then
+  return {'lock_missing'}
+end
+if lock_token ~= ARGV[2] then
+  return {'lock_mismatch'}
+end
+
+local removed_from_active = redis.call('ZREM', KEYS[2], ARGV[1])
+if removed_from_active == 0 then
+  return {'state', 'active_index_missing'}
+end
+
+redis.call('DEL', KEYS[4])
+
+job["state"] = "delayed"
+job["scheduled_at"] = ARGV[3]
+job["processed_at"] = cjson.null
+job["worker_id"] = cjson.null
+job["lock_token"] = cjson.null
+job["lease_expires_at"] = cjson.null
+job["failed_reason"] = cjson.null
+if not job["options"] or job["options"] == cjson.null then
+  job["options"] = {}
+end
+job["options"]["delay"] = cjson.decode(ARGV[5])
+
+local updated = cjson.encode(job)
+redis.call('HSET', KEYS[1], ARGV[1], updated)
+redis.call('ZADD', KEYS[3], ARGV[4], ARGV[1])
+
+return {'ok', updated}
+"#;
+
 const RECOVER_STALLED_SCRIPT: &str = r#"
 local function deduplication_id(job)
   if not job["options"] or job["options"] == cjson.null then
@@ -3541,6 +3589,35 @@ impl JobQueueBackend for RedisJobQueue {
         let mut job = decode_transition_result(&result, job_id, "renew lease")?;
         job.lock_token = Some(lock_token.to_string());
         Ok(job)
+    }
+
+    async fn delay_active_job(
+        &self,
+        job_id: &str,
+        lock_token: &str,
+        delay: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Job> {
+        let mut conn = self.connection().await?;
+        let scheduled_at = add_duration(now, delay);
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(DELAY_ACTIVE_JOB_SCRIPT)
+            .arg(4)
+            .arg(self.jobs_key())
+            .arg(self.state_key(JobState::Active))
+            .arg(self.state_key(JobState::Delayed))
+            .arg(self.lock_key(job_id))
+            .arg(job_id)
+            .arg(lock_token)
+            .arg(scheduled_at.to_rfc3339())
+            .arg(millis(scheduled_at))
+            .arg(serde_json::to_string(&delay).map_err(|error| {
+                LaneError::Other(format!("failed to encode Redis job delay: {error}"))
+            })?)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_transition_result(&result, job_id, "delay active")
     }
 
     async fn promote_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {
