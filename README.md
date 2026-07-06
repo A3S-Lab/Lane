@@ -370,9 +370,9 @@ A3S stack and language SDKs.
 | --- | --- | --- |
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
 | Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, debounce TTL extension, delayed-owner replace, and keep-last-if-active requeue, repeat-key ownership, explicit job states, priority ordering, delayed jobs, token-owned worker leases, completion/failure snapshots, retry backoff, rate-limited claims, shared active concurrency limits, stalled-job recovery, pause/resume. |
-| Job management API | In progress | Add/get/remove/remove-repeat/promote/retry/update-priority/pause/resume/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
+| Job management API | In progress | Add/get/remove/remove-repeat/promote/retry/update-priority/pause/resume/drain/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, and stalled recovery loops. |
-| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, repeat-key ownership and removal, flow submission, delayed promotion, single-job promote, manual retry, priority update, progress update, log append, list/stat snapshots, clean, claim, rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
+| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, repeat-key ownership and removal, flow submission, delayed promotion, single-job promote, manual retry, priority update, progress update, log append, list/stat snapshots, drain, clean, claim, rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, end timestamps, and repeat-key removal are available across in-memory, local durable, and Redis backends. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
@@ -447,6 +447,8 @@ waiting, `retry_job()` manually requeues failed jobs, `update_priority()`
 changes non-terminal job priority, `renew_lease()` extends an active worker
 lease with the claim token, `remove_job()` removes non-active jobs,
 `remove_repeat()` removes the current non-active owner for a repeat key,
+`drain_jobs(false)` removes waiting jobs, `drain_jobs(true)` also removes
+ordinary delayed jobs while preserving current delayed repeat owners,
 `clean_jobs()` removes old records by state, and these cleanup paths can
 unblock flow parents when a pending child is removed.
 Set `JobOptions::with_job_id()` when producers need idempotent submission:
@@ -896,6 +898,16 @@ appends and trims retained log entries inside one script; `clean_jobs()` filters
 retained records by the parsed millisecond reference time, removes their lock
 keys, hash entries, and state indexes atomically, updates flow parents for
 removed child jobs, and returns the removed snapshots.
+
+Queue draining follows the same rule. `drain_jobs(false)` removes waiting jobs
+and `drain_jobs(true)` also removes ordinary delayed jobs in one Redis turn,
+while leaving active, completed, failed, and waiting-children jobs in place.
+Like BullMQ's `drain` script, Lane protects the current delayed repeat
+occurrence: BullMQ derives that set from job scheduler records, while Lane
+checks the `repeat:<key>` owner key and skips the delayed job when it is still
+the current series owner. Removed children update their parent dependency set in
+the same script, so a parent can move from `waiting_children` to `waiting`,
+`delayed`, or `failed` without a follow-up client pass.
 
 Queue reads use the same Redis-side snapshot approach. `list_jobs()` evaluates
 one Lua script to read state pages and job JSON snapshots in the same Redis turn

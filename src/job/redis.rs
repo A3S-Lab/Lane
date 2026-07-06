@@ -2382,6 +2382,234 @@ end
 return removed
 "#;
 
+const DRAIN_JOBS_SCRIPT: &str = r#"
+local function days_from_civil(year, month, day)
+  if month <= 2 then
+    year = year - 1
+  end
+  local era = math.floor(year / 400)
+  local yoe = year - era * 400
+  local shifted_month = month
+  if month > 2 then
+    shifted_month = month - 3
+  else
+    shifted_month = month + 9
+  end
+  local doy = math.floor((153 * shifted_month + 2) / 5) + day - 1
+  local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+  return era * 146097 + doe - 719468
+end
+
+local function iso_to_millis(value)
+  local year = tonumber(string.sub(value, 1, 4))
+  local month = tonumber(string.sub(value, 6, 7))
+  local day = tonumber(string.sub(value, 9, 10))
+  local hour = tonumber(string.sub(value, 12, 13))
+  local minute = tonumber(string.sub(value, 15, 16))
+  local second = tonumber(string.sub(value, 18, 19))
+  local millis = 0
+  if string.sub(value, 20, 20) == "." then
+    local digits = string.match(string.sub(value, 21), "^(%d+)")
+    if digits then
+      digits = string.sub(digits .. "000", 1, 3)
+      millis = tonumber(digits) or 0
+    end
+  end
+
+  local days = days_from_civil(year, month, day)
+  return (((days * 24 + hour) * 60 + minute) * 60 + second) * 1000 + millis
+end
+
+local function deduplication_id(job)
+  if not job["options"] or job["options"] == cjson.null then
+    return nil
+  end
+  local deduplication = job["options"]["deduplication"]
+  if not deduplication or deduplication == cjson.null then
+    return nil
+  end
+  local id = deduplication["id"]
+  if not id or id == cjson.null or id == '' then
+    return nil
+  end
+  return id
+end
+
+local function release_deduplication_key(job, job_id, deduplication_prefix)
+  local id = deduplication_id(job)
+  if id then
+    local key = deduplication_prefix .. id
+    if redis.call('GET', key) == job_id then
+      redis.call('DEL', key)
+    end
+  end
+end
+
+local function repeat_key(job)
+  local key = job["repeat_key"]
+  if not key or key == cjson.null or key == '' then
+    return nil
+  end
+  return key
+end
+
+local function release_repeat_key(job, job_id, repeat_prefix)
+  local key = repeat_key(job)
+  if key then
+    local owner_key = repeat_prefix .. key
+    if redis.call('GET', owner_key) == job_id then
+      redis.call('DEL', owner_key)
+    end
+  end
+end
+
+local function is_current_delayed_repeat_owner(job, job_id)
+  if job["state"] ~= "delayed" then
+    return false
+  end
+  local key = repeat_key(job)
+  if not key then
+    return false
+  end
+  return redis.call('GET', ARGV[8] .. key) == job_id
+end
+
+local function release_parent_after_removed_child(job, removed_id)
+  local parent_id = job["parent_id"]
+  if not parent_id or parent_id == cjson.null then
+    return
+  end
+
+  local parent_raw = redis.call('HGET', KEYS[1], parent_id)
+  if not parent_raw then
+    return
+  end
+
+  local parent = cjson.decode(parent_raw)
+  if parent["state"] ~= "waiting_children" then
+    return
+  end
+
+  local all_done = true
+  local failed_child_id = nil
+  local failed_reason = nil
+  local dependency_key = ARGV[6] .. parent_id
+  local had_dependency_set = redis.call('EXISTS', dependency_key) == 1
+
+  if had_dependency_set then
+    redis.call('SREM', dependency_key, removed_id)
+    if redis.call('SCARD', dependency_key) > 0 then
+      all_done = false
+    end
+  else
+    for _, child_id in ipairs(parent["child_ids"] or {}) do
+      local child_raw = nil
+      if child_id ~= removed_id then
+        child_raw = redis.call('HGET', KEYS[1], child_id)
+      end
+
+      if child_raw then
+        local child = cjson.decode(child_raw)
+        if child["state"] == "failed" then
+          failed_child_id = child_id
+          failed_reason = child["failed_reason"]
+          if not failed_reason or failed_reason == cjson.null then
+            failed_reason = "unknown error"
+          end
+          break
+        elseif child["state"] ~= "completed" then
+          all_done = false
+          break
+        end
+      end
+    end
+  end
+
+  if failed_child_id then
+    redis.call('DEL', dependency_key)
+    redis.call('ZREM', KEYS[5], parent_id)
+    parent["state"] = "failed"
+    parent["finished_at"] = ARGV[2]
+    parent["worker_id"] = cjson.null
+    parent["lock_token"] = cjson.null
+    parent["lease_expires_at"] = cjson.null
+    parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
+    release_deduplication_key(parent, parent_id, ARGV[7])
+    release_repeat_key(parent, parent_id, ARGV[8])
+    if parent["options"] and parent["options"]["remove_on_fail"] == true then
+      redis.call('HDEL', KEYS[1], parent_id)
+    else
+      redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+      redis.call('ZADD', KEYS[7], ARGV[3], parent_id)
+    end
+  elseif all_done then
+    redis.call('DEL', dependency_key)
+    redis.call('ZREM', KEYS[5], parent_id)
+    parent["processed_at"] = cjson.null
+    parent["finished_at"] = cjson.null
+    parent["worker_id"] = cjson.null
+    parent["lock_token"] = cjson.null
+    parent["lease_expires_at"] = cjson.null
+    parent["failed_reason"] = cjson.null
+
+    local parent_scheduled_millis = iso_to_millis(parent["scheduled_at"])
+    if parent_scheduled_millis <= tonumber(ARGV[3]) then
+      parent["state"] = "waiting"
+      local priority = tonumber(parent["priority"] or '1000') or 1000
+      local sequence = redis.call('INCR', KEYS[8])
+      local waiting_score = (priority * tonumber(ARGV[4])) + sequence
+      redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+      redis.call('ZADD', KEYS[2], waiting_score, parent_id)
+    else
+      parent["state"] = "delayed"
+      redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+      redis.call('ZADD', KEYS[3], parent_scheduled_millis, parent_id)
+    end
+  end
+end
+
+local function collect_jobs(state_key, state, candidates)
+  local ids = redis.call('ZRANGE', state_key, 0, -1)
+  for _, id in ipairs(ids) do
+    local raw = redis.call('HGET', KEYS[1], id)
+    if raw then
+      local job = cjson.decode(raw)
+      if job["state"] == state then
+        if not is_current_delayed_repeat_owner(job, id) then
+          table.insert(candidates, { id = id, raw = raw, job = job })
+        end
+      else
+        redis.call('ZREM', state_key, id)
+      end
+    else
+      redis.call('ZREM', state_key, id)
+    end
+  end
+end
+
+local candidates = {}
+collect_jobs(KEYS[2], "waiting", candidates)
+if ARGV[1] == "1" then
+  collect_jobs(KEYS[3], "delayed", candidates)
+end
+
+local removed = {}
+for index, candidate in ipairs(candidates) do
+  redis.call('DEL', ARGV[5] .. candidate.id)
+  for key_index = 2, 7 do
+    redis.call('ZREM', KEYS[key_index], candidate.id)
+  end
+  redis.call('DEL', ARGV[6] .. candidate.id)
+  release_deduplication_key(candidate.job, candidate.id, ARGV[7])
+  release_repeat_key(candidate.job, candidate.id, ARGV[8])
+  redis.call('HDEL', KEYS[1], candidate.id)
+  release_parent_after_removed_child(candidate.job, candidate.id)
+  removed[index] = candidate.raw
+end
+
+return removed
+"#;
+
 const LIST_JOBS_SCRIPT: &str = r#"
 local function iso_sort_key(value)
   if not value or value == cjson.null then
@@ -3317,6 +3545,34 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(WAITING_SCORE_BUCKET)
             .arg(self.dependencies_key_prefix())
             .arg(millis(cutoff))
+            .arg(self.deduplication_key_prefix())
+            .arg(self.repeat_key_prefix())
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_clean_jobs_result(&result)
+    }
+
+    async fn drain_jobs(&self, include_delayed: bool) -> Result<Vec<Job>> {
+        let mut conn = self.connection().await?;
+        let now = Utc::now();
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(DRAIN_JOBS_SCRIPT)
+            .arg(8)
+            .arg(self.jobs_key())
+            .arg(self.state_key(JobState::Waiting))
+            .arg(self.state_key(JobState::Delayed))
+            .arg(self.state_key(JobState::Active))
+            .arg(self.state_key(JobState::WaitingChildren))
+            .arg(self.state_key(JobState::Completed))
+            .arg(self.state_key(JobState::Failed))
+            .arg(self.sequence_key())
+            .arg(if include_delayed { "1" } else { "0" })
+            .arg(now.to_rfc3339())
+            .arg(millis(now))
+            .arg(WAITING_SCORE_BUCKET)
+            .arg(self.lock_key_prefix())
+            .arg(self.dependencies_key_prefix())
             .arg(self.deduplication_key_prefix())
             .arg(self.repeat_key_prefix())
             .query_async(&mut conn)

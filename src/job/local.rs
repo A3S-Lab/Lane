@@ -128,6 +128,13 @@ impl LocalJobQueue {
         Ok(job)
     }
 
+    /// Drain waiting jobs and optionally non-repeat delayed jobs.
+    pub async fn drain(&self, include_delayed: bool) -> Result<Vec<Job>> {
+        let jobs = self.inner.drain(include_delayed).await?;
+        self.persist().await?;
+        Ok(jobs)
+    }
+
     async fn persist(&self) -> Result<()> {
         persist_job_snapshot(&self.snapshot_path, &self.inner.snapshot().await).await
     }
@@ -242,6 +249,10 @@ impl JobQueueBackend for LocalJobQueue {
         let jobs = self.inner.clean_jobs(state, grace, limit, now).await?;
         self.persist().await?;
         Ok(jobs)
+    }
+
+    async fn drain_jobs(&self, include_delayed: bool) -> Result<Vec<Job>> {
+        LocalJobQueue::drain(self, include_delayed).await
     }
 
     async fn list_jobs(&self, options: JobListOptions) -> Result<JobListPage> {

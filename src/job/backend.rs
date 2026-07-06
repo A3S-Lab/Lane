@@ -72,6 +72,8 @@ pub trait JobQueueBackend: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<Vec<Job>>;
 
+    async fn drain_jobs(&self, include_delayed: bool) -> Result<Vec<Job>>;
+
     async fn list_jobs(&self, options: JobListOptions) -> Result<JobListPage>;
 
     async fn update_progress(&self, job_id: &str, progress: Value) -> Result<Job>;

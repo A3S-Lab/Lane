@@ -20,7 +20,7 @@ async fn redis_backend_runs_job_lifecycle_against_real_server() {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
         return;
     };
-    tokio::time::timeout(Duration::from_secs(90), run_job_lifecycle(redis_url))
+    tokio::time::timeout(Duration::from_secs(120), run_job_lifecycle(redis_url))
         .await
         .expect("Redis integration test timed out")
         .unwrap();
@@ -2176,6 +2176,211 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     assert_eq!(first_clean_millis[0].id, clean_millis_a_id);
     trace_stage("clean-millis:done");
 
+    let drain_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "drain")
+        .expect("valid Redis URL should build the drain queue");
+    let mut drain_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let drain_repeat = drain_queue
+        .add_job(
+            "drain-repeat".to_string(),
+            serde_json::json!({ "kind": "repeat" }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(60))
+                    .with_limit(2)
+                    .with_key("drain-heartbeat"),
+            ),
+        )
+        .await
+        .expect("drain repeat should add");
+    let drain_repeat_claim = drain_queue
+        .claim_next(
+            "worker-drain-repeat".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("drain repeat claim should return")
+        .expect("drain repeat should be claimable");
+    assert_eq!(drain_repeat_claim.id, drain_repeat.id);
+    drain_queue
+        .complete_job(
+            &drain_repeat_claim.id,
+            lock_token(&drain_repeat_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("drain repeat should complete");
+    let drain_repeat_successor = drain_queue
+        .list_jobs(JobListOptions::new().with_state(JobState::Delayed))
+        .await
+        .expect("drain repeat delayed jobs should list")
+        .jobs
+        .into_iter()
+        .find(|job| job.repeat_key.as_deref() == Some("drain-heartbeat"))
+        .expect("drain repeat successor should be delayed");
+
+    let drain_completed = drain_queue
+        .add_job(
+            "drain-completed".to_string(),
+            serde_json::json!({ "kind": "completed" }),
+            JobOptions::new().with_priority(1),
+        )
+        .await
+        .expect("drain completed should add");
+    let drain_completed_claim = drain_queue
+        .claim_next(
+            "worker-drain-completed".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("drain completed claim should return")
+        .expect("drain completed should be claimable");
+    assert_eq!(drain_completed_claim.id, drain_completed.id);
+    drain_queue
+        .complete_job(
+            &drain_completed_claim.id,
+            lock_token(&drain_completed_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("drain completed should complete");
+
+    let drain_active = drain_queue
+        .add_job(
+            "drain-active".to_string(),
+            serde_json::json!({ "kind": "active" }),
+            JobOptions::new().with_priority(1),
+        )
+        .await
+        .expect("drain active should add");
+    let drain_active_claim = drain_queue
+        .claim_next(
+            "worker-drain-active".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("drain active claim should return")
+        .expect("drain active should be claimable");
+    assert_eq!(drain_active_claim.id, drain_active.id);
+
+    let drain_waiting = drain_queue
+        .add_job(
+            "drain-waiting".to_string(),
+            serde_json::json!({ "kind": "waiting" }),
+            JobOptions::new().with_priority(50),
+        )
+        .await
+        .expect("drain waiting should add");
+    let drain_delayed = drain_queue
+        .add_job(
+            "drain-delayed".to_string(),
+            serde_json::json!({ "kind": "delayed" }),
+            JobOptions::new().with_delay(Duration::from_secs(60)),
+        )
+        .await
+        .expect("drain delayed should add");
+    let drain_flow = drain_queue
+        .add_flow_at(
+            JobSpec::new("drain-parent", serde_json::json!({ "kind": "parent" })),
+            vec![JobSpec::new(
+                "drain-child",
+                serde_json::json!({ "kind": "child" }),
+            )],
+            Utc::now(),
+        )
+        .await
+        .expect("drain flow should add");
+
+    let drained_waiting = drain_queue
+        .drain_jobs(false)
+        .await
+        .expect("drain waiting should run");
+    let drained_waiting_ids = drained_waiting
+        .iter()
+        .map(|job| job.id.as_str())
+        .collect::<Vec<_>>();
+    assert!(drained_waiting_ids.contains(&drain_waiting.id.as_str()));
+    assert!(drained_waiting_ids.contains(&drain_flow.children[0].id.as_str()));
+    assert_eq!(drained_waiting.len(), 2);
+    assert!(drain_queue
+        .get_job(&drain_waiting.id)
+        .await
+        .expect("drain waiting lookup should return")
+        .is_none());
+    assert!(drain_queue
+        .get_job(&drain_flow.children[0].id)
+        .await
+        .expect("drain child lookup should return")
+        .is_none());
+    assert_eq!(
+        drain_queue
+            .get_job(&drain_flow.parent.id)
+            .await
+            .expect("drain parent lookup should return")
+            .expect("drain parent should remain")
+            .state,
+        JobState::Waiting
+    );
+    drain_queue
+        .remove_job(&drain_flow.parent.id)
+        .await
+        .expect("released drain parent should remove")
+        .expect("released drain parent should be returned");
+    assert_eq!(
+        drain_queue
+            .get_job(&drain_active.id)
+            .await
+            .expect("drain active lookup should return")
+            .expect("drain active should remain")
+            .state,
+        JobState::Active
+    );
+    assert_eq!(
+        drain_queue
+            .get_job(&drain_completed.id)
+            .await
+            .expect("drain completed lookup should return")
+            .expect("drain completed should remain")
+            .state,
+        JobState::Completed
+    );
+    assert!(drain_queue
+        .get_job(&drain_delayed.id)
+        .await
+        .expect("drain delayed lookup should return")
+        .is_some());
+
+    let drained_delayed = drain_queue
+        .drain_jobs(true)
+        .await
+        .expect("drain delayed should run");
+    assert_eq!(drained_delayed.len(), 1);
+    assert_eq!(drained_delayed[0].id, drain_delayed.id);
+    let drain_delayed_score_after: Option<f64> = drain_conn
+        .zscore(format!("{namespace}:drain:delayed"), &drain_delayed.id)
+        .await?;
+    assert!(drain_delayed_score_after.is_none());
+    let drain_repeat_score_after: Option<f64> = drain_conn
+        .zscore(
+            format!("{namespace}:drain:delayed"),
+            &drain_repeat_successor.id,
+        )
+        .await?;
+    assert!(drain_repeat_score_after.is_some());
+    let drain_repeat_owner_after: Option<String> = drain_conn
+        .get(format!("{namespace}:drain:repeat:drain-heartbeat"))
+        .await?;
+    assert_eq!(
+        drain_repeat_owner_after.as_deref(),
+        Some(drain_repeat_successor.id.as_str())
+    );
+    trace_stage("drain:done");
+
     let mut flow_index_conn = redis::Client::open(redis_url.as_str())?
         .get_connection_manager()
         .await?;
@@ -3332,7 +3537,20 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     assert!(atomic_delayed_score.is_some());
 
     trace_stage("cleanup:final:start");
-    cleanup_namespace(&redis_url, &namespace).await?;
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        cleanup_namespace_with_conn(&mut atomic_add_conn, &namespace),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            eprintln!("warning: final Redis cleanup failed for {namespace}: {error}");
+        }
+        Err(_) => {
+            eprintln!("warning: final Redis cleanup timed out for {namespace}");
+        }
+    }
     trace_stage("cleanup:final:done");
     Ok(())
 }
@@ -3370,12 +3588,30 @@ fn trace_stage(stage: &str) {
 async fn cleanup_namespace(redis_url: &str, namespace: &str) -> redis::RedisResult<()> {
     let client = redis::Client::open(redis_url)?;
     let mut conn = client.get_connection_manager().await?;
-    let keys: Vec<String> = redis::cmd("KEYS")
-        .arg(format!("{namespace}:*"))
-        .query_async(&mut conn)
-        .await?;
-    if !keys.is_empty() {
-        let _: usize = conn.del(keys).await?;
+    cleanup_namespace_with_conn(&mut conn, namespace).await
+}
+
+async fn cleanup_namespace_with_conn(
+    conn: &mut redis::aio::ConnectionManager,
+    namespace: &str,
+) -> redis::RedisResult<()> {
+    let mut cursor = 0_u64;
+    loop {
+        let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(format!("{namespace}:*"))
+            .arg("COUNT")
+            .arg(100_u16)
+            .query_async(conn)
+            .await?;
+        if !keys.is_empty() {
+            let _: usize = conn.del(keys).await?;
+        }
+        if next_cursor == 0 {
+            break;
+        }
+        cursor = next_cursor;
     }
     Ok(())
 }

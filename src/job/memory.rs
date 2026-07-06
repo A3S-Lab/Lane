@@ -514,6 +514,37 @@ impl InMemoryJobQueue {
         Ok(jobs)
     }
 
+    /// Drain waiting jobs and optionally non-repeat delayed jobs.
+    pub async fn drain(&self, include_delayed: bool) -> Result<Vec<Job>> {
+        let mut inner = self.inner.lock().await;
+        let mut jobs = inner
+            .jobs
+            .values()
+            .filter(|job| {
+                job.state == JobState::Waiting
+                    || (include_delayed
+                        && job.state == JobState::Delayed
+                        && !is_delayed_repeat_owner(&inner.jobs, job))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        jobs.sort_by(compare_list_order);
+
+        let parent_ids = jobs
+            .iter()
+            .filter_map(|job| job.parent_id.clone())
+            .collect::<Vec<_>>();
+
+        for job in &jobs {
+            inner.jobs.remove(&job.id);
+        }
+        for parent_id in parent_ids {
+            Self::release_parent_if_ready_locked(&mut inner, &parent_id, Utc::now());
+        }
+
+        Ok(jobs)
+    }
+
     /// Update progress for a non-terminal job.
     pub async fn set_progress(&self, job_id: &str, progress: Value) -> Result<Job> {
         let mut inner = self.inner.lock().await;
@@ -875,6 +906,10 @@ impl JobQueueBackend for InMemoryJobQueue {
         self.clean(state, grace, limit, now).await
     }
 
+    async fn drain_jobs(&self, include_delayed: bool) -> Result<Vec<Job>> {
+        self.drain(include_delayed).await
+    }
+
     async fn list_jobs(&self, options: JobListOptions) -> Result<JobListPage> {
         self.list(options).await
     }
@@ -1175,6 +1210,16 @@ fn find_active_repeat_key_except<'a>(
 ) -> Option<&'a Job> {
     jobs.values()
         .find(|job| job.id != excluded_job_id && active_repeat_key(job) == Some(repeat_key))
+}
+
+fn is_delayed_repeat_owner(jobs: &HashMap<JobId, Job>, job: &Job) -> bool {
+    if job.state != JobState::Delayed {
+        return false;
+    }
+    let Some(repeat_key) = job.repeat_key.as_deref() else {
+        return false;
+    };
+    find_active_repeat_key(jobs, repeat_key).is_some_and(|owner| owner.id == job.id)
 }
 
 fn state_after_dependencies(scheduled_at: DateTime<Utc>, now: DateTime<Utc>) -> JobState {

@@ -1005,6 +1005,174 @@ async fn remove_repeat_rejects_active_leased_owner() {
     );
 }
 
+#[tokio::test]
+async fn drain_jobs_removes_waiting_and_optional_delayed_jobs() {
+    let queue = InMemoryJobQueue::new("drain");
+    let now = ts(1_000);
+
+    let repeat = queue
+        .add_at(
+            "repeat",
+            serde_json::json!({ "kind": "repeat" }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(60))
+                    .with_limit(2)
+                    .with_key("heartbeat"),
+            ),
+            now,
+        )
+        .await
+        .unwrap();
+    let repeat_claim = queue
+        .claim_next("worker-repeat".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(repeat_claim.id, repeat.id);
+    queue
+        .complete_job(
+            &repeat_claim.id,
+            lock_token(&repeat_claim),
+            serde_json::json!({ "ok": true }),
+            ts(1_100),
+        )
+        .await
+        .unwrap();
+    let repeat_successor = queue
+        .list_jobs(JobListOptions::new().with_state(JobState::Delayed))
+        .await
+        .unwrap()
+        .jobs
+        .into_iter()
+        .find(|job| job.repeat_key.as_deref() == Some("heartbeat"))
+        .unwrap();
+
+    let completed = queue
+        .add_at(
+            "completed",
+            serde_json::json!({ "kind": "completed" }),
+            JobOptions::new().with_priority(1),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+    let completed_claim = queue
+        .claim_next(
+            "worker-completed".to_string(),
+            Duration::from_secs(30),
+            ts(1_200),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed_claim.id, completed.id);
+    queue
+        .complete_job(
+            &completed_claim.id,
+            lock_token(&completed_claim),
+            serde_json::json!({ "ok": true }),
+            ts(1_250),
+        )
+        .await
+        .unwrap();
+
+    let active = queue
+        .add_at(
+            "active",
+            serde_json::json!({ "kind": "active" }),
+            JobOptions::new().with_priority(1),
+            ts(1_300),
+        )
+        .await
+        .unwrap();
+    let active_claim = queue
+        .claim_next(
+            "worker-active".to_string(),
+            Duration::from_secs(30),
+            ts(1_300),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active_claim.id, active.id);
+
+    let waiting = queue
+        .add_at(
+            "waiting",
+            serde_json::json!({ "kind": "waiting" }),
+            JobOptions::new().with_priority(50),
+            ts(1_400),
+        )
+        .await
+        .unwrap();
+    let delayed = queue
+        .add_at(
+            "delayed",
+            serde_json::json!({ "kind": "delayed" }),
+            JobOptions::new().with_delay(Duration::from_secs(60)),
+            ts(1_400),
+        )
+        .await
+        .unwrap();
+
+    let drained_waiting = queue.drain_jobs(false).await.unwrap();
+    assert_eq!(drained_waiting.len(), 1);
+    assert_eq!(drained_waiting[0].id, waiting.id);
+    assert!(queue.get_job(&waiting.id).await.unwrap().is_none());
+    assert!(queue.get_job(&delayed.id).await.unwrap().is_some());
+    assert!(queue.get_job(&repeat_successor.id).await.unwrap().is_some());
+    assert_eq!(
+        queue.get_job(&active.id).await.unwrap().unwrap().state,
+        JobState::Active
+    );
+    assert_eq!(
+        queue.get_job(&completed.id).await.unwrap().unwrap().state,
+        JobState::Completed
+    );
+
+    let drained_delayed = queue.drain_jobs(true).await.unwrap();
+    assert_eq!(drained_delayed.len(), 1);
+    assert_eq!(drained_delayed[0].id, delayed.id);
+    assert!(queue.get_job(&delayed.id).await.unwrap().is_none());
+    assert_eq!(
+        queue
+            .get_job(&repeat_successor.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        JobState::Delayed
+    );
+}
+
+#[tokio::test]
+async fn drain_jobs_releases_flow_parents_after_removing_children() {
+    let queue = InMemoryJobQueue::new("drain-flow");
+    let now = ts(1_000);
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({ "kind": "parent" })),
+            vec![JobSpec::new(
+                "child",
+                serde_json::json!({ "kind": "child" }),
+            )],
+            now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(flow.parent.state, JobState::WaitingChildren);
+    assert_eq!(flow.children[0].state, JobState::Waiting);
+
+    let drained = queue.drain_jobs(false).await.unwrap();
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].id, flow.children[0].id);
+    assert!(queue.get_job(&flow.children[0].id).await.unwrap().is_none());
+    assert_eq!(
+        queue.get_job(&flow.parent.id).await.unwrap().unwrap().state,
+        JobState::Waiting
+    );
+}
+
 #[test]
 fn repeat_options_deserialize_legacy_interval_shape() {
     let repeat: RepeatOptions = serde_json::from_value(serde_json::json!({
