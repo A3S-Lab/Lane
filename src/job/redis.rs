@@ -781,6 +781,33 @@ end
 return nil
 "#;
 
+const CLAIM_RATE_LIMIT_TTL_SCRIPT: &str = r#"
+local function rate_limit_ttl(max_jobs, rate_limit_key)
+  if max_jobs and max_jobs <= tonumber(redis.call('GET', rate_limit_key) or '0') then
+    local ttl = redis.call('PTTL', rate_limit_key)
+    if ttl == 0 then
+      redis.call('DEL', rate_limit_key)
+    end
+    if ttl > 0 then
+      return ttl
+    end
+  end
+  return 0
+end
+
+local max_jobs = tonumber(ARGV[1])
+if max_jobs and max_jobs > 0 then
+  return rate_limit_ttl(max_jobs, KEYS[1])
+end
+
+local configured_max = redis.call('HGET', KEYS[2], 'max')
+if configured_max then
+  return rate_limit_ttl(tonumber(configured_max), KEYS[1])
+end
+
+return redis.call('PTTL', KEYS[1])
+"#;
+
 const COMPLETE_SCRIPT: &str = r#"
 local function days_from_civil(year, month, day)
   if month <= 2 then
@@ -3050,6 +3077,25 @@ impl RedisJobQueue {
         let rate_limit = JobRateLimit::new(max_claims, Duration::from_millis(duration));
         rate_limit.validate()?;
         Ok(Some(rate_limit))
+    }
+
+    /// Return the current claim rate-limit TTL in milliseconds.
+    ///
+    /// When `max_claims` is provided, the TTL is returned only if the limiter
+    /// counter has reached that threshold. When it is omitted, Redis-shared
+    /// `meta.max` is used if present; otherwise this returns the raw `PTTL` for
+    /// the limiter key.
+    pub async fn get_claim_rate_limit_ttl(&self, max_claims: Option<u64>) -> Result<i64> {
+        let mut conn = self.connection().await?;
+        redis::cmd("EVAL")
+            .arg(CLAIM_RATE_LIMIT_TTL_SCRIPT)
+            .arg(2)
+            .arg(self.claim_rate_limit_key())
+            .arg(self.meta_key())
+            .arg(max_claims.unwrap_or_default())
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)
     }
 
     /// Clear the Redis-backed queue-level claim rate limit.

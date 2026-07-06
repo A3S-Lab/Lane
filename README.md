@@ -778,6 +778,7 @@ assert_eq!(
     queue.get_claim_rate_limit().await?,
     Some(JobRateLimit::new(100, Duration::from_secs(60)))
 );
+let _rate_limit_ttl_ms = queue.get_claim_rate_limit_ttl(None).await?;
 queue.set_max_active_jobs(32).await?;
 assert_eq!(queue.get_max_active_jobs().await?, Some(32));
 
@@ -819,10 +820,14 @@ sharing the counter key through Redis for workers that use the same namespace
 and queue. `set_claim_rate_limit()` stores the shared configuration in the queue
 meta hash as `max` and `duration`, matching BullMQ's global rate-limit
 mechanism. `get_claim_rate_limit()` reads those fields with `HMGET`, and
-`clear_claim_rate_limit()` removes them. The Lua claim script prefers an
-explicit worker-local limit and otherwise reads the Redis meta values before
-checking the rate-limit counter. When the window is exhausted, `claim_next()`
-returns `None` and the job remains waiting for a later poll.
+`get_claim_rate_limit_ttl()` follows BullMQ's `getRateLimitTtl` script shape:
+with an explicit max it returns a TTL only after the limiter counter reaches
+that threshold, otherwise it uses Redis-shared `meta.max` when present and falls
+back to raw `PTTL` for the limiter key. `clear_claim_rate_limit()` removes the
+shared config fields. The Lua claim script prefers an explicit worker-local
+limit and otherwise reads the Redis meta values before checking the rate-limit
+counter. When the window is exhausted, `claim_next()` returns `None` and the job
+remains waiting for a later poll.
 
 `set_max_active_jobs()` configures a Redis-shared active job ceiling for the
 queue. It stores the value in the queue meta hash as `concurrency`, matching

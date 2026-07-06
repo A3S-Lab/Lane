@@ -1064,7 +1064,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         None
     );
     global_rate_admin
-        .set_claim_rate_limit(JobRateLimit::new(1, Duration::from_millis(200)))
+        .set_claim_rate_limit(JobRateLimit::new(1, Duration::from_millis(1_000)))
         .await
         .expect("global rate limit should be configured");
     let global_rate_meta_key = format!("{namespace}:global-rate:meta");
@@ -1074,13 +1074,13 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     let stored_global_rate: (Option<u64>, Option<u64>) = global_rate_conn
         .hmget(&global_rate_meta_key, &["max", "duration"])
         .await?;
-    assert_eq!(stored_global_rate, (Some(1), Some(200)));
+    assert_eq!(stored_global_rate, (Some(1), Some(1_000)));
     assert_eq!(
         global_rate_worker
             .get_claim_rate_limit()
             .await
             .expect("stored global rate limit should load"),
-        Some(JobRateLimit::new(1, Duration::from_millis(200)))
+        Some(JobRateLimit::new(1, Duration::from_millis(1_000)))
     );
     let global_rate_first = global_rate_admin
         .add_job(
@@ -1108,6 +1108,26 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("first global-rate claim should return")
         .expect("first global-rate job should be claimable");
     assert_eq!(global_rate_first_claim.id, global_rate_first.id);
+    let global_rate_ttl = global_rate_worker
+        .get_claim_rate_limit_ttl(None)
+        .await
+        .expect("global rate-limit TTL should load from meta max");
+    assert!(
+        (1..=1_000).contains(&global_rate_ttl),
+        "expected global rate-limit TTL to be within the configured window, got {global_rate_ttl}"
+    );
+    assert_eq!(
+        global_rate_worker
+            .get_claim_rate_limit_ttl(Some(2))
+            .await
+            .expect("non-exceeded explicit rate-limit TTL should load"),
+        0
+    );
+    let raw_global_rate_ttl: i64 = redis::cmd("PTTL")
+        .arg(format!("{namespace}:global-rate:claim_rate_limit"))
+        .query_async(&mut global_rate_conn)
+        .await?;
+    assert!(raw_global_rate_ttl > 0);
     assert!(global_rate_worker
         .claim_next(
             "worker-global-rate".to_string(),
@@ -1131,6 +1151,14 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             .await
             .expect("cleared global rate limit should load"),
         None
+    );
+    let raw_ttl_after_clear = global_rate_worker
+        .get_claim_rate_limit_ttl(None)
+        .await
+        .expect("raw rate-limit TTL should load after clearing meta config");
+    assert!(
+        raw_ttl_after_clear > 0,
+        "expected raw limiter key TTL to remain after clearing config, got {raw_ttl_after_clear}"
     );
     let global_rate_second_claim = global_rate_worker
         .claim_next(
