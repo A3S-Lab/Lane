@@ -22,7 +22,7 @@ pub use redis::RedisJobQueue;
 pub use types::{
     Job, JobFlow, JobId, JobListOptions, JobListPage, JobLogEntry, JobOptions, JobPriority,
     JobQueueSnapshot, JobQueueStats, JobSpec, JobState, JobWorkerId, QueueName, RepeatOptions,
-    DEFAULT_JOB_PRIORITY,
+    RepeatSchedule, DEFAULT_JOB_PRIORITY,
 };
 pub use worker::{
     job_processor_fn, JobContext, JobProcessor, JobProcessorFn, JobRunOutcome, JobWorker,

@@ -149,6 +149,67 @@ async fn repeatable_jobs_schedule_next_occurrence_after_completion() {
 }
 
 #[tokio::test]
+async fn cron_repeatable_jobs_schedule_next_matching_occurrence() {
+    let queue = InMemoryJobQueue::new("cron-repeat");
+    let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let job = queue
+        .add_at(
+            "sync",
+            serde_json::json!({ "source": "warehouse" }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::cron("0/5 * * * * * *")
+                    .with_limit(2)
+                    .with_key("warehouse-sync"),
+            ),
+            now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(job.repeat_key.as_deref(), Some("warehouse-sync"));
+
+    let first = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .complete_job(&first.id, serde_json::json!({ "ok": true }), now)
+        .await
+        .unwrap();
+
+    let delayed = queue
+        .list_jobs(JobListOptions::new().with_state(JobState::Delayed))
+        .await
+        .unwrap();
+    assert_eq!(delayed.total, 1);
+    let next = &delayed.jobs[0];
+    assert_eq!(next.repeat_key.as_deref(), Some("warehouse-sync"));
+    assert_eq!(next.repeat_count, 1);
+    assert_eq!(
+        next.scheduled_at,
+        Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 5).unwrap()
+    );
+}
+
+#[test]
+fn repeat_options_deserialize_legacy_interval_shape() {
+    let repeat: RepeatOptions = serde_json::from_value(serde_json::json!({
+        "interval": {
+            "secs": 5,
+            "nanos": 0
+        },
+        "limit": 2,
+        "key": "legacy-sync"
+    }))
+    .unwrap();
+
+    assert_eq!(repeat.interval(), Some(Duration::from_secs(5)));
+    assert_eq!(repeat.cron_expression(), None);
+    assert_eq!(repeat.limit, Some(2));
+    assert_eq!(repeat.key.as_deref(), Some("legacy-sync"));
+}
+
+#[tokio::test]
 async fn repeat_options_reject_invalid_schedules() {
     let queue = InMemoryJobQueue::new("repeat-invalid");
     let zero_interval = queue
@@ -173,6 +234,17 @@ async fn repeat_options_reject_invalid_schedules() {
         .await
         .unwrap_err();
     assert!(matches!(zero_limit, LaneError::ConfigError(_)));
+
+    let invalid_cron = queue
+        .add_at(
+            "sync",
+            serde_json::json!({}),
+            JobOptions::new().with_repeat(RepeatOptions::cron("not a cron")),
+            ts(1_000),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(invalid_cron, LaneError::ConfigError(_)));
 }
 
 #[tokio::test]

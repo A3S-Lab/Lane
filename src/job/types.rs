@@ -1,7 +1,10 @@
+use crate::error::{LaneError, Result};
 use crate::retry::RetryPolicy;
 use chrono::{DateTime, Utc};
+use cron::Schedule;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::str::FromStr;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -139,15 +142,35 @@ pub struct JobFlow {
     pub children: Vec<Job>,
 }
 
-/// Fixed-interval repeat settings for a generic job.
+/// Repeat schedule used by a generic job.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum RepeatSchedule {
+    /// Repeat at a fixed interval after each successful completion.
+    Every {
+        /// Delay between completed occurrence and the next scheduled occurrence.
+        interval: Duration,
+    },
+    /// Repeat on a cron expression in UTC.
+    Cron {
+        /// Seven-field cron expression: second, minute, hour, day of month,
+        /// month, day of week, and year.
+        #[serde(rename = "cron")]
+        expression: String,
+    },
+}
+
+/// Repeat settings for a generic job.
 ///
 /// `limit` counts total executions, including the first job. For example,
 /// `limit = 3` allows the original job plus two automatically scheduled
 /// successors.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RepeatOptions {
-    /// Delay between completed occurrence and the next scheduled occurrence.
-    pub interval: Duration,
+    /// The repeat schedule. This is flattened in JSON so legacy interval
+    /// snapshots keep using the `{ "interval": ... }` shape.
+    #[serde(flatten)]
+    pub schedule: RepeatSchedule,
     /// Optional maximum total execution count for this repeat series.
     pub limit: Option<u32>,
     /// Optional latest scheduled time for a new occurrence.
@@ -160,10 +183,41 @@ impl RepeatOptions {
     /// Repeat at a fixed interval after each successful completion.
     pub fn every(interval: Duration) -> Self {
         Self {
-            interval,
+            schedule: RepeatSchedule::Every { interval },
             limit: None,
             end_at: None,
             key: None,
+        }
+    }
+
+    /// Repeat according to a UTC cron expression.
+    ///
+    /// The expression uses seven fields: second, minute, hour, day of month,
+    /// month, day of week, and year.
+    pub fn cron(expression: impl Into<String>) -> Self {
+        Self {
+            schedule: RepeatSchedule::Cron {
+                expression: expression.into(),
+            },
+            limit: None,
+            end_at: None,
+            key: None,
+        }
+    }
+
+    /// Return the fixed interval when this repeat uses interval scheduling.
+    pub fn interval(&self) -> Option<Duration> {
+        match &self.schedule {
+            RepeatSchedule::Every { interval } => Some(*interval),
+            RepeatSchedule::Cron { .. } => None,
+        }
+    }
+
+    /// Return the cron expression when this repeat uses cron scheduling.
+    pub fn cron_expression(&self) -> Option<&str> {
+        match &self.schedule {
+            RepeatSchedule::Every { .. } => None,
+            RepeatSchedule::Cron { expression } => Some(expression),
         }
     }
 
@@ -183,6 +237,41 @@ impl RepeatOptions {
     pub fn with_key(mut self, key: impl Into<String>) -> Self {
         self.key = Some(key.into());
         self
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        match &self.schedule {
+            RepeatSchedule::Every { interval } => {
+                if interval.is_zero() {
+                    return Err(LaneError::ConfigError(
+                        "repeat interval must be greater than zero".to_string(),
+                    ));
+                }
+            }
+            RepeatSchedule::Cron { expression } => {
+                parse_cron_expression(expression)?;
+            }
+        }
+
+        if self.limit == Some(0) {
+            return Err(LaneError::ConfigError(
+                "repeat limit must be greater than zero".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn next_scheduled_at(&self, after: DateTime<Utc>) -> Result<Option<DateTime<Utc>>> {
+        let scheduled_at = match &self.schedule {
+            RepeatSchedule::Every { interval } => Some(add_duration(after, *interval)),
+            RepeatSchedule::Cron { expression } => {
+                let schedule = parse_cron_expression(expression)?;
+                schedule.after(&after).next()
+            }
+        };
+
+        Ok(scheduled_at)
     }
 }
 
@@ -365,6 +454,21 @@ pub(crate) fn add_duration(at: DateTime<Utc>, duration: Duration) -> DateTime<Ut
         Ok(delta) => at.checked_add_signed(delta).unwrap_or(at),
         Err(_) => at,
     }
+}
+
+fn parse_cron_expression(expression: &str) -> Result<Schedule> {
+    let expression = expression.trim();
+    if expression.is_empty() {
+        return Err(LaneError::ConfigError(
+            "repeat cron expression must not be empty".to_string(),
+        ));
+    }
+
+    Schedule::from_str(expression).map_err(|error| {
+        LaneError::ConfigError(format!(
+            "invalid repeat cron expression `{expression}`: {error}"
+        ))
+    })
 }
 
 /// Queue state counts for generic jobs.

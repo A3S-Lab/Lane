@@ -374,7 +374,7 @@ A3S stack and language SDKs.
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, runs async processors, completes/fails jobs, supports processor progress/log updates, timeouts, and stalled recovery loops. |
 | Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` for multi-process distributed claims. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
-| Repeat jobs | In progress | Fixed-interval repeatable jobs with repeat keys, limits, and end timestamps are available across in-memory, local durable, and Redis backends. Cron expressions remain planned. |
+| Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, and end timestamps are available across in-memory, local durable, and Redis backends. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
 
 The generic job runtime is exposed through the `JobQueueBackend` trait.
@@ -452,8 +452,10 @@ assert_eq!(flow.parent.state, JobState::WaitingChildren);
 # }
 ```
 
-Repeat jobs schedule the next occurrence after a successful completion. The
-repeat `limit` counts total executions, including the first job:
+Repeat jobs schedule the next occurrence after a successful completion. Use
+`RepeatOptions::every()` for fixed intervals or `RepeatOptions::cron()` for a
+seven-field UTC cron expression. The repeat `limit` counts total executions,
+including the first job:
 
 ```rust
 use a3s_lane::{InMemoryJobQueue, JobOptions, RepeatOptions};
@@ -475,6 +477,23 @@ let job = queue
     .await?;
 
 assert_eq!(job.repeat_key.as_deref(), Some("crm-heartbeat"));
+
+let cron_job = queue
+    .add(
+        "nightly-import",
+        serde_json::json!({ "target": "warehouse" }),
+        JobOptions::new().with_repeat(
+            RepeatOptions::cron("0 0 2 * * * *")
+                .with_limit(30)
+                .with_key("warehouse-nightly-import"),
+        ),
+    )
+    .await?;
+
+assert_eq!(
+    cron_job.repeat_key.as_deref(),
+    Some("warehouse-nightly-import")
+);
 # Ok(())
 # }
 ```

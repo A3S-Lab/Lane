@@ -472,7 +472,7 @@ impl JobQueueBackend for InMemoryJobQueue {
         if completed.options.remove_on_complete {
             inner.jobs.remove(job_id);
         }
-        if let Some(next_job) = next_repeat_job(&completed, now) {
+        if let Some(next_job) = next_repeat_job(&completed, now)? {
             inner.jobs.insert(next_job.id.clone(), next_job);
         }
         if let Some(parent_id) = &completed.parent_id {
@@ -716,30 +716,25 @@ fn state_after_dependencies(scheduled_at: DateTime<Utc>, now: DateTime<Utc>) -> 
 
 fn validate_job_options(options: &JobOptions) -> Result<()> {
     if let Some(repeat) = &options.repeat {
-        if repeat.interval.is_zero() {
-            return Err(LaneError::ConfigError(
-                "repeat interval must be greater than zero".to_string(),
-            ));
-        }
-        if repeat.limit == Some(0) {
-            return Err(LaneError::ConfigError(
-                "repeat limit must be greater than zero".to_string(),
-            ));
-        }
+        repeat.validate()?;
     }
     Ok(())
 }
 
-fn next_repeat_job(job: &Job, now: DateTime<Utc>) -> Option<Job> {
-    let repeat = job.options.repeat.as_ref()?;
+fn next_repeat_job(job: &Job, now: DateTime<Utc>) -> Result<Option<Job>> {
+    let Some(repeat) = job.options.repeat.as_ref() else {
+        return Ok(None);
+    };
     let next_count = job.repeat_count.saturating_add(1);
     if matches!(repeat.limit, Some(limit) if next_count >= limit) {
-        return None;
+        return Ok(None);
     }
 
-    let scheduled_at = add_duration(now, repeat.interval);
+    let Some(scheduled_at) = repeat.next_scheduled_at(now)? else {
+        return Ok(None);
+    };
     if matches!(repeat.end_at, Some(end_at) if scheduled_at > end_at) {
-        return None;
+        return Ok(None);
     }
 
     let mut next = Job::new(
@@ -753,7 +748,7 @@ fn next_repeat_job(job: &Job, now: DateTime<Utc>) -> Option<Job> {
     next.state = state_after_dependencies(scheduled_at, now);
     next.repeat_key = job.repeat_key.clone();
     next.repeat_count = next_count;
-    Some(next)
+    Ok(Some(next))
 }
 
 fn require_active(job: &Job, action: &str) -> Result<()> {

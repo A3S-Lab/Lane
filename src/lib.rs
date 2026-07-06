@@ -93,7 +93,7 @@ pub use job::{
     JobListPage, JobLogEntry, JobOptions, JobPriority, JobProcessor, JobProcessorFn,
     JobQueueBackend, JobQueueSnapshot, JobQueueStats, JobRunOutcome, JobSpec, JobState, JobWorker,
     JobWorkerConfig, JobWorkerHandle, JobWorkerId, LocalJobQueue, QueueName, RepeatOptions,
-    DEFAULT_JOB_PRIORITY,
+    RepeatSchedule, DEFAULT_JOB_PRIORITY,
 };
 pub use manager::{QueueManager, QueueManagerBuilder};
 pub use queue::{

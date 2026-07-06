@@ -4,7 +4,7 @@ use a3s_lane::{
     JobListOptions, JobOptions, JobQueueBackend, JobSpec, JobState, RedisJobQueue, RepeatOptions,
     RetryPolicy,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use redis::AsyncCommands;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -308,8 +308,97 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .iter()
         .any(|job| job.repeat_key.as_deref() == Some("heartbeat")));
 
+    let cron_repeat = producer
+        .add_job(
+            "cron-repeat".to_string(),
+            serde_json::json!({ "kind": "cron-heartbeat" }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::cron("0/1 * * * * * *")
+                    .with_limit(2)
+                    .with_key("cron-heartbeat"),
+            ),
+        )
+        .await
+        .expect("cron repeat job should be added");
+    let first_cron_repeat = worker
+        .claim_next(
+            "worker-cron-repeat-a".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("cron repeat claim should return")
+        .expect("cron repeat job should be claimable");
+    assert_eq!(first_cron_repeat.id, cron_repeat.id);
+    let cron_completed_at = Utc::now();
+    worker
+        .complete_job(
+            &first_cron_repeat.id,
+            serde_json::json!({ "tick": 1 }),
+            cron_completed_at,
+        )
+        .await
+        .expect("first cron repeat should complete");
+    let delayed_cron_repeats = producer
+        .list_jobs(JobListOptions::new().with_state(JobState::Delayed))
+        .await
+        .expect("delayed cron repeat should list");
+    let cron_successor = delayed_cron_repeats
+        .jobs
+        .iter()
+        .find(|job| job.repeat_key.as_deref() == Some("cron-heartbeat"))
+        .expect("cron repeat successor should be delayed");
+    assert_eq!(cron_successor.repeat_count, 1);
+    assert!(cron_successor.scheduled_at > cron_completed_at);
+
+    sleep_until_due(cron_successor.scheduled_at).await;
+    producer
+        .promote_due_jobs(Utc::now())
+        .await
+        .expect("cron repeat successor should promote");
+    let second_cron_repeat = worker
+        .claim_next(
+            "worker-cron-repeat-b".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("second cron repeat claim should return")
+        .expect("second cron repeat should be claimable");
+    assert_eq!(
+        second_cron_repeat.repeat_key.as_deref(),
+        Some("cron-heartbeat")
+    );
+    assert_eq!(second_cron_repeat.repeat_count, 1);
+    worker
+        .complete_job(
+            &second_cron_repeat.id,
+            serde_json::json!({ "tick": 2 }),
+            Utc::now(),
+        )
+        .await
+        .expect("second cron repeat should complete");
+    let delayed_after_cron_limit = producer
+        .list_jobs(JobListOptions::new().with_state(JobState::Delayed))
+        .await
+        .expect("delayed jobs should list after cron repeat limit");
+    assert!(!delayed_after_cron_limit
+        .jobs
+        .iter()
+        .any(|job| job.repeat_key.as_deref() == Some("cron-heartbeat")));
+
     cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())
+}
+
+async fn sleep_until_due(scheduled_at: DateTime<Utc>) {
+    let delay = scheduled_at
+        .signed_duration_since(Utc::now())
+        .to_std()
+        .unwrap_or(Duration::ZERO)
+        .saturating_add(Duration::from_millis(50))
+        .min(Duration::from_secs(2));
+    tokio::time::sleep(delay).await;
 }
 
 fn redis_url() -> Option<String> {
