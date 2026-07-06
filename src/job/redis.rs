@@ -44,6 +44,43 @@ end
 return {'inserted', ARGV[2]}
 "#;
 
+const ADD_FLOW_SCRIPT: &str = r#"
+local count = tonumber(ARGV[1])
+local offset = 2
+
+for index = 1, count do
+  local id = ARGV[offset]
+  if redis.call('HGET', KEYS[1], id) then
+    return {'exists', id}
+  end
+  offset = offset + 5
+end
+
+offset = 2
+for index = 1, count do
+  local id = ARGV[offset]
+  local raw = ARGV[offset + 1]
+  local state = ARGV[offset + 2]
+  local scheduled_score = ARGV[offset + 3]
+  local priority = tonumber(ARGV[offset + 4])
+
+  redis.call('HSET', KEYS[1], id, raw)
+  if state == 'waiting' then
+    local sequence = redis.call('INCR', KEYS[5])
+    local waiting_score = (priority * tonumber(ARGV[2 + count * 5])) + sequence
+    redis.call('ZADD', KEYS[2], waiting_score, id)
+  elseif state == 'delayed' then
+    redis.call('ZADD', KEYS[3], scheduled_score, id)
+  elseif state == 'waiting_children' then
+    redis.call('ZADD', KEYS[4], scheduled_score, id)
+  end
+
+  offset = offset + 5
+end
+
+return {'ok'}
+"#;
+
 const CLAIM_SCRIPT: &str = r#"
 local due_ids = redis.call('ZRANGEBYSCORE', KEYS[6], '-inf', ARGV[10], 'LIMIT', 0, ARGV[12])
 for _, due_id in ipairs(due_ids) do
@@ -478,19 +515,8 @@ impl RedisJobQueue {
         validate_flow_job_ids(&parent_job, &child_jobs)?;
 
         let mut conn = self.connection().await?;
-        for id in std::iter::once(&parent_job.id).chain(child_jobs.iter().map(|job| &job.id)) {
-            if self.load_job(&mut conn, id).await?.is_some() {
-                return Err(LaneError::ConfigError(format!(
-                    "flow job id `{id}` already exists"
-                )));
-            }
-        }
-        self.store_job(&mut conn, &parent_job).await?;
-        self.index_new_job(&mut conn, &parent_job).await?;
-        for child in &child_jobs {
-            self.store_job(&mut conn, child).await?;
-            self.index_new_job(&mut conn, child).await?;
-        }
+        self.add_flow_jobs(&mut conn, &parent_job, &child_jobs)
+            .await?;
 
         Ok(JobFlow {
             parent: parent_job,
@@ -588,6 +614,38 @@ impl RedisJobQueue {
             .await
             .map_err(redis_error)?;
         decode_add_job_result(&result, &job.id)
+    }
+
+    async fn add_flow_jobs(
+        &self,
+        conn: &mut ConnectionManager,
+        parent: &Job,
+        children: &[Job],
+    ) -> Result<()> {
+        let job_count = 1 + children.len();
+        let mut command = redis::cmd("EVAL");
+        command
+            .arg(ADD_FLOW_SCRIPT)
+            .arg(5)
+            .arg(self.jobs_key())
+            .arg(self.state_key(JobState::Waiting))
+            .arg(self.state_key(JobState::Delayed))
+            .arg(self.state_key(JobState::WaitingChildren))
+            .arg(self.sequence_key())
+            .arg(job_count);
+
+        for job in std::iter::once(parent).chain(children.iter()) {
+            command
+                .arg(&job.id)
+                .arg(encode_job(job)?)
+                .arg(job_state_name(job.state))
+                .arg(millis(job.scheduled_at))
+                .arg(job.priority);
+        }
+        command.arg(WAITING_SCORE_BUCKET);
+
+        let result: Vec<String> = command.query_async(conn).await.map_err(redis_error)?;
+        decode_add_flow_result(&result)
     }
 
     async fn index_new_job(&self, conn: &mut ConnectionManager, job: &Job) -> Result<()> {
@@ -1440,6 +1498,24 @@ fn decode_add_job_result(result: &[String], job_id: &str) -> Result<Job> {
         None => Err(LaneError::Other(format!(
             "Redis add job script returned no status for {job_id}"
         ))),
+    }
+}
+
+fn decode_add_flow_result(result: &[String]) -> Result<()> {
+    match result.first().map(String::as_str) {
+        Some("ok") => Ok(()),
+        Some("exists") => {
+            let id = result.get(1).map(String::as_str).unwrap_or("unknown");
+            Err(LaneError::ConfigError(format!(
+                "flow job id `{id}` already exists"
+            )))
+        }
+        Some(other) => Err(LaneError::Other(format!(
+            "unexpected Redis add flow script status `{other}`"
+        ))),
+        None => Err(LaneError::Other(
+            "Redis add flow script returned no status".to_string(),
+        )),
     }
 }
 

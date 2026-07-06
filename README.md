@@ -372,7 +372,7 @@ A3S stack and language SDKs.
 | Generic job runtime | In progress | JSON jobs, bulk submission, idempotent custom job IDs, explicit job states, priority ordering, delayed jobs, token-owned worker leases, completion/failure snapshots, retry backoff, rate-limited claims, shared active concurrency limits, stalled-job recovery, pause/resume. |
 | Job management API | In progress | Add/get/remove/promote/retry/update-priority/pause/resume/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, timeouts, and stalled recovery loops. |
-| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, delayed promotion, claim, rate limit, max-active, flow parent release/failure, complete, fail, renew, and stalled recovery semantics. Postgres/NATS backends remain planned. |
+| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, flow submission, delayed promotion, claim, rate limit, max-active, flow parent release/failure, complete, fail, renew, and stalled recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, and end timestamps are available across in-memory, local durable, and Redis backends. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
@@ -646,6 +646,11 @@ Redis adds are Lua-backed as well. The add script writes the job JSON and the
 waiting, delayed, or waiting-children index in the same Redis turn. If a custom
 job id already exists, the script returns the existing job without advancing the
 waiting sequence or writing duplicate state indexes.
+
+Redis flow submission is all-or-nothing: the flow add script first checks every
+parent and child job id, then writes the parent, children, and all state indexes
+in one Redis turn. If any job id already exists, no partial parent or child
+records are created.
 
 Flow fan-in is also protected in Redis transitions. When a child job completes
 or reaches terminal failure, the completion/failure Lua script updates the

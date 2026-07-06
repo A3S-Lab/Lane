@@ -627,6 +627,66 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     assert_eq!(stats.failed, 1);
     assert_eq!(stats.active, 1);
 
+    let mut flow_index_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let existing_flow_child_id = format!("{namespace}:flow:existing-child");
+    producer
+        .add_job(
+            "existing-flow-child".to_string(),
+            serde_json::json!({ "kind": "existing" }),
+            JobOptions::new()
+                .with_job_id(existing_flow_child_id.clone())
+                .with_delay(Duration::from_secs(60)),
+        )
+        .await
+        .expect("existing flow child id should be added");
+    let rejected_flow_parent_id = format!("{namespace}:flow:rejected-parent");
+    let rejected_flow_new_child_id = format!("{namespace}:flow:rejected-new-child");
+    let rejected_flow = producer
+        .add_flow_at(
+            JobSpec::new(
+                "rejected-flow-parent",
+                serde_json::json!({ "kind": "aggregate" }),
+            )
+            .with_options(JobOptions::new().with_job_id(rejected_flow_parent_id.clone())),
+            vec![
+                JobSpec::new("duplicate-flow-child", serde_json::json!({ "n": 1 }))
+                    .with_options(JobOptions::new().with_job_id(existing_flow_child_id.clone())),
+                JobSpec::new("new-flow-child", serde_json::json!({ "n": 2 })).with_options(
+                    JobOptions::new().with_job_id(rejected_flow_new_child_id.clone()),
+                ),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect_err("flow with an existing Redis job id should be rejected");
+    assert!(matches!(rejected_flow, LaneError::ConfigError(_)));
+    assert!(producer
+        .get_job(&rejected_flow_parent_id)
+        .await
+        .expect("rejected flow parent lookup should return")
+        .is_none());
+    assert!(producer
+        .get_job(&rejected_flow_new_child_id)
+        .await
+        .expect("rejected flow child lookup should return")
+        .is_none());
+    let rejected_parent_waiting_children_score: Option<f64> = flow_index_conn
+        .zscore(
+            format!("{namespace}:jobs:waiting_children"),
+            &rejected_flow_parent_id,
+        )
+        .await?;
+    assert!(rejected_parent_waiting_children_score.is_none());
+    let rejected_child_waiting_score: Option<f64> = flow_index_conn
+        .zscore(
+            format!("{namespace}:jobs:waiting"),
+            &rejected_flow_new_child_id,
+        )
+        .await?;
+    assert!(rejected_child_waiting_score.is_none());
+
     let flow = producer
         .add_flow_at(
             JobSpec::new("flow-parent", serde_json::json!({ "kind": "aggregate" }))
@@ -698,9 +758,6 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("released parent should load")
         .expect("released parent should exist");
     assert_eq!(parent.state, JobState::Waiting);
-    let mut flow_index_conn = redis::Client::open(redis_url.as_str())?
-        .get_connection_manager()
-        .await?;
     let released_parent_waiting_score: Option<f64> = flow_index_conn
         .zscore(format!("{namespace}:jobs:waiting"), &flow.parent.id)
         .await?;
