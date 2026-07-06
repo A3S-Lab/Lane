@@ -1038,6 +1038,131 @@ end
 return removed
 "#;
 
+const LIST_JOBS_SCRIPT: &str = r#"
+local function iso_sort_key(value)
+  if not value or value == cjson.null then
+    return ''
+  end
+
+  local base = string.sub(value, 1, 19)
+  local digits = ''
+  if string.sub(value, 20, 20) == "." then
+    digits = string.match(string.sub(value, 21), "^(%d+)") or ''
+  end
+  digits = string.sub(digits .. "000000000", 1, 9)
+  return base .. "." .. digits
+end
+
+local function state_rank(state)
+  if state == 'waiting' then
+    return 0
+  elseif state == 'delayed' then
+    return 1
+  elseif state == 'active' then
+    return 2
+  elseif state == 'waiting_children' then
+    return 3
+  elseif state == 'completed' then
+    return 4
+  elseif state == 'failed' then
+    return 5
+  end
+  return 6
+end
+
+local offset = tonumber(ARGV[1])
+local limit = tonumber(ARGV[2])
+local state = ARGV[3]
+local result = {}
+
+if state ~= '' then
+  local state_key = nil
+  if state == 'waiting' then
+    state_key = KEYS[2]
+  elseif state == 'delayed' then
+    state_key = KEYS[3]
+  elseif state == 'active' then
+    state_key = KEYS[4]
+  elseif state == 'waiting_children' then
+    state_key = KEYS[5]
+  elseif state == 'completed' then
+    state_key = KEYS[6]
+  elseif state == 'failed' then
+    state_key = KEYS[7]
+  else
+    return {'bad_state'}
+  end
+
+  local ids = redis.call('ZRANGE', state_key, 0, -1)
+  local raws = {}
+  for _, id in ipairs(ids) do
+    local raw = redis.call('HGET', KEYS[1], id)
+    if raw then
+      local job = cjson.decode(raw)
+      if job["state"] == state then
+        table.insert(raws, raw)
+      else
+        redis.call('ZREM', state_key, id)
+      end
+    else
+      redis.call('ZREM', state_key, id)
+    end
+  end
+
+  result[1] = #raws
+  if limit > 0 then
+    local first = offset + 1
+    local last = math.min(offset + limit, #raws)
+    local out = 2
+    for index = first, last do
+      result[out] = raws[index]
+      out = out + 1
+    end
+  end
+  return result
+end
+
+local raw_jobs = redis.call('HVALS', KEYS[1])
+local jobs = {}
+for _, raw in ipairs(raw_jobs) do
+  local job = cjson.decode(raw)
+  table.insert(jobs, {
+    raw = raw,
+    state_rank = state_rank(job["state"]),
+    priority = tonumber(job["priority"] or '1000') or 1000,
+    scheduled_at = iso_sort_key(job["scheduled_at"]),
+    created_at = iso_sort_key(job["created_at"]),
+    id = job["id"] or ''
+  })
+end
+
+table.sort(jobs, function(left, right)
+  if left.state_rank ~= right.state_rank then
+    return left.state_rank < right.state_rank
+  elseif left.priority ~= right.priority then
+    return left.priority < right.priority
+  elseif left.scheduled_at ~= right.scheduled_at then
+    return left.scheduled_at < right.scheduled_at
+  elseif left.created_at ~= right.created_at then
+    return left.created_at < right.created_at
+  end
+  return left.id < right.id
+end)
+
+result[1] = #jobs
+if limit > 0 then
+  local first = offset + 1
+  local last = math.min(offset + limit, #jobs)
+  local out = 2
+  for index = first, last do
+    result[out] = jobs[index].raw
+    out = out + 1
+  end
+end
+
+return result
+"#;
+
 const UPDATE_PROGRESS_SCRIPT: &str = r#"
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
@@ -1742,63 +1867,23 @@ impl JobQueueBackend for RedisJobQueue {
 
     async fn list_jobs(&self, options: JobListOptions) -> Result<JobListPage> {
         let mut conn = self.connection().await?;
-        if let Some(state) = options.state {
-            let total: usize = conn
-                .zcard(self.state_key(state))
-                .await
-                .map_err(redis_error)?;
-            let end = if options.limit == 0 {
-                options.offset
-            } else {
-                options
-                    .offset
-                    .saturating_add(options.limit)
-                    .saturating_sub(1)
-            };
-            let ids: Vec<String> = if options.limit == 0 {
-                Vec::new()
-            } else {
-                redis::cmd("ZRANGE")
-                    .arg(self.state_key(state))
-                    .arg(options.offset)
-                    .arg(end)
-                    .query_async(&mut conn)
-                    .await
-                    .map_err(redis_error)?
-            };
-            let jobs = self.load_jobs(&mut conn, ids).await?;
-            return Ok(JobListPage {
-                jobs,
-                total,
-                offset: options.offset,
-                limit: options.limit,
-            });
-        }
-
-        let raw_jobs: Vec<String> = redis::cmd("HVALS")
+        let result: Vec<redis::Value> = redis::cmd("EVAL")
+            .arg(LIST_JOBS_SCRIPT)
+            .arg(7)
             .arg(self.jobs_key())
+            .arg(self.state_key(JobState::Waiting))
+            .arg(self.state_key(JobState::Delayed))
+            .arg(self.state_key(JobState::Active))
+            .arg(self.state_key(JobState::WaitingChildren))
+            .arg(self.state_key(JobState::Completed))
+            .arg(self.state_key(JobState::Failed))
+            .arg(options.offset)
+            .arg(options.limit)
+            .arg(options.state.map(job_state_name).unwrap_or(""))
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
-        let mut jobs = raw_jobs
-            .into_iter()
-            .map(|raw| decode_job(&raw))
-            .collect::<Result<Vec<_>>>()?;
-        jobs.sort_by(compare_list_order);
-        let total = jobs.len();
-        let start = options.offset.min(total);
-        let end = start.saturating_add(options.limit).min(total);
-        let jobs = if options.limit == 0 {
-            Vec::new()
-        } else {
-            jobs[start..end].to_vec()
-        };
-        Ok(JobListPage {
-            jobs,
-            total,
-            offset: options.offset,
-            limit: options.limit,
-        })
+        decode_list_jobs_result(&result, options.offset, options.limit)
     }
 
     async fn update_progress(&self, job_id: &str, progress: Value) -> Result<Job> {
@@ -1929,16 +2014,6 @@ impl RedisJobQueue {
         self.load_job(conn, job_id)
             .await?
             .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))
-    }
-
-    async fn load_jobs(&self, conn: &mut ConnectionManager, ids: Vec<String>) -> Result<Vec<Job>> {
-        let mut jobs = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(job) = self.load_job(conn, &id).await? {
-                jobs.push(job);
-            }
-        }
-        Ok(jobs)
     }
 }
 
@@ -2094,6 +2169,47 @@ fn decode_clean_jobs_result(result: &[String]) -> Result<Vec<Job>> {
     result.iter().map(|raw| decode_job(raw)).collect()
 }
 
+fn decode_list_jobs_result(
+    result: &[redis::Value],
+    offset: usize,
+    limit: usize,
+) -> Result<JobListPage> {
+    if result.is_empty() {
+        return Err(LaneError::Other(
+            "Redis list jobs script returned no values".to_string(),
+        ));
+    }
+
+    if matches!(decode_redis_string(&result[0]).as_deref(), Ok("bad_state")) {
+        return Err(LaneError::Other(
+            "Redis list jobs script received an unknown state".to_string(),
+        ));
+    }
+
+    let total = redis::from_redis_value::<usize>(&result[0]).map_err(redis_error)?;
+    let jobs = result[1..]
+        .iter()
+        .map(|value| {
+            let raw = decode_redis_string(value)?;
+            decode_job(&raw)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if limit > 0 && jobs.len() > limit {
+        return Err(LaneError::Other(format!(
+            "Redis list jobs script returned {} jobs, expected at most {limit}",
+            jobs.len()
+        )));
+    }
+
+    Ok(JobListPage {
+        jobs,
+        total,
+        offset,
+        limit,
+    })
+}
+
 fn decode_stats_result(result: &[i64]) -> Result<JobQueueStats> {
     if result.len() != 7 {
         return Err(LaneError::Other(format!(
@@ -2150,6 +2266,10 @@ fn decode_stats_count(value: i64, field: &str) -> Result<usize> {
     })
 }
 
+fn decode_redis_string(value: &redis::Value) -> Result<String> {
+    redis::from_redis_value::<String>(value).map_err(redis_error)
+}
+
 fn normalize_lua_empty_array(value: &mut Value, field: &str) {
     let Some(object) = value.as_object_mut() else {
         return;
@@ -2201,26 +2321,6 @@ fn duration_millis(duration: Duration) -> u64 {
 fn should_retry(job: &Job) -> bool {
     job.options.retry_policy.max_retries > 0
         && job.attempts_made <= job.options.retry_policy.max_retries
-}
-
-fn compare_list_order(a: &Job, b: &Job) -> std::cmp::Ordering {
-    state_rank(a.state)
-        .cmp(&state_rank(b.state))
-        .then_with(|| a.priority.cmp(&b.priority))
-        .then_with(|| a.scheduled_at.cmp(&b.scheduled_at))
-        .then_with(|| a.created_at.cmp(&b.created_at))
-        .then_with(|| a.id.cmp(&b.id))
-}
-
-fn state_rank(state: JobState) -> u8 {
-    match state {
-        JobState::Waiting => 0,
-        JobState::Delayed => 1,
-        JobState::Active => 2,
-        JobState::WaitingChildren => 3,
-        JobState::Completed => 4,
-        JobState::Failed => 5,
-    }
 }
 
 fn state_after_dependencies(scheduled_at: DateTime<Utc>, now: DateTime<Utc>) -> JobState {
@@ -2351,6 +2451,53 @@ mod tests {
         assert!(decoded.logs.is_empty());
         assert!(decoded.child_ids.is_empty());
         assert_eq!(decoded.payload, serde_json::json!({ "n": 1 }));
+    }
+
+    #[test]
+    fn decode_list_jobs_result_builds_page() {
+        let job = Job::new(
+            "jobs".to_string(),
+            "list".to_string(),
+            serde_json::json!({ "n": 1 }),
+            JobOptions::new(),
+            Utc.timestamp_millis_opt(10_000).unwrap(),
+        );
+        let raw = encode_job(&job).expect("job should encode");
+
+        let page = decode_list_jobs_result(
+            &[
+                redis::Value::Int(3),
+                redis::Value::BulkString(raw.into_bytes()),
+            ],
+            2,
+            10,
+        )
+        .expect("valid Redis list jobs payload should decode");
+
+        assert_eq!(page.total, 3);
+        assert_eq!(page.offset, 2);
+        assert_eq!(page.limit, 10);
+        assert_eq!(page.jobs, vec![job]);
+    }
+
+    #[test]
+    fn decode_list_jobs_result_rejects_bad_script_payloads() {
+        let empty = decode_list_jobs_result(&[], 0, 10)
+            .expect_err("empty Redis list jobs payload should be rejected");
+        assert!(matches!(
+            empty,
+            LaneError::Other(message)
+                if message == "Redis list jobs script returned no values"
+        ));
+
+        let bad_state =
+            decode_list_jobs_result(&[redis::Value::BulkString(b"bad_state".to_vec())], 0, 10)
+                .expect_err("bad state payload should be rejected");
+        assert!(matches!(
+            bad_state,
+            LaneError::Other(message)
+                if message == "Redis list jobs script received an unknown state"
+        ));
     }
 
     #[test]
