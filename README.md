@@ -371,7 +371,7 @@ A3S stack and language SDKs.
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
 | Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, explicit job states, priority ordering, delayed jobs, token-owned worker leases, completion/failure snapshots, retry backoff, rate-limited claims, shared active concurrency limits, stalled-job recovery, pause/resume. |
 | Job management API | In progress | Add/get/remove/promote/retry/update-priority/pause/resume/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
-| Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, timeouts, and stalled recovery loops. |
+| Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, and stalled recovery loops. |
 | Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, flow submission, delayed promotion, single-job promote, manual retry, priority update, progress update, log append, clean, claim, rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, and end timestamps are available across in-memory, local durable, and Redis backends. |
@@ -721,6 +721,7 @@ backend
     .await?;
 
 let send_processor: Arc<dyn JobProcessor> = Arc::new(job_processor_fn(|job, context| async move {
+    context.ensure_lease()?;
     context.update_progress(serde_json::json!({ "phase": "sending" })).await?;
     context.add_log("provider accepted message").await?;
     Ok(serde_json::json!({ "sent": job.payload["to"] }))
@@ -737,6 +738,11 @@ worker.run_until_idle(100).await?;
 # Ok(())
 # }
 ```
+
+`JobContext::has_lost_lease()` and `JobContext::ensure_lease()` let long-running
+processors stop before doing more external work after the worker observes a
+failed lease renewal. Context progress and log helpers also refuse to write once
+that lease-loss flag is set.
 
 ## Benchmarks
 

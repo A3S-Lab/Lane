@@ -1509,6 +1509,78 @@ async fn worker_timeout_fails_job() {
 }
 
 #[tokio::test]
+async fn worker_context_reports_lost_lease_after_renewal_failure() {
+    let queue = Arc::new(InMemoryJobQueue::new("worker-lease-lost"));
+    let backend: Arc<dyn JobQueueBackend> = queue.clone();
+    let job = backend
+        .add_job(
+            "lease-sensitive".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .unwrap();
+
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (lost_tx, mut lost_rx) = tokio::sync::mpsc::unbounded_channel();
+    let processor = Arc::new(job_processor_fn(move |_job: Job, context: JobContext| {
+        let started_tx = started_tx.clone();
+        let lost_tx = lost_tx.clone();
+        async move {
+            let _ = started_tx.send(());
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            loop {
+                if context.has_lost_lease() {
+                    let progress_error = context
+                        .update_progress(serde_json::json!({ "stale": true }))
+                        .await
+                        .unwrap_err();
+                    assert!(matches!(progress_error, LaneError::JobLeaseConflict(_)));
+                    let _ = lost_tx.send(());
+                    return Ok(serde_json::json!({ "stale": true }));
+                }
+
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(LaneError::Other(
+                        "lease loss was not reported to the processor".to_string(),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }));
+    let worker = JobWorker::new(
+        Arc::clone(&backend),
+        processor,
+        JobWorkerConfig::new("worker-a")
+            .with_lease_duration(Duration::from_secs(30))
+            .with_lease_renew_interval(Duration::from_millis(10)),
+    );
+
+    let run = tokio::spawn(async move { worker.run_once(ts(1_000)).await });
+    tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+        .await
+        .expect("processor should start")
+        .expect("processor should send start signal");
+
+    assert_eq!(queue.recover_stalled_jobs(ts(40_000)).await.unwrap(), 1);
+    tokio::time::timeout(Duration::from_secs(1), lost_rx.recv())
+        .await
+        .expect("processor should observe lost lease")
+        .expect("processor should send lost lease signal");
+
+    let error = run
+        .await
+        .expect("worker task should join")
+        .expect_err("worker should not finalize a job after lease loss");
+    assert!(matches!(error, LaneError::JobLeaseConflict(_)));
+    assert_eq!(
+        backend.get_job(&job.id).await.unwrap().unwrap().state,
+        JobState::Waiting
+    );
+}
+
+#[tokio::test]
 async fn worker_run_until_idle_processes_ready_jobs() {
     let backend: Arc<dyn JobQueueBackend> = Arc::new(InMemoryJobQueue::new("worker"));
     for name in ["a", "b"] {

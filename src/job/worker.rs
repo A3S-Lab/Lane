@@ -125,6 +125,7 @@ pub struct JobContext {
     lock_token: JobLockToken,
     lease_duration: Duration,
     log_retention: usize,
+    lease_lost: Arc<AtomicBool>,
 }
 
 impl JobContext {
@@ -135,6 +136,7 @@ impl JobContext {
         lock_token: JobLockToken,
         lease_duration: Duration,
         log_retention: usize,
+        lease_lost: Arc<AtomicBool>,
     ) -> Self {
         Self {
             backend,
@@ -143,6 +145,7 @@ impl JobContext {
             lock_token,
             lease_duration,
             log_retention,
+            lease_lost,
         }
     }
 
@@ -161,13 +164,32 @@ impl JobContext {
         &self.lock_token
     }
 
+    /// Whether the worker has observed that it no longer owns the job lease.
+    pub fn has_lost_lease(&self) -> bool {
+        self.lease_lost.load(Ordering::Relaxed)
+    }
+
+    /// Return an error if the worker has observed that it lost the job lease.
+    pub fn ensure_lease(&self) -> Result<()> {
+        if self.has_lost_lease() {
+            Err(LaneError::JobLeaseConflict(format!(
+                "worker {} lost lease for job {}",
+                self.worker_id, self.job_id
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Store a progress value for the current job.
     pub async fn update_progress(&self, progress: Value) -> Result<Job> {
+        self.ensure_lease()?;
         self.backend.update_progress(&self.job_id, progress).await
     }
 
     /// Append a retained log line for the current job.
     pub async fn add_log(&self, line: impl Into<String>) -> Result<Job> {
+        self.ensure_lease()?;
         self.backend
             .add_log(&self.job_id, line.into(), self.log_retention, Utc::now())
             .await
@@ -175,7 +197,9 @@ impl JobContext {
 
     /// Renew the current job lease using the worker's configured lease duration.
     pub async fn renew_lease(&self) -> Result<Job> {
-        self.backend
+        self.ensure_lease()?;
+        match self
+            .backend
             .renew_lease(
                 &self.job_id,
                 &self.lock_token,
@@ -183,6 +207,13 @@ impl JobContext {
                 Utc::now(),
             )
             .await
+        {
+            Ok(job) => Ok(job),
+            Err(error) => {
+                self.lease_lost.store(true, Ordering::Relaxed);
+                Err(error)
+            }
+        }
     }
 }
 
@@ -395,17 +426,27 @@ impl JobWorker {
             lock_token.clone(),
             self.config.lease_duration,
             self.config.log_retention,
+            Arc::new(AtomicBool::new(false)),
         );
 
         let lease_shutdown = Arc::new(AtomicBool::new(false));
         let renew_handle = self.spawn_lease_renewer(context.clone(), Arc::clone(&lease_shutdown));
         let job_id = job.id.clone();
         let timeout = job.options.timeout;
-        let result = self.process_with_timeout(job, context, timeout).await;
+        let result = self
+            .process_with_timeout(job, context.clone(), timeout)
+            .await;
         lease_shutdown.store(true, Ordering::Relaxed);
         if let Some(handle) = renew_handle {
             handle.abort();
             let _ = handle.await;
+        }
+
+        if context.has_lost_lease() {
+            return Err(LaneError::JobLeaseConflict(format!(
+                "worker {} lost lease for job {job_id} before finalizing",
+                self.config.worker_id
+            )));
         }
 
         match result {
