@@ -1,7 +1,7 @@
 use super::backend::JobQueueBackend;
 use super::types::{
     add_duration, Job, JobFlow, JobListOptions, JobListPage, JobLogEntry, JobOptions, JobPriority,
-    JobQueueStats, JobSpec, JobState, JobWorkerId, QueueName,
+    JobQueueStats, JobRateLimit, JobSpec, JobState, JobWorkerId, QueueName,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -16,6 +16,14 @@ use uuid::Uuid;
 const WAITING_SCORE_BUCKET: f64 = 1_000_000_000_000.0;
 
 const CLAIM_SCRIPT: &str = r#"
+local rate_limit_max = tonumber(ARGV[8])
+if rate_limit_max and rate_limit_max > 0 then
+  local current_claims = tonumber(redis.call('GET', KEYS[4]) or '0')
+  if current_claims >= rate_limit_max then
+    return nil
+  end
+end
+
 local ids = redis.call('ZRANGE', KEYS[1], 0, 0)
 if #ids == 0 then
   return nil
@@ -30,6 +38,12 @@ end
 
 local lock_key = ARGV[7] .. id
 redis.call('SET', lock_key, ARGV[5], 'PX', ARGV[6])
+if rate_limit_max and rate_limit_max > 0 then
+  local counter = redis.call('INCR', KEYS[4])
+  if counter == 1 then
+    redis.call('PEXPIRE', KEYS[4], ARGV[9])
+  end
+end
 
 local job = cjson.decode(raw)
 job["state"] = "active"
@@ -171,6 +185,7 @@ pub struct RedisJobQueue {
     client: redis::Client,
     namespace: String,
     queue: QueueName,
+    claim_rate_limit: Option<JobRateLimit>,
 }
 
 impl RedisJobQueue {
@@ -191,7 +206,17 @@ impl RedisJobQueue {
             client,
             namespace: namespace.into(),
             queue: queue.into(),
+            claim_rate_limit: None,
         })
+    }
+
+    /// Configure a Redis-backed queue-level claim rate limit.
+    ///
+    /// The limit is shared by every worker using the same namespace and queue.
+    pub fn with_claim_rate_limit(mut self, rate_limit: JobRateLimit) -> Result<Self> {
+        rate_limit.validate()?;
+        self.claim_rate_limit = Some(rate_limit);
+        Ok(self)
     }
 
     /// Queue name.
@@ -332,6 +357,10 @@ impl RedisJobQueue {
 
     fn sequence_key(&self) -> String {
         self.key("sequence")
+    }
+
+    fn claim_rate_limit_key(&self) -> String {
+        self.key("claim_rate_limit")
     }
 
     fn lock_key(&self, job_id: &str) -> String {
@@ -632,12 +661,18 @@ impl JobQueueBackend for RedisJobQueue {
 
         let lease_expires_at = add_duration(now, lease_for);
         let lock_token = Uuid::new_v4().to_string();
+        let (rate_limit_max, rate_limit_window_ms) = self
+            .claim_rate_limit
+            .as_ref()
+            .map(|limit| (limit.max_claims, duration_millis(limit.window).max(1)))
+            .unwrap_or((0, 0));
         let raw: Option<String> = redis::cmd("EVAL")
             .arg(CLAIM_SCRIPT)
-            .arg(3)
+            .arg(4)
             .arg(self.state_key(JobState::Waiting))
             .arg(self.state_key(JobState::Active))
             .arg(self.jobs_key())
+            .arg(self.claim_rate_limit_key())
             .arg(millis(lease_expires_at))
             .arg(now.to_rfc3339())
             .arg(worker_id)
@@ -645,6 +680,8 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(&lock_token)
             .arg(lock_duration_millis(lease_for))
             .arg(self.lock_key_prefix())
+            .arg(rate_limit_max)
+            .arg(rate_limit_window_ms)
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -1281,7 +1318,11 @@ fn waiting_score(priority: JobPriority, sequence: u64) -> f64 {
 }
 
 fn lock_duration_millis(duration: Duration) -> u64 {
-    duration.as_millis().try_into().unwrap_or(u64::MAX).max(1)
+    duration_millis(duration).max(1)
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 fn should_retry(job: &Job) -> bool {
@@ -1403,6 +1444,25 @@ mod tests {
             subtract_duration(now, Duration::from_millis(250)),
             Utc.timestamp_millis_opt(9_750).unwrap()
         );
+    }
+
+    #[test]
+    fn claim_rate_limit_rejects_invalid_values() {
+        let queue = RedisJobQueue::with_namespace("redis://127.0.0.1/", "test:lane", "email")
+            .expect("valid Redis URL should build a queue client");
+
+        let zero_max = queue
+            .clone()
+            .with_claim_rate_limit(JobRateLimit::new(0, Duration::from_secs(1)))
+            .err()
+            .expect("zero max should be rejected");
+        assert!(matches!(zero_max, LaneError::ConfigError(_)));
+
+        let zero_window = queue
+            .with_claim_rate_limit(JobRateLimit::new(1, Duration::ZERO))
+            .err()
+            .expect("zero window should be rejected");
+        assert!(matches!(zero_window, LaneError::ConfigError(_)));
     }
 
     #[test]

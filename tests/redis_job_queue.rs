@@ -1,8 +1,8 @@
 #![cfg(feature = "redis-backend")]
 
 use a3s_lane::{
-    JobListOptions, JobOptions, JobQueueBackend, JobSpec, JobState, LaneError, RedisJobQueue,
-    RepeatOptions, RetryPolicy,
+    JobListOptions, JobOptions, JobQueueBackend, JobRateLimit, JobSpec, JobState, LaneError,
+    RedisJobQueue, RepeatOptions, RetryPolicy,
 };
 use chrono::{DateTime, Utc};
 use redis::AsyncCommands;
@@ -77,6 +77,77 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("priority job should complete");
+
+    let rate_producer = RedisJobQueue::with_namespace(&redis_url, &namespace, "rate")
+        .expect("valid Redis URL should build the rate producer");
+    let rate_worker = RedisJobQueue::with_namespace(&redis_url, &namespace, "rate")
+        .expect("valid Redis URL should build the rate worker")
+        .with_claim_rate_limit(JobRateLimit::new(1, Duration::from_millis(200)))
+        .expect("rate limit should be valid");
+    let rate_first = rate_producer
+        .add_job(
+            "rate-first".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("first rate-limited job should be added");
+    let rate_second = rate_producer
+        .add_job(
+            "rate-second".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("second rate-limited job should be added");
+    let first_rate_claim = rate_worker
+        .claim_next(
+            "worker-rate".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("first rate claim should return")
+        .expect("first rate job should be claimable");
+    assert_eq!(first_rate_claim.id, rate_first.id);
+    assert!(rate_worker
+        .claim_next(
+            "worker-rate".to_string(),
+            Duration::from_secs(30),
+            Utc::now()
+        )
+        .await
+        .expect("rate-limited claim should return")
+        .is_none());
+    rate_worker
+        .complete_job(
+            &first_rate_claim.id,
+            lock_token(&first_rate_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("first rate job should complete");
+    tokio::time::sleep(Duration::from_millis(240)).await;
+    let second_rate_claim = rate_worker
+        .claim_next(
+            "worker-rate".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("second rate claim should return")
+        .expect("second rate job should be claimable after window");
+    assert_eq!(second_rate_claim.id, rate_second.id);
+    rate_worker
+        .complete_job(
+            &second_rate_claim.id,
+            lock_token(&second_rate_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("second rate job should complete");
 
     producer.pause().await.expect("pause should succeed");
     let high = producer

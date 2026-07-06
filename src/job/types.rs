@@ -26,6 +26,51 @@ pub type JobPriority = u32;
 /// Default priority for jobs that do not specify one.
 pub const DEFAULT_JOB_PRIORITY: JobPriority = 1000;
 
+/// Queue-level rate limit for claiming generic jobs.
+///
+/// The limit is counted when a job is successfully moved from waiting to
+/// active. Workers that hit the limit simply receive no job and can poll again
+/// later.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobRateLimit {
+    /// Maximum number of claimed jobs in the window.
+    pub max_claims: u64,
+    /// Window duration.
+    pub window: Duration,
+}
+
+impl JobRateLimit {
+    /// Create a rate limit for claimed jobs.
+    pub fn new(max_claims: u64, window: Duration) -> Self {
+        Self { max_claims, window }
+    }
+
+    /// Limit claimed jobs per second.
+    pub fn per_second(max_claims: u64) -> Self {
+        Self::new(max_claims, Duration::from_secs(1))
+    }
+
+    /// Limit claimed jobs per minute.
+    pub fn per_minute(max_claims: u64) -> Self {
+        Self::new(max_claims, Duration::from_secs(60))
+    }
+
+    /// Validate the rate limit values.
+    pub fn validate(&self) -> Result<()> {
+        if self.max_claims == 0 {
+            return Err(LaneError::ConfigError(
+                "job claim rate limit max_claims must be greater than zero".to_string(),
+            ));
+        }
+        if self.window.is_zero() {
+            return Err(LaneError::ConfigError(
+                "job claim rate limit window must be greater than zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Lifecycle state for a durable job.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]

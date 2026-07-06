@@ -91,9 +91,9 @@ pub use job::RedisJobQueue;
 pub use job::{
     job_processor_fn, InMemoryJobQueue, Job, JobContext, JobFlow, JobId, JobListOptions,
     JobListPage, JobLockToken, JobLogEntry, JobOptions, JobPriority, JobProcessor, JobProcessorFn,
-    JobProcessorRouter, JobQueueBackend, JobQueueSnapshot, JobQueueStats, JobRunOutcome, JobSpec,
-    JobState, JobWorker, JobWorkerConfig, JobWorkerHandle, JobWorkerId, LocalJobQueue, QueueName,
-    RepeatOptions, RepeatSchedule, DEFAULT_JOB_PRIORITY,
+    JobProcessorRouter, JobQueueBackend, JobQueueSnapshot, JobQueueStats, JobRateLimit,
+    JobRunOutcome, JobSpec, JobState, JobWorker, JobWorkerConfig, JobWorkerHandle, JobWorkerId,
+    LocalJobQueue, QueueName, RepeatOptions, RepeatSchedule, DEFAULT_JOB_PRIORITY,
 };
 pub use manager::{QueueManager, QueueManagerBuilder};
 pub use queue::{

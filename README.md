@@ -369,10 +369,10 @@ A3S stack and language SDKs.
 | Phase | Status | Scope |
 | --- | --- | --- |
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
-| Generic job runtime | In progress | JSON jobs, bulk submission, idempotent custom job IDs, explicit job states, priority ordering, delayed jobs, token-owned worker leases, completion/failure snapshots, retry backoff, stalled-job recovery, pause/resume. |
+| Generic job runtime | In progress | JSON jobs, bulk submission, idempotent custom job IDs, explicit job states, priority ordering, delayed jobs, token-owned worker leases, completion/failure snapshots, retry backoff, rate-limited claims, stalled-job recovery, pause/resume. |
 | Job management API | In progress | Add/get/remove/promote/retry/update-priority/pause/resume/clean APIs, state queries, pagination, job logs, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, timeouts, and stalled recovery loops. |
-| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed claim, complete, fail, renew, and stalled recovery semantics. Postgres/NATS backends remain planned. |
+| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed claim, rate limit, complete, fail, renew, and stalled recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, and end timestamps are available across in-memory, local durable, and Redis backends. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
@@ -580,7 +580,7 @@ script mutates the active/completed/failed/delayed indexes. Stalled recovery
 checks the TTL lock key, not only the job JSON snapshot:
 
 ```rust
-use a3s_lane::{JobOptions, JobQueueBackend, RedisJobQueue, RetryPolicy};
+use a3s_lane::{JobOptions, JobQueueBackend, JobRateLimit, RedisJobQueue, RetryPolicy};
 use std::time::Duration;
 
 # async fn redis_example() -> a3s_lane::Result<()> {
@@ -588,7 +588,8 @@ let queue = RedisJobQueue::with_namespace(
     "redis://127.0.0.1/",
     "a3s:lane",
     "email",
-)?;
+)?
+.with_claim_rate_limit(JobRateLimit::new(100, Duration::from_secs(60)))?;
 
 let job = queue
     .add_job(
@@ -622,6 +623,10 @@ assert_eq!(queue.get_job(&job.id).await?.map(|job| job.name), Some("send".to_str
 # Ok(())
 # }
 ```
+
+The claim rate limit is shared through Redis for workers that use the same
+namespace and queue. When the window is exhausted, `claim_next()` returns
+`None` and the job remains waiting for a later poll.
 
 Run the Redis integration test against any reachable Redis server:
 
