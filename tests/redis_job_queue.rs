@@ -4054,6 +4054,15 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     );
     assert_eq!(flow_dependencies.pending_child_ids, flow.parent.child_ids);
     assert!(flow_dependencies.missing_child_ids.is_empty());
+    let flow_counts = producer
+        .get_flow_dependency_counts(&flow.parent.id)
+        .await
+        .expect("flow dependency counts should load")
+        .expect("flow dependency counts should exist");
+    assert_eq!(flow_counts.processed, 0);
+    assert_eq!(flow_counts.unprocessed, 2);
+    assert_eq!(flow_counts.failed, 0);
+    assert_eq!(flow_counts.missing, 0);
 
     let child_a = worker
         .claim_next(
@@ -4094,6 +4103,15 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         vec![flow.children[1].id.clone()]
     );
     assert!(flow_dependencies_after_child_a.missing_child_ids.is_empty());
+    let flow_counts_after_child_a = producer
+        .get_flow_dependency_counts(&flow.parent.id)
+        .await
+        .expect("flow dependency counts after child a should load")
+        .expect("flow dependency counts after child a should exist");
+    assert_eq!(flow_counts_after_child_a.processed, 1);
+    assert_eq!(flow_counts_after_child_a.unprocessed, 1);
+    assert_eq!(flow_counts_after_child_a.failed, 0);
+    assert_eq!(flow_counts_after_child_a.missing, 0);
     assert_eq!(
         producer
             .get_job(&flow.parent.id)
@@ -4150,6 +4168,15 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("flow dependencies after release should exist");
     assert!(flow_dependencies_after_release.pending_child_ids.is_empty());
     assert!(flow_dependencies_after_release.missing_child_ids.is_empty());
+    let flow_counts_after_release = producer
+        .get_flow_dependency_counts(&flow.parent.id)
+        .await
+        .expect("flow dependency counts after release should load")
+        .expect("flow dependency counts after release should exist");
+    assert_eq!(flow_counts_after_release.processed, 2);
+    assert_eq!(flow_counts_after_release.unprocessed, 0);
+    assert_eq!(flow_counts_after_release.failed, 0);
+    assert_eq!(flow_counts_after_release.missing, 0);
     let claimed_parent = worker
         .claim_next(
             "worker-flow-parent".to_string(),
@@ -4218,6 +4245,15 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         remove_released_dependencies.missing_child_ids,
         vec![remove_release_flow.children[1].id.clone()]
     );
+    let remove_released_counts = producer
+        .get_flow_dependency_counts(&remove_release_flow.parent.id)
+        .await
+        .expect("remove-released dependency counts should load")
+        .expect("remove-released dependency counts should exist");
+    assert_eq!(remove_released_counts.processed, 1);
+    assert_eq!(remove_released_counts.unprocessed, 0);
+    assert_eq!(remove_released_counts.failed, 0);
+    assert_eq!(remove_released_counts.missing, 1);
     let remove_released_parent_waiting_score: Option<f64> = flow_index_conn
         .zscore(
             format!("{namespace}:jobs:waiting"),

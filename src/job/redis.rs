@@ -1,9 +1,9 @@
 use super::backend::JobQueueBackend;
 use super::types::{
-    add_duration, deduplication_expiration, Job, JobFlow, JobFlowDependencies, JobId,
-    JobListOptions, JobListPage, JobLogEntry, JobLogPage, JobOptions, JobPriority,
-    JobPriorityCount, JobQueueStats, JobRateLimit, JobRepeatEntry, JobSpec, JobState,
-    JobStateCount, JobWorkerId, QueueName,
+    add_duration, deduplication_expiration, Job, JobFlow, JobFlowDependencies,
+    JobFlowDependencyCounts, JobId, JobListOptions, JobListPage, JobLogEntry, JobLogPage,
+    JobOptions, JobPriority, JobPriorityCount, JobQueueStats, JobRateLimit, JobRepeatEntry,
+    JobSpec, JobState, JobStateCount, JobWorkerId, QueueName,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -3229,6 +3229,44 @@ end
 return results
 "#;
 
+const FLOW_DEPENDENCY_COUNTS_SCRIPT: &str = r#"
+local parent_raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not parent_raw then
+  return {'missing'}
+end
+
+local parent = cjson.decode(parent_raw)
+local has_dependency_set = redis.call('EXISTS', KEYS[2]) == 1
+local pending_child_ids = {}
+if has_dependency_set then
+  for _, pending_child_id in ipairs(redis.call('SMEMBERS', KEYS[2])) do
+    pending_child_ids[pending_child_id] = true
+  end
+end
+local processed = 0
+local unprocessed = 0
+local failed = 0
+local missing = 0
+
+for _, child_id in ipairs(parent['child_ids'] or {}) do
+  local child_raw = redis.call('HGET', KEYS[1], child_id)
+  if not child_raw then
+    missing = missing + 1
+  else
+    local child = cjson.decode(child_raw)
+    if child["state"] == "completed" then
+      processed = processed + 1
+    elseif child["state"] == "failed" then
+      failed = failed + 1
+    elseif not has_dependency_set or pending_child_ids[child_id] then
+      unprocessed = unprocessed + 1
+    end
+  end
+end
+
+return {'ok', tostring(processed), tostring(unprocessed), tostring(failed), tostring(missing)}
+"#;
+
 const FLOW_DEPENDENCIES_SCRIPT: &str = r#"
 local parent_raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not parent_raw then
@@ -3622,6 +3660,24 @@ impl RedisJobQueue {
         decode_flow_dependencies_result(&result, parent_id)
     }
 
+    /// Return a parent flow's dependency counts.
+    pub async fn get_flow_dependency_counts(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowDependencyCounts>> {
+        let mut conn = self.connection().await?;
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(FLOW_DEPENDENCY_COUNTS_SCRIPT)
+            .arg(2)
+            .arg(self.jobs_key())
+            .arg(self.dependencies_key(parent_id))
+            .arg(parent_id)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_flow_dependency_counts_result(&result, parent_id)
+    }
+
     async fn connection(&self) -> Result<ConnectionManager> {
         self.client
             .get_connection_manager()
@@ -3663,6 +3719,10 @@ impl RedisJobQueue {
 
     fn dependencies_key_prefix(&self) -> String {
         format!("{}:{}:dependencies:", self.namespace, self.queue)
+    }
+
+    fn dependencies_key(&self, parent_id: &str) -> String {
+        format!("{}{}", self.dependencies_key_prefix(), parent_id)
     }
 
     fn logs_key(&self, job_id: &str) -> String {
@@ -3857,6 +3917,13 @@ impl JobQueueBackend for RedisJobQueue {
 
     async fn get_flow_dependencies(&self, parent_id: &str) -> Result<Option<JobFlowDependencies>> {
         RedisJobQueue::get_flow_dependencies(self, parent_id).await
+    }
+
+    async fn get_flow_dependency_counts(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowDependencyCounts>> {
+        RedisJobQueue::get_flow_dependency_counts(self, parent_id).await
     }
 
     async fn claim_next(
@@ -4799,6 +4866,43 @@ fn decode_priority_update_result(result: &[String], job_id: &str) -> Result<Job>
             "Redis priority update script returned no status for {job_id}"
         ))),
     }
+}
+
+fn decode_flow_dependency_counts_result(
+    result: &[String],
+    parent_id: &str,
+) -> Result<Option<JobFlowDependencyCounts>> {
+    match result.first().map(String::as_str) {
+        Some("missing") => Ok(None),
+        Some("ok") => {
+            if result.len() != 5 {
+                return Err(LaneError::Other(format!(
+                    "Redis flow dependency count script returned {} fields for {parent_id}",
+                    result.len()
+                )));
+            }
+            Ok(Some(JobFlowDependencyCounts {
+                processed: decode_usize_field(&result[1], "processed", parent_id)?,
+                unprocessed: decode_usize_field(&result[2], "unprocessed", parent_id)?,
+                failed: decode_usize_field(&result[3], "failed", parent_id)?,
+                missing: decode_usize_field(&result[4], "missing", parent_id)?,
+            }))
+        }
+        Some(other) => Err(LaneError::Other(format!(
+            "unexpected Redis flow dependency count script status `{other}` for {parent_id}"
+        ))),
+        None => Err(LaneError::Other(format!(
+            "Redis flow dependency count script returned no status for {parent_id}"
+        ))),
+    }
+}
+
+fn decode_usize_field(raw: &str, field: &str, owner_id: &str) -> Result<usize> {
+    raw.parse::<usize>().map_err(|error| {
+        LaneError::Other(format!(
+            "failed to decode Redis {field} count for {owner_id}: {error}"
+        ))
+    })
 }
 
 fn decode_flow_dependencies_result(

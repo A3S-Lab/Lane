@@ -1,9 +1,9 @@
 use super::backend::JobQueueBackend;
 use super::memory::InMemoryJobQueue;
 use super::types::{
-    Job, JobFlow, JobFlowDependencies, JobId, JobListOptions, JobListPage, JobLogPage, JobOptions,
-    JobPriority, JobPriorityCount, JobQueueSnapshot, JobQueueStats, JobRepeatEntry, JobSpec,
-    JobState, JobStateCount, JobWorkerId,
+    Job, JobFlow, JobFlowDependencies, JobFlowDependencyCounts, JobId, JobListOptions, JobListPage,
+    JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueSnapshot, JobQueueStats,
+    JobRepeatEntry, JobSpec, JobState, JobStateCount, JobWorkerId,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -125,6 +125,14 @@ impl LocalJobQueue {
         self.inner.get_flow_dependencies(parent_id).await
     }
 
+    /// Return a parent flow's dependency counts.
+    pub async fn get_flow_dependency_counts(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowDependencyCounts>> {
+        self.inner.get_flow_dependency_counts(parent_id).await
+    }
+
     /// Return the current state for a job id.
     pub async fn get_state(&self, job_id: &str) -> Result<Option<JobState>> {
         self.inner.get_state(job_id).await
@@ -201,6 +209,13 @@ impl JobQueueBackend for LocalJobQueue {
 
     async fn get_flow_dependencies(&self, parent_id: &str) -> Result<Option<JobFlowDependencies>> {
         LocalJobQueue::get_flow_dependencies(self, parent_id).await
+    }
+
+    async fn get_flow_dependency_counts(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowDependencyCounts>> {
+        LocalJobQueue::get_flow_dependency_counts(self, parent_id).await
     }
 
     async fn claim_next(

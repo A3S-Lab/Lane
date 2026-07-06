@@ -237,6 +237,19 @@ pub struct JobFlowDependencies {
     pub missing_child_ids: Vec<JobId>,
 }
 
+/// Dependency counts for a flow parent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobFlowDependencyCounts {
+    /// Retained children that completed successfully.
+    pub processed: usize,
+    /// Retained children that are still waiting, delayed, active, or waiting on children.
+    pub unprocessed: usize,
+    /// Retained children that failed terminally.
+    pub failed: usize,
+    /// Child ids recorded on the parent but no longer retained.
+    pub missing: usize,
+}
+
 /// Repeat schedule used by a generic job.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]

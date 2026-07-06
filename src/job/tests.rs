@@ -2700,6 +2700,11 @@ async fn flow_parent_waits_for_children_before_claiming() {
         .await
         .unwrap()
         .is_none());
+    assert!(queue
+        .get_flow_dependency_counts("missing-parent")
+        .await
+        .unwrap()
+        .is_none());
     let flow = queue
         .add_flow_at(
             JobSpec::new("parent", serde_json::json!({ "kind": "aggregate" }))
@@ -2737,6 +2742,19 @@ async fn flow_parent_waits_for_children_before_claiming() {
     );
     assert_eq!(dependencies.pending_child_ids, flow.parent.child_ids);
     assert!(dependencies.missing_child_ids.is_empty());
+    assert_eq!(
+        queue
+            .get_flow_dependency_counts(&flow.parent.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        JobFlowDependencyCounts {
+            processed: 0,
+            unprocessed: 2,
+            failed: 0,
+            missing: 0,
+        }
+    );
 
     let stats = queue.stats().await.unwrap();
     assert_eq!(stats.waiting_children, 1);
@@ -2771,6 +2789,19 @@ async fn flow_parent_waits_for_children_before_claiming() {
         vec![flow.children[1].id.clone()]
     );
     assert!(dependencies_after_first.missing_child_ids.is_empty());
+    assert_eq!(
+        queue
+            .get_flow_dependency_counts(&flow.parent.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        JobFlowDependencyCounts {
+            processed: 1,
+            unprocessed: 1,
+            failed: 0,
+            missing: 0,
+        }
+    );
 
     let second_child = queue
         .claim_next("worker-b".to_string(), Duration::from_secs(30), ts(1_300))
@@ -2801,6 +2832,19 @@ async fn flow_parent_waits_for_children_before_claiming() {
         .unwrap();
     assert!(dependencies_after_release.pending_child_ids.is_empty());
     assert!(dependencies_after_release.missing_child_ids.is_empty());
+    assert_eq!(
+        queue
+            .get_flow_dependency_counts(&flow.parent.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        JobFlowDependencyCounts {
+            processed: 2,
+            unprocessed: 0,
+            failed: 0,
+            missing: 0,
+        }
+    );
 
     let claimed_parent = queue
         .claim_next(
@@ -2871,6 +2915,19 @@ async fn flow_parent_releases_when_pending_child_is_cleaned() {
     assert_eq!(
         dependencies.missing_child_ids,
         vec![flow.children[1].id.clone()]
+    );
+    assert_eq!(
+        queue
+            .get_flow_dependency_counts(&flow.parent.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        JobFlowDependencyCounts {
+            processed: 1,
+            unprocessed: 0,
+            failed: 0,
+            missing: 1,
+        }
     );
     let claimed_parent = queue
         .claim_next(
@@ -2960,6 +3017,19 @@ async fn flow_parent_fails_when_child_terminally_fails() {
         .as_deref()
         .unwrap_or_default()
         .contains("child job"));
+    assert_eq!(
+        queue
+            .get_flow_dependency_counts(&flow.parent.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        JobFlowDependencyCounts {
+            processed: 0,
+            unprocessed: 0,
+            failed: 1,
+            missing: 0,
+        }
+    );
 }
 
 #[tokio::test]
@@ -3027,6 +3097,19 @@ async fn local_job_queue_persists_flow_relationships() {
     assert_eq!(dependencies.children[0].id, child.id);
     assert_eq!(dependencies.pending_child_ids, vec![child.id.clone()]);
     assert!(dependencies.missing_child_ids.is_empty());
+    assert_eq!(
+        reopened
+            .get_flow_dependency_counts(&flow.parent.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        JobFlowDependencyCounts {
+            processed: 0,
+            unprocessed: 1,
+            failed: 0,
+            missing: 0,
+        }
+    );
 }
 
 #[tokio::test]

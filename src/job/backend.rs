@@ -1,7 +1,7 @@
 use super::types::{
-    Job, JobFlow, JobFlowDependencies, JobId, JobListOptions, JobListPage, JobLogPage, JobOptions,
-    JobPriority, JobPriorityCount, JobQueueStats, JobRepeatEntry, JobSpec, JobState, JobStateCount,
-    JobWorkerId,
+    Job, JobFlow, JobFlowDependencies, JobFlowDependencyCounts, JobId, JobListOptions, JobListPage,
+    JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueStats, JobRepeatEntry, JobSpec,
+    JobState, JobStateCount, JobWorkerId,
 };
 use crate::error::Result;
 use async_trait::async_trait;
@@ -25,6 +25,11 @@ pub trait JobQueueBackend: Send + Sync {
     ) -> Result<JobFlow>;
 
     async fn get_flow_dependencies(&self, parent_id: &str) -> Result<Option<JobFlowDependencies>>;
+
+    async fn get_flow_dependency_counts(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowDependencyCounts>>;
 
     async fn claim_next(
         &self,

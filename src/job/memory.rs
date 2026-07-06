@@ -1,9 +1,9 @@
 use super::backend::JobQueueBackend;
 use super::types::{
-    deduplication_expiration, Job, JobFlow, JobFlowDependencies, JobId, JobListOptions,
-    JobListPage, JobLogEntry, JobLogPage, JobOptions, JobPriority, JobPriorityCount,
-    JobQueueSnapshot, JobQueueStats, JobRepeatEntry, JobSpec, JobState, JobStateCount, JobWorkerId,
-    QueueName,
+    deduplication_expiration, Job, JobFlow, JobFlowDependencies, JobFlowDependencyCounts, JobId,
+    JobListOptions, JobListPage, JobLogEntry, JobLogPage, JobOptions, JobPriority,
+    JobPriorityCount, JobQueueSnapshot, JobQueueStats, JobRepeatEntry, JobSpec, JobState,
+    JobStateCount, JobWorkerId, QueueName,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -374,6 +374,19 @@ impl InMemoryJobQueue {
             pending_child_ids,
             missing_child_ids,
         }))
+    }
+
+    /// Return dependency counts for a flow parent.
+    pub async fn get_flow_dependency_counts(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowDependencyCounts>> {
+        let inner = self.inner.lock().await;
+        let Some(parent) = inner.jobs.get(parent_id) else {
+            return Ok(None);
+        };
+
+        Ok(Some(flow_dependency_counts(parent, &inner.jobs)))
     }
 
     /// Return the current state for a job id.
@@ -1061,6 +1074,13 @@ impl JobQueueBackend for InMemoryJobQueue {
         InMemoryJobQueue::get_flow_dependencies(self, parent_id).await
     }
 
+    async fn get_flow_dependency_counts(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowDependencyCounts>> {
+        InMemoryJobQueue::get_flow_dependency_counts(self, parent_id).await
+    }
+
     async fn claim_next(
         &self,
         worker_id: JobWorkerId,
@@ -1548,6 +1568,26 @@ fn sorted_released_deduplication_owners(
     let mut owners = released_owners.iter().cloned().collect::<Vec<_>>();
     owners.sort();
     owners
+}
+
+fn flow_dependency_counts(parent: &Job, jobs: &HashMap<JobId, Job>) -> JobFlowDependencyCounts {
+    let mut counts = JobFlowDependencyCounts {
+        processed: 0,
+        unprocessed: 0,
+        failed: 0,
+        missing: 0,
+    };
+
+    for child_id in &parent.child_ids {
+        match jobs.get(child_id).map(|child| child.state) {
+            Some(JobState::Completed) => counts.processed += 1,
+            Some(JobState::Failed) => counts.failed += 1,
+            Some(_) => counts.unprocessed += 1,
+            None => counts.missing += 1,
+        }
+    }
+
+    counts
 }
 
 fn active_deduplication_id(job: &Job, now: DateTime<Utc>) -> Option<&str> {
