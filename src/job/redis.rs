@@ -965,6 +965,7 @@ local state = ARGV[1]
 local cutoff = ARGV[2]
 local limit = tonumber(ARGV[3])
 local lock_prefix = ARGV[4]
+local cutoff_millis = tonumber(ARGV[9])
 local state_key = nil
 
 if state == 'waiting' then
@@ -1003,8 +1004,11 @@ for _, id in ipairs(ids) do
         reference = job["scheduled_at"]
       end
 
-      if reference and reference ~= cjson.null and reference <= cutoff then
-        table.insert(candidates, { id = id, reference = reference, raw = raw, job = job })
+      if reference and reference ~= cjson.null then
+        local reference_millis = iso_to_millis(reference)
+        if reference_millis <= cutoff_millis then
+          table.insert(candidates, { id = id, reference_millis = reference_millis, raw = raw, job = job })
+        end
       end
     else
       redis.call('ZREM', state_key, id)
@@ -1015,10 +1019,10 @@ for _, id in ipairs(ids) do
 end
 
 table.sort(candidates, function(left, right)
-  if left.reference == right.reference then
+  if left.reference_millis == right.reference_millis then
     return left.id < right.id
   end
-  return left.reference < right.reference
+  return left.reference_millis < right.reference_millis
 end)
 
 local removed = {}
@@ -1859,6 +1863,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(millis(now))
             .arg(WAITING_SCORE_BUCKET)
             .arg(self.dependencies_key_prefix())
+            .arg(millis(cutoff))
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;

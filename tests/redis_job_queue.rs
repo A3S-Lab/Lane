@@ -4,7 +4,7 @@ use a3s_lane::{
     JobListOptions, JobOptions, JobQueueBackend, JobRateLimit, JobSpec, JobState, LaneError,
     RedisJobQueue, RepeatOptions, RetryPolicy,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use redis::AsyncCommands;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1073,6 +1073,98 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await?;
     assert!(retained_new_score.is_some());
     trace_stage("clean-script:done");
+
+    let clean_millis_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "clean-millis")
+        .expect("valid Redis URL should build the clean-millis queue");
+    let clean_millis_a_id = format!("{namespace}:clean-millis:a");
+    let clean_millis_b_id = format!("{namespace}:clean-millis:b");
+    clean_millis_queue
+        .add_job(
+            "clean-millis-a".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_job_id(clean_millis_a_id.clone()),
+        )
+        .await
+        .expect("first clean-millis job should add");
+    clean_millis_queue
+        .add_job(
+            "clean-millis-b".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_job_id(clean_millis_b_id.clone()),
+        )
+        .await
+        .expect("second clean-millis job should add");
+    let clean_millis_a = clean_millis_queue
+        .claim_next(
+            "worker-clean-millis-a".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("first clean-millis claim should return")
+        .expect("first clean-millis job should claim");
+    let clean_millis_b = clean_millis_queue
+        .claim_next(
+            "worker-clean-millis-b".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("second clean-millis claim should return")
+        .expect("second clean-millis job should claim");
+    let same_finished_at = Utc.timestamp_millis_opt(1_100).unwrap();
+    clean_millis_queue
+        .complete_job(
+            &clean_millis_a.id,
+            lock_token(&clean_millis_a),
+            serde_json::json!({}),
+            same_finished_at,
+        )
+        .await
+        .expect("first clean-millis job should complete");
+    clean_millis_queue
+        .complete_job(
+            &clean_millis_b.id,
+            lock_token(&clean_millis_b),
+            serde_json::json!({}),
+            same_finished_at,
+        )
+        .await
+        .expect("second clean-millis job should complete");
+    let clean_millis_jobs_key = format!("{namespace}:clean-millis:jobs");
+    let raw_a: String = clean_conn
+        .hget(&clean_millis_jobs_key, &clean_millis_a_id)
+        .await?;
+    let raw_b: String = clean_conn
+        .hget(&clean_millis_jobs_key, &clean_millis_b_id)
+        .await?;
+    let mut value_a: serde_json::Value =
+        serde_json::from_str(&raw_a).expect("first clean-millis raw should be JSON");
+    let mut value_b: serde_json::Value =
+        serde_json::from_str(&raw_b).expect("second clean-millis raw should be JSON");
+    value_a["finished_at"] = serde_json::Value::String("1970-01-01T00:00:01.100+00:00".into());
+    value_b["finished_at"] = serde_json::Value::String("1970-01-01T00:00:01.1+00:00".into());
+    let _: usize = clean_conn
+        .hset(
+            &clean_millis_jobs_key,
+            &clean_millis_a_id,
+            serde_json::to_string(&value_a).expect("first clean-millis raw should encode"),
+        )
+        .await?;
+    let _: usize = clean_conn
+        .hset(
+            &clean_millis_jobs_key,
+            &clean_millis_b_id,
+            serde_json::to_string(&value_b).expect("second clean-millis raw should encode"),
+        )
+        .await?;
+    let first_clean_millis = clean_millis_queue
+        .clean_jobs(JobState::Completed, Duration::ZERO, 1, same_finished_at)
+        .await
+        .expect("clean-millis should use millisecond ordering");
+    assert_eq!(first_clean_millis.len(), 1);
+    assert_eq!(first_clean_millis[0].id, clean_millis_a_id);
+    trace_stage("clean-millis:done");
 
     let mut flow_index_conn = redis::Client::open(redis_url.as_str())?
         .get_connection_manager()

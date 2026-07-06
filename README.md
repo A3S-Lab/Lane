@@ -681,9 +681,9 @@ commands.
 Redis job management mutations are script-backed too. `update_progress()` checks
 the current state and writes the progress value in one Redis turn; `add_log()`
 appends and trims retained log entries inside one script; `clean_jobs()` filters
-retained records by the job reference time, removes their lock keys, hash
-entries, and state indexes atomically, updates flow parents for removed child
-jobs, and returns the removed snapshots.
+retained records by the parsed millisecond reference time, removes their lock
+keys, hash entries, and state indexes atomically, updates flow parents for
+removed child jobs, and returns the removed snapshots.
 
 Queue reads use the same Redis-side snapshot approach. `list_jobs()` evaluates
 one Lua script to read state pages and job JSON snapshots in the same Redis turn
