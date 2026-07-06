@@ -149,6 +149,151 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect("second rate job should complete");
 
+    let active_limit_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "active-limit")
+        .expect("valid Redis URL should build the active limit queue");
+    let zero_active_limit = active_limit_queue
+        .set_max_active_jobs(0)
+        .await
+        .expect_err("zero active limit should be rejected");
+    assert!(matches!(zero_active_limit, LaneError::ConfigError(_)));
+    active_limit_queue
+        .set_max_active_jobs(1)
+        .await
+        .expect("active limit should be configured");
+    let active_limit_meta_key = format!("{namespace}:active-limit:meta");
+    let mut active_limit_meta_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let stored_concurrency: Option<usize> = active_limit_meta_conn
+        .hget(&active_limit_meta_key, "concurrency")
+        .await?;
+    assert_eq!(stored_concurrency, Some(1));
+    let active_first = active_limit_queue
+        .add_job(
+            "active-first".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("first active-limit job should be added");
+    let active_second = active_limit_queue
+        .add_job(
+            "active-second".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("second active-limit job should be added");
+    let first_active_claim = active_limit_queue
+        .claim_next(
+            "worker-active-a".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("first active-limit claim should return")
+        .expect("first active-limit job should be claimable");
+    assert_eq!(first_active_claim.id, active_first.id);
+    assert!(active_limit_queue
+        .claim_next(
+            "worker-active-b".to_string(),
+            Duration::from_secs(30),
+            Utc::now()
+        )
+        .await
+        .expect("maxed active-limit claim should return")
+        .is_none());
+    active_limit_queue
+        .complete_job(
+            &first_active_claim.id,
+            lock_token(&first_active_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("first active-limit job should complete");
+    let second_active_claim = active_limit_queue
+        .claim_next(
+            "worker-active-b".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("second active-limit claim should return")
+        .expect("second active-limit job should be claimable after completion");
+    assert_eq!(second_active_claim.id, active_second.id);
+    active_limit_queue
+        .complete_job(
+            &second_active_claim.id,
+            lock_token(&second_active_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("second active-limit job should complete");
+    active_limit_queue
+        .clear_max_active_jobs()
+        .await
+        .expect("active limit should clear");
+    let cleared_concurrency: Option<usize> = active_limit_meta_conn
+        .hget(&active_limit_meta_key, "concurrency")
+        .await?;
+    assert_eq!(cleared_concurrency, None);
+    let active_unlimited_first = active_limit_queue
+        .add_job(
+            "active-unlimited-first".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("first unlimited active-limit job should be added");
+    let active_unlimited_second = active_limit_queue
+        .add_job(
+            "active-unlimited-second".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("second unlimited active-limit job should be added");
+    let first_unlimited_claim = active_limit_queue
+        .claim_next(
+            "worker-active-unlimited-a".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("first unlimited active-limit claim should return")
+        .expect("first unlimited active-limit job should be claimable");
+    assert_eq!(first_unlimited_claim.id, active_unlimited_first.id);
+    let second_unlimited_claim = active_limit_queue
+        .claim_next(
+            "worker-active-unlimited-b".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("second unlimited active-limit claim should return")
+        .expect("second unlimited active-limit job should be claimable");
+    assert_eq!(second_unlimited_claim.id, active_unlimited_second.id);
+    active_limit_queue
+        .complete_job(
+            &first_unlimited_claim.id,
+            lock_token(&first_unlimited_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("first unlimited active-limit job should complete");
+    active_limit_queue
+        .complete_job(
+            &second_unlimited_claim.id,
+            lock_token(&second_unlimited_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("second unlimited active-limit job should complete");
+
     producer.pause().await.expect("pause should succeed");
     let high = producer
         .add_job(

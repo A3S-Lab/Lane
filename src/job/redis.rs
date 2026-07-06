@@ -24,6 +24,14 @@ if rate_limit_max and rate_limit_max > 0 then
   end
 end
 
+local max_concurrency = tonumber(redis.call('HGET', KEYS[5], 'concurrency') or '0')
+if max_concurrency and max_concurrency > 0 then
+  local active_count = redis.call('ZCARD', KEYS[2])
+  if active_count >= max_concurrency then
+    return nil
+  end
+end
+
 local ids = redis.call('ZRANGE', KEYS[1], 0, 0)
 if #ids == 0 then
   return nil
@@ -217,6 +225,34 @@ impl RedisJobQueue {
         rate_limit.validate()?;
         self.claim_rate_limit = Some(rate_limit);
         Ok(self)
+    }
+
+    /// Set a Redis-backed queue-level active job limit.
+    ///
+    /// The limit is shared by every worker using the same namespace and queue.
+    /// When the active set reaches this value, `claim_next` returns `None`
+    /// until jobs complete, fail, or stalled recovery requeues them.
+    ///
+    /// Redis stores this value in the queue meta hash as `concurrency`, matching
+    /// BullMQ's queue-maxed check while Lane keeps a Rust-native method name.
+    pub async fn set_max_active_jobs(&self, max_active_jobs: usize) -> Result<()> {
+        if max_active_jobs == 0 {
+            return Err(LaneError::ConfigError(
+                "max active jobs must be greater than zero".to_string(),
+            ));
+        }
+        let mut conn = self.connection().await?;
+        conn.hset(self.meta_key(), "concurrency", max_active_jobs)
+            .await
+            .map_err(redis_error)
+    }
+
+    /// Clear the Redis-backed active job limit.
+    pub async fn clear_max_active_jobs(&self) -> Result<()> {
+        let mut conn = self.connection().await?;
+        conn.hdel(self.meta_key(), "concurrency")
+            .await
+            .map_err(redis_error)
     }
 
     /// Queue name.
@@ -668,11 +704,12 @@ impl JobQueueBackend for RedisJobQueue {
             .unwrap_or((0, 0));
         let raw: Option<String> = redis::cmd("EVAL")
             .arg(CLAIM_SCRIPT)
-            .arg(4)
+            .arg(5)
             .arg(self.state_key(JobState::Waiting))
             .arg(self.state_key(JobState::Active))
             .arg(self.jobs_key())
             .arg(self.claim_rate_limit_key())
+            .arg(self.meta_key())
             .arg(millis(lease_expires_at))
             .arg(now.to_rfc3339())
             .arg(worker_id)
