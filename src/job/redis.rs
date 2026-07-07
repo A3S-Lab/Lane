@@ -2917,6 +2917,121 @@ local function release_repeat_key(job, job_id, repeat_prefix)
   end
 end
 
+local function duration_millis(duration)
+  if not duration or duration == cjson.null then
+    return nil
+  end
+  if type(duration) == 'number' then
+    return math.floor(duration)
+  end
+  local secs = tonumber(duration["secs"] or duration["seconds"] or 0) or 0
+  local nanos = tonumber(duration["nanos"] or duration["subsec_nanos"] or 0) or 0
+  local millis = (secs * 1000) + math.floor(nanos / 1000000)
+  if millis <= 0 then
+    return nil
+  end
+  return millis
+end
+
+local function retention_options(job)
+  if not job["options"] or job["options"] == cjson.null then
+    return nil
+  end
+  if job["options"]["remove_on_fail"] == true then
+    return { count = 0 }
+  end
+  local retention = job["options"]["failure_retention"]
+  if retention and retention ~= cjson.null then
+    return retention
+  end
+  return nil
+end
+
+local function retention_count(retention)
+  if not retention or retention == cjson.null then
+    return nil
+  end
+  local count = retention["count"]
+  if count == nil or count == cjson.null then
+    return nil
+  end
+  return tonumber(count)
+end
+
+local function retention_age_millis(retention)
+  if not retention or retention == cjson.null then
+    return nil
+  end
+  return duration_millis(retention["age"])
+end
+
+local function retention_limit(retention)
+  if not retention or retention == cjson.null then
+    return 1000
+  end
+  local limit = tonumber(retention["limit"] or '1000') or 1000
+  if limit <= 0 then
+    return 1000
+  end
+  return limit
+end
+
+local function remove_finished_job(job_id)
+  local removed_raw = redis.call('HGET', KEYS[1], job_id)
+  if removed_raw then
+    local removed = cjson.decode(removed_raw)
+    release_deduplication_key(removed, job_id, ARGV[6])
+    release_repeat_key(removed, job_id, ARGV[7])
+  end
+  for index = 3, 8 do
+    redis.call('ZREM', KEYS[index], job_id)
+  end
+  redis.call('HDEL', KEYS[1], job_id)
+  redis.call('DEL', ARGV[5] .. job_id)
+  redis.call('DEL', ARGV[8] .. job_id)
+end
+
+local function remove_finished_jobs_by_max_age(timestamp, retention)
+  local max_age = retention_age_millis(retention)
+  if not max_age then
+    return
+  end
+  local max_limit = retention_limit(retention)
+  local start = tonumber(timestamp) - max_age
+  local job_ids = redis.call('ZREVRANGEBYSCORE', KEYS[8], start, '-inf', 'LIMIT', 0, max_limit)
+  for _, job_id in ipairs(job_ids) do
+    remove_finished_job(job_id)
+  end
+  if #job_ids > 0 then
+    if #job_ids < max_limit then
+      redis.call('ZREMRANGEBYSCORE', KEYS[8], '-inf', start)
+    else
+      for _, job_id in ipairs(job_ids) do
+        redis.call('ZREM', KEYS[8], job_id)
+      end
+    end
+  end
+end
+
+local function remove_finished_jobs_by_max_count(max_count)
+  if not max_count or max_count <= 0 then
+    return
+  end
+  local job_ids = redis.call('ZREVRANGE', KEYS[8], max_count, -1)
+  for _, job_id in ipairs(job_ids) do
+    remove_finished_job(job_id)
+  end
+  redis.call('ZREMRANGEBYRANK', KEYS[8], 0, -(max_count + 1))
+end
+
+local function apply_failed_retention(timestamp, retention)
+  if not retention or retention == cjson.null then
+    return
+  end
+  remove_finished_jobs_by_max_age(timestamp, retention)
+  remove_finished_jobs_by_max_count(retention_count(retention))
+end
+
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
   redis.call('DEL', KEYS[2])
@@ -2992,12 +3107,14 @@ if parent_id and parent_id ~= cjson.null then
         parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
         release_deduplication_key(parent, parent_id, ARGV[6])
         release_repeat_key(parent, parent_id, ARGV[7])
-        if parent["options"] and parent["options"]["remove_on_fail"] == true then
-          redis.call('HDEL', KEYS[1], parent_id)
-          redis.call('DEL', ARGV[8] .. parent_id)
+        local parent_failure_retention = retention_options(parent)
+        local parent_failure_max_count = retention_count(parent_failure_retention)
+        if parent_failure_max_count == 0 then
+          remove_finished_job(parent_id)
         else
           redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
           redis.call('ZADD', KEYS[8], ARGV[3], parent_id)
+          apply_failed_retention(ARGV[3], parent_failure_retention)
         end
       elseif all_done then
         redis.call('DEL', dependency_key)
@@ -3132,6 +3249,125 @@ local function release_repeat_key(job, job_id, repeat_prefix)
   end
 end
 
+local function duration_millis(duration)
+  if not duration or duration == cjson.null then
+    return nil
+  end
+  if type(duration) == 'number' then
+    return math.floor(duration)
+  end
+  local secs = tonumber(duration["secs"] or duration["seconds"] or 0) or 0
+  local nanos = tonumber(duration["nanos"] or duration["subsec_nanos"] or 0) or 0
+  local millis = (secs * 1000) + math.floor(nanos / 1000000)
+  if millis <= 0 then
+    return nil
+  end
+  return millis
+end
+
+local function retention_options(job)
+  if not job["options"] or job["options"] == cjson.null then
+    return nil
+  end
+  if job["options"]["remove_on_fail"] == true then
+    return { count = 0 }
+  end
+  local retention = job["options"]["failure_retention"]
+  if retention and retention ~= cjson.null then
+    return retention
+  end
+  return nil
+end
+
+local function retention_count(retention)
+  if not retention or retention == cjson.null then
+    return nil
+  end
+  local count = retention["count"]
+  if count == nil or count == cjson.null then
+    return nil
+  end
+  return tonumber(count)
+end
+
+local function retention_age_millis(retention)
+  if not retention or retention == cjson.null then
+    return nil
+  end
+  return duration_millis(retention["age"])
+end
+
+local function retention_limit(retention)
+  if not retention or retention == cjson.null then
+    return 1000
+  end
+  local limit = tonumber(retention["limit"] or '1000') or 1000
+  if limit <= 0 then
+    return 1000
+  end
+  return limit
+end
+
+local function remove_state_indexes(job_id)
+  for key_index = 2, 7 do
+    redis.call('ZREM', KEYS[key_index], job_id)
+  end
+end
+
+local function remove_finished_job(job_id)
+  local removed_raw = redis.call('HGET', KEYS[1], job_id)
+  if removed_raw then
+    local removed = cjson.decode(removed_raw)
+    release_deduplication_key(removed, job_id, ARGV[10])
+    release_repeat_key(removed, job_id, ARGV[11])
+  end
+  remove_state_indexes(job_id)
+  redis.call('HDEL', KEYS[1], job_id)
+  redis.call('DEL', ARGV[8] .. job_id)
+  redis.call('DEL', ARGV[12] .. job_id)
+end
+
+local function remove_finished_jobs_by_max_age(timestamp, retention)
+  local max_age = retention_age_millis(retention)
+  if not max_age then
+    return
+  end
+  local max_limit = retention_limit(retention)
+  local start = tonumber(timestamp) - max_age
+  local job_ids = redis.call('ZREVRANGEBYSCORE', KEYS[7], start, '-inf', 'LIMIT', 0, max_limit)
+  for _, job_id in ipairs(job_ids) do
+    remove_finished_job(job_id)
+  end
+  if #job_ids > 0 then
+    if #job_ids < max_limit then
+      redis.call('ZREMRANGEBYSCORE', KEYS[7], '-inf', start)
+    else
+      for _, job_id in ipairs(job_ids) do
+        redis.call('ZREM', KEYS[7], job_id)
+      end
+    end
+  end
+end
+
+local function remove_finished_jobs_by_max_count(max_count)
+  if not max_count or max_count <= 0 then
+    return
+  end
+  local job_ids = redis.call('ZREVRANGE', KEYS[7], max_count, -1)
+  for _, job_id in ipairs(job_ids) do
+    remove_finished_job(job_id)
+  end
+  redis.call('ZREMRANGEBYRANK', KEYS[7], 0, -(max_count + 1))
+end
+
+local function apply_failed_retention(timestamp, retention)
+  if not retention or retention == cjson.null then
+    return
+  end
+  remove_finished_jobs_by_max_age(timestamp, retention)
+  remove_finished_jobs_by_max_count(retention_count(retention))
+end
+
 local function release_parent_after_removed_child(job, removed_id)
   local parent_id = job["parent_id"]
   if not parent_id or parent_id == cjson.null then
@@ -3194,12 +3430,14 @@ local function release_parent_after_removed_child(job, removed_id)
     parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
     release_deduplication_key(parent, parent_id, ARGV[10])
     release_repeat_key(parent, parent_id, ARGV[11])
-    if parent["options"] and parent["options"]["remove_on_fail"] == true then
-      redis.call('HDEL', KEYS[1], parent_id)
-      redis.call('DEL', ARGV[12] .. parent_id)
+    local parent_failure_retention = retention_options(parent)
+    local parent_failure_max_count = retention_count(parent_failure_retention)
+    if parent_failure_max_count == 0 then
+      remove_finished_job(parent_id)
     else
       redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
       redis.call('ZADD', KEYS[7], ARGV[6], parent_id)
+      apply_failed_retention(ARGV[6], parent_failure_retention)
     end
   elseif all_done then
     redis.call('DEL', dependency_key)
@@ -3409,6 +3647,125 @@ local function release_repeat_key(job, job_id, repeat_prefix)
   end
 end
 
+local function duration_millis(duration)
+  if not duration or duration == cjson.null then
+    return nil
+  end
+  if type(duration) == 'number' then
+    return math.floor(duration)
+  end
+  local secs = tonumber(duration["secs"] or duration["seconds"] or 0) or 0
+  local nanos = tonumber(duration["nanos"] or duration["subsec_nanos"] or 0) or 0
+  local millis = (secs * 1000) + math.floor(nanos / 1000000)
+  if millis <= 0 then
+    return nil
+  end
+  return millis
+end
+
+local function retention_options(job)
+  if not job["options"] or job["options"] == cjson.null then
+    return nil
+  end
+  if job["options"]["remove_on_fail"] == true then
+    return { count = 0 }
+  end
+  local retention = job["options"]["failure_retention"]
+  if retention and retention ~= cjson.null then
+    return retention
+  end
+  return nil
+end
+
+local function retention_count(retention)
+  if not retention or retention == cjson.null then
+    return nil
+  end
+  local count = retention["count"]
+  if count == nil or count == cjson.null then
+    return nil
+  end
+  return tonumber(count)
+end
+
+local function retention_age_millis(retention)
+  if not retention or retention == cjson.null then
+    return nil
+  end
+  return duration_millis(retention["age"])
+end
+
+local function retention_limit(retention)
+  if not retention or retention == cjson.null then
+    return 1000
+  end
+  local limit = tonumber(retention["limit"] or '1000') or 1000
+  if limit <= 0 then
+    return 1000
+  end
+  return limit
+end
+
+local function remove_state_indexes(job_id)
+  for key_index = 2, 7 do
+    redis.call('ZREM', KEYS[key_index], job_id)
+  end
+end
+
+local function remove_finished_job(job_id)
+  local removed_raw = redis.call('HGET', KEYS[1], job_id)
+  if removed_raw then
+    local removed = cjson.decode(removed_raw)
+    release_deduplication_key(removed, job_id, ARGV[7])
+    release_repeat_key(removed, job_id, ARGV[8])
+  end
+  remove_state_indexes(job_id)
+  redis.call('HDEL', KEYS[1], job_id)
+  redis.call('DEL', ARGV[6] .. job_id)
+  redis.call('DEL', ARGV[9] .. job_id)
+end
+
+local function remove_finished_jobs_by_max_age(timestamp, retention)
+  local max_age = retention_age_millis(retention)
+  if not max_age then
+    return
+  end
+  local max_limit = retention_limit(retention)
+  local start = tonumber(timestamp) - max_age
+  local job_ids = redis.call('ZREVRANGEBYSCORE', KEYS[7], start, '-inf', 'LIMIT', 0, max_limit)
+  for _, job_id in ipairs(job_ids) do
+    remove_finished_job(job_id)
+  end
+  if #job_ids > 0 then
+    if #job_ids < max_limit then
+      redis.call('ZREMRANGEBYSCORE', KEYS[7], '-inf', start)
+    else
+      for _, job_id in ipairs(job_ids) do
+        redis.call('ZREM', KEYS[7], job_id)
+      end
+    end
+  end
+end
+
+local function remove_finished_jobs_by_max_count(max_count)
+  if not max_count or max_count <= 0 then
+    return
+  end
+  local job_ids = redis.call('ZREVRANGE', KEYS[7], max_count, -1)
+  for _, job_id in ipairs(job_ids) do
+    remove_finished_job(job_id)
+  end
+  redis.call('ZREMRANGEBYRANK', KEYS[7], 0, -(max_count + 1))
+end
+
+local function apply_failed_retention(timestamp, retention)
+  if not retention or retention == cjson.null then
+    return
+  end
+  remove_finished_jobs_by_max_age(timestamp, retention)
+  remove_finished_jobs_by_max_count(retention_count(retention))
+end
+
 local function is_current_delayed_repeat_owner(job, job_id)
   if job["state"] ~= "delayed" then
     return false
@@ -3482,12 +3839,14 @@ local function release_parent_after_removed_child(job, removed_id)
     parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
     release_deduplication_key(parent, parent_id, ARGV[7])
     release_repeat_key(parent, parent_id, ARGV[8])
-    if parent["options"] and parent["options"]["remove_on_fail"] == true then
-      redis.call('HDEL', KEYS[1], parent_id)
-      redis.call('DEL', ARGV[9] .. parent_id)
+    local parent_failure_retention = retention_options(parent)
+    local parent_failure_max_count = retention_count(parent_failure_retention)
+    if parent_failure_max_count == 0 then
+      remove_finished_job(parent_id)
     else
       redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
       redis.call('ZADD', KEYS[7], ARGV[3], parent_id)
+      apply_failed_retention(ARGV[3], parent_failure_retention)
     end
   elseif all_done then
     redis.call('DEL', dependency_key)
@@ -3540,9 +3899,7 @@ end
 local removed = {}
 for index, candidate in ipairs(candidates) do
   redis.call('DEL', ARGV[5] .. candidate.id)
-  for key_index = 2, 7 do
-    redis.call('ZREM', KEYS[key_index], candidate.id)
-  end
+  remove_state_indexes(candidate.id)
   redis.call('DEL', ARGV[6] .. candidate.id)
   redis.call('DEL', ARGV[9] .. candidate.id)
   release_deduplication_key(candidate.job, candidate.id, ARGV[7])
@@ -4040,6 +4397,119 @@ local function remove_state_indexes(job_id)
   end
 end
 
+local function duration_millis(duration)
+  if not duration or duration == cjson.null then
+    return nil
+  end
+  if type(duration) == 'number' then
+    return math.floor(duration)
+  end
+  local secs = tonumber(duration["secs"] or duration["seconds"] or 0) or 0
+  local nanos = tonumber(duration["nanos"] or duration["subsec_nanos"] or 0) or 0
+  local millis = (secs * 1000) + math.floor(nanos / 1000000)
+  if millis <= 0 then
+    return nil
+  end
+  return millis
+end
+
+local function retention_options(job)
+  if not job["options"] or job["options"] == cjson.null then
+    return nil
+  end
+  if job["options"]["remove_on_fail"] == true then
+    return { count = 0 }
+  end
+  local retention = job["options"]["failure_retention"]
+  if retention and retention ~= cjson.null then
+    return retention
+  end
+  return nil
+end
+
+local function retention_count(retention)
+  if not retention or retention == cjson.null then
+    return nil
+  end
+  local count = retention["count"]
+  if count == nil or count == cjson.null then
+    return nil
+  end
+  return tonumber(count)
+end
+
+local function retention_age_millis(retention)
+  if not retention or retention == cjson.null then
+    return nil
+  end
+  return duration_millis(retention["age"])
+end
+
+local function retention_limit(retention)
+  if not retention or retention == cjson.null then
+    return 1000
+  end
+  local limit = tonumber(retention["limit"] or '1000') or 1000
+  if limit <= 0 then
+    return 1000
+  end
+  return limit
+end
+
+local function remove_finished_job(job_id)
+  local removed_raw = redis.call('HGET', KEYS[1], job_id)
+  if removed_raw then
+    local removed = cjson.decode(removed_raw)
+    release_deduplication_key(removed, job_id)
+    release_repeat_key(removed, job_id)
+  end
+  remove_state_indexes(job_id)
+  redis.call('HDEL', KEYS[1], job_id)
+  redis.call('DEL', ARGV[6] .. job_id)
+  redis.call('DEL', ARGV[9] .. job_id)
+end
+
+local function remove_finished_jobs_by_max_age(timestamp, retention)
+  local max_age = retention_age_millis(retention)
+  if not max_age then
+    return
+  end
+  local max_limit = retention_limit(retention)
+  local start = tonumber(timestamp) - max_age
+  local job_ids = redis.call('ZREVRANGEBYSCORE', KEYS[7], start, '-inf', 'LIMIT', 0, max_limit)
+  for _, job_id in ipairs(job_ids) do
+    remove_finished_job(job_id)
+  end
+  if #job_ids > 0 then
+    if #job_ids < max_limit then
+      redis.call('ZREMRANGEBYSCORE', KEYS[7], '-inf', start)
+    else
+      for _, job_id in ipairs(job_ids) do
+        redis.call('ZREM', KEYS[7], job_id)
+      end
+    end
+  end
+end
+
+local function remove_finished_jobs_by_max_count(max_count)
+  if not max_count or max_count <= 0 then
+    return
+  end
+  local job_ids = redis.call('ZREVRANGE', KEYS[7], max_count, -1)
+  for _, job_id in ipairs(job_ids) do
+    remove_finished_job(job_id)
+  end
+  redis.call('ZREMRANGEBYRANK', KEYS[7], 0, -(max_count + 1))
+end
+
+local function apply_failed_retention(timestamp, retention)
+  if not retention or retention == cjson.null then
+    return
+  end
+  remove_finished_jobs_by_max_age(timestamp, retention)
+  remove_finished_jobs_by_max_count(retention_count(retention))
+end
+
 local function remove_job_record(job_id, job)
   release_deduplication_key(job, job_id)
   release_repeat_key(job, job_id)
@@ -4128,14 +4598,14 @@ local function release_parent_if_ready(parent_id, parent)
     parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
     release_deduplication_key(parent, parent_id)
     release_repeat_key(parent, parent_id)
-    if parent["options"] and parent["options"]["remove_on_fail"] == true then
-      remove_state_indexes(parent_id)
-      redis.call('HDEL', KEYS[1], parent_id)
-      redis.call('DEL', ARGV[6] .. parent_id)
-      redis.call('DEL', ARGV[9] .. parent_id)
+    local parent_failure_retention = retention_options(parent)
+    local parent_failure_max_count = retention_count(parent_failure_retention)
+    if parent_failure_max_count == 0 then
+      remove_finished_job(parent_id)
     else
       redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
       redis.call('ZADD', KEYS[7], ARGV[3], parent_id)
+      apply_failed_retention(ARGV[3], parent_failure_retention)
     end
   elseif all_done then
     redis.call('DEL', KEYS[9])
@@ -4285,6 +4755,119 @@ local function remove_state_indexes(job_id)
   end
 end
 
+local function duration_millis(duration)
+  if not duration or duration == cjson.null then
+    return nil
+  end
+  if type(duration) == 'number' then
+    return math.floor(duration)
+  end
+  local secs = tonumber(duration["secs"] or duration["seconds"] or 0) or 0
+  local nanos = tonumber(duration["nanos"] or duration["subsec_nanos"] or 0) or 0
+  local millis = (secs * 1000) + math.floor(nanos / 1000000)
+  if millis <= 0 then
+    return nil
+  end
+  return millis
+end
+
+local function retention_options(job)
+  if not job["options"] or job["options"] == cjson.null then
+    return nil
+  end
+  if job["options"]["remove_on_fail"] == true then
+    return { count = 0 }
+  end
+  local retention = job["options"]["failure_retention"]
+  if retention and retention ~= cjson.null then
+    return retention
+  end
+  return nil
+end
+
+local function retention_count(retention)
+  if not retention or retention == cjson.null then
+    return nil
+  end
+  local count = retention["count"]
+  if count == nil or count == cjson.null then
+    return nil
+  end
+  return tonumber(count)
+end
+
+local function retention_age_millis(retention)
+  if not retention or retention == cjson.null then
+    return nil
+  end
+  return duration_millis(retention["age"])
+end
+
+local function retention_limit(retention)
+  if not retention or retention == cjson.null then
+    return 1000
+  end
+  local limit = tonumber(retention["limit"] or '1000') or 1000
+  if limit <= 0 then
+    return 1000
+  end
+  return limit
+end
+
+local function remove_finished_job(job_id)
+  local removed_raw = redis.call('HGET', KEYS[1], job_id)
+  if removed_raw then
+    local removed = cjson.decode(removed_raw)
+    release_deduplication_key(removed, job_id)
+    release_repeat_key(removed, job_id)
+  end
+  remove_state_indexes(job_id)
+  redis.call('HDEL', KEYS[1], job_id)
+  redis.call('DEL', ARGV[5] .. job_id)
+  redis.call('DEL', ARGV[8] .. job_id)
+end
+
+local function remove_finished_jobs_by_max_age(timestamp, retention)
+  local max_age = retention_age_millis(retention)
+  if not max_age then
+    return
+  end
+  local max_limit = retention_limit(retention)
+  local start = tonumber(timestamp) - max_age
+  local job_ids = redis.call('ZREVRANGEBYSCORE', KEYS[7], start, '-inf', 'LIMIT', 0, max_limit)
+  for _, job_id in ipairs(job_ids) do
+    remove_finished_job(job_id)
+  end
+  if #job_ids > 0 then
+    if #job_ids < max_limit then
+      redis.call('ZREMRANGEBYSCORE', KEYS[7], '-inf', start)
+    else
+      for _, job_id in ipairs(job_ids) do
+        redis.call('ZREM', KEYS[7], job_id)
+      end
+    end
+  end
+end
+
+local function remove_finished_jobs_by_max_count(max_count)
+  if not max_count or max_count <= 0 then
+    return
+  end
+  local job_ids = redis.call('ZREVRANGE', KEYS[7], max_count, -1)
+  for _, job_id in ipairs(job_ids) do
+    remove_finished_job(job_id)
+  end
+  redis.call('ZREMRANGEBYRANK', KEYS[7], 0, -(max_count + 1))
+end
+
+local function apply_failed_retention(timestamp, retention)
+  if not retention or retention == cjson.null then
+    return
+  end
+  remove_finished_jobs_by_max_age(timestamp, retention)
+  remove_finished_jobs_by_max_count(retention_count(retention))
+end
+
 local function release_parent_if_ready(parent_id, parent, dependency_key)
   if parent["state"] ~= "waiting_children" then
     redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
@@ -4328,14 +4911,14 @@ local function release_parent_if_ready(parent_id, parent, dependency_key)
     parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
     release_deduplication_key(parent, parent_id)
     release_repeat_key(parent, parent_id)
-    if parent["options"] and parent["options"]["remove_on_fail"] == true then
-      remove_state_indexes(parent_id)
-      redis.call('HDEL', KEYS[1], parent_id)
-      redis.call('DEL', ARGV[5] .. parent_id)
-      redis.call('DEL', ARGV[8] .. parent_id)
+    local parent_failure_retention = retention_options(parent)
+    local parent_failure_max_count = retention_count(parent_failure_retention)
+    if parent_failure_max_count == 0 then
+      remove_finished_job(parent_id)
     else
       redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
       redis.call('ZADD', KEYS[7], ARGV[3], parent_id)
+      apply_failed_retention(ARGV[3], parent_failure_retention)
     end
   elseif all_done then
     redis.call('DEL', dependency_key)
@@ -6900,6 +7483,23 @@ mod tests {
             .err()
             .expect("zero window should be rejected");
         assert!(matches!(zero_window, LaneError::ConfigError(_)));
+    }
+
+    #[test]
+    fn flow_parent_failure_scripts_use_retention_helpers() {
+        for script in [
+            REMOVE_JOB_SCRIPT,
+            CLEAN_JOBS_SCRIPT,
+            DRAIN_JOBS_SCRIPT,
+            REMOVE_UNPROCESSED_CHILDREN_SCRIPT,
+            REMOVE_CHILD_DEPENDENCY_SCRIPT,
+        ] {
+            assert!(script.contains("failure_retention"));
+            assert!(script.contains("apply_failed_retention"));
+            assert!(!script.contains(
+                "parent[\"options\"] and parent[\"options\"][\"remove_on_fail\"] == true"
+            ));
+        }
     }
 
     #[test]

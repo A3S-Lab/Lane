@@ -1007,9 +1007,10 @@ zset with the finish timestamp as score, then calls
 `removeJobsByMaxAge(timestamp, maxAge, targetSet, prefix, maxLimit)` and
 `removeJobsByMaxCount(maxCount, targetSet, prefix)` in the same Lua turn.
 Lane mirrors that storage-level behavior: Redis completion, terminal failure,
-and stalled terminal-failure scripts first finalize the current job, then apply
-age cleanup, then count cleanup against the terminal zset while deleting the job
-hash, log list, dependency set, and stale ownership keys for removed jobs.
+stalled terminal-failure, and flow-cleanup scripts that fail a parent first
+finalize the job, then apply age cleanup, then count cleanup against the
+terminal zset while deleting the job hash, log list, dependency set, and stale
+ownership keys for removed jobs.
 In-memory and local durable queues use the same order against `finished_at`
 timestamps. Age cleanup is best-effort just like BullMQ: there is no background
 timer, so an over-age completed or failed job is removed only when a later job
