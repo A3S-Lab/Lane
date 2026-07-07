@@ -142,6 +142,19 @@ async fn redis_backend_renews_leases_in_bulk_against_real_server() {
 }
 
 #[tokio::test]
+async fn redis_backend_reports_maxed_active_limit_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(Duration::from_secs(120), run_maxed_active_limit(redis_url))
+        .await
+        .expect("Redis maxed active-limit integration test timed out")
+        .unwrap();
+}
+
+#[tokio::test]
 async fn redis_job_worker_uses_bulk_lease_renewal_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -155,6 +168,125 @@ async fn redis_job_worker_uses_bulk_lease_renewal_against_real_server() {
     .await
     .expect("Redis worker bulk lease renewal integration test timed out")
     .unwrap();
+}
+
+async fn run_maxed_active_limit(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    trace_stage("maxed-active-limit:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("maxed-active-limit:cleanup:done");
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "maxed-active")
+        .expect("valid Redis URL should build the maxed-active queue");
+    assert!(!queue
+        .is_maxed()
+        .await
+        .expect("unset max-active queue should not be maxed"));
+    queue
+        .set_max_active_jobs(1)
+        .await
+        .expect("max active jobs should configure");
+    assert!(!queue
+        .is_maxed()
+        .await
+        .expect("empty max-active queue should not be maxed"));
+
+    let first = queue
+        .add_job(
+            "maxed-first".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("first maxed-active job should add");
+    let second = queue
+        .add_job(
+            "maxed-second".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("second maxed-active job should add");
+
+    let first_claim = queue
+        .claim_next(
+            "worker-maxed-a".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("first maxed-active claim should return")
+        .expect("first maxed-active job should claim");
+    assert_eq!(first_claim.id, first.id);
+    assert!(queue
+        .is_maxed()
+        .await
+        .expect("queue should be maxed with one active job"));
+    assert!(queue
+        .claim_next(
+            "worker-maxed-b".to_string(),
+            Duration::from_secs(30),
+            Utc::now()
+        )
+        .await
+        .expect("maxed queue claim should return")
+        .is_none());
+
+    queue
+        .complete_job(
+            &first_claim.id,
+            lock_token(&first_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("first maxed-active job should complete");
+    assert!(!queue
+        .is_maxed()
+        .await
+        .expect("queue should not be maxed after completion"));
+
+    let second_claim = queue
+        .claim_next(
+            "worker-maxed-b".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("second maxed-active claim should return")
+        .expect("second maxed-active job should claim after completion");
+    assert_eq!(second_claim.id, second.id);
+    assert!(queue
+        .is_maxed()
+        .await
+        .expect("queue should be maxed with the second active job"));
+    queue
+        .complete_job(
+            &second_claim.id,
+            lock_token(&second_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("second maxed-active job should complete");
+    assert!(!queue
+        .is_maxed()
+        .await
+        .expect("queue should not be maxed after all jobs complete"));
+
+    queue
+        .clear_max_active_jobs()
+        .await
+        .expect("max active jobs should clear");
+    assert!(!queue
+        .is_maxed()
+        .await
+        .expect("cleared max-active queue should not be maxed"));
+
+    trace_stage("maxed-active-limit:cleanup-final:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("maxed-active-limit:cleanup-final:done");
+    Ok(())
 }
 
 async fn run_worker_bulk_lease_renewal(redis_url: String) -> redis::RedisResult<()> {

@@ -950,6 +950,7 @@ queue.rate_limit_claims_for(Duration::from_millis(500)).await?;
 queue.clear_claim_rate_limit_key().await?;
 queue.set_max_active_jobs(32).await?;
 assert_eq!(queue.get_max_active_jobs().await?, Some(32));
+assert!(!queue.is_maxed().await?);
 
 let job = queue
     .add_job(
@@ -1011,10 +1012,12 @@ limiter window can admit another job, capped by the worker's blocking deadline.
 `set_max_active_jobs()` configures a Redis-shared active job ceiling for the
 queue. It stores the value in the queue meta hash as `concurrency`, matching
 BullMQ's queue-maxed mechanism. `get_max_active_jobs()` reads that same meta
-field, mirroring BullMQ's global concurrency getter. The Lua claim script reads
-the meta value, checks the active sorted set count in the same Redis turn, and
-returns `None` without moving a job or consuming rate-limit capacity when the
-queue is already maxed. `clear_max_active_jobs()` removes the shared ceiling.
+field, mirroring BullMQ's global concurrency getter. `is_maxed()` mirrors
+BullMQ's `isMaxed()` queue getter by reading `meta.concurrency` and the active
+sorted-set count in one Lua turn. The Lua claim script reads the meta value,
+checks the active sorted set count in the same Redis turn, and returns `None`
+without moving a job or consuming rate-limit capacity when the queue is already
+maxed. `clear_max_active_jobs()` removes the shared ceiling.
 
 Like BullMQ's `moveToActive` script, Redis claims also promote due delayed jobs
 inside the same Lua script before checking pause, rate-limit, max-active, and

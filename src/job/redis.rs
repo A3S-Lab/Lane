@@ -1920,6 +1920,20 @@ end
 return 0
 "#;
 
+const IS_MAXED_SCRIPT: &str = r#"
+local concurrency = tonumber(redis.call('HGET', KEYS[1], 'concurrency') or '0')
+if not concurrency or concurrency <= 0 then
+  return 0
+end
+
+local active_count = redis.call('ZCARD', KEYS[2])
+if active_count >= concurrency then
+  return 1
+end
+
+return 0
+"#;
+
 const COMPLETE_SCRIPT: &str = r#"
 local function waiting_score_for(priority, sequence, job, bucket)
   local bucket_value = tonumber(bucket)
@@ -7484,6 +7498,24 @@ impl RedisJobQueue {
         conn.hget(self.meta_key(), "concurrency")
             .await
             .map_err(redis_error)
+    }
+
+    /// Return whether the Redis-shared active job limit is currently reached.
+    ///
+    /// This mirrors BullMQ's `isMaxed()` / queue-maxed check: Redis reads
+    /// `meta.concurrency` and the active sorted-set cardinality inside one Lua
+    /// turn. Missing or non-positive concurrency means the queue is not maxed.
+    pub async fn is_maxed(&self) -> Result<bool> {
+        let mut conn = self.connection().await?;
+        let maxed: i64 = redis::cmd("EVAL")
+            .arg(IS_MAXED_SCRIPT)
+            .arg(2)
+            .arg(self.meta_key())
+            .arg(self.state_key(JobState::Active))
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        Ok(maxed != 0)
     }
 
     /// Clear the Redis-backed active job limit.
