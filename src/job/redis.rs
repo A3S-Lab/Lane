@@ -30,14 +30,29 @@ local function waiting_score_for(priority, sequence, job, bucket)
   return (priority * bucket_value) + half_bucket + sequence_index
 end
 
-local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket)
+local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket, marker_key)
   local sequence = redis.call('INCR', sequence_key)
   job["enqueued_seq"] = sequence
   local waiting_score = waiting_score_for(priority, sequence, job, bucket)
   local updated = cjson.encode(job)
   redis.call('HSET', jobs_key, job_id, updated)
   redis.call('ZADD', waiting_key, waiting_score, job_id)
+  if marker_key and marker_key ~= '' then
+    redis.call('ZADD', marker_key, 0, '0')
+  end
   return updated
+end
+
+local function refresh_delay_marker(marker_key, delayed_key)
+  if not marker_key or marker_key == '' then
+    return
+  end
+  local next_delayed = redis.call('ZRANGE', delayed_key, 0, 0, 'WITHSCORES')
+  if next_delayed[2] then
+    redis.call('ZADD', marker_key, next_delayed[2], '1')
+  else
+    redis.call('ZREM', marker_key, '1')
+  end
 end
 
 local function active_deduplicated_raw(jobs_key, deduplication_prefix, deduplication_id)
@@ -339,9 +354,10 @@ local state = ARGV[3]
 local inserted_raw = ARGV[2]
 if state == 'waiting' then
   local job = cjson.decode(ARGV[2])
-  inserted_raw = enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[5], job, ARGV[1], tonumber(ARGV[5]), ARGV[6])
+  inserted_raw = enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[5], job, ARGV[1], tonumber(ARGV[5]), ARGV[6], KEYS[#KEYS])
 elseif state == 'delayed' then
   redis.call('ZADD', KEYS[3], ARGV[4], ARGV[1])
+  refresh_delay_marker(KEYS[#KEYS], KEYS[3])
 elseif state == 'waiting_children' then
   redis.call('ZADD', KEYS[4], ARGV[4], ARGV[1])
 end
@@ -376,14 +392,29 @@ local function waiting_score_for(priority, sequence, job, bucket)
   return (priority * bucket_value) + half_bucket + sequence_index
 end
 
-local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket)
+local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket, marker_key)
   local sequence = redis.call('INCR', sequence_key)
   job["enqueued_seq"] = sequence
   local waiting_score = waiting_score_for(priority, sequence, job, bucket)
   local updated = cjson.encode(job)
   redis.call('HSET', jobs_key, job_id, updated)
   redis.call('ZADD', waiting_key, waiting_score, job_id)
+  if marker_key and marker_key ~= '' then
+    redis.call('ZADD', marker_key, 0, '0')
+  end
   return updated
+end
+
+local function refresh_delay_marker(marker_key, delayed_key)
+  if not marker_key or marker_key == '' then
+    return
+  end
+  local next_delayed = redis.call('ZRANGE', delayed_key, 0, 0, 'WITHSCORES')
+  if next_delayed[2] then
+    redis.call('ZADD', marker_key, next_delayed[2], '1')
+  else
+    redis.call('ZREM', marker_key, '1')
+  end
 end
 
 local function duration_millis(duration)
@@ -650,9 +681,10 @@ local state = ARGV[3]
 local inserted_raw = ARGV[2]
 if state == 'waiting' then
   local job = cjson.decode(ARGV[2])
-  inserted_raw = enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[5], job, ARGV[1], tonumber(ARGV[5]), ARGV[6])
+  inserted_raw = enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[5], job, ARGV[1], tonumber(ARGV[5]), ARGV[6], KEYS[#KEYS])
 elseif state == 'delayed' then
   redis.call('ZADD', KEYS[3], ARGV[4], ARGV[1])
+  refresh_delay_marker(KEYS[#KEYS], KEYS[3])
 elseif state == 'waiting_children' then
   redis.call('ZADD', KEYS[4], ARGV[4], ARGV[1])
 end
@@ -685,14 +717,29 @@ local function waiting_score_for(priority, sequence, job, bucket)
   return (priority * bucket_value) + half_bucket + sequence_index
 end
 
-local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket)
+local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket, marker_key)
   local sequence = redis.call('INCR', sequence_key)
   job["enqueued_seq"] = sequence
   local waiting_score = waiting_score_for(priority, sequence, job, bucket)
   local updated = cjson.encode(job)
   redis.call('HSET', jobs_key, job_id, updated)
   redis.call('ZADD', waiting_key, waiting_score, job_id)
+  if marker_key and marker_key ~= '' then
+    redis.call('ZADD', marker_key, 0, '0')
+  end
   return updated
+end
+
+local function refresh_delay_marker(marker_key, delayed_key)
+  if not marker_key or marker_key == '' then
+    return
+  end
+  local next_delayed = redis.call('ZRANGE', delayed_key, 0, 0, 'WITHSCORES')
+  if next_delayed[2] then
+    redis.call('ZADD', marker_key, next_delayed[2], '1')
+  else
+    redis.call('ZREM', marker_key, '1')
+  end
 end
 
 local function active_deduplicated_raw(jobs_key, deduplication_prefix, deduplication_id)
@@ -1017,9 +1064,10 @@ for index = 1, count do
       else
         local inserted_raw = raw
         if state == 'waiting' then
-          inserted_raw = enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[5], cjson.decode(raw), id, priority, waiting_score_bucket)
+          inserted_raw = enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[5], cjson.decode(raw), id, priority, waiting_score_bucket, KEYS[#KEYS])
         elseif state == 'delayed' then
           redis.call('ZADD', KEYS[3], scheduled_score, id)
+          refresh_delay_marker(KEYS[#KEYS], KEYS[3])
         elseif state == 'waiting_children' then
           redis.call('ZADD', KEYS[4], scheduled_score, id)
         end
@@ -1059,14 +1107,29 @@ local function waiting_score_for(priority, sequence, job, bucket)
   return (priority * bucket_value) + half_bucket + sequence_index
 end
 
-local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket)
+local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket, marker_key)
   local sequence = redis.call('INCR', sequence_key)
   job["enqueued_seq"] = sequence
   local waiting_score = waiting_score_for(priority, sequence, job, bucket)
   local updated = cjson.encode(job)
   redis.call('HSET', jobs_key, job_id, updated)
   redis.call('ZADD', waiting_key, waiting_score, job_id)
+  if marker_key and marker_key ~= '' then
+    redis.call('ZADD', marker_key, 0, '0')
+  end
   return updated
+end
+
+local function refresh_delay_marker(marker_key, delayed_key)
+  if not marker_key or marker_key == '' then
+    return
+  end
+  local next_delayed = redis.call('ZRANGE', delayed_key, 0, 0, 'WITHSCORES')
+  if next_delayed[2] then
+    redis.call('ZADD', marker_key, next_delayed[2], '1')
+  else
+    redis.call('ZREM', marker_key, '1')
+  end
 end
 
 local function active_deduplication_id(jobs_key, deduplication_prefix, deduplication_id)
@@ -1290,9 +1353,10 @@ for index = 1, count do
 
   redis.call('HSET', KEYS[1], id, raw)
   if state == 'waiting' then
-    enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[5], cjson.decode(raw), id, priority, waiting_score_bucket)
+    enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[5], cjson.decode(raw), id, priority, waiting_score_bucket, KEYS[#KEYS])
   elseif state == 'delayed' then
     redis.call('ZADD', KEYS[3], scheduled_score, id)
+    refresh_delay_marker(KEYS[#KEYS], KEYS[3])
   elseif state == 'waiting_children' then
     redis.call('ZADD', KEYS[4], scheduled_score, id)
   end
@@ -1340,14 +1404,29 @@ local function waiting_score_for(priority, sequence, job, bucket)
   return (priority * bucket_value) + half_bucket + sequence_index
 end
 
-local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket)
+local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket, marker_key)
   local sequence = redis.call('INCR', sequence_key)
   job["enqueued_seq"] = sequence
   local waiting_score = waiting_score_for(priority, sequence, job, bucket)
   local updated = cjson.encode(job)
   redis.call('HSET', jobs_key, job_id, updated)
   redis.call('ZADD', waiting_key, waiting_score, job_id)
+  if marker_key and marker_key ~= '' then
+    redis.call('ZADD', marker_key, 0, '0')
+  end
   return updated
+end
+
+local function refresh_delay_marker(marker_key, delayed_key)
+  if not marker_key or marker_key == '' then
+    return
+  end
+  local next_delayed = redis.call('ZRANGE', delayed_key, 0, 0, 'WITHSCORES')
+  if next_delayed[2] then
+    redis.call('ZADD', marker_key, next_delayed[2], '1')
+  else
+    redis.call('ZREM', marker_key, '1')
+  end
 end
 
 local due_ids = redis.call('ZRANGEBYSCORE', KEYS[6], '-inf', ARGV[10], 'LIMIT', 0, ARGV[12])
@@ -1359,11 +1438,12 @@ for _, due_id in ipairs(due_ids) do
     if delayed_job["state"] == "delayed" then
       delayed_job["state"] = "waiting"
       local priority = tonumber(delayed_job["priority"] or '1000') or 1000
-      enqueue_waiting_job(KEYS[3], KEYS[1], KEYS[7], delayed_job, due_id, priority, ARGV[11])
+      enqueue_waiting_job(KEYS[3], KEYS[1], KEYS[7], delayed_job, due_id, priority, ARGV[11], KEYS[#KEYS])
       redis.call('XADD', KEYS[8], 'MAXLEN', '~', ARGV[14], '*', 'event', 'waiting', 'jobId', due_id, 'prev', 'delayed')
     end
   end
 end
+refresh_delay_marker(KEYS[#KEYS], KEYS[6])
 
 local paused = redis.call('HGET', KEYS[5], 'paused')
 if paused == '0' then
@@ -1478,14 +1558,29 @@ local function waiting_score_for(priority, sequence, job, bucket)
   return (priority * bucket_value) + half_bucket + sequence_index
 end
 
-local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket)
+local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket, marker_key)
   local sequence = redis.call('INCR', sequence_key)
   job["enqueued_seq"] = sequence
   local waiting_score = waiting_score_for(priority, sequence, job, bucket)
   local updated = cjson.encode(job)
   redis.call('HSET', jobs_key, job_id, updated)
   redis.call('ZADD', waiting_key, waiting_score, job_id)
+  if marker_key and marker_key ~= '' then
+    redis.call('ZADD', marker_key, 0, '0')
+  end
   return updated
+end
+
+local function refresh_delay_marker(marker_key, delayed_key)
+  if not marker_key or marker_key == '' then
+    return
+  end
+  local next_delayed = redis.call('ZRANGE', delayed_key, 0, 0, 'WITHSCORES')
+  if next_delayed[2] then
+    redis.call('ZADD', marker_key, next_delayed[2], '1')
+  else
+    redis.call('ZREM', marker_key, '1')
+  end
 end
 
 local function days_from_civil(year, month, day)
@@ -1930,9 +2025,10 @@ local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delay
   end
   if next_job["state"] == "waiting" then
     local priority = tonumber(next_job["priority"] or '1000') or 1000
-    enqueue_waiting_job(jobs_key, waiting_key, sequence_key, next_job, next_job["id"], priority, waiting_score_bucket)
+    enqueue_waiting_job(jobs_key, waiting_key, sequence_key, next_job, next_job["id"], priority, waiting_score_bucket, KEYS[#KEYS])
   else
     redis.call('ZADD', delayed_key, scheduled_millis, next_job["id"])
+    refresh_delay_marker(KEYS[#KEYS], delayed_key)
   end
   redis.call('DEL', next_key)
   return true
@@ -2052,11 +2148,12 @@ if parent_id and parent_id ~= cjson.null then
         if parent_scheduled_millis <= tonumber(ARGV[5]) then
           parent["state"] = "waiting"
           local priority = tonumber(parent["priority"] or '1000') or 1000
-          enqueue_waiting_job(KEYS[1], KEYS[5], KEYS[7], parent, parent_id, priority, ARGV[7])
+          enqueue_waiting_job(KEYS[1], KEYS[5], KEYS[7], parent, parent_id, priority, ARGV[7], KEYS[#KEYS])
         else
           parent["state"] = "delayed"
           redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
           redis.call('ZADD', KEYS[9], parent_scheduled_millis, parent_id)
+          refresh_delay_marker(KEYS[#KEYS], KEYS[9])
         end
       end
     end
@@ -2073,9 +2170,10 @@ if not enqueued_deduplicated_next and repeat_next_id and repeat_next_id ~= '' th
     local repeat_next_state = ARGV[10]
     if repeat_next_state == 'waiting' then
       local repeat_priority = tonumber(ARGV[12])
-      enqueue_waiting_job(KEYS[1], KEYS[5], KEYS[7], repeat_next, repeat_next_id, repeat_priority, ARGV[7])
+      enqueue_waiting_job(KEYS[1], KEYS[5], KEYS[7], repeat_next, repeat_next_id, repeat_priority, ARGV[7], KEYS[#KEYS])
     elseif repeat_next_state == 'delayed' then
       redis.call('ZADD', KEYS[9], ARGV[11], repeat_next_id)
+      refresh_delay_marker(KEYS[#KEYS], KEYS[9])
     elseif repeat_next_state == 'waiting_children' then
       redis.call('ZADD', KEYS[6], ARGV[11], repeat_next_id)
     end
@@ -2099,14 +2197,29 @@ local function waiting_score_for(priority, sequence, job, bucket)
   return (priority * bucket_value) + half_bucket + sequence_index
 end
 
-local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket)
+local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket, marker_key)
   local sequence = redis.call('INCR', sequence_key)
   job["enqueued_seq"] = sequence
   local waiting_score = waiting_score_for(priority, sequence, job, bucket)
   local updated = cjson.encode(job)
   redis.call('HSET', jobs_key, job_id, updated)
   redis.call('ZADD', waiting_key, waiting_score, job_id)
+  if marker_key and marker_key ~= '' then
+    redis.call('ZADD', marker_key, 0, '0')
+  end
   return updated
+end
+
+local function refresh_delay_marker(marker_key, delayed_key)
+  if not marker_key or marker_key == '' then
+    return
+  end
+  local next_delayed = redis.call('ZRANGE', delayed_key, 0, 0, 'WITHSCORES')
+  if next_delayed[2] then
+    redis.call('ZADD', marker_key, next_delayed[2], '1')
+  else
+    redis.call('ZREM', marker_key, '1')
+  end
 end
 
 local function deduplication_id(job)
@@ -2508,9 +2621,10 @@ local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delay
   end
   if next_job["state"] == "waiting" then
     local priority = tonumber(next_job["priority"] or '1000') or 1000
-    enqueue_waiting_job(jobs_key, waiting_key, sequence_key, next_job, next_job["id"], priority, waiting_score_bucket)
+    enqueue_waiting_job(jobs_key, waiting_key, sequence_key, next_job, next_job["id"], priority, waiting_score_bucket, KEYS[#KEYS])
   else
     redis.call('ZADD', delayed_key, scheduled_millis, next_job["id"])
+    refresh_delay_marker(KEYS[#KEYS], delayed_key)
   end
   redis.call('DEL', next_key)
   return true
@@ -2549,6 +2663,7 @@ if ARGV[5] == '1' then
   local updated = cjson.encode(job)
   redis.call('HSET', KEYS[1], ARGV[1], updated)
   redis.call('ZADD', KEYS[3], ARGV[7], ARGV[1])
+  refresh_delay_marker(KEYS[#KEYS], KEYS[3])
   redis.call('XADD', KEYS[9], 'MAXLEN', '~', ARGV[16], '*', 'event', 'delayed', 'jobId', ARGV[1], 'failedReason', ARGV[4], 'prev', 'active')
   return {'ok', updated}
 end
@@ -2632,6 +2747,18 @@ return {'ok', updated}
 "#;
 
 const DELAY_ACTIVE_JOB_SCRIPT: &str = r#"
+local function refresh_delay_marker(marker_key, delayed_key)
+  if not marker_key or marker_key == '' then
+    return
+  end
+  local next_delayed = redis.call('ZRANGE', delayed_key, 0, 0, 'WITHSCORES')
+  if next_delayed[2] then
+    redis.call('ZADD', marker_key, next_delayed[2], '1')
+  else
+    redis.call('ZREM', marker_key, '1')
+  end
+end
+
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
   redis.call('ZREM', KEYS[2], ARGV[1])
@@ -2677,6 +2804,7 @@ job["options"]["delay"] = cjson.decode(ARGV[5])
 local updated = cjson.encode(job)
 redis.call('HSET', KEYS[1], ARGV[1], updated)
 redis.call('ZADD', KEYS[3], ARGV[4], ARGV[1])
+refresh_delay_marker(KEYS[#KEYS], KEYS[3])
 redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[6], '*', 'event', 'delayed', 'jobId', ARGV[1], 'prev', 'active')
 
 return {'ok', updated}
@@ -2693,14 +2821,29 @@ local function waiting_score_for(priority, sequence, job, bucket)
   return (priority * bucket_value) + half_bucket + sequence_index
 end
 
-local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket)
+local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket, marker_key)
   local sequence = redis.call('INCR', sequence_key)
   job["enqueued_seq"] = sequence
   local waiting_score = waiting_score_for(priority, sequence, job, bucket)
   local updated = cjson.encode(job)
   redis.call('HSET', jobs_key, job_id, updated)
   redis.call('ZADD', waiting_key, waiting_score, job_id)
+  if marker_key and marker_key ~= '' then
+    redis.call('ZADD', marker_key, 0, '0')
+  end
   return updated
+end
+
+local function refresh_delay_marker(marker_key, delayed_key)
+  if not marker_key or marker_key == '' then
+    return
+  end
+  local next_delayed = redis.call('ZRANGE', delayed_key, 0, 0, 'WITHSCORES')
+  if next_delayed[2] then
+    redis.call('ZADD', marker_key, next_delayed[2], '1')
+  else
+    redis.call('ZREM', marker_key, '1')
+  end
 end
 
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
@@ -2742,7 +2885,7 @@ job["lease_expires_at"] = cjson.null
 job["failed_reason"] = cjson.null
 
 local priority = tonumber(job["priority"] or '1000') or 1000
-local updated = enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[4], job, ARGV[1], priority, ARGV[5])
+local updated = enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[4], job, ARGV[1], priority, ARGV[5], KEYS[#KEYS])
 redis.call('XADD', KEYS[6], 'MAXLEN', '~', ARGV[6], '*', 'event', 'waiting', 'jobId', ARGV[1], 'prev', 'active')
 
 return {'ok', updated}
@@ -2759,14 +2902,29 @@ local function waiting_score_for(priority, sequence, job, bucket)
   return (priority * bucket_value) + half_bucket + sequence_index
 end
 
-local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket)
+local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket, marker_key)
   local sequence = redis.call('INCR', sequence_key)
   job["enqueued_seq"] = sequence
   local waiting_score = waiting_score_for(priority, sequence, job, bucket)
   local updated = cjson.encode(job)
   redis.call('HSET', jobs_key, job_id, updated)
   redis.call('ZADD', waiting_key, waiting_score, job_id)
+  if marker_key and marker_key ~= '' then
+    redis.call('ZADD', marker_key, 0, '0')
+  end
   return updated
+end
+
+local function refresh_delay_marker(marker_key, delayed_key)
+  if not marker_key or marker_key == '' then
+    return
+  end
+  local next_delayed = redis.call('ZRANGE', delayed_key, 0, 0, 'WITHSCORES')
+  if next_delayed[2] then
+    redis.call('ZADD', marker_key, next_delayed[2], '1')
+  else
+    redis.call('ZREM', marker_key, '1')
+  end
 end
 
 local function deduplication_id(job)
@@ -3176,9 +3334,10 @@ local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delay
   end
   if next_job["state"] == "waiting" then
     local priority = tonumber(next_job["priority"] or '1000') or 1000
-    enqueue_waiting_job(jobs_key, waiting_key, sequence_key, next_job, next_job["id"], priority, waiting_score_bucket)
+    enqueue_waiting_job(jobs_key, waiting_key, sequence_key, next_job, next_job["id"], priority, waiting_score_bucket, KEYS[#KEYS])
   else
     redis.call('ZADD', delayed_key, scheduled_millis, next_job["id"])
+    refresh_delay_marker(KEYS[#KEYS], delayed_key)
   end
   redis.call('DEL', next_key)
   return true
@@ -3270,7 +3429,7 @@ for _, id in ipairs(ids) do
           job["state"] = "waiting"
           job["processed_at"] = cjson.null
           local priority = tonumber(job["priority"] or '1000') or 1000
-          enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[5], job, id, priority, ARGV[4])
+          enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[5], job, id, priority, ARGV[4], KEYS[#KEYS])
         end
 
         recovered = recovered + 1
@@ -3297,14 +3456,29 @@ local function waiting_score_for(priority, sequence, job, bucket)
   return (priority * bucket_value) + half_bucket + sequence_index
 end
 
-local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket)
+local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket, marker_key)
   local sequence = redis.call('INCR', sequence_key)
   job["enqueued_seq"] = sequence
   local waiting_score = waiting_score_for(priority, sequence, job, bucket)
   local updated = cjson.encode(job)
   redis.call('HSET', jobs_key, job_id, updated)
   redis.call('ZADD', waiting_key, waiting_score, job_id)
+  if marker_key and marker_key ~= '' then
+    redis.call('ZADD', marker_key, 0, '0')
+  end
   return updated
+end
+
+local function refresh_delay_marker(marker_key, delayed_key)
+  if not marker_key or marker_key == '' then
+    return
+  end
+  local next_delayed = redis.call('ZRANGE', delayed_key, 0, 0, 'WITHSCORES')
+  if next_delayed[2] then
+    redis.call('ZADD', marker_key, next_delayed[2], '1')
+  else
+    redis.call('ZREM', marker_key, '1')
+  end
 end
 
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
@@ -3314,6 +3488,7 @@ if not raw then
 end
 
 local removed_from_delayed = redis.call('ZREM', KEYS[3], ARGV[1])
+refresh_delay_marker(KEYS[#KEYS], KEYS[3])
 
 local job = cjson.decode(raw)
 if job["state"] ~= "delayed" then
@@ -3327,13 +3502,25 @@ end
 job["state"] = "waiting"
 job["scheduled_at"] = ARGV[2]
 local priority = tonumber(job["priority"] or '1000') or 1000
-local updated = enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[4], job, ARGV[1], priority, ARGV[3])
+local updated = enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[4], job, ARGV[1], priority, ARGV[3], KEYS[#KEYS])
 redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[4], '*', 'event', 'waiting', 'jobId', ARGV[1], 'prev', 'delayed')
 
 return {'ok', updated}
 "#;
 
 const RESCHEDULE_JOB_SCRIPT: &str = r#"
+local function refresh_delay_marker(marker_key, delayed_key)
+  if not marker_key or marker_key == '' then
+    return
+  end
+  local next_delayed = redis.call('ZRANGE', delayed_key, 0, 0, 'WITHSCORES')
+  if next_delayed[2] then
+    redis.call('ZADD', marker_key, next_delayed[2], '1')
+  else
+    redis.call('ZREM', marker_key, '1')
+  end
+end
+
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
   redis.call('ZREM', KEYS[2], ARGV[1])
@@ -3359,6 +3546,7 @@ job["options"]["delay"] = cjson.decode(ARGV[4])
 
 local updated = cjson.encode(job)
 redis.call('ZADD', KEYS[2], ARGV[3], ARGV[1])
+refresh_delay_marker(KEYS[#KEYS], KEYS[2])
 redis.call('HSET', KEYS[1], ARGV[1], updated)
 
 return {'ok', updated}
@@ -3375,14 +3563,29 @@ local function waiting_score_for(priority, sequence, job, bucket)
   return (priority * bucket_value) + half_bucket + sequence_index
 end
 
-local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket)
+local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket, marker_key)
   local sequence = redis.call('INCR', sequence_key)
   job["enqueued_seq"] = sequence
   local waiting_score = waiting_score_for(priority, sequence, job, bucket)
   local updated = cjson.encode(job)
   redis.call('HSET', jobs_key, job_id, updated)
   redis.call('ZADD', waiting_key, waiting_score, job_id)
+  if marker_key and marker_key ~= '' then
+    redis.call('ZADD', marker_key, 0, '0')
+  end
   return updated
+end
+
+local function refresh_delay_marker(marker_key, delayed_key)
+  if not marker_key or marker_key == '' then
+    return
+  end
+  local next_delayed = redis.call('ZRANGE', delayed_key, 0, 0, 'WITHSCORES')
+  if next_delayed[2] then
+    redis.call('ZADD', marker_key, next_delayed[2], '1')
+  else
+    redis.call('ZREM', marker_key, '1')
+  end
 end
 
 local function deduplication_id(job)
@@ -3582,7 +3785,7 @@ if retry_deduplication_id then
 end
 
 local priority = tonumber(job["priority"] or '1000') or 1000
-local updated = enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[4], job, ARGV[1], priority, ARGV[3])
+local updated = enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[4], job, ARGV[1], priority, ARGV[3], KEYS[#KEYS])
 redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[8], '*', 'event', 'waiting', 'jobId', ARGV[1], 'prev', 'failed')
 if retry_deduplication_id then
   if ARGV[7] ~= '' then
@@ -3610,14 +3813,29 @@ local function waiting_score_for(priority, sequence, job, bucket)
   return (priority * bucket_value) + half_bucket + sequence_index
 end
 
-local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket)
+local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket, marker_key)
   local sequence = redis.call('INCR', sequence_key)
   job["enqueued_seq"] = sequence
   local waiting_score = waiting_score_for(priority, sequence, job, bucket)
   local updated = cjson.encode(job)
   redis.call('HSET', jobs_key, job_id, updated)
   redis.call('ZADD', waiting_key, waiting_score, job_id)
+  if marker_key and marker_key ~= '' then
+    redis.call('ZADD', marker_key, 0, '0')
+  end
   return updated
+end
+
+local function refresh_delay_marker(marker_key, delayed_key)
+  if not marker_key or marker_key == '' then
+    return
+  end
+  local next_delayed = redis.call('ZRANGE', delayed_key, 0, 0, 'WITHSCORES')
+  if next_delayed[2] then
+    redis.call('ZADD', marker_key, next_delayed[2], '1')
+  else
+    redis.call('ZREM', marker_key, '1')
+  end
 end
 
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
@@ -3648,7 +3866,7 @@ elseif ARGV[4] == '0' then
 end
 
 if job["state"] == "waiting" then
-  enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[3], job, ARGV[1], priority, ARGV[3])
+  enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[3], job, ARGV[1], priority, ARGV[3], KEYS[#KEYS])
 end
 
 local updated = cjson.encode(job)
@@ -3668,14 +3886,29 @@ local function waiting_score_for(priority, sequence, job, bucket)
   return (priority * bucket_value) + half_bucket + sequence_index
 end
 
-local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket)
+local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket, marker_key)
   local sequence = redis.call('INCR', sequence_key)
   job["enqueued_seq"] = sequence
   local waiting_score = waiting_score_for(priority, sequence, job, bucket)
   local updated = cjson.encode(job)
   redis.call('HSET', jobs_key, job_id, updated)
   redis.call('ZADD', waiting_key, waiting_score, job_id)
+  if marker_key and marker_key ~= '' then
+    redis.call('ZADD', marker_key, 0, '0')
+  end
   return updated
+end
+
+local function refresh_delay_marker(marker_key, delayed_key)
+  if not marker_key or marker_key == '' then
+    return
+  end
+  local next_delayed = redis.call('ZRANGE', delayed_key, 0, 0, 'WITHSCORES')
+  if next_delayed[2] then
+    redis.call('ZADD', marker_key, next_delayed[2], '1')
+  else
+    redis.call('ZREM', marker_key, '1')
+  end
 end
 
 local ids = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1], 'LIMIT', 0, ARGV[3])
@@ -3689,12 +3922,13 @@ for _, id in ipairs(ids) do
     if job["state"] == "delayed" then
       job["state"] = "waiting"
       local priority = tonumber(job["priority"] or '1000') or 1000
-      enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[4], job, id, priority, ARGV[2])
+      enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[4], job, id, priority, ARGV[2], KEYS[#KEYS])
       redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[4], '*', 'event', 'waiting', 'jobId', id, 'prev', 'delayed')
       promoted = promoted + 1
     end
   end
 end
+refresh_delay_marker(KEYS[#KEYS], KEYS[2])
 
 return promoted
 "#;
@@ -3710,14 +3944,29 @@ local function waiting_score_for(priority, sequence, job, bucket)
   return (priority * bucket_value) + half_bucket + sequence_index
 end
 
-local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket)
+local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket, marker_key)
   local sequence = redis.call('INCR', sequence_key)
   job["enqueued_seq"] = sequence
   local waiting_score = waiting_score_for(priority, sequence, job, bucket)
   local updated = cjson.encode(job)
   redis.call('HSET', jobs_key, job_id, updated)
   redis.call('ZADD', waiting_key, waiting_score, job_id)
+  if marker_key and marker_key ~= '' then
+    redis.call('ZADD', marker_key, 0, '0')
+  end
   return updated
+end
+
+local function refresh_delay_marker(marker_key, delayed_key)
+  if not marker_key or marker_key == '' then
+    return
+  end
+  local next_delayed = redis.call('ZRANGE', delayed_key, 0, 0, 'WITHSCORES')
+  if next_delayed[2] then
+    redis.call('ZADD', marker_key, next_delayed[2], '1')
+  else
+    redis.call('ZREM', marker_key, '1')
+  end
 end
 
 local function days_from_civil(year, month, day)
@@ -4027,11 +4276,12 @@ if parent_id and parent_id ~= cjson.null then
         if parent_scheduled_millis <= tonumber(ARGV[3]) then
           parent["state"] = "waiting"
           local priority = tonumber(parent["priority"] or '1000') or 1000
-          enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[9], parent, parent_id, priority, ARGV[4])
+          enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[9], parent, parent_id, priority, ARGV[4], KEYS[#KEYS])
         else
           parent["state"] = "delayed"
           redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
           redis.call('ZADD', KEYS[4], parent_scheduled_millis, parent_id)
+      refresh_delay_marker(KEYS[#KEYS], KEYS[4])
         end
       end
     end
@@ -4052,14 +4302,29 @@ local function waiting_score_for(priority, sequence, job, bucket)
   return (priority * bucket_value) + half_bucket + sequence_index
 end
 
-local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket)
+local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket, marker_key)
   local sequence = redis.call('INCR', sequence_key)
   job["enqueued_seq"] = sequence
   local waiting_score = waiting_score_for(priority, sequence, job, bucket)
   local updated = cjson.encode(job)
   redis.call('HSET', jobs_key, job_id, updated)
   redis.call('ZADD', waiting_key, waiting_score, job_id)
+  if marker_key and marker_key ~= '' then
+    redis.call('ZADD', marker_key, 0, '0')
+  end
   return updated
+end
+
+local function refresh_delay_marker(marker_key, delayed_key)
+  if not marker_key or marker_key == '' then
+    return
+  end
+  local next_delayed = redis.call('ZRANGE', delayed_key, 0, 0, 'WITHSCORES')
+  if next_delayed[2] then
+    redis.call('ZADD', marker_key, next_delayed[2], '1')
+  else
+    redis.call('ZREM', marker_key, '1')
+  end
 end
 
 local function days_from_civil(year, month, day)
@@ -4360,11 +4625,12 @@ local function release_parent_after_removed_child(job, removed_id)
     if parent_scheduled_millis <= tonumber(ARGV[6]) then
       parent["state"] = "waiting"
       local priority = tonumber(parent["priority"] or '1000') or 1000
-      enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[8], parent, parent_id, priority, ARGV[7])
+      enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[8], parent, parent_id, priority, ARGV[7], KEYS[#KEYS])
     else
       parent["state"] = "delayed"
       redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
       redis.call('ZADD', KEYS[3], parent_scheduled_millis, parent_id)
+      refresh_delay_marker(KEYS[#KEYS], KEYS[3])
     end
   end
 end
@@ -4464,14 +4730,29 @@ local function waiting_score_for(priority, sequence, job, bucket)
   return (priority * bucket_value) + half_bucket + sequence_index
 end
 
-local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket)
+local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket, marker_key)
   local sequence = redis.call('INCR', sequence_key)
   job["enqueued_seq"] = sequence
   local waiting_score = waiting_score_for(priority, sequence, job, bucket)
   local updated = cjson.encode(job)
   redis.call('HSET', jobs_key, job_id, updated)
   redis.call('ZADD', waiting_key, waiting_score, job_id)
+  if marker_key and marker_key ~= '' then
+    redis.call('ZADD', marker_key, 0, '0')
+  end
   return updated
+end
+
+local function refresh_delay_marker(marker_key, delayed_key)
+  if not marker_key or marker_key == '' then
+    return
+  end
+  local next_delayed = redis.call('ZRANGE', delayed_key, 0, 0, 'WITHSCORES')
+  if next_delayed[2] then
+    redis.call('ZADD', marker_key, next_delayed[2], '1')
+  else
+    redis.call('ZREM', marker_key, '1')
+  end
 end
 
 local function days_from_civil(year, month, day)
@@ -4779,11 +5060,12 @@ local function release_parent_after_removed_child(job, removed_id)
     if parent_scheduled_millis <= tonumber(ARGV[3]) then
       parent["state"] = "waiting"
       local priority = tonumber(parent["priority"] or '1000') or 1000
-      enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[8], parent, parent_id, priority, ARGV[4])
+      enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[8], parent, parent_id, priority, ARGV[4], KEYS[#KEYS])
     else
       parent["state"] = "delayed"
       redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
       redis.call('ZADD', KEYS[3], parent_scheduled_millis, parent_id)
+      refresh_delay_marker(KEYS[#KEYS], KEYS[3])
     end
   end
 end
@@ -5217,14 +5499,29 @@ local function waiting_score_for(priority, sequence, job, bucket)
   return (priority * bucket_value) + half_bucket + sequence_index
 end
 
-local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket)
+local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket, marker_key)
   local sequence = redis.call('INCR', sequence_key)
   job["enqueued_seq"] = sequence
   local waiting_score = waiting_score_for(priority, sequence, job, bucket)
   local updated = cjson.encode(job)
   redis.call('HSET', jobs_key, job_id, updated)
   redis.call('ZADD', waiting_key, waiting_score, job_id)
+  if marker_key and marker_key ~= '' then
+    redis.call('ZADD', marker_key, 0, '0')
+  end
   return updated
+end
+
+local function refresh_delay_marker(marker_key, delayed_key)
+  if not marker_key or marker_key == '' then
+    return
+  end
+  local next_delayed = redis.call('ZRANGE', delayed_key, 0, 0, 'WITHSCORES')
+  if next_delayed[2] then
+    redis.call('ZADD', marker_key, next_delayed[2], '1')
+  else
+    redis.call('ZREM', marker_key, '1')
+  end
 end
 
 local function days_from_civil(year, month, day)
@@ -5549,11 +5846,12 @@ local function release_parent_if_ready(parent_id, parent)
     if parent_scheduled_millis <= tonumber(ARGV[3]) then
       parent["state"] = "waiting"
       local priority = tonumber(parent["priority"] or '1000') or 1000
-      enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[8], parent, parent_id, priority, ARGV[4])
+      enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[8], parent, parent_id, priority, ARGV[4], KEYS[#KEYS])
     else
       parent["state"] = "delayed"
       redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
       redis.call('ZADD', KEYS[3], parent_scheduled_millis, parent_id)
+      refresh_delay_marker(KEYS[#KEYS], KEYS[3])
     end
   end
 end
@@ -5585,14 +5883,29 @@ local function waiting_score_for(priority, sequence, job, bucket)
   return (priority * bucket_value) + half_bucket + sequence_index
 end
 
-local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket)
+local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket, marker_key)
   local sequence = redis.call('INCR', sequence_key)
   job["enqueued_seq"] = sequence
   local waiting_score = waiting_score_for(priority, sequence, job, bucket)
   local updated = cjson.encode(job)
   redis.call('HSET', jobs_key, job_id, updated)
   redis.call('ZADD', waiting_key, waiting_score, job_id)
+  if marker_key and marker_key ~= '' then
+    redis.call('ZADD', marker_key, 0, '0')
+  end
   return updated
+end
+
+local function refresh_delay_marker(marker_key, delayed_key)
+  if not marker_key or marker_key == '' then
+    return
+  end
+  local next_delayed = redis.call('ZRANGE', delayed_key, 0, 0, 'WITHSCORES')
+  if next_delayed[2] then
+    redis.call('ZADD', marker_key, next_delayed[2], '1')
+  else
+    redis.call('ZREM', marker_key, '1')
+  end
 end
 
 local function days_from_civil(year, month, day)
@@ -5872,11 +6185,12 @@ local function release_parent_if_ready(parent_id, parent, dependency_key)
     if parent_scheduled_millis <= tonumber(ARGV[3]) then
       parent["state"] = "waiting"
       local priority = tonumber(parent["priority"] or '1000') or 1000
-      enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[8], parent, parent_id, priority, ARGV[4])
+      enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[8], parent, parent_id, priority, ARGV[4], KEYS[#KEYS])
     else
       parent["state"] = "delayed"
       redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
       redis.call('ZADD', KEYS[3], parent_scheduled_millis, parent_id)
+      refresh_delay_marker(KEYS[#KEYS], KEYS[3])
     end
   else
     redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
@@ -6241,7 +6555,7 @@ impl RedisJobQueue {
         let mut conn = self.connection().await?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(UPSERT_REPEAT_SCRIPT)
-            .arg(9)
+            .arg(10)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Waiting))
             .arg(self.state_key(JobState::Delayed))
@@ -6251,6 +6565,7 @@ impl RedisJobQueue {
             .arg(self.state_key(JobState::Completed))
             .arg(self.state_key(JobState::Failed))
             .arg(self.events_key())
+            .arg(self.marker_key())
             .arg(&job.id)
             .arg(encoded)
             .arg(job_state_name(job.state))
@@ -6298,7 +6613,7 @@ impl RedisJobQueue {
         let mut command = redis::cmd("EVAL");
         command
             .arg(ADD_JOBS_SCRIPT)
-            .arg(7)
+            .arg(8)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Waiting))
             .arg(self.state_key(JobState::Delayed))
@@ -6306,6 +6621,7 @@ impl RedisJobQueue {
             .arg(self.sequence_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.events_key())
+            .arg(self.marker_key())
             .arg(created.len());
         for job in &created {
             command
@@ -6429,7 +6745,7 @@ impl RedisJobQueue {
         let mut conn = self.connection().await?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(REMOVE_UNPROCESSED_CHILDREN_SCRIPT)
-            .arg(9)
+            .arg(10)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Waiting))
             .arg(self.state_key(JobState::Delayed))
@@ -6439,6 +6755,7 @@ impl RedisJobQueue {
             .arg(self.state_key(JobState::Failed))
             .arg(self.sequence_key())
             .arg(self.dependencies_key(parent_id))
+            .arg(self.marker_key())
             .arg(parent_id)
             .arg(now.to_rfc3339())
             .arg(millis(now))
@@ -6463,7 +6780,7 @@ impl RedisJobQueue {
         let mut conn = self.connection().await?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(REMOVE_CHILD_DEPENDENCY_SCRIPT)
-            .arg(8)
+            .arg(9)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Waiting))
             .arg(self.state_key(JobState::Delayed))
@@ -6472,6 +6789,7 @@ impl RedisJobQueue {
             .arg(self.state_key(JobState::Completed))
             .arg(self.state_key(JobState::Failed))
             .arg(self.sequence_key())
+            .arg(self.marker_key())
             .arg(child_id)
             .arg(now.to_rfc3339())
             .arg(millis(now))
@@ -6515,6 +6833,10 @@ impl RedisJobQueue {
 
     fn events_key(&self) -> String {
         self.key("events")
+    }
+
+    fn marker_key(&self) -> String {
+        self.key("marker")
     }
 
     fn claim_rate_limit_key(&self) -> String {
@@ -6592,7 +6914,7 @@ impl RedisJobQueue {
         let encoded = encode_job(job)?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(ADD_JOB_SCRIPT)
-            .arg(7)
+            .arg(8)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Waiting))
             .arg(self.state_key(JobState::Delayed))
@@ -6600,6 +6922,7 @@ impl RedisJobQueue {
             .arg(self.sequence_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.events_key())
+            .arg(self.marker_key())
             .arg(&job.id)
             .arg(encoded)
             .arg(job_state_name(job.state))
@@ -6629,13 +6952,14 @@ impl RedisJobQueue {
         let mut command = redis::cmd("EVAL");
         command
             .arg(ADD_FLOW_SCRIPT)
-            .arg(6)
+            .arg(7)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Waiting))
             .arg(self.state_key(JobState::Delayed))
             .arg(self.state_key(JobState::WaitingChildren))
             .arg(self.sequence_key())
             .arg(self.events_key())
+            .arg(self.marker_key())
             .arg(job_count);
 
         for job in std::iter::once(parent).chain(children.iter()) {
@@ -6707,7 +7031,7 @@ impl RedisJobQueue {
     ) -> Result<Option<Job>> {
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(REMOVE_JOB_SCRIPT)
-            .arg(9)
+            .arg(10)
             .arg(self.jobs_key())
             .arg(self.lock_key(job_id))
             .arg(self.state_key(JobState::Waiting))
@@ -6717,6 +7041,7 @@ impl RedisJobQueue {
             .arg(self.state_key(JobState::Completed))
             .arg(self.state_key(JobState::Failed))
             .arg(self.sequence_key())
+            .arg(self.marker_key())
             .arg(job_id)
             .arg(now.to_rfc3339())
             .arg(millis(now))
@@ -6783,10 +7108,11 @@ impl RedisJobQueue {
         let mut conn = self.connection().await?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(UPDATE_PRIORITY_SCRIPT)
-            .arg(3)
+            .arg(4)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Waiting))
             .arg(self.sequence_key())
+            .arg(self.marker_key())
             .arg(job_id)
             .arg(priority)
             .arg(WAITING_SCORE_BUCKET)
@@ -6823,7 +7149,7 @@ impl RedisJobQueue {
         let scheduled_at = retry_at.unwrap_or(now);
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(FAIL_SCRIPT)
-            .arg(10)
+            .arg(11)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.state_key(JobState::Delayed))
@@ -6834,6 +7160,7 @@ impl RedisJobQueue {
             .arg(self.sequence_key())
             .arg(self.events_key())
             .arg(self.stalled_key())
+            .arg(self.marker_key())
             .arg(job_id)
             .arg(lock_token)
             .arg(now.to_rfc3339())
@@ -6920,7 +7247,7 @@ impl JobQueueBackend for RedisJobQueue {
             .unwrap_or((0, 0));
         let raw: Option<String> = redis::cmd("EVAL")
             .arg(CLAIM_SCRIPT)
-            .arg(8)
+            .arg(9)
             .arg(self.state_key(JobState::Waiting))
             .arg(self.state_key(JobState::Active))
             .arg(self.jobs_key())
@@ -6929,6 +7256,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.state_key(JobState::Delayed))
             .arg(self.sequence_key())
             .arg(self.events_key())
+            .arg(self.marker_key())
             .arg(millis(lease_expires_at))
             .arg(now.to_rfc3339())
             .arg(worker_id)
@@ -6968,7 +7296,7 @@ impl JobQueueBackend for RedisJobQueue {
         let next_repeat = next_repeat_job(&active_job, now)?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(COMPLETE_SCRIPT)
-            .arg(11)
+            .arg(12)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.state_key(JobState::Completed))
@@ -6980,6 +7308,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.state_key(JobState::Delayed))
             .arg(self.events_key())
             .arg(self.stalled_key())
+            .arg(self.marker_key())
             .arg(job_id)
             .arg(lock_token)
             .arg(now.to_rfc3339())
@@ -7072,6 +7401,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.state_key(JobState::Active))
             .arg(self.lock_key(job_id))
             .arg(self.stalled_key())
+            .arg(self.marker_key())
             .arg(job_id)
             .arg(lock_token)
             .arg(lease_expires_at.to_rfc3339())
@@ -7096,13 +7426,14 @@ impl JobQueueBackend for RedisJobQueue {
         let scheduled_at = add_duration(now, delay);
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(DELAY_ACTIVE_JOB_SCRIPT)
-            .arg(6)
+            .arg(7)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.state_key(JobState::Delayed))
             .arg(self.lock_key(job_id))
             .arg(self.events_key())
             .arg(self.stalled_key())
+            .arg(self.marker_key())
             .arg(job_id)
             .arg(lock_token)
             .arg(scheduled_at.to_rfc3339())
@@ -7126,7 +7457,7 @@ impl JobQueueBackend for RedisJobQueue {
         let mut conn = self.connection().await?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(RELEASE_ACTIVE_JOB_SCRIPT)
-            .arg(7)
+            .arg(8)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.state_key(JobState::Waiting))
@@ -7134,6 +7465,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.lock_key(job_id))
             .arg(self.events_key())
             .arg(self.stalled_key())
+            .arg(self.marker_key())
             .arg(job_id)
             .arg(lock_token)
             .arg(now.to_rfc3339())
@@ -7150,12 +7482,13 @@ impl JobQueueBackend for RedisJobQueue {
         let mut conn = self.connection().await?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(PROMOTE_JOB_SCRIPT)
-            .arg(5)
+            .arg(6)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Waiting))
             .arg(self.state_key(JobState::Delayed))
             .arg(self.sequence_key())
             .arg(self.events_key())
+            .arg(self.marker_key())
             .arg(job_id)
             .arg(now.to_rfc3339())
             .arg(WAITING_SCORE_BUCKET)
@@ -7184,9 +7517,10 @@ impl JobQueueBackend for RedisJobQueue {
         let mut conn = self.connection().await?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(RESCHEDULE_JOB_SCRIPT)
-            .arg(2)
+            .arg(3)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Delayed))
+            .arg(self.marker_key())
             .arg(job_id)
             .arg(scheduled_at.to_rfc3339())
             .arg(millis(scheduled_at))
@@ -7212,12 +7546,13 @@ impl JobQueueBackend for RedisJobQueue {
             .unwrap_or_default();
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(RETRY_JOB_SCRIPT)
-            .arg(5)
+            .arg(6)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Failed))
             .arg(self.state_key(JobState::Waiting))
             .arg(self.sequence_key())
             .arg(self.events_key())
+            .arg(self.marker_key())
             .arg(job_id)
             .arg(now.to_rfc3339())
             .arg(WAITING_SCORE_BUCKET)
@@ -7335,7 +7670,7 @@ impl JobQueueBackend for RedisJobQueue {
         let mut conn = self.connection().await?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(CLEAN_JOBS_SCRIPT)
-            .arg(8)
+            .arg(9)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Waiting))
             .arg(self.state_key(JobState::Delayed))
@@ -7344,6 +7679,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.state_key(JobState::Completed))
             .arg(self.state_key(JobState::Failed))
             .arg(self.sequence_key())
+            .arg(self.marker_key())
             .arg(job_state_name(state))
             .arg(cutoff.to_rfc3339())
             .arg(limit)
@@ -7367,7 +7703,7 @@ impl JobQueueBackend for RedisJobQueue {
         let now = Utc::now();
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(DRAIN_JOBS_SCRIPT)
-            .arg(8)
+            .arg(9)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Waiting))
             .arg(self.state_key(JobState::Delayed))
@@ -7376,6 +7712,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.state_key(JobState::Completed))
             .arg(self.state_key(JobState::Failed))
             .arg(self.sequence_key())
+            .arg(self.marker_key())
             .arg(if include_delayed { "1" } else { "0" })
             .arg(now.to_rfc3339())
             .arg(millis(now))
@@ -7622,12 +7959,13 @@ impl JobQueueBackend for RedisJobQueue {
         loop {
             let promoted: usize = redis::cmd("EVAL")
                 .arg(PROMOTE_DUE_JOBS_SCRIPT)
-                .arg(5)
+                .arg(6)
                 .arg(self.jobs_key())
                 .arg(self.state_key(JobState::Delayed))
                 .arg(self.state_key(JobState::Waiting))
                 .arg(self.sequence_key())
                 .arg(self.events_key())
+                .arg(self.marker_key())
                 .arg(millis(now))
                 .arg(WAITING_SCORE_BUCKET)
                 .arg(1_000_u16)
@@ -7647,7 +7985,7 @@ impl JobQueueBackend for RedisJobQueue {
         let mut conn = self.connection().await?;
         redis::cmd("EVAL")
             .arg(RECOVER_STALLED_SCRIPT)
-            .arg(8)
+            .arg(9)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.state_key(JobState::Waiting))
@@ -7656,6 +7994,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.state_key(JobState::WaitingChildren))
             .arg(self.state_key(JobState::Delayed))
             .arg(self.stalled_key())
+            .arg(self.marker_key())
             .arg(millis(now))
             .arg(now.to_rfc3339())
             .arg(self.lock_key_prefix())

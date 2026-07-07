@@ -130,6 +130,18 @@ async fn redis_backend_records_queue_events_against_real_server() {
 }
 
 #[tokio::test]
+async fn redis_backend_updates_worker_markers_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    tokio::time::timeout(Duration::from_secs(120), run_worker_markers(redis_url))
+        .await
+        .expect("Redis worker-marker integration test timed out")
+        .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_applies_finished_retention_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -384,6 +396,73 @@ async fn run_queue_events(redis_url: String) -> redis::RedisResult<()> {
     );
 
     cleanup_namespace(&redis_url, &namespace).await?;
+    Ok(())
+}
+
+async fn run_worker_markers(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "markers")
+        .expect("valid Redis URL should build the marker queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let marker_key = format!("{namespace}:markers:marker");
+    let delayed_key = format!("{namespace}:markers:delayed");
+
+    queue
+        .add_job(
+            "ready".to_string(),
+            serde_json::json!({ "kind": "ready" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("waiting job should add");
+    let ready_marker: Option<f64> = conn.zscore(&marker_key, "0").await?;
+    assert_eq!(ready_marker, Some(0.0));
+
+    let early = queue
+        .add_job(
+            "early-delayed".to_string(),
+            serde_json::json!({ "kind": "early" }),
+            JobOptions::new().with_delay(Duration::from_secs(10)),
+        )
+        .await
+        .expect("early delayed job should add");
+    let late = queue
+        .add_job(
+            "late-delayed".to_string(),
+            serde_json::json!({ "kind": "late" }),
+            JobOptions::new().with_delay(Duration::from_secs(30)),
+        )
+        .await
+        .expect("late delayed job should add");
+
+    let delayed_head: Vec<(String, f64)> = conn.zrange_withscores(&delayed_key, 0, 0).await?;
+    assert_eq!(delayed_head.len(), 1);
+    assert_eq!(delayed_head[0].0, early.id);
+    let delayed_marker: Option<f64> = conn.zscore(&marker_key, "1").await?;
+    assert_eq!(delayed_marker, Some(delayed_head[0].1));
+
+    queue
+        .promote_job(&early.id, Utc::now())
+        .await
+        .expect("early delayed job should promote");
+    let ready_marker_after_promote: Option<f64> = conn.zscore(&marker_key, "0").await?;
+    assert_eq!(ready_marker_after_promote, Some(0.0));
+    let delayed_head_after_promote: Vec<(String, f64)> =
+        conn.zrange_withscores(&delayed_key, 0, 0).await?;
+    assert_eq!(delayed_head_after_promote.len(), 1);
+    assert_eq!(delayed_head_after_promote[0].0, late.id);
+    let delayed_marker_after_promote: Option<f64> = conn.zscore(&marker_key, "1").await?;
+    assert_eq!(
+        delayed_marker_after_promote,
+        Some(delayed_head_after_promote[0].1)
+    );
+
+    cleanup_namespace_with_conn(&mut conn, &namespace).await?;
     Ok(())
 }
 
