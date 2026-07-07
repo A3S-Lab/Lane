@@ -993,10 +993,14 @@ marker only as a wake-up signal, and then reruns the normal Lua claim path so
 pause, rate-limit, max-active, delayed promotion, and lock ownership checks stay
 atomic. A successful claim rewrites the base marker to fan out multiple blocked
 workers over bulk-added jobs, and pause/resume updates the marker set so resumed
-queues wake sleeping Redis workers. `JobQueueBackend::claim_next_blocking()`
-exposes that wait path to the backend-agnostic `JobWorker`; non-blocking
-backends use the default immediate `claim_next()` fallback, while Redis workers
-use the marker-backed `BZPOPMIN` path.
+queues wake sleeping Redis workers. Active-job finalization paths also refresh
+the base marker whenever waiting work remains, so completing, terminally
+failing, retry-delaying, or manually delaying a leased job wakes blocked Redis
+workers after a `set_max_active_jobs()` slot becomes available.
+`JobQueueBackend::claim_next_blocking()` exposes that wait path to the
+backend-agnostic `JobWorker`; non-blocking backends use the default immediate
+`claim_next()` fallback, while Redis workers use the marker-backed `BZPOPMIN`
+path.
 
 Redis adds are Lua-backed as well. The add scripts write job JSON and the
 waiting, delayed, or waiting-children index in the same Redis turn. If a custom

@@ -1586,6 +1586,12 @@ local function refresh_delay_marker(marker_key, delayed_key)
   end
 end
 
+local function add_base_marker_if_waiting(marker_key, waiting_key)
+  if marker_key and marker_key ~= '' and redis.call('ZCARD', waiting_key) > 0 then
+    redis.call('ZADD', marker_key, 0, '0')
+  end
+end
+
 local function days_from_civil(year, month, day)
   if month <= 2 then
     year = year - 1
@@ -2184,6 +2190,7 @@ if not enqueued_deduplicated_next and repeat_next_id and repeat_next_id ~= '' th
 end
 release_repeat_key(job, ARGV[1], ARGV[15])
 
+add_base_marker_if_waiting(KEYS[#KEYS], KEYS[5])
 redis.call('XADD', KEYS[10], 'MAXLEN', '~', ARGV[18], '*', 'event', 'completed', 'jobId', ARGV[1], 'returnvalue', ARGV[4], 'prev', 'active')
 
 return {'ok', updated}
@@ -2222,6 +2229,12 @@ local function refresh_delay_marker(marker_key, delayed_key)
     redis.call('ZADD', marker_key, next_delayed[2], '1')
   else
     redis.call('ZREM', marker_key, '1')
+  end
+end
+
+local function add_base_marker_if_waiting(marker_key, waiting_key)
+  if marker_key and marker_key ~= '' and redis.call('ZCARD', waiting_key) > 0 then
+    redis.call('ZADD', marker_key, 0, '0')
   end
 end
 
@@ -2667,6 +2680,7 @@ if ARGV[5] == '1' then
   redis.call('HSET', KEYS[1], ARGV[1], updated)
   redis.call('ZADD', KEYS[3], ARGV[7], ARGV[1])
   refresh_delay_marker(KEYS[#KEYS], KEYS[3])
+  add_base_marker_if_waiting(KEYS[#KEYS], KEYS[7])
   redis.call('XADD', KEYS[9], 'MAXLEN', '~', ARGV[16], '*', 'event', 'delayed', 'jobId', ARGV[1], 'failedReason', ARGV[4], 'prev', 'active')
   return {'ok', updated}
 end
@@ -2716,6 +2730,7 @@ if parent_id and parent_id ~= cjson.null then
   end
 end
 
+add_base_marker_if_waiting(KEYS[#KEYS], KEYS[7])
 redis.call('XADD', KEYS[9], 'MAXLEN', '~', ARGV[16], '*', 'event', 'failed', 'jobId', ARGV[1], 'failedReason', ARGV[4], 'prev', 'active')
 
 return {'ok', updated}
@@ -2759,6 +2774,12 @@ local function refresh_delay_marker(marker_key, delayed_key)
     redis.call('ZADD', marker_key, next_delayed[2], '1')
   else
     redis.call('ZREM', marker_key, '1')
+  end
+end
+
+local function add_base_marker_if_waiting(marker_key, waiting_key)
+  if marker_key and marker_key ~= '' and redis.call('ZCARD', waiting_key) > 0 then
+    redis.call('ZADD', marker_key, 0, '0')
   end
 end
 
@@ -2808,6 +2829,7 @@ local updated = cjson.encode(job)
 redis.call('HSET', KEYS[1], ARGV[1], updated)
 redis.call('ZADD', KEYS[3], ARGV[4], ARGV[1])
 refresh_delay_marker(KEYS[#KEYS], KEYS[3])
+add_base_marker_if_waiting(KEYS[#KEYS], KEYS[7])
 redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[6], '*', 'event', 'delayed', 'jobId', ARGV[1], 'prev', 'active')
 
 return {'ok', updated}
@@ -7517,13 +7539,14 @@ impl JobQueueBackend for RedisJobQueue {
         let scheduled_at = add_duration(now, delay);
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(DELAY_ACTIVE_JOB_SCRIPT)
-            .arg(7)
+            .arg(8)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.state_key(JobState::Delayed))
             .arg(self.lock_key(job_id))
             .arg(self.events_key())
             .arg(self.stalled_key())
+            .arg(self.state_key(JobState::Waiting))
             .arg(self.marker_key())
             .arg(job_id)
             .arg(lock_token)

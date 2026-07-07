@@ -636,6 +636,80 @@ async fn run_blocking_worker_markers(redis_url: String) -> redis::RedisResult<()
         .expect("paused blocking claim should find a job after resume");
     assert_eq!(paused_claim.id, paused.id);
 
+    let max_active_queue =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "blocking-max-active")
+            .expect("valid Redis URL should build the max-active blocking queue");
+    max_active_queue
+        .set_max_active_jobs(1)
+        .await
+        .expect("max-active blocking queue should configure concurrency");
+    let max_active_first = max_active_queue
+        .add_job(
+            "max-active-first".to_string(),
+            serde_json::json!({ "slot": "first" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("first max-active blocking job should add");
+    let max_active_second = max_active_queue
+        .add_job(
+            "max-active-second".to_string(),
+            serde_json::json!({ "slot": "second" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("second max-active blocking job should add");
+    let max_active_first_claim = max_active_queue
+        .claim_next(
+            "worker-blocking-max-active-a".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("first max-active blocking claim should return")
+        .expect("first max-active blocking job should claim");
+    assert_eq!(max_active_first_claim.id, max_active_first.id);
+
+    let max_active_worker =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "blocking-max-active")
+            .expect("valid Redis URL should build the max-active blocking worker queue");
+    let max_active_waiter = tokio::spawn(async move {
+        max_active_worker
+            .claim_next_blocking(
+                "worker-blocking-max-active-b".to_string(),
+                Duration::from_secs(30),
+                Duration::from_secs(5),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!max_active_waiter.is_finished());
+    max_active_queue
+        .complete_job(
+            &max_active_first_claim.id,
+            lock_token(&max_active_first_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("first max-active blocking job should complete");
+    let max_active_second_claim = tokio::time::timeout(Duration::from_secs(10), max_active_waiter)
+        .await
+        .expect("max-active blocking waiter should wake after active release")
+        .expect("max-active blocking waiter should join")
+        .expect("max-active blocking claim should return")
+        .expect("max-active blocking claim should find the waiting job");
+    assert_eq!(max_active_second_claim.id, max_active_second.id);
+    max_active_queue
+        .complete_job(
+            &max_active_second_claim.id,
+            lock_token(&max_active_second_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("second max-active blocking job should complete");
+
     cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())
 }
