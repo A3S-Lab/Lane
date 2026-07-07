@@ -1951,6 +1951,99 @@ local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job
   return updated
 end
 
+local function days_from_civil(year, month, day)
+  if month <= 2 then
+    year = year - 1
+  end
+  local era = math.floor(year / 400)
+  local yoe = year - era * 400
+  local shifted_month = month
+  if month > 2 then
+    shifted_month = month - 3
+  else
+    shifted_month = month + 9
+  end
+  local doy = math.floor((153 * shifted_month + 2) / 5) + day - 1
+  local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+  return era * 146097 + doe - 719468
+end
+
+local function iso_to_millis(value)
+  local year = tonumber(string.sub(value, 1, 4))
+  local month = tonumber(string.sub(value, 6, 7))
+  local day = tonumber(string.sub(value, 9, 10))
+  local hour = tonumber(string.sub(value, 12, 13))
+  local minute = tonumber(string.sub(value, 15, 16))
+  local second = tonumber(string.sub(value, 18, 19))
+  if not year or not month or not day or not hour or not minute or not second then
+    return 0
+  end
+
+  local millis = 0
+  if string.sub(value, 20, 20) == "." then
+    local digits = string.match(string.sub(value, 21), "^(%d+)")
+    if digits then
+      digits = string.sub(digits .. "000", 1, 3)
+      millis = tonumber(digits) or 0
+    end
+  end
+
+  local days = days_from_civil(year, month, day)
+  return (((days * 24 + hour) * 60 + minute) * 60 + second) * 1000 + millis
+end
+
+local function repeat_key(job)
+  local key = job["repeat_key"]
+  if not key or key == cjson.null or key == '' then
+    return nil
+  end
+  return key
+end
+
+local function repeat_scheduler_key(repeat_prefix)
+  return string.sub(repeat_prefix, 1, -2)
+end
+
+local function repeat_scheduler_meta_key(repeat_prefix, repeat_key_value)
+  return string.sub(repeat_prefix, 1, -8) .. 'repeat_meta:' .. repeat_key_value
+end
+
+local function sync_repeat_scheduler(job, job_id, repeat_prefix, scheduled_millis)
+  local key = repeat_key(job)
+  if not key or not repeat_prefix or repeat_prefix == '' then
+    return
+  end
+
+  local owner_key = repeat_prefix .. key
+  local owner_id = redis.call('GET', owner_key)
+  local meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
+  local scheduler_owner_id = redis.call('HGET', meta_key, 'jid')
+  if owner_id and owner_id ~= job_id and scheduler_owner_id ~= job_id then
+    return
+  end
+  if not owner_id then
+    redis.call('SET', owner_key, job_id, 'NX')
+  end
+
+  redis.call('ZADD', repeat_scheduler_key(repeat_prefix), scheduled_millis, key)
+  redis.call(
+    'HSET',
+    meta_key,
+    'jid',
+    job_id,
+    'name',
+    job["name"] or '',
+    'next',
+    scheduled_millis,
+    'state',
+    job["state"] or '',
+    'count',
+    job["repeat_count"] or 0,
+    'key',
+    key
+  )
+end
+
 local function refresh_delay_marker(marker_key, delayed_key)
   if not marker_key or marker_key == '' then
     return
@@ -1973,6 +2066,7 @@ for _, due_id in ipairs(due_ids) do
       delayed_job["state"] = "waiting"
       local priority = tonumber(delayed_job["priority"] or '1000') or 1000
       enqueue_waiting_job(KEYS[3], KEYS[1], KEYS[7], delayed_job, due_id, priority, ARGV[11], KEYS[#KEYS])
+      sync_repeat_scheduler(delayed_job, due_id, ARGV[15], iso_to_millis(delayed_job["scheduled_at"]))
       redis.call('XADD', KEYS[8], 'MAXLEN', '~', ARGV[14], '*', 'event', 'waiting', 'jobId', due_id, 'prev', 'delayed')
     end
   end
@@ -2045,6 +2139,7 @@ for _, id in ipairs(ids) do
       redis.call('ZREM', KEYS[1], id)
       redis.call('ZADD', KEYS[2], ARGV[1], id)
       redis.call('HSET', KEYS[3], id, updated)
+      sync_repeat_scheduler(job, id, ARGV[15], iso_to_millis(job["scheduled_at"]))
       redis.call('XADD', KEYS[8], 'MAXLEN', '~', ARGV[14], '*', 'event', 'active', 'jobId', id, 'prev', 'waiting')
       redis.call('ZADD', KEYS[#KEYS], 0, '0')
       return updated
@@ -3815,6 +3910,58 @@ local function add_base_marker_if_waiting(marker_key, waiting_key)
   end
 end
 
+local function repeat_key(job)
+  local key = job["repeat_key"]
+  if not key or key == cjson.null or key == '' then
+    return nil
+  end
+  return key
+end
+
+local function repeat_scheduler_key(repeat_prefix)
+  return string.sub(repeat_prefix, 1, -2)
+end
+
+local function repeat_scheduler_meta_key(repeat_prefix, repeat_key_value)
+  return string.sub(repeat_prefix, 1, -8) .. 'repeat_meta:' .. repeat_key_value
+end
+
+local function sync_repeat_scheduler(job, job_id, repeat_prefix, scheduled_millis)
+  local key = repeat_key(job)
+  if not key or not repeat_prefix or repeat_prefix == '' then
+    return
+  end
+
+  local owner_key = repeat_prefix .. key
+  local owner_id = redis.call('GET', owner_key)
+  local meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
+  local scheduler_owner_id = redis.call('HGET', meta_key, 'jid')
+  if owner_id and owner_id ~= job_id and scheduler_owner_id ~= job_id then
+    return
+  end
+  if not owner_id then
+    redis.call('SET', owner_key, job_id, 'NX')
+  end
+
+  redis.call('ZADD', repeat_scheduler_key(repeat_prefix), scheduled_millis, key)
+  redis.call(
+    'HSET',
+    meta_key,
+    'jid',
+    job_id,
+    'name',
+    job["name"] or '',
+    'next',
+    scheduled_millis,
+    'state',
+    job["state"] or '',
+    'count',
+    job["repeat_count"] or 0,
+    'key',
+    key
+  )
+end
+
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
   redis.call('ZREM', KEYS[2], ARGV[1])
@@ -3863,6 +4010,7 @@ redis.call('HSET', KEYS[1], ARGV[1], updated)
 redis.call('ZADD', KEYS[3], ARGV[4], ARGV[1])
 refresh_delay_marker(KEYS[#KEYS], KEYS[3])
 add_base_marker_if_waiting(KEYS[#KEYS], KEYS[7])
+sync_repeat_scheduler(job, ARGV[1], ARGV[7], ARGV[4])
 redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[6], '*', 'event', 'delayed', 'jobId', ARGV[1], 'prev', 'active')
 
 return {'ok', updated}
@@ -3902,6 +4050,58 @@ local function refresh_delay_marker(marker_key, delayed_key)
   else
     redis.call('ZREM', marker_key, '1')
   end
+end
+
+local function repeat_key(job)
+  local key = job["repeat_key"]
+  if not key or key == cjson.null or key == '' then
+    return nil
+  end
+  return key
+end
+
+local function repeat_scheduler_key(repeat_prefix)
+  return string.sub(repeat_prefix, 1, -2)
+end
+
+local function repeat_scheduler_meta_key(repeat_prefix, repeat_key_value)
+  return string.sub(repeat_prefix, 1, -8) .. 'repeat_meta:' .. repeat_key_value
+end
+
+local function sync_repeat_scheduler(job, job_id, repeat_prefix, scheduled_millis)
+  local key = repeat_key(job)
+  if not key or not repeat_prefix or repeat_prefix == '' then
+    return
+  end
+
+  local owner_key = repeat_prefix .. key
+  local owner_id = redis.call('GET', owner_key)
+  local meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
+  local scheduler_owner_id = redis.call('HGET', meta_key, 'jid')
+  if owner_id and owner_id ~= job_id and scheduler_owner_id ~= job_id then
+    return
+  end
+  if not owner_id then
+    redis.call('SET', owner_key, job_id, 'NX')
+  end
+
+  redis.call('ZADD', repeat_scheduler_key(repeat_prefix), scheduled_millis, key)
+  redis.call(
+    'HSET',
+    meta_key,
+    'jid',
+    job_id,
+    'name',
+    job["name"] or '',
+    'next',
+    scheduled_millis,
+    'state',
+    job["state"] or '',
+    'count',
+    job["repeat_count"] or 0,
+    'key',
+    key
+  )
 end
 
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
@@ -3945,6 +4145,7 @@ job["failed_reason"] = cjson.null
 
 local priority = tonumber(job["priority"] or '1000') or 1000
 local updated = enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[4], job, ARGV[1], priority, ARGV[5], KEYS[#KEYS])
+sync_repeat_scheduler(job, ARGV[1], ARGV[7], ARGV[4])
 redis.call('XADD', KEYS[6], 'MAXLEN', '~', ARGV[6], '*', 'event', 'waiting', 'jobId', ARGV[1], 'prev', 'active')
 
 return {'ok', updated}
@@ -4789,6 +4990,58 @@ local function refresh_delay_marker(marker_key, delayed_key)
   end
 end
 
+local function repeat_key(job)
+  local key = job["repeat_key"]
+  if not key or key == cjson.null or key == '' then
+    return nil
+  end
+  return key
+end
+
+local function repeat_scheduler_key(repeat_prefix)
+  return string.sub(repeat_prefix, 1, -2)
+end
+
+local function repeat_scheduler_meta_key(repeat_prefix, repeat_key_value)
+  return string.sub(repeat_prefix, 1, -8) .. 'repeat_meta:' .. repeat_key_value
+end
+
+local function sync_repeat_scheduler(job, job_id, repeat_prefix, scheduled_millis)
+  local key = repeat_key(job)
+  if not key or not repeat_prefix or repeat_prefix == '' then
+    return
+  end
+
+  local owner_key = repeat_prefix .. key
+  local owner_id = redis.call('GET', owner_key)
+  local meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
+  local scheduler_owner_id = redis.call('HGET', meta_key, 'jid')
+  if owner_id and owner_id ~= job_id and scheduler_owner_id ~= job_id then
+    return
+  end
+  if not owner_id then
+    redis.call('SET', owner_key, job_id, 'NX')
+  end
+
+  redis.call('ZADD', repeat_scheduler_key(repeat_prefix), scheduled_millis, key)
+  redis.call(
+    'HSET',
+    meta_key,
+    'jid',
+    job_id,
+    'name',
+    job["name"] or '',
+    'next',
+    scheduled_millis,
+    'state',
+    job["state"] or '',
+    'count',
+    job["repeat_count"] or 0,
+    'key',
+    key
+  )
+end
+
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
   redis.call('ZREM', KEYS[3], ARGV[1])
@@ -4811,6 +5064,7 @@ job["state"] = "waiting"
 job["scheduled_at"] = ARGV[2]
 local priority = tonumber(job["priority"] or '1000') or 1000
 local updated = enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[4], job, ARGV[1], priority, ARGV[3], KEYS[#KEYS])
+sync_repeat_scheduler(job, ARGV[1], ARGV[5], ARGV[6])
 redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[4], '*', 'event', 'waiting', 'jobId', ARGV[1], 'prev', 'delayed')
 
 return {'ok', updated}
@@ -4827,6 +5081,58 @@ local function refresh_delay_marker(marker_key, delayed_key)
   else
     redis.call('ZREM', marker_key, '1')
   end
+end
+
+local function repeat_key(job)
+  local key = job["repeat_key"]
+  if not key or key == cjson.null or key == '' then
+    return nil
+  end
+  return key
+end
+
+local function repeat_scheduler_key(repeat_prefix)
+  return string.sub(repeat_prefix, 1, -2)
+end
+
+local function repeat_scheduler_meta_key(repeat_prefix, repeat_key_value)
+  return string.sub(repeat_prefix, 1, -8) .. 'repeat_meta:' .. repeat_key_value
+end
+
+local function sync_repeat_scheduler(job, job_id, repeat_prefix, scheduled_millis)
+  local key = repeat_key(job)
+  if not key or not repeat_prefix or repeat_prefix == '' then
+    return
+  end
+
+  local owner_key = repeat_prefix .. key
+  local owner_id = redis.call('GET', owner_key)
+  local meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
+  local scheduler_owner_id = redis.call('HGET', meta_key, 'jid')
+  if owner_id and owner_id ~= job_id and scheduler_owner_id ~= job_id then
+    return
+  end
+  if not owner_id then
+    redis.call('SET', owner_key, job_id, 'NX')
+  end
+
+  redis.call('ZADD', repeat_scheduler_key(repeat_prefix), scheduled_millis, key)
+  redis.call(
+    'HSET',
+    meta_key,
+    'jid',
+    job_id,
+    'name',
+    job["name"] or '',
+    'next',
+    scheduled_millis,
+    'state',
+    job["state"] or '',
+    'count',
+    job["repeat_count"] or 0,
+    'key',
+    key
+  )
 end
 
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
@@ -4856,6 +5162,7 @@ local updated = cjson.encode(job)
 redis.call('ZADD', KEYS[2], ARGV[3], ARGV[1])
 refresh_delay_marker(KEYS[#KEYS], KEYS[2])
 redis.call('HSET', KEYS[1], ARGV[1], updated)
+sync_repeat_scheduler(job, ARGV[1], ARGV[5], ARGV[3])
 
 return {'ok', updated}
 "#;
@@ -9135,6 +9442,7 @@ impl RedisJobQueue {
             .arg(1_000_u16)
             .arg(1_000_u16)
             .arg(DEFAULT_JOB_EVENT_RETENTION)
+            .arg(self.repeat_key_prefix())
             .query_async(conn)
             .await
             .map_err(redis_error)?;
@@ -9522,6 +9830,7 @@ impl JobQueueBackend for RedisJobQueue {
                 LaneError::Other(format!("failed to encode Redis job delay: {error}"))
             })?)
             .arg(DEFAULT_JOB_EVENT_RETENTION)
+            .arg(self.repeat_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -9552,6 +9861,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(millis(now))
             .arg(WAITING_SCORE_BUCKET)
             .arg(DEFAULT_JOB_EVENT_RETENTION)
+            .arg(self.repeat_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -9573,6 +9883,8 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(now.to_rfc3339())
             .arg(WAITING_SCORE_BUCKET)
             .arg(DEFAULT_JOB_EVENT_RETENTION)
+            .arg(self.repeat_key_prefix())
+            .arg(millis(now))
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -9605,6 +9917,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(scheduled_at.to_rfc3339())
             .arg(millis(scheduled_at))
             .arg(delay)
+            .arg(self.repeat_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;

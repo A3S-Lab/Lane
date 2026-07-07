@@ -990,6 +990,22 @@ async fn redis_backend_preserves_cleaned_repeat_from_scheduler_metadata_against_
 }
 
 #[tokio::test]
+async fn redis_backend_syncs_repeat_scheduler_metadata_on_nonterminal_moves_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_repeat_nonterminal_scheduler_metadata(redis_url),
+    )
+    .await
+    .expect("Redis repeat scheduler metadata move integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_removes_repeat_from_scheduler_metadata_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -4968,6 +4984,212 @@ async fn run_repeat_clean_scheduler_metadata(redis_url: String) -> redis::RedisR
 
     cleanup_namespace_with_conn(&mut conn, &namespace).await?;
     trace_stage("repeat-clean-scheduler:cleanup-final:done");
+    Ok(())
+}
+
+async fn run_repeat_nonterminal_scheduler_metadata(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    trace_stage("repeat-metadata-moves:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("repeat-metadata-moves:cleanup:done");
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "repeat-metadata-moves")
+        .expect("valid Redis URL should build the repeat metadata move queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let owner_key = format!("{namespace}:repeat-metadata-moves:repeat:metadata-moves");
+
+    let added = queue
+        .add_job(
+            "scheduler-metadata-owner".to_string(),
+            serde_json::json!({ "path": "metadata" }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(60))
+                    .with_limit(3)
+                    .with_key("metadata-moves"),
+            ),
+        )
+        .await
+        .expect("repeat metadata owner should add");
+    assert_repeat_scheduler_metadata(
+        &mut conn,
+        &namespace,
+        "repeat-metadata-moves",
+        "metadata-moves",
+        &added,
+        "waiting",
+    )
+    .await?;
+
+    let removed_owner: usize = conn.del(&owner_key).await?;
+    assert_eq!(removed_owner, 1);
+    let first_claim = queue
+        .claim_next(
+            "worker-repeat-metadata-a".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("repeat metadata claim should return")
+        .expect("repeat metadata owner should claim");
+    assert_repeat_scheduler_metadata(
+        &mut conn,
+        &namespace,
+        "repeat-metadata-moves",
+        "metadata-moves",
+        &first_claim,
+        "active",
+    )
+    .await?;
+
+    let removed_owner: usize = conn.del(&owner_key).await?;
+    assert_eq!(removed_owner, 1);
+    let delayed = queue
+        .delay_active_job(
+            &first_claim.id,
+            lock_token(&first_claim),
+            Duration::from_secs(60),
+            Utc::now(),
+        )
+        .await
+        .expect("repeat metadata active owner should delay");
+    assert_repeat_scheduler_metadata(
+        &mut conn,
+        &namespace,
+        "repeat-metadata-moves",
+        "metadata-moves",
+        &delayed,
+        "delayed",
+    )
+    .await?;
+
+    let removed_owner: usize = conn.del(&owner_key).await?;
+    assert_eq!(removed_owner, 1);
+    let promoted = queue
+        .promote_job(&delayed.id, Utc::now())
+        .await
+        .expect("repeat metadata delayed owner should promote");
+    assert_repeat_scheduler_metadata(
+        &mut conn,
+        &namespace,
+        "repeat-metadata-moves",
+        "metadata-moves",
+        &promoted,
+        "waiting",
+    )
+    .await?;
+
+    let second_claim = queue
+        .claim_next(
+            "worker-repeat-metadata-b".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("repeat metadata second claim should return")
+        .expect("repeat metadata owner should claim again");
+    assert_repeat_scheduler_metadata(
+        &mut conn,
+        &namespace,
+        "repeat-metadata-moves",
+        "metadata-moves",
+        &second_claim,
+        "active",
+    )
+    .await?;
+
+    let removed_owner: usize = conn.del(&owner_key).await?;
+    assert_eq!(removed_owner, 1);
+    let released = queue
+        .release_active_job(&second_claim.id, lock_token(&second_claim), Utc::now())
+        .await
+        .expect("repeat metadata active owner should release");
+    assert_repeat_scheduler_metadata(
+        &mut conn,
+        &namespace,
+        "repeat-metadata-moves",
+        "metadata-moves",
+        &released,
+        "waiting",
+    )
+    .await?;
+
+    let third_claim = queue
+        .claim_next(
+            "worker-repeat-metadata-c".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("repeat metadata third claim should return")
+        .expect("repeat metadata owner should claim after release");
+    let delayed_again = queue
+        .delay_active_job(
+            &third_claim.id,
+            lock_token(&third_claim),
+            Duration::from_secs(60),
+            Utc::now(),
+        )
+        .await
+        .expect("repeat metadata owner should delay again");
+    assert_repeat_scheduler_metadata(
+        &mut conn,
+        &namespace,
+        "repeat-metadata-moves",
+        "metadata-moves",
+        &delayed_again,
+        "delayed",
+    )
+    .await?;
+
+    let removed_owner: usize = conn.del(&owner_key).await?;
+    assert_eq!(removed_owner, 1);
+    let rescheduled = queue
+        .reschedule_job(&delayed_again.id, Duration::from_secs(120), Utc::now())
+        .await
+        .expect("repeat metadata delayed owner should reschedule");
+    assert_repeat_scheduler_metadata(
+        &mut conn,
+        &namespace,
+        "repeat-metadata-moves",
+        "metadata-moves",
+        &rescheduled,
+        "delayed",
+    )
+    .await?;
+
+    cleanup_namespace_with_conn(&mut conn, &namespace).await?;
+    trace_stage("repeat-metadata-moves:cleanup-final:done");
+    Ok(())
+}
+
+async fn assert_repeat_scheduler_metadata(
+    conn: &mut redis::aio::ConnectionManager,
+    namespace: &str,
+    queue: &str,
+    repeat_key: &str,
+    job: &Job,
+    expected_state: &str,
+) -> redis::RedisResult<()> {
+    let owner_key = format!("{namespace}:{queue}:repeat:{repeat_key}");
+    let scheduler_key = format!("{namespace}:{queue}:repeat");
+    let scheduler_meta_key = format!("{namespace}:{queue}:repeat_meta:{repeat_key}");
+    let expected_next = job.scheduled_at.timestamp_millis();
+
+    let owner_id: Option<String> = conn.get(&owner_key).await?;
+    assert_eq!(owner_id.as_deref(), Some(job.id.as_str()));
+    let meta_owner_id: Option<String> = conn.hget(&scheduler_meta_key, "jid").await?;
+    assert_eq!(meta_owner_id.as_deref(), Some(job.id.as_str()));
+    let meta_state: Option<String> = conn.hget(&scheduler_meta_key, "state").await?;
+    assert_eq!(meta_state.as_deref(), Some(expected_state));
+    let meta_next: Option<String> = conn.hget(&scheduler_meta_key, "next").await?;
+    let meta_next = meta_next
+        .as_deref()
+        .and_then(|value| value.parse::<f64>().ok());
+    assert_eq!(meta_next, Some(expected_next as f64));
+    let scheduler_score: Option<f64> = conn.zscore(&scheduler_key, repeat_key).await?;
+    assert_eq!(scheduler_score, Some(expected_next as f64));
     Ok(())
 }
 
