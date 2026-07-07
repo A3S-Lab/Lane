@@ -1,5 +1,5 @@
 use super::backend::JobQueueBackend;
-use super::types::{Job, JobId, JobLockToken, JobWorkerId};
+use super::types::{Job, JobId, JobLeaseRenewal, JobLockToken, JobWorkerId};
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -9,6 +9,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 /// User-provided processor for generic queue jobs.
@@ -337,6 +338,18 @@ pub enum JobRunOutcome {
     NoJob,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseRenewalMode {
+    PerJob,
+    SharedWorker,
+}
+
+#[derive(Clone)]
+struct ActiveJobLease {
+    lock_token: JobLockToken,
+    lease_lost: Arc<AtomicBool>,
+}
+
 /// Backend-agnostic worker runtime for generic queue jobs.
 #[derive(Clone)]
 pub struct JobWorker {
@@ -344,6 +357,7 @@ pub struct JobWorker {
     processor: Arc<dyn JobProcessor>,
     config: JobWorkerConfig,
     shutdown: Arc<AtomicBool>,
+    active_leases: Arc<Mutex<HashMap<JobId, ActiveJobLease>>>,
 }
 
 impl JobWorker {
@@ -358,6 +372,7 @@ impl JobWorker {
             processor,
             config,
             shutdown: Arc::new(AtomicBool::new(false)),
+            active_leases: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -422,11 +437,23 @@ impl JobWorker {
     /// Start background worker loops.
     pub fn start(&self) -> JobWorkerHandle {
         self.shutdown.store(false, Ordering::Relaxed);
-        let mut handles = Vec::with_capacity(self.config.concurrency + 1);
+        let lease_renewal_enabled = self.lease_renewal_enabled();
+        let mut handles = Vec::with_capacity(
+            self.config.concurrency
+                + usize::from(self.config.recover_stalled)
+                + usize::from(lease_renewal_enabled),
+        );
         for _ in 0..self.config.concurrency {
             let worker = self.clone();
             handles.push(tokio::spawn(async move {
                 worker.run_loop().await;
+            }));
+        }
+
+        if lease_renewal_enabled {
+            let worker = self.clone();
+            handles.push(tokio::spawn(async move {
+                worker.lease_renewal_loop().await;
             }));
         }
 
@@ -445,10 +472,7 @@ impl JobWorker {
 
     async fn run_loop(self) {
         while !self.shutdown.load(Ordering::Relaxed) {
-            match self
-                .run_once_blocking(self.config.blocking_claim_timeout)
-                .await
-            {
+            match self.run_loop_once().await {
                 Ok(JobRunOutcome::NoJob) => tokio::time::sleep(self.config.poll_interval).await,
                 Ok(JobRunOutcome::Completed(_)) | Ok(JobRunOutcome::Failed(_)) => {}
                 Err(error) => {
@@ -457,6 +481,24 @@ impl JobWorker {
                 }
             }
         }
+    }
+
+    async fn run_loop_once(&self) -> Result<JobRunOutcome> {
+        self.backend.promote_due_jobs(Utc::now()).await?;
+        let Some(job) = self
+            .backend
+            .claim_next_blocking(
+                self.config.worker_id.clone(),
+                self.config.lease_duration,
+                self.config.blocking_claim_timeout,
+            )
+            .await?
+        else {
+            return Ok(JobRunOutcome::NoJob);
+        };
+
+        self.process_claimed_with_mode(job, LeaseRenewalMode::SharedWorker)
+            .await
     }
 
     async fn recovery_loop(self) {
@@ -468,7 +510,70 @@ impl JobWorker {
         }
     }
 
+    async fn lease_renewal_loop(self) {
+        loop {
+            tokio::time::sleep(self.config.lease_renew_interval).await;
+            let renewals = self.active_lease_renewals().await;
+            if renewals.is_empty() {
+                if self.shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                continue;
+            }
+            tracing::debug!(
+                worker_id = %self.config.worker_id,
+                lease_count = renewals.len(),
+                "renewing active job leases"
+            );
+
+            match self
+                .backend
+                .renew_leases(&renewals, self.config.lease_duration, Utc::now())
+                .await
+            {
+                Ok(failed_job_ids) => {
+                    tracing::debug!(
+                        worker_id = %self.config.worker_id,
+                        lease_count = renewals.len(),
+                        failed_count = failed_job_ids.len(),
+                        "renewed active job leases"
+                    );
+                    let marked_lost = self.mark_lost_leases(&failed_job_ids).await;
+                    if marked_lost > 0 {
+                        tracing::warn!(
+                            worker_id = %self.config.worker_id,
+                            failed_count = marked_lost,
+                            "batch job lease renewal failed for some jobs"
+                        );
+                    }
+                }
+                Err(error) => {
+                    let failed_job_ids = renewals
+                        .iter()
+                        .map(|renewal| renewal.job_id.clone())
+                        .collect::<Vec<_>>();
+                    let marked_lost = self.mark_lost_leases(&failed_job_ids).await;
+                    tracing::warn!(
+                        error = %error,
+                        worker_id = %self.config.worker_id,
+                        failed_count = marked_lost,
+                        "batch job lease renewal failed"
+                    );
+                }
+            }
+        }
+    }
+
     async fn process_claimed(&self, job: Job) -> Result<JobRunOutcome> {
+        self.process_claimed_with_mode(job, LeaseRenewalMode::PerJob)
+            .await
+    }
+
+    async fn process_claimed_with_mode(
+        &self,
+        job: Job,
+        renewal_mode: LeaseRenewalMode,
+    ) -> Result<JobRunOutcome> {
         let lock_token = job.lock_token.clone().ok_or_else(|| {
             LaneError::JobLeaseConflict(format!("claimed job {} has no lock token", job.id))
         })?;
@@ -479,6 +584,7 @@ impl JobWorker {
                 .await?;
             return Ok(JobRunOutcome::Failed(failed));
         }
+        let lease_lost = Arc::new(AtomicBool::new(false));
         let context = JobContext::new(
             Arc::clone(&self.backend),
             job.id.clone(),
@@ -486,51 +592,125 @@ impl JobWorker {
             lock_token.clone(),
             self.config.lease_duration,
             self.config.log_retention,
-            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&lease_lost),
         );
 
         let lease_shutdown = Arc::new(AtomicBool::new(false));
-        let renew_handle = self.spawn_lease_renewer(context.clone(), Arc::clone(&lease_shutdown));
+        let renew_handle = match renewal_mode {
+            LeaseRenewalMode::PerJob => {
+                self.spawn_lease_renewer(context.clone(), Arc::clone(&lease_shutdown))
+            }
+            LeaseRenewalMode::SharedWorker => {
+                self.register_active_lease(&job.id, &lock_token, Arc::clone(&lease_lost))
+                    .await;
+                None
+            }
+        };
         let job_id = job.id.clone();
         let timeout = job.options.timeout;
         let result = self
             .process_with_timeout(job, context.clone(), timeout)
             .await;
-        lease_shutdown.store(true, Ordering::Relaxed);
-        if let Some(handle) = renew_handle {
-            handle.abort();
-            let _ = handle.await;
-        }
 
         if context.has_lost_lease() {
+            self.stop_lease_renewal(&job_id, renewal_mode, lease_shutdown, renew_handle)
+                .await;
             return Err(LaneError::JobLeaseConflict(format!(
                 "worker {} lost lease for job {job_id} before finalizing",
                 self.config.worker_id
             )));
         }
 
-        match result {
-            Ok(value) => {
-                let completed = self
-                    .backend
-                    .complete_job(&job_id, &lock_token, value, Utc::now())
-                    .await?;
-                Ok(JobRunOutcome::Completed(completed))
-            }
+        let outcome = match result {
+            Ok(value) => self
+                .backend
+                .complete_job(&job_id, &lock_token, value, Utc::now())
+                .await
+                .map(JobRunOutcome::Completed),
             Err(error) => {
                 let discard_retry = context.should_discard_retry() || error.is_unrecoverable_job();
                 let error = error.to_string();
-                let failed = if discard_retry {
+                if discard_retry {
                     self.backend
                         .fail_job_discarding_retry(&job_id, &lock_token, error, Utc::now())
-                        .await?
+                        .await
                 } else {
                     self.backend
                         .fail_job(&job_id, &lock_token, error, Utc::now())
-                        .await?
-                };
-                Ok(JobRunOutcome::Failed(failed))
+                        .await
+                }
+                .map(JobRunOutcome::Failed)
             }
+        };
+
+        self.stop_lease_renewal(&job_id, renewal_mode, lease_shutdown, renew_handle)
+            .await;
+        outcome
+    }
+
+    fn lease_renewal_enabled(&self) -> bool {
+        !self.config.lease_renew_interval.is_zero()
+            && self.config.lease_renew_interval < self.config.lease_duration
+    }
+
+    async fn register_active_lease(
+        &self,
+        job_id: &str,
+        lock_token: &str,
+        lease_lost: Arc<AtomicBool>,
+    ) {
+        self.active_leases.lock().await.insert(
+            job_id.to_string(),
+            ActiveJobLease {
+                lock_token: lock_token.to_string(),
+                lease_lost,
+            },
+        );
+    }
+
+    async fn unregister_active_lease(&self, job_id: &str) {
+        self.active_leases.lock().await.remove(job_id);
+    }
+
+    async fn active_lease_renewals(&self) -> Vec<JobLeaseRenewal> {
+        self.active_leases
+            .lock()
+            .await
+            .iter()
+            .map(|(job_id, lease)| JobLeaseRenewal::new(job_id.clone(), lease.lock_token.clone()))
+            .collect()
+    }
+
+    async fn mark_lost_leases(&self, job_ids: &[JobId]) -> usize {
+        if job_ids.is_empty() {
+            return 0;
+        }
+
+        let active_leases = self.active_leases.lock().await;
+        let mut marked = 0;
+        for job_id in job_ids {
+            if let Some(lease) = active_leases.get(job_id) {
+                lease.lease_lost.store(true, Ordering::Relaxed);
+                marked += 1;
+            }
+        }
+        marked
+    }
+
+    async fn stop_lease_renewal(
+        &self,
+        job_id: &str,
+        renewal_mode: LeaseRenewalMode,
+        lease_shutdown: Arc<AtomicBool>,
+        renew_handle: Option<JoinHandle<()>>,
+    ) {
+        lease_shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = renew_handle {
+            handle.abort();
+            let _ = handle.await;
+        }
+        if renewal_mode == LeaseRenewalMode::SharedWorker {
+            self.unregister_active_lease(job_id).await;
         }
     }
 

@@ -141,6 +141,102 @@ async fn redis_backend_renews_leases_in_bulk_against_real_server() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn redis_job_worker_uses_bulk_lease_renewal_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_worker_bulk_lease_renewal(redis_url),
+    )
+    .await
+    .expect("Redis worker bulk lease renewal integration test timed out")
+    .unwrap();
+}
+
+async fn run_worker_bulk_lease_renewal(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    trace_stage("worker-bulk-lease:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("worker-bulk-lease:cleanup:done");
+
+    let queue = Arc::new(
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "worker-bulk-leases")
+            .expect("valid Redis URL should build the worker bulk lease queue"),
+    );
+    let backend: Arc<dyn JobQueueBackend> = queue.clone();
+    for name in ["slow-a", "slow-b"] {
+        queue
+            .add_job(name.to_string(), serde_json::json!({}), JobOptions::new())
+            .await
+            .expect("slow worker bulk lease job should add");
+    }
+    trace_stage("worker-bulk-lease:jobs-added");
+
+    let processor: Arc<dyn JobProcessor> = Arc::new(job_processor_fn(
+        |job: Job, context: JobContext| async move {
+            trace_stage(&format!("worker-bulk-lease:processor-start:{}", job.name));
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            context.ensure_lease()?;
+            trace_stage(&format!("worker-bulk-lease:processor-finish:{}", job.name));
+            Ok(serde_json::json!({ "name": job.name }))
+        },
+    ));
+    let worker = JobWorker::new(
+        Arc::clone(&backend),
+        processor,
+        JobWorkerConfig::new("worker-bulk-leases")
+            .with_concurrency(2)
+            .with_lease_duration(Duration::from_secs(1))
+            .with_lease_renew_interval(Duration::from_millis(100))
+            .with_poll_interval(Duration::from_millis(10))
+            .with_blocking_claim_timeout(Duration::from_millis(250))
+            .with_recover_stalled(false),
+    );
+
+    let handle = worker.start();
+    trace_stage("worker-bulk-lease:worker-started");
+    if tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if queue
+                .get_job_count(&[JobState::Completed])
+                .await
+                .expect("completed count should load")
+                == 2
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        let stats = queue.stats().await.expect("timed out stats should load");
+        panic!("worker bulk lease jobs should complete, got stats: {stats:?}");
+    }
+    handle.shutdown().await;
+    trace_stage("worker-bulk-lease:worker-shutdown");
+
+    let completed = queue
+        .list_jobs(JobListOptions::new().with_state(JobState::Completed))
+        .await
+        .expect("completed bulk lease jobs should list");
+    assert_eq!(completed.total, 2);
+    assert!(completed.jobs.iter().all(|job| job
+        .return_value
+        .as_ref()
+        .is_some_and(|value| value["name"].is_string())));
+
+    trace_stage("worker-bulk-lease:cleanup-final:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("worker-bulk-lease:cleanup-final:done");
+    Ok(())
+}
+
 async fn run_bulk_lease_renewal(redis_url: String) -> redis::RedisResult<()> {
     let namespace = unique_namespace();
     trace_stage("bulk-lease:cleanup:start");

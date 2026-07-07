@@ -6139,6 +6139,54 @@ async fn worker_context_reports_lost_lease_after_renewal_failure() {
 }
 
 #[tokio::test]
+async fn background_worker_renews_concurrent_leases_in_shared_loop() {
+    let backend: Arc<dyn JobQueueBackend> = Arc::new(InMemoryJobQueue::new("worker-bulk-renew"));
+    for name in ["slow-a", "slow-b"] {
+        backend
+            .add_job(name.to_string(), serde_json::json!({}), JobOptions::new())
+            .await
+            .unwrap();
+    }
+
+    let processor = Arc::new(job_processor_fn(
+        |job: Job, context: JobContext| async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            context.ensure_lease()?;
+            Ok(serde_json::json!({ "name": job.name }))
+        },
+    ));
+    let worker = JobWorker::new(
+        Arc::clone(&backend),
+        processor,
+        JobWorkerConfig::new("worker-bulk-renew")
+            .with_concurrency(2)
+            .with_lease_duration(Duration::from_secs(30))
+            .with_lease_renew_interval(Duration::from_millis(10))
+            .with_poll_interval(Duration::from_millis(5))
+            .with_recover_stalled(false),
+    );
+
+    let handle = worker.start();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let stats = backend.stats().await.unwrap();
+            if stats.completed == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background worker should complete both jobs");
+    handle.shutdown().await;
+
+    let stats = backend.stats().await.unwrap();
+    assert_eq!(stats.completed, 2);
+    assert_eq!(stats.active, 0);
+    assert_eq!(stats.waiting, 0);
+}
+
+#[tokio::test]
 async fn worker_run_until_idle_processes_ready_jobs() {
     let backend: Arc<dyn JobQueueBackend> = Arc::new(InMemoryJobQueue::new("worker"));
     for name in ["a", "b"] {
