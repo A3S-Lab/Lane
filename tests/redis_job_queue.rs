@@ -1,10 +1,11 @@
 #![cfg(feature = "redis-backend")]
 
 use a3s_lane::{
-    job_processor_fn, DeduplicationOptions, Job, JobContext, JobFinishedResult, JobListOptions,
-    JobLogEntry, JobOptions, JobPriorityCount, JobProcessor, JobQueueBackend, JobRateLimit,
-    JobRepeatListOptions, JobRetention, JobRunOutcome, JobSpec, JobState, JobStateCount, JobWorker,
-    JobWorkerConfig, LaneError, RedisJobQueue, RepeatOptions, RetryPolicy,
+    job_processor_fn, DeduplicationOptions, Job, JobContext, JobFinishedResult, JobLeaseRenewal,
+    JobListOptions, JobLogEntry, JobOptions, JobPriorityCount, JobProcessor, JobQueueBackend,
+    JobRateLimit, JobRepeatListOptions, JobRetention, JobRunOutcome, JobSpec, JobState,
+    JobStateCount, JobWorker, JobWorkerConfig, LaneError, RedisJobQueue, RepeatOptions,
+    RetryPolicy,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use redis::AsyncCommands;
@@ -125,6 +126,118 @@ async fn redis_backend_records_job_metrics_against_real_server() {
         .await
         .expect("Redis job metrics integration test timed out")
         .unwrap();
+}
+
+#[tokio::test]
+async fn redis_backend_renews_leases_in_bulk_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(Duration::from_secs(120), run_bulk_lease_renewal(redis_url))
+        .await
+        .expect("Redis bulk lease renewal integration test timed out")
+        .unwrap();
+}
+
+async fn run_bulk_lease_renewal(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    trace_stage("bulk-lease:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("bulk-lease:cleanup:done");
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "bulk-leases")
+        .expect("valid Redis URL should build the bulk-leases queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    trace_stage("bulk-lease:queue-created");
+    let active_key = format!("{namespace}:bulk-leases:active");
+    let stalled_key = format!("{namespace}:bulk-leases:stalled");
+    let lock_key_prefix = format!("{namespace}:bulk-leases:locks:");
+
+    let first = queue
+        .add_job(
+            "first".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("first bulk lease job should add");
+    trace_stage("bulk-lease:first-added");
+    let second = queue
+        .add_job(
+            "second".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("second bulk lease job should add");
+    trace_stage("bulk-lease:second-added");
+    let first_claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(1_000))
+        .await
+        .expect("first bulk lease claim should return")
+        .expect("first bulk lease job should claim");
+    trace_stage("bulk-lease:first-claimed");
+    let second_claimed = queue
+        .claim_next("worker-b".to_string(), Duration::from_secs(30), ts(1_000))
+        .await
+        .expect("second bulk lease claim should return")
+        .expect("second bulk lease job should claim");
+    trace_stage("bulk-lease:second-claimed");
+    assert_eq!(first_claimed.id, first.id);
+    assert_eq!(second_claimed.id, second.id);
+
+    let _: usize = conn.sadd(&stalled_key, &[&first.id, &second.id]).await?;
+    trace_stage("bulk-lease:stalled-seeded");
+    let failed = queue
+        .renew_leases(
+            &[
+                JobLeaseRenewal::new(&first.id, lock_token(&first_claimed)),
+                JobLeaseRenewal::new(&second.id, "wrong-token"),
+                JobLeaseRenewal::new("missing-bulk-lease", "missing-token"),
+            ],
+            Duration::from_secs(5),
+            ts(2_000),
+        )
+        .await
+        .expect("bulk lease renewal should run");
+    trace_stage("bulk-lease:renewed");
+    assert_eq!(
+        failed,
+        vec![second.id.clone(), "missing-bulk-lease".to_string()]
+    );
+
+    let first_after = queue
+        .get_job(&first.id)
+        .await
+        .expect("renewed job should load")
+        .expect("renewed job should exist");
+    let second_after = queue
+        .get_job(&second.id)
+        .await
+        .expect("failed renewal job should load")
+        .expect("failed renewal job should exist");
+    assert_eq!(first_after.lease_expires_at, Some(ts(7_000)));
+    assert_eq!(second_after.lease_expires_at, Some(ts(31_000)));
+
+    let first_score: f64 = conn.zscore(&active_key, &first.id).await?;
+    let second_score: f64 = conn.zscore(&active_key, &second.id).await?;
+    assert_eq!(first_score, 7_000.0);
+    assert_eq!(second_score, 31_000.0);
+    let first_stalled: bool = conn.sismember(&stalled_key, &first.id).await?;
+    let second_stalled: bool = conn.sismember(&stalled_key, &second.id).await?;
+    assert!(!first_stalled);
+    assert!(second_stalled);
+    let first_ttl: i64 = conn.pttl(format!("{lock_key_prefix}{}", first.id)).await?;
+    assert!(first_ttl > 0);
+
+    trace_stage("bulk-lease:cleanup-final:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("bulk-lease:cleanup-final:done");
+    Ok(())
 }
 
 async fn run_job_metrics(redis_url: String) -> redis::RedisResult<()> {

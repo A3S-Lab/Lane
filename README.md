@@ -370,7 +370,7 @@ A3S stack and language SDKs.
 | --- | --- | --- |
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
 | Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, debounce TTL extension, delayed-owner replace, and keep-last-if-active requeue, repeat-key ownership and upsert, explicit job states, priority plus FIFO/LIFO same-priority ordering, finished-job retention by age/count/limit, retained queue event streams, delayed jobs, token-owned worker leases, active-to-wait/delayed movement, completion/failure snapshots, retry backoff, Redis-shared rate-limit and active-concurrency controls, BullMQ-style two-phase stalled recovery with repeat scheduler requeue handling, pause/resume. |
-| Job management API | In progress | Add/get/get-state/get-job-finished-result/get-job-counts/get-job-count/count-pending/remove/remove-repeat/upsert-repeat/remove-deduplication-key/get-deduplication-job-id/list-repeats/get-repeat/count-repeats/list-repeats-page/add-flow-children/get-flow-dependencies/get-flow-dependency-counts/get-flow-children-values/get-flow-ignored-children-failures/remove-unprocessed-children/remove-child-dependency/promote/reschedule/delay-active/release-active/retry/update-priority/update-priority-with-lifo/update-data/save-stacktrace/pause/resume/is-paused/drain/clean/obliterate APIs, multi-state pagination, ascending/descending listing, waiting priority counts, add-log/get-logs/clear-job-logs, read-events/trim-events, progress updates, lease renewal, Redis terminal metrics. |
+| Job management API | In progress | Add/get/get-state/get-job-finished-result/get-job-counts/get-job-count/count-pending/remove/remove-repeat/upsert-repeat/remove-deduplication-key/get-deduplication-job-id/list-repeats/get-repeat/count-repeats/list-repeats-page/add-flow-children/get-flow-dependencies/get-flow-dependency-counts/get-flow-children-values/get-flow-ignored-children-failures/remove-unprocessed-children/remove-child-dependency/promote/reschedule/delay-active/release-active/retry/update-priority/update-priority-with-lifo/update-data/save-stacktrace/pause/resume/is-paused/drain/clean/obliterate APIs, multi-state pagination, ascending/descending listing, waiting priority counts, add-log/get-logs/clear-job-logs, read-events/trim-events, progress updates, single and bulk lease renewal, Redis terminal metrics. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, uses backend-native blocking claim hooks when available, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, and stalled recovery loops. |
 | Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, FIFO/LIFO waiting score ordering, BullMQ-style Redis worker marker zset updates, Redis marker-backed blocking claim, Redis stream queue events, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership, Redis-backed repeat scheduler zset/hash metadata, listing/removal/upsert/pagination, static flow submission, dynamic flow child fan-out, flow dependency inspection, flow child-value and ignored-failure reads, delayed promotion and rescheduling, active-to-wait/delayed movement, single-job promote, state-index and finished-result queries, job count snapshots, terminal metrics, manual retry, priority update, progress update, stacktrace update, log append, list/stat snapshots, finished-job age/count retention during complete/fail/stalled scripts, drain, clean, obliterate, claim, Redis-shared rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled candidate-set recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, dependency inspection, child return-value inspection, ignored, removed, continued, and fail-parent child-failure release, static and dynamic fan-out, and fan-in release are available across in-memory, local durable, and Redis backends. |
@@ -466,7 +466,8 @@ manually requeues failed jobs, `fail_job_discarding_retry()` fails an active
 token-owned job without applying remaining automatic retries, `update_priority()`
 changes non-terminal job priority, `update_priority_with_lifo()` also chooses
 the same-priority waiting reinsert side, `renew_lease()` extends an active
-worker lease with the claim token,
+worker lease with the claim token, `renew_leases()` renews multiple claimed
+leases and returns the job ids that failed renewal,
 `remove_job()` removes non-active jobs,
 `remove_repeat()` removes the current non-active owner for a repeat key,
 `upsert_repeat()` creates or replaces the current non-active owner for a repeat
@@ -920,11 +921,14 @@ and transition leased jobs. The Redis backend follows the core BullMQ locking
 mechanism: a claim creates an independent TTL lock key for the job, and
 complete, fail, release, delay, and renew operations must prove ownership by
 matching the lock token before the script mutates the
-active/completed/failed/delayed indexes. Stalled recovery uses BullMQ's
-two-phase candidate set shape: a recovery pass records active jobs in a
-`stalled` set for the next pass, successful renew/finalize scripts remove the
-job from that set, and only a later pass whose candidate has no TTL lock can
-requeue or fail the job:
+active/completed/failed/delayed indexes. `renew_leases()` mirrors BullMQ's
+`extendLocks` shape: Redis checks every token in one Lua turn, renews valid lock
+keys, updates active lease scores and retained job snapshots, removes successful
+jobs from the `stalled` candidate set, and returns only the failed job ids.
+Stalled recovery uses BullMQ's two-phase candidate set shape: a recovery pass
+records active jobs in a `stalled` set for the next pass, successful
+renew/finalize scripts remove the job from that set, and only a later pass whose
+candidate has no TTL lock can requeue or fail the job:
 
 ```rust
 use a3s_lane::{JobOptions, JobQueueBackend, JobRateLimit, RedisJobQueue, RetryPolicy};

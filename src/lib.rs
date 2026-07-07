@@ -90,8 +90,8 @@ pub use event::{EventEmitter, EventPayload, EventStream, LaneEvent};
 pub use job::RedisJobQueue;
 pub use job::{
     job_processor_fn, DeduplicationOptions, InMemoryJobQueue, Job, JobContext, JobEvent,
-    JobFinishedResult, JobFlow, JobFlowDependencyCounts, JobId, JobListOptions, JobListPage,
-    JobLockToken, JobLogEntry, JobMetrics, JobMetricsMeta, JobOptions, JobPriority,
+    JobFinishedResult, JobFlow, JobFlowDependencyCounts, JobId, JobLeaseRenewal, JobListOptions,
+    JobListPage, JobLockToken, JobLogEntry, JobMetrics, JobMetricsMeta, JobOptions, JobPriority,
     JobPriorityCount, JobProcessor, JobProcessorFn, JobProcessorRouter, JobQueueBackend,
     JobQueueSnapshot, JobQueueStats, JobRateLimit, JobRepeatEntry, JobRepeatListOptions,
     JobRepeatPage, JobRetention, JobRunOutcome, JobSpec, JobState, JobStateCount, JobWorker,

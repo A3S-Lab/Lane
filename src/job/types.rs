@@ -21,6 +21,23 @@ pub type JobWorkerId = String;
 /// Opaque token proving ownership of a claimed job lease.
 pub type JobLockToken = String;
 
+/// Job lease ownership tuple used for batch renewal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobLeaseRenewal {
+    pub job_id: JobId,
+    pub lock_token: JobLockToken,
+}
+
+impl JobLeaseRenewal {
+    /// Create a lease renewal request for a claimed job.
+    pub fn new(job_id: impl Into<JobId>, lock_token: impl Into<JobLockToken>) -> Self {
+        Self {
+            job_id: job_id.into(),
+            lock_token: lock_token.into(),
+        }
+    }
+}
+
 /// Job priority. Lower values run first.
 pub type JobPriority = u32;
 

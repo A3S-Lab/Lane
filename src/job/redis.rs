@@ -2,10 +2,10 @@ use super::backend::JobQueueBackend;
 use super::types::{
     add_duration, deduplication_expiration, page_repeat_entries, Job, JobEvent, JobFinishedResult,
     JobFlow, JobFlowChildValues, JobFlowDependencies, JobFlowDependencyCounts,
-    JobFlowIgnoredFailures, JobId, JobListOptions, JobListPage, JobLogEntry, JobLogPage,
-    JobMetrics, JobMetricsMeta, JobOptions, JobPriority, JobPriorityCount, JobQueueStats,
-    JobRateLimit, JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobSpec, JobState,
-    JobStateCount, JobWorkerId, QueueName, DEFAULT_JOB_EVENT_RETENTION,
+    JobFlowIgnoredFailures, JobId, JobLeaseRenewal, JobListOptions, JobListPage, JobLogEntry,
+    JobLogPage, JobMetrics, JobMetricsMeta, JobOptions, JobPriority, JobPriorityCount,
+    JobQueueStats, JobRateLimit, JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobSpec,
+    JobState, JobStateCount, JobWorkerId, QueueName, DEFAULT_JOB_EVENT_RETENTION,
     DEFAULT_JOB_METRICS_RETENTION,
 };
 use crate::error::{LaneError, Result};
@@ -3391,6 +3391,49 @@ local updated = cjson.encode(job)
 redis.call('HSET', KEYS[1], ARGV[1], updated)
 redis.call('ZADD', KEYS[2], ARGV[4], ARGV[1])
 return {'ok', updated}
+"#;
+
+const RENEW_LEASES_SCRIPT: &str = r#"
+local jobs_key = KEYS[1]
+local active_key = KEYS[2]
+local stalled_key = KEYS[3]
+local lock_prefix = ARGV[1]
+local lease_expires_at = ARGV[2]
+local lease_score = ARGV[3]
+local lock_duration = ARGV[4]
+local count = tonumber(ARGV[5]) or 0
+local failed = {}
+local offset = 6
+
+for index = 1, count do
+  local job_id = ARGV[offset]
+  local token = ARGV[offset + 1]
+  local raw = redis.call('HGET', jobs_key, job_id)
+  local ok = false
+
+  if raw then
+    local job = cjson.decode(raw)
+    if job["state"] == "active" and redis.call('ZSCORE', active_key, job_id) then
+      local lock_key = lock_prefix .. job_id
+      local current_token = redis.call('GET', lock_key)
+      if current_token and current_token == token then
+        redis.call('SET', lock_key, token, 'PX', lock_duration)
+        redis.call('SREM', stalled_key, job_id)
+        job["lease_expires_at"] = lease_expires_at
+        redis.call('HSET', jobs_key, job_id, cjson.encode(job))
+        redis.call('ZADD', active_key, lease_score, job_id)
+        ok = true
+      end
+    end
+  end
+
+  if not ok then
+    failed[#failed + 1] = job_id
+  end
+  offset = offset + 2
+end
+
+return failed
 "#;
 
 const DELAY_ACTIVE_JOB_SCRIPT: &str = r#"
@@ -8762,6 +8805,37 @@ impl JobQueueBackend for RedisJobQueue {
         Ok(job)
     }
 
+    async fn renew_leases(
+        &self,
+        renewals: &[JobLeaseRenewal],
+        lease_for: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<JobId>> {
+        if renewals.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut conn = self.connection().await?;
+        let lease_expires_at = add_duration(now, lease_for);
+        let mut command = redis::cmd("EVAL");
+        command
+            .arg(RENEW_LEASES_SCRIPT)
+            .arg(3)
+            .arg(self.jobs_key())
+            .arg(self.state_key(JobState::Active))
+            .arg(self.stalled_key())
+            .arg(self.lock_key_prefix())
+            .arg(lease_expires_at.to_rfc3339())
+            .arg(millis(lease_expires_at))
+            .arg(lock_duration_millis(lease_for))
+            .arg(renewals.len());
+        for renewal in renewals {
+            command.arg(&renewal.job_id).arg(&renewal.lock_token);
+        }
+
+        command.query_async(&mut conn).await.map_err(redis_error)
+    }
+
     async fn delay_active_job(
         &self,
         job_id: &str,
@@ -10649,6 +10723,8 @@ mod tests {
             .contains("redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1]"));
 
         assert!(RENEW_LEASE_SCRIPT.contains("redis.call('SREM', KEYS[4], ARGV[1])"));
+        assert!(RENEW_LEASES_SCRIPT.contains("redis.call('SREM', stalled_key, job_id)"));
+        assert!(RENEW_LEASES_SCRIPT.contains("failed[#failed + 1] = job_id"));
         assert!(COMPLETE_SCRIPT.contains("redis.call('SREM', KEYS[11], ARGV[1])"));
         assert!(FAIL_SCRIPT.contains("redis.call('SREM', KEYS[10], ARGV[1])"));
         assert!(DELAY_ACTIVE_JOB_SCRIPT.contains("redis.call('SREM', KEYS[6], ARGV[1])"));

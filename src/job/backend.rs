@@ -1,9 +1,9 @@
 use super::types::{
     page_repeat_entries, Job, JobEvent, JobFinishedResult, JobFlow, JobFlowChildValues,
-    JobFlowDependencies, JobFlowDependencyCounts, JobFlowIgnoredFailures, JobId, JobListOptions,
-    JobListPage, JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueStats,
-    JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobSpec, JobState, JobStateCount,
-    JobWorkerId,
+    JobFlowDependencies, JobFlowDependencyCounts, JobFlowIgnoredFailures, JobId, JobLeaseRenewal,
+    JobListOptions, JobListPage, JobLogPage, JobOptions, JobPriority, JobPriorityCount,
+    JobQueueStats, JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobSpec, JobState,
+    JobStateCount, JobWorkerId,
 };
 use crate::error::Result;
 use async_trait::async_trait;
@@ -129,6 +129,31 @@ pub trait JobQueueBackend: Send + Sync {
         lease_for: Duration,
         now: DateTime<Utc>,
     ) -> Result<Job>;
+
+    /// Renew multiple active job leases.
+    ///
+    /// This mirrors BullMQ's `extendLocks` script shape: valid token-owned
+    /// active jobs are renewed, and failures are returned as job ids instead of
+    /// aborting the whole batch. Backend transport/script failures still return
+    /// `Err`.
+    async fn renew_leases(
+        &self,
+        renewals: &[JobLeaseRenewal],
+        lease_for: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<JobId>> {
+        let mut failed = Vec::new();
+        for renewal in renewals {
+            if self
+                .renew_lease(&renewal.job_id, &renewal.lock_token, lease_for, now)
+                .await
+                .is_err()
+            {
+                failed.push(renewal.job_id.clone());
+            }
+        }
+        Ok(failed)
+    }
 
     async fn delay_active_job(
         &self,

@@ -3355,6 +3355,76 @@ async fn lease_renewal_requires_active_owner() {
 }
 
 #[tokio::test]
+async fn bulk_lease_renewal_returns_failed_job_ids() {
+    let queue = InMemoryJobQueue::new("bulk-leases");
+    let first = queue
+        .add_at("first", serde_json::json!({}), JobOptions::new(), ts(1_000))
+        .await
+        .unwrap();
+    let second = queue
+        .add_at(
+            "second",
+            serde_json::json!({}),
+            JobOptions::new(),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    let first_claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(1), ts(1_000))
+        .await
+        .unwrap()
+        .unwrap();
+    let second_claimed = queue
+        .claim_next("worker-b".to_string(), Duration::from_secs(1), ts(1_000))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let failed = queue
+        .renew_leases(
+            &[
+                JobLeaseRenewal::new(&first_claimed.id, lock_token(&first_claimed)),
+                JobLeaseRenewal::new(&second_claimed.id, "wrong-token"),
+                JobLeaseRenewal::new("missing-bulk-lease", "missing-token"),
+            ],
+            Duration::from_secs(5),
+            ts(2_000),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        failed,
+        vec![second.id.clone(), "missing-bulk-lease".to_string()]
+    );
+    assert_eq!(
+        queue
+            .get_job(&first.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .lease_expires_at,
+        Some(ts(7_000))
+    );
+    assert_eq!(
+        queue
+            .get_job(&second.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .lease_expires_at,
+        Some(ts(2_000))
+    );
+    assert!(queue
+        .renew_leases(&[], Duration::from_secs(5), ts(2_000))
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
 async fn management_api_lists_progress_logs_retries_and_cleans_jobs() {
     let queue = InMemoryJobQueue::new("ops");
     let now = ts(1_000);
