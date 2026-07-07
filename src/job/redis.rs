@@ -14,10 +14,12 @@ use redis::streams::{StreamMaxlen, StreamRangeReply};
 use redis::AsyncCommands;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const WAITING_SCORE_BUCKET: f64 = 1_000_000_000_000.0;
+const MAX_MARKER_BLOCK_TIMEOUT: Duration = Duration::from_secs(10);
+const MIN_MARKER_BLOCK_TIMEOUT: Duration = Duration::from_millis(1);
 
 const ADD_JOB_SCRIPT: &str = r#"
 local function waiting_score_for(priority, sequence, job, bucket)
@@ -1512,6 +1514,7 @@ for _, id in ipairs(ids) do
       redis.call('ZADD', KEYS[2], ARGV[1], id)
       redis.call('HSET', KEYS[3], id, updated)
       redis.call('XADD', KEYS[8], 'MAXLEN', '~', ARGV[14], '*', 'event', 'active', 'jobId', id, 'prev', 'waiting')
+      redis.call('ZADD', KEYS[#KEYS], 0, '0')
       return updated
     end
   end
@@ -6436,6 +6439,75 @@ impl RedisJobQueue {
             .map_err(redis_error)
     }
 
+    /// Claim the next job, waiting on the Redis worker marker zset when idle.
+    ///
+    /// This mirrors BullMQ's worker wait path: `BZPOPMIN` is used only as a
+    /// wake-up signal, and the actual ownership transition still goes through
+    /// Lane's Lua claim script so pause, rate limit, concurrency, delay
+    /// promotion, and lock creation remain atomic.
+    pub async fn claim_next_blocking(
+        &self,
+        worker_id: JobWorkerId,
+        lease_for: Duration,
+        block_for: Duration,
+    ) -> Result<Option<Job>> {
+        let deadline = Instant::now() + block_for;
+        let mut claim_conn = self.connection().await?;
+        let mut blocking_conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(redis_error)?;
+        let mut block_until_millis = None;
+        let mut first_attempt = true;
+
+        loop {
+            if !first_attempt
+                && (block_for.is_zero()
+                    || match deadline.checked_duration_since(Instant::now()) {
+                        Some(remaining) => remaining.is_zero(),
+                        None => true,
+                    })
+            {
+                return Ok(None);
+            }
+            first_attempt = false;
+
+            let now = Utc::now();
+            if let Some(job) = self
+                .claim_next_with_conn(&mut claim_conn, &worker_id, lease_for, now)
+                .await?
+            {
+                return Ok(Some(job));
+            }
+
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Ok(None);
+            };
+            if block_for.is_zero() || remaining.is_zero() {
+                return Ok(None);
+            }
+
+            let wait_for = marker_block_timeout(block_until_millis, remaining, Utc::now());
+            if wait_for.is_zero() {
+                block_until_millis = None;
+                continue;
+            }
+
+            let marker: Option<(String, String, f64)> = blocking_conn
+                .bzpopmin(self.marker_key(), wait_for.as_secs_f64())
+                .await
+                .map_err(redis_error)?;
+            if let Some((_key, member, score)) = marker {
+                block_until_millis = if member == "1" {
+                    Some(score.ceil() as i64)
+                } else {
+                    None
+                };
+            }
+        }
+    }
+
     /// Queue name.
     pub fn queue_name(&self) -> &str {
         &self.queue
@@ -7099,6 +7171,58 @@ impl RedisJobQueue {
         Ok(())
     }
 
+    async fn claim_next_with_conn(
+        &self,
+        conn: &mut ConnectionManager,
+        worker_id: &str,
+        lease_for: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Job>> {
+        let lease_expires_at = add_duration(now, lease_for);
+        let lock_token = Uuid::new_v4().to_string();
+        let (rate_limit_max, rate_limit_window_ms) = self
+            .claim_rate_limit
+            .as_ref()
+            .map(|limit| (limit.max_claims, duration_millis(limit.window).max(1)))
+            .unwrap_or((0, 0));
+        let raw: Option<String> = redis::cmd("EVAL")
+            .arg(CLAIM_SCRIPT)
+            .arg(9)
+            .arg(self.state_key(JobState::Waiting))
+            .arg(self.state_key(JobState::Active))
+            .arg(self.jobs_key())
+            .arg(self.claim_rate_limit_key())
+            .arg(self.meta_key())
+            .arg(self.state_key(JobState::Delayed))
+            .arg(self.sequence_key())
+            .arg(self.events_key())
+            .arg(self.marker_key())
+            .arg(millis(lease_expires_at))
+            .arg(now.to_rfc3339())
+            .arg(worker_id)
+            .arg(lease_expires_at.to_rfc3339())
+            .arg(&lock_token)
+            .arg(lock_duration_millis(lease_for))
+            .arg(self.lock_key_prefix())
+            .arg(rate_limit_max)
+            .arg(rate_limit_window_ms)
+            .arg(millis(now))
+            .arg(WAITING_SCORE_BUCKET)
+            .arg(1_000_u16)
+            .arg(1_000_u16)
+            .arg(DEFAULT_JOB_EVENT_RETENTION)
+            .query_async(conn)
+            .await
+            .map_err(redis_error)?;
+
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        let mut job = decode_job(&raw)?;
+        job.lock_token = Some(lock_token);
+        Ok(Some(job))
+    }
+
     async fn update_priority_order(
         &self,
         job_id: &str,
@@ -7237,50 +7361,8 @@ impl JobQueueBackend for RedisJobQueue {
         now: DateTime<Utc>,
     ) -> Result<Option<Job>> {
         let mut conn = self.connection().await?;
-
-        let lease_expires_at = add_duration(now, lease_for);
-        let lock_token = Uuid::new_v4().to_string();
-        let (rate_limit_max, rate_limit_window_ms) = self
-            .claim_rate_limit
-            .as_ref()
-            .map(|limit| (limit.max_claims, duration_millis(limit.window).max(1)))
-            .unwrap_or((0, 0));
-        let raw: Option<String> = redis::cmd("EVAL")
-            .arg(CLAIM_SCRIPT)
-            .arg(9)
-            .arg(self.state_key(JobState::Waiting))
-            .arg(self.state_key(JobState::Active))
-            .arg(self.jobs_key())
-            .arg(self.claim_rate_limit_key())
-            .arg(self.meta_key())
-            .arg(self.state_key(JobState::Delayed))
-            .arg(self.sequence_key())
-            .arg(self.events_key())
-            .arg(self.marker_key())
-            .arg(millis(lease_expires_at))
-            .arg(now.to_rfc3339())
-            .arg(worker_id)
-            .arg(lease_expires_at.to_rfc3339())
-            .arg(&lock_token)
-            .arg(lock_duration_millis(lease_for))
-            .arg(self.lock_key_prefix())
-            .arg(rate_limit_max)
-            .arg(rate_limit_window_ms)
-            .arg(millis(now))
-            .arg(WAITING_SCORE_BUCKET)
-            .arg(1_000_u16)
-            .arg(1_000_u16)
-            .arg(DEFAULT_JOB_EVENT_RETENTION)
-            .query_async(&mut conn)
+        self.claim_next_with_conn(&mut conn, &worker_id, lease_for, now)
             .await
-            .map_err(redis_error)?;
-
-        let Some(raw) = raw else {
-            return Ok(None);
-        };
-        let mut job = decode_job(&raw)?;
-        job.lock_token = Some(lock_token);
-        Ok(Some(job))
     }
 
     async fn complete_job(
@@ -8015,12 +8097,14 @@ impl JobQueueBackend for RedisJobQueue {
         let _: i64 = redis::cmd("EVAL")
             .arg(
                 "redis.call('HSET', KEYS[1], 'paused', 1); \
+                 redis.call('DEL', KEYS[3]); \
                  redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[2], '*', 'event', ARGV[1]); \
                  return 1",
             )
-            .arg(2)
+            .arg(3)
             .arg(self.meta_key())
             .arg(self.events_key())
+            .arg(self.marker_key())
             .arg("paused")
             .arg(DEFAULT_JOB_EVENT_RETENTION)
             .query_async(&mut conn)
@@ -8034,12 +8118,24 @@ impl JobQueueBackend for RedisJobQueue {
         let _: i64 = redis::cmd("EVAL")
             .arg(
                 "redis.call('HDEL', KEYS[1], 'paused'); \
+                 if redis.call('ZCARD', KEYS[3]) > 0 then \
+                   redis.call('ZADD', KEYS[5], 0, '0'); \
+                 end; \
+                 local next_delayed = redis.call('ZRANGE', KEYS[4], 0, 0, 'WITHSCORES'); \
+                 if next_delayed[2] then \
+                   redis.call('ZADD', KEYS[5], next_delayed[2], '1'); \
+                 else \
+                   redis.call('ZREM', KEYS[5], '1'); \
+                 end; \
                  redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[2], '*', 'event', ARGV[1]); \
                  return 1",
             )
-            .arg(2)
+            .arg(5)
             .arg(self.meta_key())
             .arg(self.events_key())
+            .arg(self.state_key(JobState::Waiting))
+            .arg(self.state_key(JobState::Delayed))
+            .arg(self.marker_key())
             .arg("resumed")
             .arg(DEFAULT_JOB_EVENT_RETENTION)
             .query_async(&mut conn)
@@ -8771,6 +8867,31 @@ fn normalize_lua_empty_array(value: &mut Value, field: &str) {
 
 fn redis_error(error: redis::RedisError) -> LaneError {
     LaneError::Other(format!("Redis job backend error: {error}"))
+}
+
+fn marker_block_timeout(
+    block_until_millis: Option<i64>,
+    remaining: Duration,
+    now: DateTime<Utc>,
+) -> Duration {
+    if remaining.is_zero() {
+        return Duration::ZERO;
+    }
+
+    let mut timeout = remaining.min(MAX_MARKER_BLOCK_TIMEOUT);
+    if let Some(block_until_millis) = block_until_millis {
+        let delay_millis = block_until_millis.saturating_sub(now.timestamp_millis());
+        if delay_millis <= 0 {
+            return Duration::ZERO;
+        }
+        timeout = timeout.min(Duration::from_millis(delay_millis as u64));
+    }
+
+    if timeout < MIN_MARKER_BLOCK_TIMEOUT && remaining >= MIN_MARKER_BLOCK_TIMEOUT {
+        MIN_MARKER_BLOCK_TIMEOUT
+    } else {
+        timeout
+    }
 }
 
 fn millis(at: DateTime<Utc>) -> f64 {

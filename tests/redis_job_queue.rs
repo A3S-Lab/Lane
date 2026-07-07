@@ -7,6 +7,7 @@ use a3s_lane::{
 };
 use chrono::{DateTime, TimeZone, Utc};
 use redis::AsyncCommands;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -139,6 +140,21 @@ async fn redis_backend_updates_worker_markers_against_real_server() {
         .await
         .expect("Redis worker-marker integration test timed out")
         .unwrap();
+}
+
+#[tokio::test]
+async fn redis_backend_blocks_on_worker_markers_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_blocking_worker_markers(redis_url),
+    )
+    .await
+    .expect("Redis blocking worker-marker integration test timed out")
+    .unwrap();
 }
 
 #[tokio::test]
@@ -463,6 +479,150 @@ async fn run_worker_markers(redis_url: String) -> redis::RedisResult<()> {
     );
 
     cleanup_namespace_with_conn(&mut conn, &namespace).await?;
+    Ok(())
+}
+
+async fn run_blocking_worker_markers(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "blocking")
+        .expect("valid Redis URL should build the blocking queue");
+    let ready_worker = RedisJobQueue::with_namespace(&redis_url, &namespace, "blocking")
+        .expect("valid Redis URL should build the ready worker queue");
+    let ready_waiter = tokio::spawn(async move {
+        ready_worker
+            .claim_next_blocking(
+                "worker-blocking-ready".to_string(),
+                Duration::from_secs(30),
+                Duration::from_secs(5),
+            )
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ready = queue
+        .add_job(
+            "ready-blocking".to_string(),
+            serde_json::json!({ "kind": "ready" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("ready blocking job should add");
+    let ready_claim = ready_waiter
+        .await
+        .expect("ready blocking waiter should join")
+        .expect("ready blocking claim should return")
+        .expect("ready blocking claim should find a job");
+    assert_eq!(ready_claim.id, ready.id);
+
+    let fanout_worker_a = RedisJobQueue::with_namespace(&redis_url, &namespace, "blocking")
+        .expect("valid Redis URL should build fanout worker A");
+    let fanout_worker_b = RedisJobQueue::with_namespace(&redis_url, &namespace, "blocking")
+        .expect("valid Redis URL should build fanout worker B");
+    let fanout_waiter_a = tokio::spawn(async move {
+        fanout_worker_a
+            .claim_next_blocking(
+                "worker-blocking-fanout-a".to_string(),
+                Duration::from_secs(30),
+                Duration::from_secs(5),
+            )
+            .await
+    });
+    let fanout_waiter_b = tokio::spawn(async move {
+        fanout_worker_b
+            .claim_next_blocking(
+                "worker-blocking-fanout-b".to_string(),
+                Duration::from_secs(30),
+                Duration::from_secs(5),
+            )
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let bulk = queue
+        .add_jobs(
+            vec![
+                JobSpec::new("bulk-blocking-a", serde_json::json!({ "slot": "a" })),
+                JobSpec::new("bulk-blocking-b", serde_json::json!({ "slot": "b" })),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("bulk blocking jobs should add");
+    let fanout_claim_a = fanout_waiter_a
+        .await
+        .expect("fanout waiter A should join")
+        .expect("fanout claim A should return")
+        .expect("fanout claim A should find a job");
+    let fanout_claim_b = fanout_waiter_b
+        .await
+        .expect("fanout waiter B should join")
+        .expect("fanout claim B should return")
+        .expect("fanout claim B should find a job");
+    let expected_ids = bulk
+        .iter()
+        .map(|job| job.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let claimed_ids = [fanout_claim_a.id.as_str(), fanout_claim_b.id.as_str()]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(claimed_ids, expected_ids);
+
+    let delayed_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "blocking-delayed")
+        .expect("valid Redis URL should build the delayed blocking queue");
+    let delayed = delayed_queue
+        .add_job(
+            "delayed-blocking".to_string(),
+            serde_json::json!({ "kind": "delayed" }),
+            JobOptions::new().with_delay(Duration::from_secs(2)),
+        )
+        .await
+        .expect("delayed blocking job should add");
+    let delayed_claim = delayed_queue
+        .claim_next_blocking(
+            "worker-blocking-delayed".to_string(),
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("delayed blocking claim should return")
+        .expect("delayed blocking claim should find a job");
+    assert_eq!(delayed_claim.id, delayed.id);
+
+    let paused_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "blocking-paused")
+        .expect("valid Redis URL should build the paused blocking queue");
+    let paused = paused_queue
+        .add_job(
+            "paused-blocking".to_string(),
+            serde_json::json!({ "kind": "paused" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("paused blocking job should add");
+    paused_queue.pause().await.expect("queue should pause");
+    let paused_worker = RedisJobQueue::with_namespace(&redis_url, &namespace, "blocking-paused")
+        .expect("valid Redis URL should build the paused worker queue");
+    let paused_waiter = tokio::spawn(async move {
+        paused_worker
+            .claim_next_blocking(
+                "worker-blocking-paused".to_string(),
+                Duration::from_secs(30),
+                Duration::from_secs(5),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!paused_waiter.is_finished());
+    paused_queue.resume().await.expect("queue should resume");
+    let paused_claim = paused_waiter
+        .await
+        .expect("paused blocking waiter should join")
+        .expect("paused blocking claim should return")
+        .expect("paused blocking claim should find a job after resume");
+    assert_eq!(paused_claim.id, paused.id);
+
+    cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())
 }
 
