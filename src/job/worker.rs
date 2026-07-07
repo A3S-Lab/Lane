@@ -472,6 +472,13 @@ impl JobWorker {
         let lock_token = job.lock_token.clone().ok_or_else(|| {
             LaneError::JobLeaseConflict(format!("claimed job {} has no lock token", job.id))
         })?;
+        if let Some(deferred_failure) = job.deferred_failure.clone() {
+            let failed = self
+                .backend
+                .fail_job_discarding_retry(&job.id, &lock_token, deferred_failure, Utc::now())
+                .await?;
+            return Ok(JobRunOutcome::Failed(failed));
+        }
         let context = JobContext::new(
             Arc::clone(&self.backend),
             job.id.clone(),

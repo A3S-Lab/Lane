@@ -152,6 +152,7 @@ impl InMemoryJobQueue {
             job.worker_id = None;
             job.lock_token = None;
             job.lease_expires_at = None;
+            job.deferred_failure = None;
             job.failed_reason = Some(error);
 
             if allow_retry && should_retry(job) {
@@ -178,7 +179,11 @@ impl InMemoryJobQueue {
             }
             Self::enqueue_deduplicated_next_locked(&mut inner, &failed, now);
             if let Some(parent_id) = &failed.parent_id {
-                if failed.options.continue_parent_on_failure {
+                if failed.options.fail_parent_on_failure {
+                    Self::defer_parent_failure_after_child_failure_locked(
+                        &mut inner, parent_id, &failed.id, now,
+                    );
+                } else if failed.options.continue_parent_on_failure {
                     Self::continue_parent_after_child_failure_locked(&mut inner, parent_id, now);
                 } else if child_failure_releases_dependency(&failed) {
                     Self::release_parent_if_ready_locked(&mut inner, parent_id, now);
@@ -896,6 +901,7 @@ impl InMemoryJobQueue {
         job.worker_id = None;
         job.lock_token = None;
         job.lease_expires_at = None;
+        job.deferred_failure = None;
         job.failed_reason = None;
         job.enqueued_seq = enqueued_seq;
         let job = job.clone();
@@ -951,6 +957,7 @@ impl InMemoryJobQueue {
         job.worker_id = None;
         job.lock_token = None;
         job.lease_expires_at = None;
+        job.deferred_failure = None;
         job.failed_reason = None;
         let job = job.clone();
         emit_event_locked(
@@ -991,6 +998,7 @@ impl InMemoryJobQueue {
         job.worker_id = None;
         job.lock_token = None;
         job.lease_expires_at = None;
+        job.deferred_failure = None;
         job.failed_reason = None;
         job.enqueued_seq = enqueued_seq;
         let job = job.clone();
@@ -1479,18 +1487,27 @@ impl InMemoryJobQueue {
 
         let child_ids = parent.child_ids.clone();
         let mut child_failure = None;
+        let mut deferred_child_failure = None;
         for child_id in &child_ids {
             let Some(child) = inner.jobs.get(child_id) else {
                 continue;
             };
             match child.state {
                 JobState::Completed => {}
+                JobState::Failed if child.options.fail_parent_on_failure => {
+                    deferred_child_failure = Some(child.id.clone())
+                }
                 JobState::Failed if child_failure_releases_dependency(child) => {}
                 JobState::Failed => {
                     child_failure = Some((child.id.clone(), child.failed_reason.clone()))
                 }
                 _ => return Some(parent.clone()),
             }
+        }
+        if let Some(child_id) = deferred_child_failure {
+            return Self::defer_parent_failure_after_child_failure_locked(
+                inner, parent_id, &child_id, now,
+            );
         }
         if let Some((child_id, reason)) = child_failure {
             return Self::fail_waiting_parent_locked(
@@ -1515,6 +1532,7 @@ impl InMemoryJobQueue {
         parent.worker_id = None;
         parent.lock_token = None;
         parent.lease_expires_at = None;
+        parent.deferred_failure = None;
         parent.failed_reason = None;
         if let Some(enqueued_seq) = enqueued_seq {
             parent.enqueued_seq = enqueued_seq;
@@ -1546,6 +1564,7 @@ impl InMemoryJobQueue {
         parent.worker_id = None;
         parent.lock_token = None;
         parent.lease_expires_at = None;
+        parent.deferred_failure = None;
         parent.failed_reason = Some(reason);
         let failed = parent.clone();
         Self::forget_released_deduplication_owner_locked(inner, &failed);
@@ -1590,6 +1609,7 @@ impl InMemoryJobQueue {
         parent.worker_id = None;
         parent.lock_token = None;
         parent.lease_expires_at = None;
+        parent.deferred_failure = None;
         parent.failed_reason = None;
         if let Some(enqueued_seq) = enqueued_seq {
             parent.enqueued_seq = enqueued_seq;
@@ -1600,6 +1620,46 @@ impl InMemoryJobQueue {
             job_event_for_state(parent.state),
             Some(&parent),
             Some(JobState::WaitingChildren),
+            now,
+            BTreeMap::new(),
+        );
+        Some(parent)
+    }
+
+    fn defer_parent_failure_after_child_failure_locked(
+        inner: &mut InMemoryJobQueueState,
+        parent_id: &str,
+        child_id: &str,
+        now: DateTime<Utc>,
+    ) -> Option<Job> {
+        let parent = inner.jobs.get(parent_id)?;
+        if parent.state.is_terminal() {
+            return Some(parent.clone());
+        }
+
+        let parent_scheduled_at = parent.scheduled_at;
+        let parent_state = state_after_dependencies(parent_scheduled_at, now);
+        let previous_state = parent.state;
+        let enqueued_seq =
+            (parent_state == JobState::Waiting).then(|| next_waiting_sequence(&mut inner.sequence));
+        let parent = inner.jobs.get_mut(parent_id)?;
+        parent.state = parent_state;
+        parent.processed_at = None;
+        parent.finished_at = None;
+        parent.worker_id = None;
+        parent.lock_token = None;
+        parent.lease_expires_at = None;
+        parent.deferred_failure = Some(format!("child job {child_id} failed"));
+        parent.failed_reason = None;
+        if let Some(enqueued_seq) = enqueued_seq {
+            parent.enqueued_seq = enqueued_seq;
+        }
+        let parent = parent.clone();
+        emit_event_locked(
+            inner,
+            job_event_for_state(parent.state),
+            Some(&parent),
+            Some(previous_state),
             now,
             BTreeMap::new(),
         );
@@ -1737,6 +1797,7 @@ impl JobQueueBackend for InMemoryJobQueue {
             job.worker_id = None;
             job.lock_token = None;
             job.lease_expires_at = None;
+            job.deferred_failure = None;
             job.return_value = Some(value);
             job.clone()
         };
@@ -1973,6 +2034,7 @@ impl JobQueueBackend for InMemoryJobQueue {
         let mut inner = self.inner.lock().await;
         let mut recovered = 0;
         let mut remove_ids = Vec::new();
+        let mut deferred_parent_failures = Vec::new();
         let mut continuing_failed_children = Vec::new();
         let mut dependency_releasing_failed_children = Vec::new();
         let mut failed_children = Vec::new();
@@ -2003,6 +2065,7 @@ impl JobQueueBackend for InMemoryJobQueue {
                 job.worker_id = None;
                 job.lock_token = None;
                 job.lease_expires_at = None;
+                job.deferred_failure = None;
                 job.failed_reason = Some("job stalled after worker lease expired".to_string());
                 if job.stalled_count > job.options.max_stalled_count
                     && !is_repeat_scheduler_job(job)
@@ -2010,7 +2073,9 @@ impl JobQueueBackend for InMemoryJobQueue {
                     job.state = JobState::Failed;
                     job.finished_at = Some(now);
                     if let Some(parent_id) = &job.parent_id {
-                        if job.options.continue_parent_on_failure {
+                        if job.options.fail_parent_on_failure {
+                            deferred_parent_failures.push((parent_id.clone(), job.id.clone()));
+                        } else if job.options.continue_parent_on_failure {
                             continuing_failed_children.push(parent_id.clone());
                         } else if child_failure_releases_dependency(job) {
                             dependency_releasing_failed_children.push(parent_id.clone());
@@ -2053,6 +2118,11 @@ impl JobQueueBackend for InMemoryJobQueue {
             if let Some(retention) = failed.options.failed_retention() {
                 Self::apply_finished_retention_locked(&mut inner, JobState::Failed, retention, now);
             }
+        }
+        for (parent_id, child_id) in deferred_parent_failures {
+            Self::defer_parent_failure_after_child_failure_locked(
+                &mut inner, &parent_id, &child_id, now,
+            );
         }
         for parent_id in continuing_failed_children {
             Self::continue_parent_after_child_failure_locked(&mut inner, &parent_id, now);
@@ -2578,6 +2648,7 @@ fn prepare_deduplicated_next_job(job: &mut Job, now: DateTime<Utc>) {
     job.worker_id = None;
     job.lock_token = None;
     job.lease_expires_at = None;
+    job.deferred_failure = None;
     job.failed_reason = None;
     job.return_value = None;
     job.progress = None;

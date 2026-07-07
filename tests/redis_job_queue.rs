@@ -9,7 +9,7 @@ use a3s_lane::{
 use chrono::{DateTime, TimeZone, Utc};
 use redis::AsyncCommands;
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, MutexGuard};
@@ -406,6 +406,152 @@ async fn run_ignored_flow_dependency_failure(redis_url: String) -> redis::RedisR
         child_values.get(&flow.children[1].id),
         Some(&serde_json::json!({ "ok": true }))
     );
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
+#[tokio::test]
+async fn redis_backend_defers_flow_parent_failure_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_deferred_flow_parent_failure(redis_url),
+    )
+    .await
+    .expect("Redis deferred flow parent failure integration test timed out")
+    .unwrap();
+}
+
+async fn run_deferred_flow_parent_failure(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-fail-parent")
+        .expect("valid Redis URL should build the flow-fail-parent queue");
+    let worker_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-fail-parent")
+        .expect("valid Redis URL should build the flow-fail-parent worker");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new(
+                "deferred-failure-parent",
+                serde_json::json!({ "kind": "aggregate" }),
+            )
+            .with_options(JobOptions::new().with_priority(1)),
+            vec![
+                JobSpec::new(
+                    "deferred-failure-required-child",
+                    serde_json::json!({ "required": true }),
+                )
+                .with_options(
+                    JobOptions::new()
+                        .with_priority(1)
+                        .with_fail_parent_on_failure(true),
+                ),
+                JobSpec::new(
+                    "deferred-failure-still-pending-child",
+                    serde_json::json!({ "required": true }),
+                )
+                .with_options(JobOptions::new().with_priority(2)),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("deferred failure flow should be added");
+    let dependency_key = format!(
+        "{namespace}:flow-fail-parent:dependencies:{}",
+        flow.parent.id
+    );
+
+    let failing_child = worker_queue
+        .claim_next(
+            "worker-deferred-child".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("failing child claim should return")
+        .expect("failing child should be claimable");
+    assert_eq!(failing_child.id, flow.children[0].id);
+    worker_queue
+        .fail_job(
+            &failing_child.id,
+            lock_token(&failing_child),
+            "required child failed".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("failing child should fail");
+
+    let failed_child_pending: bool = conn
+        .sismember(&dependency_key, &flow.children[0].id)
+        .await?;
+    let required_child_pending: bool = conn
+        .sismember(&dependency_key, &flow.children[1].id)
+        .await?;
+    assert!(!failed_child_pending);
+    assert!(required_child_pending);
+
+    let deferred_failure = format!("child job {} failed", flow.children[0].id);
+    let parent_after_failure = queue
+        .get_job(&flow.parent.id)
+        .await
+        .expect("parent after deferred failure should load")
+        .expect("parent should exist");
+    assert_eq!(parent_after_failure.state, JobState::Waiting);
+    assert_eq!(
+        parent_after_failure.deferred_failure.as_deref(),
+        Some(deferred_failure.as_str())
+    );
+    assert!(parent_after_failure.failed_reason.is_none());
+    let counts_after_failure = queue
+        .get_flow_dependency_counts(&flow.parent.id)
+        .await
+        .expect("deferred failure counts should load")
+        .expect("deferred failure counts should exist");
+    assert_eq!(counts_after_failure.processed, 0);
+    assert_eq!(counts_after_failure.unprocessed, 1);
+    assert_eq!(counts_after_failure.failed, 1);
+    assert_eq!(counts_after_failure.ignored, 0);
+    assert_eq!(counts_after_failure.missing, 0);
+
+    let processor_called = Arc::new(AtomicBool::new(false));
+    let processor_called_for_processor = Arc::clone(&processor_called);
+    let processor = Arc::new(job_processor_fn(move |_, _| {
+        let processor_called = Arc::clone(&processor_called_for_processor);
+        async move {
+            processor_called.store(true, Ordering::SeqCst);
+            Ok(serde_json::json!({ "unexpected": true }))
+        }
+    }));
+    let backend: Arc<dyn JobQueueBackend> = Arc::new(worker_queue.clone());
+    let worker = JobWorker::new(
+        backend,
+        processor,
+        JobWorkerConfig::new("worker-deferred-parent").with_lease_renew_interval(Duration::ZERO),
+    );
+    let outcome = worker
+        .run_once(Utc::now())
+        .await
+        .expect("deferred parent worker should run once");
+    let failed_parent = match outcome {
+        JobRunOutcome::Failed(job) => job,
+        other => panic!("expected failed parent job, got {other:?}"),
+    };
+    assert_eq!(failed_parent.id, flow.parent.id);
+    assert_eq!(failed_parent.state, JobState::Failed);
+    assert_eq!(
+        failed_parent.failed_reason.as_deref(),
+        Some(deferred_failure.as_str())
+    );
+    assert!(!processor_called.load(Ordering::SeqCst));
 
     cleanup_namespace(&redis_url, &namespace).await
 }

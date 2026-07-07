@@ -2048,6 +2048,7 @@ local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delay
   next_job["worker_id"] = cjson.null
   next_job["lock_token"] = cjson.null
   next_job["lease_expires_at"] = cjson.null
+  next_job["deferred_failure"] = cjson.null
   next_job["failed_reason"] = cjson.null
   next_job["return_value"] = cjson.null
   next_job["progress"] = cjson.null
@@ -2093,6 +2094,16 @@ if redis.call('SCARD', ARGV[13] .. ARGV[1]) > 0 then
   return {'pending_dependencies'}
 end
 
+for _, child_id in ipairs(job["child_ids"] or {}) do
+  local child_raw = redis.call('HGET', KEYS[1], child_id)
+  if child_raw then
+    local child = cjson.decode(child_raw)
+    if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true or child["options"]["continue_parent_on_failure"] == true)) then
+      return {'failed_dependencies'}
+    end
+  end
+end
+
 redis.call('DEL', KEYS[4])
 redis.call('SREM', KEYS[11], ARGV[1])
 redis.call('ZREM', KEYS[2], ARGV[1])
@@ -2101,6 +2112,7 @@ job["state"] = "completed"
 job["finished_at"] = ARGV[3]
 job["worker_id"] = cjson.null
 job["lease_expires_at"] = cjson.null
+job["deferred_failure"] = cjson.null
 job["return_value"] = cjson.decode(ARGV[4])
 release_deduplication_key(job, ARGV[1], ARGV[14])
 local enqueued_deduplicated_next = enqueue_deduplicated_next(job, KEYS[1], KEYS[5], KEYS[9], KEYS[7], ARGV[14], ARGV[16], ARGV[15], ARGV[3], ARGV[5], ARGV[7])
@@ -2165,6 +2177,7 @@ if parent_id and parent_id ~= cjson.null then
         parent["worker_id"] = cjson.null
         parent["lock_token"] = cjson.null
         parent["lease_expires_at"] = cjson.null
+        parent["deferred_failure"] = cjson.null
         parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
         release_deduplication_key(parent, parent_id, ARGV[14])
         release_repeat_key(parent, parent_id, ARGV[15])
@@ -2185,6 +2198,7 @@ if parent_id and parent_id ~= cjson.null then
         parent["worker_id"] = cjson.null
         parent["lock_token"] = cjson.null
         parent["lease_expires_at"] = cjson.null
+        parent["deferred_failure"] = cjson.null
         parent["failed_reason"] = cjson.null
 
         local parent_scheduled_millis = iso_to_millis(parent["scheduled_at"])
@@ -2698,6 +2712,7 @@ local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delay
   next_job["worker_id"] = cjson.null
   next_job["lock_token"] = cjson.null
   next_job["lease_expires_at"] = cjson.null
+  next_job["deferred_failure"] = cjson.null
   next_job["failed_reason"] = cjson.null
   next_job["return_value"] = cjson.null
   next_job["progress"] = cjson.null
@@ -2745,6 +2760,7 @@ redis.call('ZREM', KEYS[2], ARGV[1])
 
 job["worker_id"] = cjson.null
 job["lease_expires_at"] = cjson.null
+job["deferred_failure"] = cjson.null
 job["failed_reason"] = ARGV[4]
 
 if ARGV[5] == '1' then
@@ -2783,15 +2799,22 @@ if parent_id and parent_id ~= cjson.null then
     local parent = cjson.decode(parent_raw)
     if parent["state"] == "waiting_children" then
       local continue_parent_failure = job["options"] and job["options"] ~= cjson.null and job["options"]["continue_parent_on_failure"] == true
-      local dependency_failure_releases_parent = job["options"] and job["options"] ~= cjson.null and (job["options"]["ignore_dependency_on_failure"] == true or job["options"]["remove_dependency_on_failure"] == true or job["options"]["continue_parent_on_failure"] == true)
+      local fail_parent_failure = job["options"] and job["options"] ~= cjson.null and job["options"]["fail_parent_on_failure"] == true
+      local dependency_failure_releases_parent = job["options"] and job["options"] ~= cjson.null and (job["options"]["ignore_dependency_on_failure"] == true or job["options"]["remove_dependency_on_failure"] == true or job["options"]["continue_parent_on_failure"] == true or job["options"]["fail_parent_on_failure"] == true)
       local dependency_key = ARGV[10] .. parent_id
       local all_done = true
       local continue_parent = false
+      local fail_parent = false
       local failed_child_id = nil
       local failed_reason = nil
 
       if dependency_failure_releases_parent then
-        if continue_parent_failure then
+        if fail_parent_failure then
+          if redis.call('EXISTS', dependency_key) == 1 then
+            redis.call('SREM', dependency_key, ARGV[1])
+          end
+          fail_parent = true
+        elseif continue_parent_failure then
           if redis.call('EXISTS', dependency_key) == 1 then
             redis.call('SREM', dependency_key, ARGV[1])
           end
@@ -2838,6 +2861,7 @@ if parent_id and parent_id ~= cjson.null then
         parent["worker_id"] = cjson.null
         parent["lock_token"] = cjson.null
         parent["lease_expires_at"] = cjson.null
+        parent["deferred_failure"] = cjson.null
         parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
         release_deduplication_key(parent, parent_id, ARGV[11])
         release_repeat_key(parent, parent_id, ARGV[12])
@@ -2850,6 +2874,27 @@ if parent_id and parent_id ~= cjson.null then
           redis.call('ZADD', KEYS[4], ARGV[8], parent_id)
           apply_finished_retention(ARGV[8], parent_failure_retention, KEYS[4], KEYS[1], ARGV[10], ARGV[11], ARGV[12], ARGV[15])
         end
+      elseif fail_parent then
+        redis.call('ZREM', KEYS[6], parent_id)
+        parent["processed_at"] = cjson.null
+        parent["finished_at"] = cjson.null
+        parent["worker_id"] = cjson.null
+        parent["lock_token"] = cjson.null
+        parent["lease_expires_at"] = cjson.null
+        parent["deferred_failure"] = "child job " .. ARGV[1] .. " failed"
+        parent["failed_reason"] = cjson.null
+
+        local parent_scheduled_millis = iso_to_millis(parent["scheduled_at"])
+        if parent_scheduled_millis <= tonumber(ARGV[8]) then
+          parent["state"] = "waiting"
+          local priority = tonumber(parent["priority"] or '1000') or 1000
+          enqueue_waiting_job(KEYS[1], KEYS[7], KEYS[8], parent, parent_id, priority, ARGV[13], KEYS[#KEYS])
+        else
+          parent["state"] = "delayed"
+          redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+          redis.call('ZADD', KEYS[3], parent_scheduled_millis, parent_id)
+          refresh_delay_marker(KEYS[#KEYS], KEYS[3])
+        end
       elseif continue_parent then
         redis.call('ZREM', KEYS[6], parent_id)
         parent["processed_at"] = cjson.null
@@ -2857,6 +2902,7 @@ if parent_id and parent_id ~= cjson.null then
         parent["worker_id"] = cjson.null
         parent["lock_token"] = cjson.null
         parent["lease_expires_at"] = cjson.null
+        parent["deferred_failure"] = cjson.null
         parent["failed_reason"] = cjson.null
 
         local parent_scheduled_millis = iso_to_millis(parent["scheduled_at"])
@@ -2878,6 +2924,7 @@ if parent_id and parent_id ~= cjson.null then
         parent["worker_id"] = cjson.null
         parent["lock_token"] = cjson.null
         parent["lease_expires_at"] = cjson.null
+        parent["deferred_failure"] = cjson.null
         parent["failed_reason"] = cjson.null
 
         local parent_scheduled_millis = iso_to_millis(parent["scheduled_at"])
@@ -2985,6 +3032,7 @@ job["processed_at"] = cjson.null
 job["worker_id"] = cjson.null
 job["lock_token"] = cjson.null
 job["lease_expires_at"] = cjson.null
+job["deferred_failure"] = cjson.null
 job["failed_reason"] = cjson.null
 if not job["options"] or job["options"] == cjson.null then
   job["options"] = {}
@@ -3073,6 +3121,7 @@ job["processed_at"] = cjson.null
 job["worker_id"] = cjson.null
 job["lock_token"] = cjson.null
 job["lease_expires_at"] = cjson.null
+job["deferred_failure"] = cjson.null
 job["failed_reason"] = cjson.null
 
 local priority = tonumber(job["priority"] or '1000') or 1000
@@ -3511,6 +3560,7 @@ local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delay
   next_job["worker_id"] = cjson.null
   next_job["lock_token"] = cjson.null
   next_job["lease_expires_at"] = cjson.null
+  next_job["deferred_failure"] = cjson.null
   next_job["failed_reason"] = cjson.null
   next_job["return_value"] = cjson.null
   next_job["progress"] = cjson.null
@@ -3562,6 +3612,7 @@ for _, id in ipairs(ids) do
         job["worker_id"] = cjson.null
         job["lock_token"] = cjson.null
         job["lease_expires_at"] = cjson.null
+        job["deferred_failure"] = cjson.null
         job["failed_reason"] = "job stalled after worker lease expired"
         redis.call('ZREM', KEYS[2], id)
 
@@ -3595,15 +3646,22 @@ for _, id in ipairs(ids) do
               local parent = cjson.decode(parent_raw)
               if parent["state"] == "waiting_children" then
                 local continue_parent_failure = job["options"] and job["options"] ~= cjson.null and job["options"]["continue_parent_on_failure"] == true
-                local dependency_failure_releases_parent = job["options"] and job["options"] ~= cjson.null and (job["options"]["ignore_dependency_on_failure"] == true or job["options"]["remove_dependency_on_failure"] == true or job["options"]["continue_parent_on_failure"] == true)
+                local fail_parent_failure = job["options"] and job["options"] ~= cjson.null and job["options"]["fail_parent_on_failure"] == true
+                local dependency_failure_releases_parent = job["options"] and job["options"] ~= cjson.null and (job["options"]["ignore_dependency_on_failure"] == true or job["options"]["remove_dependency_on_failure"] == true or job["options"]["continue_parent_on_failure"] == true or job["options"]["fail_parent_on_failure"] == true)
                 local dependency_key = ARGV[6] .. parent_id
                 local all_done = true
                 local continue_parent = false
+                local fail_parent = false
                 local failed_child_id = nil
                 local failed_reason = nil
 
                 if dependency_failure_releases_parent then
-                  if continue_parent_failure then
+                  if fail_parent_failure then
+                    if redis.call('EXISTS', dependency_key) == 1 then
+                      redis.call('SREM', dependency_key, id)
+                    end
+                    fail_parent = true
+                  elseif continue_parent_failure then
                     if redis.call('EXISTS', dependency_key) == 1 then
                       redis.call('SREM', dependency_key, id)
                     end
@@ -3651,6 +3709,7 @@ for _, id in ipairs(ids) do
                   parent["worker_id"] = cjson.null
                   parent["lock_token"] = cjson.null
                   parent["lease_expires_at"] = cjson.null
+                  parent["deferred_failure"] = cjson.null
                   parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
                   release_deduplication_key(parent, parent_id, ARGV[7])
                   release_repeat_key(parent, parent_id, ARGV[8])
@@ -3663,6 +3722,27 @@ for _, id in ipairs(ids) do
                     redis.call('ZADD', KEYS[4], ARGV[1], parent_id)
                     apply_finished_retention(ARGV[1], parent_failure_retention, KEYS[4], KEYS[1], ARGV[6], ARGV[7], ARGV[8], ARGV[10])
                   end
+                elseif fail_parent then
+                  redis.call('ZREM', KEYS[6], parent_id)
+                  parent["processed_at"] = cjson.null
+                  parent["finished_at"] = cjson.null
+                  parent["worker_id"] = cjson.null
+                  parent["lock_token"] = cjson.null
+                  parent["lease_expires_at"] = cjson.null
+                  parent["deferred_failure"] = "child job " .. id .. " failed"
+                  parent["failed_reason"] = cjson.null
+
+                  local parent_scheduled_millis = iso_to_millis(parent["scheduled_at"])
+                  if parent_scheduled_millis <= tonumber(ARGV[1]) then
+                    parent["state"] = "waiting"
+                    local priority = tonumber(parent["priority"] or '1000') or 1000
+                    enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[5], parent, parent_id, priority, ARGV[4], KEYS[#KEYS])
+                  else
+                    parent["state"] = "delayed"
+                    redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+                    redis.call('ZADD', KEYS[7], parent_scheduled_millis, parent_id)
+                    refresh_delay_marker(KEYS[#KEYS], KEYS[7])
+                  end
                 elseif continue_parent then
                   redis.call('ZREM', KEYS[6], parent_id)
                   parent["processed_at"] = cjson.null
@@ -3670,6 +3750,7 @@ for _, id in ipairs(ids) do
                   parent["worker_id"] = cjson.null
                   parent["lock_token"] = cjson.null
                   parent["lease_expires_at"] = cjson.null
+                  parent["deferred_failure"] = cjson.null
                   parent["failed_reason"] = cjson.null
 
                   local parent_scheduled_millis = iso_to_millis(parent["scheduled_at"])
@@ -3691,6 +3772,7 @@ for _, id in ipairs(ids) do
                   parent["worker_id"] = cjson.null
                   parent["lock_token"] = cjson.null
                   parent["lease_expires_at"] = cjson.null
+                  parent["deferred_failure"] = cjson.null
                   parent["failed_reason"] = cjson.null
 
                   local parent_scheduled_millis = iso_to_millis(parent["scheduled_at"])
@@ -4058,6 +4140,7 @@ job["finished_at"] = cjson.null
 job["worker_id"] = cjson.null
 job["lock_token"] = cjson.null
 job["lease_expires_at"] = cjson.null
+job["deferred_failure"] = cjson.null
 job["failed_reason"] = cjson.null
 if retry_deduplication_id then
   if ARGV[6] ~= '' then
@@ -4570,6 +4653,7 @@ if parent_id and parent_id ~= cjson.null then
         parent["worker_id"] = cjson.null
         parent["lock_token"] = cjson.null
         parent["lease_expires_at"] = cjson.null
+        parent["deferred_failure"] = cjson.null
         parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
         release_deduplication_key(parent, parent_id, ARGV[6])
         release_repeat_key(parent, parent_id, ARGV[7])
@@ -4590,6 +4674,7 @@ if parent_id and parent_id ~= cjson.null then
         parent["worker_id"] = cjson.null
         parent["lock_token"] = cjson.null
         parent["lease_expires_at"] = cjson.null
+        parent["deferred_failure"] = cjson.null
         parent["failed_reason"] = cjson.null
 
         local parent_scheduled_millis = iso_to_millis(parent["scheduled_at"])
@@ -4919,6 +5004,7 @@ local function release_parent_after_removed_child(job, removed_id)
     parent["worker_id"] = cjson.null
     parent["lock_token"] = cjson.null
     parent["lease_expires_at"] = cjson.null
+    parent["deferred_failure"] = cjson.null
     parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
     release_deduplication_key(parent, parent_id, ARGV[10])
     release_repeat_key(parent, parent_id, ARGV[11])
@@ -4939,6 +5025,7 @@ local function release_parent_after_removed_child(job, removed_id)
     parent["worker_id"] = cjson.null
     parent["lock_token"] = cjson.null
     parent["lease_expires_at"] = cjson.null
+    parent["deferred_failure"] = cjson.null
     parent["failed_reason"] = cjson.null
 
     local parent_scheduled_millis = iso_to_millis(parent["scheduled_at"])
@@ -5354,6 +5441,7 @@ local function release_parent_after_removed_child(job, removed_id)
     parent["worker_id"] = cjson.null
     parent["lock_token"] = cjson.null
     parent["lease_expires_at"] = cjson.null
+    parent["deferred_failure"] = cjson.null
     parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
     release_deduplication_key(parent, parent_id, ARGV[7])
     release_repeat_key(parent, parent_id, ARGV[8])
@@ -5374,6 +5462,7 @@ local function release_parent_after_removed_child(job, removed_id)
     parent["worker_id"] = cjson.null
     parent["lock_token"] = cjson.null
     parent["lease_expires_at"] = cjson.null
+    parent["deferred_failure"] = cjson.null
     parent["failed_reason"] = cjson.null
 
     local parent_scheduled_millis = iso_to_millis(parent["scheduled_at"])
@@ -6191,6 +6280,7 @@ local function release_parent_if_ready(parent_id, parent)
     parent["worker_id"] = cjson.null
     parent["lock_token"] = cjson.null
     parent["lease_expires_at"] = cjson.null
+    parent["deferred_failure"] = cjson.null
     parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
     release_deduplication_key(parent, parent_id)
     release_repeat_key(parent, parent_id)
@@ -6211,6 +6301,7 @@ local function release_parent_if_ready(parent_id, parent)
     parent["worker_id"] = cjson.null
     parent["lock_token"] = cjson.null
     parent["lease_expires_at"] = cjson.null
+    parent["deferred_failure"] = cjson.null
     parent["failed_reason"] = cjson.null
 
     local parent_scheduled_millis = iso_to_millis(parent["scheduled_at"])
@@ -6530,6 +6621,7 @@ local function release_parent_if_ready(parent_id, parent, dependency_key)
     parent["worker_id"] = cjson.null
     parent["lock_token"] = cjson.null
     parent["lease_expires_at"] = cjson.null
+    parent["deferred_failure"] = cjson.null
     parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
     release_deduplication_key(parent, parent_id)
     release_repeat_key(parent, parent_id)
@@ -6550,6 +6642,7 @@ local function release_parent_if_ready(parent_id, parent, dependency_key)
     parent["worker_id"] = cjson.null
     parent["lock_token"] = cjson.null
     parent["lease_expires_at"] = cjson.null
+    parent["deferred_failure"] = cjson.null
     parent["failed_reason"] = cjson.null
 
     local parent_scheduled_millis = iso_to_millis(parent["scheduled_at"])
@@ -9185,6 +9278,9 @@ fn decode_transition_result(result: &[String], job_id: &str, action: &str) -> Re
         ))),
         Some("pending_dependencies") => Err(LaneError::JobStateConflict(format!(
             "cannot {action} job {job_id}; it has pending flow dependencies"
+        ))),
+        Some("failed_dependencies") => Err(LaneError::JobStateConflict(format!(
+            "cannot {action} job {job_id}; it has failed flow dependencies"
         ))),
         Some("lock_missing") => Err(LaneError::JobLeaseConflict(format!(
             "missing lock for job {job_id}"

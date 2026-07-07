@@ -3,6 +3,7 @@ use crate::error::LaneError;
 use crate::retry::RetryPolicy;
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -2863,6 +2864,65 @@ async fn flow_parent_continues_configured_stalled_child_terminal_failure() {
 }
 
 #[tokio::test]
+async fn flow_parent_defers_configured_stalled_child_terminal_failure() {
+    let queue = InMemoryJobQueue::new("flow-fail-parent-stalled");
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({ "kind": "aggregate" }))
+                .with_options(JobOptions::new().with_priority(1)),
+            vec![
+                JobSpec::new("failing-child", serde_json::json!({ "optional": false }))
+                    .with_options(
+                        JobOptions::new()
+                            .with_priority(1)
+                            .with_max_stalled_count(0)
+                            .with_fail_parent_on_failure(true),
+                    ),
+                JobSpec::new("required-child", serde_json::json!({ "required": true }))
+                    .with_options(JobOptions::new().with_priority(2)),
+            ],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    let child = queue
+        .claim_next(
+            "worker-stalled".to_string(),
+            Duration::from_secs(1),
+            ts(1_100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child.id, flow.children[0].id);
+
+    assert_eq!(queue.recover_stalled_jobs(ts(2_200)).await.unwrap(), 1);
+    let deferred_failure = format!("child job {} failed", flow.children[0].id);
+    let parent = queue.get_job(&flow.parent.id).await.unwrap().unwrap();
+    assert_eq!(parent.state, JobState::Waiting);
+    assert_eq!(
+        parent.deferred_failure.as_deref(),
+        Some(deferred_failure.as_str())
+    );
+    assert!(parent.failed_reason.is_none());
+    assert_eq!(
+        queue
+            .get_flow_dependency_counts(&flow.parent.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        JobFlowDependencyCounts {
+            processed: 0,
+            unprocessed: 1,
+            failed: 1,
+            ignored: 0,
+            missing: 0,
+        }
+    );
+}
+
+#[tokio::test]
 async fn flow_parent_removes_configured_stalled_child_terminal_dependency() {
     let queue = InMemoryJobQueue::new("flow-remove-stalled");
     let flow = queue
@@ -3976,6 +4036,104 @@ async fn flow_parent_fails_when_child_terminally_fails() {
             missing: 0,
         }
     );
+}
+
+#[tokio::test]
+async fn flow_parent_defers_configured_child_terminal_failure() {
+    let queue = InMemoryJobQueue::new("flow-fail-parent");
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({ "kind": "aggregate" }))
+                .with_options(JobOptions::new().with_priority(1)),
+            vec![
+                JobSpec::new(
+                    "required-failing-child",
+                    serde_json::json!({ "required": true }),
+                )
+                .with_options(
+                    JobOptions::new()
+                        .with_priority(1)
+                        .with_fail_parent_on_failure(true),
+                ),
+                JobSpec::new("required-child", serde_json::json!({ "required": true }))
+                    .with_options(JobOptions::new().with_priority(2)),
+            ],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    let failing_child = queue
+        .claim_next(
+            "worker-failing".to_string(),
+            Duration::from_secs(30),
+            ts(1_100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(failing_child.id, flow.children[0].id);
+    queue
+        .fail_job(
+            &failing_child.id,
+            lock_token(&failing_child),
+            "required source failed".to_string(),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+
+    let deferred_failure = format!("child job {} failed", flow.children[0].id);
+    let parent = queue.get_job(&flow.parent.id).await.unwrap().unwrap();
+    assert_eq!(parent.state, JobState::Waiting);
+    assert_eq!(
+        parent.deferred_failure.as_deref(),
+        Some(deferred_failure.as_str())
+    );
+    assert!(parent.failed_reason.is_none());
+    assert_eq!(
+        queue
+            .get_flow_dependency_counts(&flow.parent.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        JobFlowDependencyCounts {
+            processed: 0,
+            unprocessed: 1,
+            failed: 1,
+            ignored: 0,
+            missing: 0,
+        }
+    );
+
+    let processor_called = Arc::new(AtomicBool::new(false));
+    let processor_called_for_processor = Arc::clone(&processor_called);
+    let processor = Arc::new(job_processor_fn(move |_, _| {
+        let processor_called = Arc::clone(&processor_called_for_processor);
+        async move {
+            processor_called.store(true, Ordering::SeqCst);
+            Ok(serde_json::json!({ "unexpected": true }))
+        }
+    }));
+    let backend: Arc<dyn JobQueueBackend> = Arc::new(queue.clone());
+    let worker = JobWorker::new(
+        backend,
+        processor,
+        JobWorkerConfig::new("worker-parent").with_lease_renew_interval(Duration::ZERO),
+    );
+
+    let outcome = worker.run_once(ts(1_300)).await.unwrap();
+    let failed_parent = match outcome {
+        JobRunOutcome::Failed(job) => job,
+        other => panic!("expected deferred parent failure, got {other:?}"),
+    };
+    assert_eq!(failed_parent.id, flow.parent.id);
+    assert_eq!(failed_parent.state, JobState::Failed);
+    assert_eq!(
+        failed_parent.failed_reason.as_deref(),
+        Some(deferred_failure.as_str())
+    );
+    assert!(!processor_called.load(Ordering::SeqCst));
 }
 
 #[tokio::test]

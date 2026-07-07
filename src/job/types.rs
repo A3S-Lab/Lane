@@ -818,6 +818,9 @@ pub struct JobOptions {
     /// Continue the parent flow when this child reaches terminal failure.
     #[serde(default, skip_serializing_if = "is_false")]
     pub continue_parent_on_failure: bool,
+    /// Defer parent failure when this child reaches terminal failure.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fail_parent_on_failure: bool,
 }
 
 impl Default for JobOptions {
@@ -839,6 +842,7 @@ impl Default for JobOptions {
             ignore_dependency_on_failure: false,
             remove_dependency_on_failure: false,
             continue_parent_on_failure: false,
+            fail_parent_on_failure: false,
         }
     }
 }
@@ -955,6 +959,12 @@ impl JobOptions {
         self
     }
 
+    /// Configure BullMQ-style `failParentOnFailure` for flow children.
+    pub fn with_fail_parent_on_failure(mut self, fail_parent: bool) -> Self {
+        self.fail_parent_on_failure = fail_parent;
+        self
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         if matches!(self.job_id.as_deref(), Some(job_id) if job_id.trim().is_empty()) {
             return Err(LaneError::ConfigError(
@@ -982,6 +992,7 @@ impl JobOptions {
             self.ignore_dependency_on_failure,
             self.remove_dependency_on_failure,
             self.continue_parent_on_failure,
+            self.fail_parent_on_failure,
         ]
         .into_iter()
         .filter(|enabled| *enabled)
@@ -1053,6 +1064,8 @@ pub struct Job {
     #[serde(default, skip)]
     pub lock_token: Option<JobLockToken>,
     pub lease_expires_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_failure: Option<String>,
     pub failed_reason: Option<String>,
     pub return_value: Option<Value>,
     pub progress: Option<Value>,
@@ -1114,6 +1127,7 @@ impl Job {
             worker_id: None,
             lock_token: None,
             lease_expires_at: None,
+            deferred_failure: None,
             failed_reason: None,
             return_value: None,
             progress: None,
