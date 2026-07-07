@@ -848,6 +848,22 @@ async fn redis_backend_clears_keep_last_next_for_stale_dedup_owner_against_real_
 }
 
 #[tokio::test]
+async fn redis_backend_keeps_ttl_dedup_owner_after_completion_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_ttl_dedup_finalization(redis_url),
+    )
+    .await
+    .expect("Redis TTL dedup finalization integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_materializes_flow_keep_last_after_parent_completion_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -3372,6 +3388,174 @@ async fn run_keep_last_stale_owner_cleanup(redis_url: String) -> redis::RedisRes
     assert!(owner_after_stale_get.is_none());
     let next_after_stale_get: Option<String> = conn.get(&next_key).await?;
     assert!(next_after_stale_get.is_none());
+
+    cleanup_namespace(&redis_url, &namespace).await?;
+    Ok(())
+}
+
+async fn run_ttl_dedup_finalization(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    trace_stage("dedup-ttl-finalization:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("dedup-ttl-finalization:cleanup:done");
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "dedup-ttl")
+        .expect("valid Redis URL should build the TTL dedup queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let dedup_key = format!("{namespace}:dedup-ttl:deduplication:tenant:ttl-finalization");
+
+    let owner = queue
+        .add_job(
+            "dedup-ttl-owner".to_string(),
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("tenant:ttl-finalization")
+                    .with_ttl(Duration::from_secs(30)),
+            ),
+        )
+        .await
+        .expect("TTL dedup owner should be added");
+    let claimed = queue
+        .claim_next(
+            "worker-ttl-finalization".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("TTL dedup owner should be claimable")
+        .expect("TTL dedup owner should be returned");
+    assert_eq!(claimed.id, owner.id);
+    let completed = queue
+        .complete_job(
+            &claimed.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("TTL dedup owner should complete");
+    assert_eq!(completed.state, JobState::Completed);
+
+    let pttl_after_completion: i64 = redis::cmd("PTTL")
+        .arg(&dedup_key)
+        .query_async(&mut conn)
+        .await?;
+    assert!(
+        pttl_after_completion > 0,
+        "TTL dedup key should keep its Redis TTL after completion, got {pttl_after_completion}"
+    );
+    let owner_after_completion: Option<String> = conn.get(&dedup_key).await?;
+    assert_eq!(owner_after_completion.as_deref(), Some(owner.id.as_str()));
+    let getter_after_completion = queue
+        .get_deduplication_job_id("tenant:ttl-finalization")
+        .await
+        .expect("TTL dedup getter should return");
+    assert_eq!(getter_after_completion.as_deref(), Some(owner.id.as_str()));
+
+    let duplicate = queue
+        .add_job(
+            "dedup-ttl-duplicate".to_string(),
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("tenant:ttl-finalization")
+                    .with_ttl(Duration::from_secs(30)),
+            ),
+        )
+        .await
+        .expect("duplicate before TTL expiration should return completed owner");
+    assert_eq!(duplicate.id, owner.id);
+    assert_eq!(duplicate.state, JobState::Completed);
+
+    let shortened: bool = redis::cmd("PEXPIRE")
+        .arg(&dedup_key)
+        .arg(1_u16)
+        .query_async(&mut conn)
+        .await?;
+    assert!(shortened);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let after_ttl = queue
+        .add_job(
+            "dedup-ttl-after-expiration".to_string(),
+            serde_json::json!({ "version": 3 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("tenant:ttl-finalization")
+                    .with_ttl(Duration::from_secs(30)),
+            ),
+        )
+        .await
+        .expect("dedup id should be reusable after TTL expiration");
+    assert_ne!(after_ttl.id, owner.id);
+    assert_eq!(after_ttl.state, JobState::Waiting);
+    let owner_after_ttl: Option<String> = conn.get(&dedup_key).await?;
+    assert_eq!(owner_after_ttl.as_deref(), Some(after_ttl.id.as_str()));
+    queue
+        .remove_job(&after_ttl.id)
+        .await
+        .expect("post-TTL owner should remove")
+        .expect("post-TTL owner should be returned");
+
+    let failed_dedup_key =
+        format!("{namespace}:dedup-ttl:deduplication:tenant:ttl-finalization-failed");
+    let failed_owner = queue
+        .add_job(
+            "dedup-ttl-failed-owner".to_string(),
+            serde_json::json!({ "version": 4 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("tenant:ttl-finalization-failed")
+                    .with_ttl(Duration::from_secs(30)),
+            ),
+        )
+        .await
+        .expect("failed TTL dedup owner should be added");
+    let failed_claim = queue
+        .claim_next(
+            "worker-ttl-finalization-failed".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("failed TTL dedup owner should be claimable")
+        .expect("failed TTL dedup owner should be returned");
+    assert_eq!(failed_claim.id, failed_owner.id);
+    let failed = queue
+        .fail_job(
+            &failed_claim.id,
+            lock_token(&failed_claim),
+            "boom".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("TTL dedup owner should fail");
+    assert_eq!(failed.state, JobState::Failed);
+    let failed_pttl: i64 = redis::cmd("PTTL")
+        .arg(&failed_dedup_key)
+        .query_async(&mut conn)
+        .await?;
+    assert!(
+        failed_pttl > 0,
+        "TTL dedup key should keep its Redis TTL after failure, got {failed_pttl}"
+    );
+    let failed_getter = queue
+        .get_deduplication_job_id("tenant:ttl-finalization-failed")
+        .await
+        .expect("failed TTL dedup getter should return");
+    assert_eq!(failed_getter.as_deref(), Some(failed_owner.id.as_str()));
+    let failed_duplicate = queue
+        .add_job(
+            "dedup-ttl-failed-duplicate".to_string(),
+            serde_json::json!({ "version": 5 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("tenant:ttl-finalization-failed")
+                    .with_ttl(Duration::from_secs(30)),
+            ),
+        )
+        .await
+        .expect("duplicate before failed TTL expiration should return failed owner");
+    assert_eq!(failed_duplicate.id, failed_owner.id);
+    assert_eq!(failed_duplicate.state, JobState::Failed);
 
     cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())

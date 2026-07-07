@@ -884,6 +884,122 @@ async fn deduplication_ttl_allows_new_non_terminal_owner_after_expiration() {
 }
 
 #[tokio::test]
+async fn deduplication_ttl_completed_owner_blocks_until_expiration() {
+    let queue = InMemoryJobQueue::new("dedup-ttl-completed");
+    let first = queue
+        .add_at(
+            "sync",
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("account:ttl-completed").with_ttl(Duration::from_secs(1)),
+            ),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(1_100))
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .complete_job(
+            &claimed.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+
+    let duplicate_before_ttl = queue
+        .add_at(
+            "sync-before-ttl",
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("account:ttl-completed").with_ttl(Duration::from_secs(1)),
+            ),
+            ts(1_500),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate_before_ttl.id, first.id);
+    assert_eq!(duplicate_before_ttl.state, JobState::Completed);
+
+    let after_ttl = queue
+        .add_at(
+            "sync-after-ttl",
+            serde_json::json!({ "version": 3 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("account:ttl-completed").with_ttl(Duration::from_secs(1)),
+            ),
+            ts(2_000),
+        )
+        .await
+        .unwrap();
+    assert_ne!(after_ttl.id, first.id);
+    assert_eq!(after_ttl.state, JobState::Waiting);
+}
+
+#[tokio::test]
+async fn deduplication_ttl_failed_owner_blocks_until_expiration() {
+    let queue = InMemoryJobQueue::new("dedup-ttl-failed");
+    let first = queue
+        .add_at(
+            "sync",
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("account:ttl-failed").with_ttl(Duration::from_secs(1)),
+            ),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(1_100))
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .fail_job(
+            &claimed.id,
+            lock_token(&claimed),
+            "boom".to_string(),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+
+    let duplicate_before_ttl = queue
+        .add_at(
+            "sync-before-ttl",
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("account:ttl-failed").with_ttl(Duration::from_secs(1)),
+            ),
+            ts(1_500),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate_before_ttl.id, first.id);
+    assert_eq!(duplicate_before_ttl.state, JobState::Failed);
+
+    let after_ttl = queue
+        .add_at(
+            "sync-after-ttl",
+            serde_json::json!({ "version": 3 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("account:ttl-failed").with_ttl(Duration::from_secs(1)),
+            ),
+            ts(2_000),
+        )
+        .await
+        .unwrap();
+    assert_ne!(after_ttl.id, first.id);
+    assert_eq!(after_ttl.state, JobState::Waiting);
+}
+
+#[tokio::test]
 async fn deduplication_extend_ttl_refreshes_owner_window() {
     let queue = InMemoryJobQueue::new("dedup-extend");
     let first = queue

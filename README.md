@@ -737,8 +737,8 @@ assert_eq!(
 ```
 
 Simple deduplication coalesces duplicate submissions while the first matching
-job is still non-terminal. An optional TTL limits how long a non-terminal job
-owns its deduplication id:
+job owns its deduplication id. An optional TTL limits how long that owner key
+blocks duplicates, including when the owner has already completed or failed:
 
 ```rust
 use a3s_lane::{DeduplicationOptions, InMemoryJobQueue, JobOptions, JobQueueBackend};
@@ -847,9 +847,14 @@ queue
 # }
 ```
 
-The current deduplication mode intentionally covers BullMQ's simple mode: a
-deduplication id blocks duplicate adds until the owning job completes, fails
-terminally, is removed, is cleaned, or its configured TTL expires.
+The current deduplication mode intentionally covers BullMQ's simple mode. A
+deduplication id without a TTL blocks duplicate adds until the owning job
+completes, fails terminally, is removed, or is cleaned. A TTL-backed
+deduplication id follows BullMQ's Redis finalization rule: completion and
+terminal failure keep the owner key while its Redis TTL is still positive, so
+duplicates continue to return the retained terminal owner until the TTL expires.
+Removal-style paths such as explicit remove, clean, drain, and manual
+`remove_deduplication_key()` still clear the owner immediately.
 `extend_ttl(true)` covers BullMQ's debounce extension path: duplicate adds
 return the current owner and refresh the deduplication TTL instead of allowing
 the owner key to expire at the original deadline.
@@ -873,13 +878,13 @@ flow when the active parent finalizes. Redis Lua now covers active parent
 completion, terminal failure, and stalled terminal-failure paths for flow
 keep-last.
 Retrying a failed deduplicated job reclaims the deduplication id while the job is
-waiting or active again; retry is rejected if another non-terminal job already
-owns that id.
+waiting or active again; retry is rejected if another live deduplication owner,
+including a retained terminal TTL owner, already owns that id.
 `remove_deduplication_key()` clears the queue's current owner for a
-deduplication id before that owner reaches a terminal state, matching BullMQ's
-queue-level `removeDeduplicationKey()` behavior of deleting the Redis
-deduplication key. The original job remains in its current state, but later
-submissions with the same deduplication id can become the new owner.
+deduplication id before finalization, or during a retained terminal TTL window,
+matching BullMQ's queue-level `removeDeduplicationKey()` behavior of deleting
+the Redis deduplication key. The original job remains in its current state, but
+later submissions with the same deduplication id can become the new owner.
 `get_deduplication_job_id()` mirrors BullMQ's `getDeduplicationJobId()` getter
 by returning the current owner job id for that deduplication id.
 
@@ -1062,11 +1067,15 @@ waiting sequence or writing duplicate state indexes. Bulk add follows the same
 mechanism in one script call while preserving the caller's input order.
 For simple deduplication, the same add scripts use an independent
 `deduplication:<id>` key, equivalent to BullMQ's `de:<id>` role, to return the
-currently active job before writing a duplicate. If `DeduplicationOptions` has a
-TTL, the Lua scripts write that owner key with `PX` so Redis expires the
-deduplication window even while the original job remains non-terminal. The
-keep-last-if-active mode intentionally omits that TTL, matching BullMQ's active
-owner behavior so the key cannot expire while work is still leased. If
+current owner before writing a duplicate. If `DeduplicationOptions` has a TTL,
+the Lua scripts write that owner key with `PX` so Redis expires the
+deduplication window even if the original job later completes or fails before
+the TTL does. Completion, terminal failure, and stalled terminal-failure scripts
+mirror BullMQ's `removeDeduplicationKeyIfNeededOnFinalization`: they delete a
+matching owner key only when Redis reports no TTL (`PTTL == -1`) or an expiring
+zero TTL, and preserve keys with a positive TTL. The keep-last-if-active mode
+intentionally omits that TTL, matching BullMQ's active owner behavior so the key
+cannot expire while work is still leased. If
 `extend_ttl(true)` is set, duplicate adds refresh the owner key with `PX` before
 returning the current owner, matching BullMQ's debounce extension branch.
 If `replace_delayed(true)` is set and the current owner is a standalone delayed
@@ -1145,11 +1154,13 @@ retained event entries in their snapshots so tests and embedded runtimes expose
 the same contract without Redis. Like BullMQ's `addLog` script, Lane job logs
 remain a retained log list and do not emit queue events; progress updates do.
 
-Completion, terminal failure, remove, clean, drain, and stalled terminal failure
-scripts release deduplication keys only when they still point at the job being
-finalized or removed. Removal-style scripts also clear the paired
-`deduplication_next:<id>` shadow record when they clear that owner key, matching
-BullMQ's removal cleanup for keep-last deduplication.
+Completion, terminal failure, and stalled terminal failure scripts use
+BullMQ-style finalization semantics for deduplication keys: a matching owner key
+with no TTL is released, while a matching key with a positive TTL remains until
+Redis expires it. Remove, clean, drain, repeat upsert, and flow child-removal
+paths use removal semantics instead: they release the matching owner key and
+also clear the paired `deduplication_next:<id>` shadow record, matching BullMQ's
+removal cleanup for keep-last deduplication.
 Manual retry reclaims the key inside the retry script, reapplies the TTL, and
 refuses to move the failed job back to waiting if a newer non-terminal job
 already owns the same deduplication id.
@@ -1162,9 +1173,10 @@ backends persist the same logical release by tracking the released owner id in
 their snapshots instead of relying on a client-side scan alone.
 `get_deduplication_job_id()` reads that same `deduplication:<id>` key, matching
 BullMQ's `GET de:<id>` getter path. Redis performs that getter through Lua so if
-the key points at a missing, terminal, or mismatched job, it clears both the
-stale owner key and any orphaned `deduplication_next:<id>` record before
-reporting no owner.
+the key points at a missing or mismatched job, or at a terminal job without a
+positive TTL owner key, it clears both the stale owner key and any orphaned
+`deduplication_next:<id>` record before reporting no owner. Terminal jobs with a
+positive TTL remain valid deduplication owners until Redis expires the key.
 
 Redis flow submission is all-or-nothing: the flow add script first checks every
 parent and child job id, then writes the parent, children, and all state indexes

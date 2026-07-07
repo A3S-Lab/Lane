@@ -78,6 +78,10 @@ local function active_deduplicated_raw(jobs_key, deduplication_prefix, deduplica
 
   local existing_job = cjson.decode(existing_raw)
   if existing_job["state"] == "completed" or existing_job["state"] == "failed" then
+    local pttl = redis.call('PTTL', deduplication_key)
+    if pttl > 0 then
+      return existing_raw
+    end
     redis.call('DEL', deduplication_key)
     return nil
   end
@@ -635,6 +639,10 @@ local function active_deduplicated_owner_id(jobs_key, deduplication_prefix, dedu
 
   local existing_job = cjson.decode(existing_raw)
   if existing_job["state"] == "completed" or existing_job["state"] == "failed" then
+    local pttl = redis.call('PTTL', deduplication_key)
+    if pttl > 0 then
+      return existing_id
+    end
     redis.call('DEL', deduplication_key)
     return nil
   end
@@ -826,6 +834,10 @@ local function active_deduplicated_raw(jobs_key, deduplication_prefix, deduplica
 
   local existing_job = cjson.decode(existing_raw)
   if existing_job["state"] == "completed" or existing_job["state"] == "failed" then
+    local pttl = redis.call('PTTL', deduplication_key)
+    if pttl > 0 then
+      return existing_raw
+    end
     redis.call('DEL', deduplication_key)
     return nil
   end
@@ -1237,6 +1249,10 @@ local function active_deduplication_id(jobs_key, deduplication_prefix, deduplica
 
   local existing_job = cjson.decode(existing_raw)
   if existing_job["state"] == "completed" or existing_job["state"] == "failed" then
+    local pttl = redis.call('PTTL', deduplication_key)
+    if pttl > 0 then
+      return existing_id
+    end
     redis.call('DEL', deduplication_key)
     return nil
   end
@@ -1623,6 +1639,10 @@ local function active_deduplication_id(jobs_key, deduplication_prefix, deduplica
 
   local existing_job = cjson.decode(existing_raw)
   if existing_job["state"] == "completed" or existing_job["state"] == "failed" then
+    local pttl = redis.call('PTTL', deduplication_key)
+    if pttl > 0 then
+      return existing_id
+    end
     redis.call('DEL', deduplication_key)
     return nil
   end
@@ -2444,6 +2464,19 @@ local function release_deduplication_key(job, job_id, deduplication_prefix, dedu
   end
 end
 
+local function release_deduplication_key_on_finalization(job, job_id, deduplication_prefix)
+  local id = deduplication_id(job)
+  if id then
+    local key = deduplication_prefix .. id
+    local pttl = redis.call('PTTL', key)
+    if pttl == 0 then
+      redis.call('DEL', key)
+    elseif pttl == -1 and redis.call('GET', key) == job_id then
+      redis.call('DEL', key)
+    end
+  end
+end
+
 local function set_deduplication_key(job, job_id, deduplication_prefix)
   local id = deduplication_id(job)
   if id then
@@ -2918,7 +2951,8 @@ job["worker_id"] = cjson.null
 job["lease_expires_at"] = cjson.null
 job["deferred_failure"] = cjson.null
 job["return_value"] = cjson.decode(ARGV[4])
-release_deduplication_key(job, ARGV[1], ARGV[14])
+
+release_deduplication_key_on_finalization(job, ARGV[1], ARGV[14])
 local enqueued_deduplicated_next = enqueue_deduplicated_next(job, KEYS[1], KEYS[5], KEYS[6], KEYS[9], KEYS[7], ARGV[14], ARGV[16], ARGV[15], ARGV[13], ARGV[3], ARGV[5], ARGV[7], KEYS[#KEYS])
 
 local updated = cjson.encode(job)
@@ -2984,7 +3018,7 @@ if parent_id and parent_id ~= cjson.null then
         parent["lease_expires_at"] = cjson.null
         parent["deferred_failure"] = cjson.null
         parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
-        release_deduplication_key(parent, parent_id, ARGV[14])
+        release_deduplication_key_on_finalization(parent, parent_id, ARGV[14])
         release_repeat_key(parent, parent_id, ARGV[15])
         local parent_failure_retention = retention_options(parent, 'remove_on_fail', 'failure_retention', false)
         local parent_failure_max_count = retention_count(parent_failure_retention)
@@ -3701,7 +3735,21 @@ end
 
 job["state"] = "failed"
 job["finished_at"] = ARGV[3]
-release_deduplication_key(job, ARGV[1], ARGV[11])
+
+local function release_deduplication_key_on_finalization(job, job_id, deduplication_prefix)
+  local id = deduplication_id(job)
+  if id then
+    local key = deduplication_prefix .. id
+    local pttl = redis.call('PTTL', key)
+    if pttl == 0 then
+      redis.call('DEL', key)
+    elseif pttl == -1 and redis.call('GET', key) == job_id then
+      redis.call('DEL', key)
+    end
+  end
+end
+
+release_deduplication_key_on_finalization(job, ARGV[1], ARGV[11])
 release_repeat_key(job, ARGV[1], ARGV[12])
 enqueue_deduplicated_next(job, KEYS[1], KEYS[7], KEYS[6], KEYS[3], KEYS[8], ARGV[11], ARGV[14], ARGV[12], ARGV[10], ARGV[3], ARGV[8], ARGV[13], KEYS[#KEYS])
 local updated = cjson.encode(job)
@@ -3787,7 +3835,7 @@ if parent_id and parent_id ~= cjson.null then
         parent["lease_expires_at"] = cjson.null
         parent["deferred_failure"] = cjson.null
         parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
-        release_deduplication_key(parent, parent_id, ARGV[11])
+        release_deduplication_key_on_finalization(parent, parent_id, ARGV[11])
         release_repeat_key(parent, parent_id, ARGV[12])
         local parent_failure_retention = retention_options(parent, 'remove_on_fail', 'failure_retention', false)
         local parent_failure_max_count = retention_count(parent_failure_retention)
@@ -4910,11 +4958,24 @@ for _, id in ipairs(ids) do
           max_stalled = tonumber(job["options"]["max_stalled_count"])
         end
 
+        local function release_deduplication_key_on_finalization(job, job_id, deduplication_prefix)
+          local id = deduplication_id(job)
+          if id then
+            local key = deduplication_prefix .. id
+            local pttl = redis.call('PTTL', key)
+            if pttl == 0 then
+              redis.call('DEL', key)
+            elseif pttl == -1 and redis.call('GET', key) == job_id then
+              redis.call('DEL', key)
+            end
+          end
+        end
+
         if job["stalled_count"] > max_stalled and not is_current_repeat_scheduler_job(job, id, ARGV[8]) then
           job["state"] = "failed"
           job["finished_at"] = ARGV[2]
           redis.call('DEL', ARGV[6] .. id)
-          release_deduplication_key(job, id, ARGV[7])
+          release_deduplication_key_on_finalization(job, id, ARGV[7])
           release_repeat_key(job, id, ARGV[8])
           enqueue_deduplicated_next(job, KEYS[1], KEYS[3], KEYS[6], KEYS[7], KEYS[5], ARGV[7], ARGV[9], ARGV[8], ARGV[6], ARGV[2], ARGV[1], ARGV[4], KEYS[#KEYS])
 
@@ -5001,7 +5062,7 @@ for _, id in ipairs(ids) do
                   parent["lease_expires_at"] = cjson.null
                   parent["deferred_failure"] = cjson.null
                   parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
-                  release_deduplication_key(parent, parent_id, ARGV[7])
+                  release_deduplication_key_on_finalization(parent, parent_id, ARGV[7])
                   release_repeat_key(parent, parent_id, ARGV[8])
                   local parent_failure_retention = retention_options(parent, 'remove_on_fail', 'failure_retention')
                   local parent_failure_max_count = retention_count(parent_failure_retention)
@@ -5474,6 +5535,10 @@ local function active_deduplication_owner(jobs_key, deduplication_prefix, dedupl
 
   local existing_job = cjson.decode(existing_raw)
   if existing_job["state"] == "completed" or existing_job["state"] == "failed" then
+    local pttl = redis.call('PTTL', deduplication_key)
+    if pttl > 0 then
+      return existing_id
+    end
     redis.call('DEL', deduplication_key)
     return nil
   end
@@ -6018,11 +6083,17 @@ local deduplication = nil
 if job["options"] and job["options"] ~= cjson.null then
   deduplication = job["options"]["deduplication"]
 end
-if job["state"] == "completed"
-  or job["state"] == "failed"
-  or not deduplication
+if not deduplication
   or deduplication == cjson.null
   or deduplication["id"] ~= ARGV[1] then
+  redis.call('DEL', KEYS[2], KEYS[3])
+  return nil
+end
+if job["state"] == "completed" or job["state"] == "failed" then
+  local pttl = redis.call('PTTL', KEYS[2])
+  if pttl > 0 then
+    return job_id
+  end
   redis.call('DEL', KEYS[2], KEYS[3])
   return nil
 end

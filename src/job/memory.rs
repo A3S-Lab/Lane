@@ -195,7 +195,6 @@ impl InMemoryJobQueue {
             job.clone()
         };
         if failed.state == JobState::Failed {
-            Self::forget_released_deduplication_owner_locked(&mut inner, &failed);
             if failed.options.removes_failed_immediately() {
                 Self::remove_job_record_locked(&mut inner, job_id);
             } else if let Some(retention) = failed.options.failed_retention() {
@@ -1841,7 +1840,6 @@ impl InMemoryJobQueue {
         parent.deferred_failure = None;
         parent.failed_reason = Some(reason);
         let failed = parent.clone();
-        Self::forget_released_deduplication_owner_locked(inner, &failed);
         if failed.options.removes_failed_immediately() {
             Self::remove_job_record_locked(inner, parent_id);
         } else if let Some(retention) = failed.options.failed_retention() {
@@ -2124,7 +2122,6 @@ impl JobQueueBackend for InMemoryJobQueue {
             job.return_value = Some(value);
             job.clone()
         };
-        Self::forget_released_deduplication_owner_locked(&mut inner, &completed);
         if completed.options.removes_completed_immediately() {
             Self::remove_job_record_locked(&mut inner, job_id);
         } else if let Some(retention) = completed.options.completed_retention() {
@@ -2447,7 +2444,6 @@ impl JobQueueBackend for InMemoryJobQueue {
             Self::remove_job_record_locked(&mut inner, &id);
         }
         for failed in terminal_failures {
-            Self::forget_released_deduplication_owner_locked(&mut inner, &failed);
             if Self::enqueue_deduplicated_next_locked(&mut inner, &failed, now).is_none() {
                 Self::enqueue_deduplicated_next_flow_locked(&mut inner, &failed, now);
             }
@@ -2870,10 +2866,10 @@ fn collect_removable_unprocessed_children(
 }
 
 fn active_deduplication_id(job: &Job, now: DateTime<Utc>) -> Option<&str> {
-    if job.state.is_terminal() {
+    if matches!(job.deduplication_expires_at, Some(expires_at) if expires_at <= now) {
         return None;
     }
-    if matches!(job.deduplication_expires_at, Some(expires_at) if expires_at <= now) {
+    if job.state.is_terminal() && job.deduplication_expires_at.is_none() {
         return None;
     }
 
