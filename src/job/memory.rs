@@ -26,6 +26,7 @@ struct InMemoryJobQueueState {
     events: Vec<JobEvent>,
     jobs: HashMap<JobId, Job>,
     deduplication_next: HashMap<String, Job>,
+    deduplication_next_flows: HashMap<String, JobFlow>,
     released_deduplication_owners: HashSet<(String, JobId)>,
 }
 
@@ -55,6 +56,12 @@ impl InMemoryJobQueue {
             .jobs
             .iter()
             .chain(snapshot.deduplication_next_jobs.iter())
+            .chain(
+                snapshot
+                    .deduplication_next_flows
+                    .iter()
+                    .flat_map(|flow| std::iter::once(&flow.parent).chain(flow.children.iter())),
+            )
             .map(|job| job.enqueued_seq)
             .max()
             .unwrap_or(0);
@@ -76,6 +83,15 @@ impl InMemoryJobQueue {
                     .filter_map(|job| {
                         let deduplication_id = job.options.deduplication.as_ref()?.id.clone();
                         Some((deduplication_id, job))
+                    })
+                    .collect(),
+                deduplication_next_flows: snapshot
+                    .deduplication_next_flows
+                    .into_iter()
+                    .filter_map(|flow| {
+                        let deduplication_id =
+                            flow.parent.options.deduplication.as_ref()?.id.clone();
+                        Some((deduplication_id, flow))
                     })
                     .collect(),
                 released_deduplication_owners: snapshot
@@ -102,6 +118,13 @@ impl InMemoryJobQueue {
             .cloned()
             .collect::<Vec<_>>();
         deduplication_next_jobs.sort_by(compare_list_order);
+        let mut deduplication_next_flows = inner
+            .deduplication_next_flows
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        deduplication_next_flows
+            .sort_by(|left, right| compare_list_order(&left.parent, &right.parent));
         JobQueueSnapshot {
             queue: self.queue.clone(),
             paused: inner.paused,
@@ -109,6 +132,7 @@ impl InMemoryJobQueue {
             event_sequence: inner.event_sequence,
             jobs,
             deduplication_next_jobs,
+            deduplication_next_flows,
             released_deduplication_owners: sorted_released_deduplication_owners(
                 &inner.released_deduplication_owners,
             ),
@@ -177,7 +201,9 @@ impl InMemoryJobQueue {
             } else if let Some(retention) = failed.options.failed_retention() {
                 Self::apply_finished_retention_locked(&mut inner, JobState::Failed, retention, now);
             }
-            Self::enqueue_deduplicated_next_locked(&mut inner, &failed, now);
+            if Self::enqueue_deduplicated_next_locked(&mut inner, &failed, now).is_none() {
+                Self::enqueue_deduplicated_next_flow_locked(&mut inner, &failed, now);
+            }
             if let Some(parent_id) = &failed.parent_id {
                 if failed.options.fail_parent_on_failure {
                     Self::defer_parent_failure_after_child_failure_locked(
@@ -420,6 +446,22 @@ impl InMemoryJobQueue {
                 return Err(LaneError::ConfigError(format!(
                     "flow job id `{id}` already exists"
                 )));
+            }
+        }
+        let candidate_flow = JobFlow {
+            parent: parent_job.clone(),
+            children: child_jobs.clone(),
+        };
+        if let Some(existing) = find_active_deduplicated_job(
+            &inner.jobs,
+            &inner.released_deduplication_owners,
+            &parent_job,
+            now,
+        )
+        .cloned()
+        {
+            if Self::store_deduplicated_next_flow_locked(&mut inner, &candidate_flow, &existing) {
+                return Ok(Self::flow_for_existing_owner_locked(&inner, &existing));
             }
         }
         let mut flow_deduplication_ids = HashSet::new();
@@ -777,6 +819,7 @@ impl InMemoryJobQueue {
             .released_deduplication_owners
             .insert((deduplication_id.to_string(), owner_id));
         inner.deduplication_next.remove(deduplication_id);
+        inner.deduplication_next_flows.remove(deduplication_id);
         Ok(true)
     }
 
@@ -1363,6 +1406,7 @@ impl InMemoryJobQueue {
         let removed = inner.jobs.len();
         inner.jobs.clear();
         inner.deduplication_next.clear();
+        inner.deduplication_next_flows.clear();
         inner.released_deduplication_owners.clear();
         inner.paused = false;
         Ok(removed)
@@ -1594,6 +1638,28 @@ impl InMemoryJobQueue {
         inner
             .deduplication_next
             .insert(deduplication_id.to_string(), candidate.clone());
+        inner.deduplication_next_flows.remove(deduplication_id);
+        if let Some(owner) = inner.jobs.get_mut(&existing.id) {
+            owner.deduplication_expires_at = None;
+        }
+        true
+    }
+
+    fn store_deduplicated_next_flow_locked(
+        inner: &mut InMemoryJobQueueState,
+        candidate: &JobFlow,
+        existing: &Job,
+    ) -> bool {
+        if !deduplication_stores_next_flow_if_active(candidate, existing) {
+            return false;
+        }
+        let Some(deduplication_id) = job_deduplication_id(&candidate.parent) else {
+            return false;
+        };
+        inner
+            .deduplication_next_flows
+            .insert(deduplication_id.to_string(), candidate.clone());
+        inner.deduplication_next.remove(deduplication_id);
         if let Some(owner) = inner.jobs.get_mut(&existing.id) {
             owner.deduplication_expires_at = None;
         }
@@ -1621,6 +1687,50 @@ impl InMemoryJobQueue {
         inner.jobs.insert(next.id.clone(), next.clone());
         Self::emit_job_created_events_locked(inner, &next, now);
         Some(next)
+    }
+
+    fn enqueue_deduplicated_next_flow_locked(
+        inner: &mut InMemoryJobQueueState,
+        owner: &Job,
+        now: DateTime<Utc>,
+    ) -> Option<JobFlow> {
+        let deduplication_id = job_deduplication_id(owner)?;
+        let mut flow = inner.deduplication_next_flows.remove(deduplication_id)?;
+        if inner.jobs.contains_key(&flow.parent.id)
+            || flow
+                .children
+                .iter()
+                .any(|child| inner.jobs.contains_key(&child.id))
+        {
+            return None;
+        }
+
+        prepare_deduplicated_next_flow(&mut flow, now);
+        Self::forget_released_deduplication_owner_locked(inner, &flow.parent);
+        assign_waiting_order(&mut inner.sequence, &mut flow.parent);
+        inner
+            .jobs
+            .insert(flow.parent.id.clone(), flow.parent.clone());
+        Self::emit_job_created_events_locked(inner, &flow.parent, now);
+        for child in &mut flow.children {
+            Self::forget_released_deduplication_owner_locked(inner, child);
+            assign_waiting_order(&mut inner.sequence, child);
+            inner.jobs.insert(child.id.clone(), child.clone());
+            Self::emit_job_created_events_locked(inner, child, now);
+        }
+        Some(flow)
+    }
+
+    fn flow_for_existing_owner_locked(inner: &InMemoryJobQueueState, owner: &Job) -> JobFlow {
+        let children = owner
+            .child_ids
+            .iter()
+            .filter_map(|child_id| inner.jobs.get(child_id).cloned())
+            .collect();
+        JobFlow {
+            parent: owner.clone(),
+            children,
+        }
     }
 
     fn extend_deduplication_expiration_locked(
@@ -2021,8 +2131,10 @@ impl JobQueueBackend for InMemoryJobQueue {
             Self::apply_finished_retention_locked(&mut inner, JobState::Completed, retention, now);
         }
         let enqueued_deduplicated_next =
-            Self::enqueue_deduplicated_next_locked(&mut inner, &completed, now);
-        if enqueued_deduplicated_next.is_none() {
+            Self::enqueue_deduplicated_next_locked(&mut inner, &completed, now).is_some()
+                || Self::enqueue_deduplicated_next_flow_locked(&mut inner, &completed, now)
+                    .is_some();
+        if !enqueued_deduplicated_next {
             if let Some(next_job) = next_repeat_job(&completed, now)? {
                 let mut next_job = next_job;
                 Self::forget_released_deduplication_owner_locked(&mut inner, &next_job);
@@ -2336,7 +2448,9 @@ impl JobQueueBackend for InMemoryJobQueue {
         }
         for failed in terminal_failures {
             Self::forget_released_deduplication_owner_locked(&mut inner, &failed);
-            Self::enqueue_deduplicated_next_locked(&mut inner, &failed, now);
+            if Self::enqueue_deduplicated_next_locked(&mut inner, &failed, now).is_none() {
+                Self::enqueue_deduplicated_next_flow_locked(&mut inner, &failed, now);
+            }
             if let Some(retention) = failed.options.failed_retention() {
                 Self::apply_finished_retention_locked(&mut inner, JobState::Failed, retention, now);
             }
@@ -2849,6 +2963,16 @@ fn deduplication_stores_next_if_active(candidate: &Job, existing: &Job) -> bool 
         && candidate.repeat_key.as_deref() == existing.repeat_key.as_deref()
 }
 
+fn deduplication_stores_next_flow_if_active(candidate: &JobFlow, existing: &Job) -> bool {
+    matches!(
+        candidate.parent.options.deduplication.as_ref(),
+        Some(deduplication) if deduplication.keep_last_if_active
+    ) && existing.state == JobState::Active
+        && candidate.parent.parent_id.is_none()
+        && candidate.parent.repeat_key.is_none()
+        && existing.repeat_key.is_none()
+}
+
 fn deduplication_extends_ttl(candidate: &Job) -> bool {
     matches!(
         candidate.options.deduplication.as_ref(),
@@ -2892,6 +3016,23 @@ fn prepare_deduplicated_next_job(job: &mut Job, now: DateTime<Utc>) {
     job.progress = None;
     job.logs.clear();
     job.deduplication_expires_at = deduplication_expiration(&job.options, now);
+}
+
+fn prepare_deduplicated_next_flow(flow: &mut JobFlow, now: DateTime<Utc>) {
+    prepare_deduplicated_next_job(&mut flow.parent, now);
+    flow.parent.child_ids = flow
+        .children
+        .iter()
+        .map(|child| child.id.clone())
+        .collect::<Vec<_>>();
+    if !flow.children.is_empty() {
+        flow.parent.state = JobState::WaitingChildren;
+    }
+    for child in &mut flow.children {
+        prepare_deduplicated_next_job(child, now);
+        child.parent_id = Some(flow.parent.id.clone());
+        child.child_ids.clear();
+    }
 }
 
 fn repeat_keep_last_next_count(owner: &Job, candidate: &Job) -> Option<Option<u32>> {
