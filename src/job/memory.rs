@@ -597,6 +597,7 @@ impl InMemoryJobQueue {
         inner
             .released_deduplication_owners
             .insert((deduplication_id.to_string(), owner_id));
+        inner.deduplication_next.remove(deduplication_id);
         Ok(true)
     }
 

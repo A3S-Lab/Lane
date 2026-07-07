@@ -1041,6 +1041,78 @@ async fn deduplication_keep_last_requeues_latest_after_active_owner_finishes() {
 }
 
 #[tokio::test]
+async fn remove_deduplication_key_clears_keep_last_next() {
+    let queue = InMemoryJobQueue::new("dedup-keep-last-release");
+    let owner = queue
+        .add_at(
+            "sync-owner",
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("account:keep-last-release").keep_last_if_active(true),
+            ),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(2_000))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, owner.id);
+
+    let duplicate = queue
+        .add_at(
+            "sync-stale-next",
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("account:keep-last-release").keep_last_if_active(true),
+            ),
+            ts(3_000),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate.id, owner.id);
+
+    assert!(queue
+        .remove_deduplication_key("account:keep-last-release")
+        .await
+        .unwrap());
+    let replacement = queue
+        .add_at(
+            "sync-after-release",
+            serde_json::json!({ "version": 3 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("account:keep-last-release").keep_last_if_active(true),
+            ),
+            ts(4_000),
+        )
+        .await
+        .unwrap();
+    assert_ne!(replacement.id, owner.id);
+
+    queue
+        .complete_job(
+            &claimed.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            ts(5_000),
+        )
+        .await
+        .unwrap();
+
+    let jobs = queue.list_jobs(JobListOptions::new()).await.unwrap();
+    assert!(!jobs.jobs.iter().any(|job| job.name == "sync-stale-next"));
+    let claimed_replacement = queue
+        .claim_next("worker-b".to_string(), Duration::from_secs(30), ts(6_000))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed_replacement.id, replacement.id);
+    assert_eq!(claimed_replacement.name, "sync-after-release");
+}
+
+#[tokio::test]
 async fn repeat_deduplication_keep_last_replaces_regular_successor() {
     let queue = InMemoryJobQueue::new("repeat-dedup-keep-last");
     let repeat = RepeatOptions::every(Duration::from_secs(60))
@@ -4317,6 +4389,77 @@ async fn local_job_queue_persists_removed_deduplication_keys() {
             .as_deref(),
         Some(second.id.as_str())
     );
+}
+
+#[tokio::test]
+async fn local_job_queue_persists_removed_keep_last_next() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("jobs").join("dedup-keep-last.json");
+    let queue = LocalJobQueue::open("durable-dedup-keep-last", &snapshot_path)
+        .await
+        .unwrap();
+    let owner = queue
+        .add_at(
+            "sync-owner",
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("account:keep-last-release").keep_last_if_active(true),
+            ),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(2_000))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, owner.id);
+
+    let duplicate = queue
+        .add_at(
+            "sync-stale-next",
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("account:keep-last-release").keep_last_if_active(true),
+            ),
+            ts(3_000),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate.id, owner.id);
+    assert!(queue
+        .remove_deduplication_key("account:keep-last-release")
+        .await
+        .unwrap());
+
+    queue
+        .complete_job(
+            &claimed.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            ts(4_000),
+        )
+        .await
+        .unwrap();
+
+    let reopened = LocalJobQueue::open("durable-dedup-keep-last", &snapshot_path)
+        .await
+        .unwrap();
+    let jobs = reopened.list_jobs(JobListOptions::new()).await.unwrap();
+    assert!(!jobs.jobs.iter().any(|job| job.name == "sync-stale-next"));
+    let after_reopen = reopened
+        .add_at(
+            "sync-after-reopen",
+            serde_json::json!({ "version": 3 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("account:keep-last-release").keep_last_if_active(true),
+            ),
+            ts(5_000),
+        )
+        .await
+        .unwrap();
+    assert_ne!(after_reopen.id, owner.id);
 }
 
 #[tokio::test]

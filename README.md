@@ -1094,13 +1094,15 @@ Manual retry reclaims the key inside the retry script, reapplies the TTL, and
 refuses to move the failed job back to waiting if a newer non-terminal job
 already owns the same deduplication id.
 `remove_deduplication_key()` deletes `deduplication:<id>` directly, so a later
-add can claim the same id even while the old owner remains non-terminal. The
-in-memory and local durable backends persist the same logical release by
-tracking the released owner id in their snapshots instead of relying on a
-client-side scan alone. `get_deduplication_job_id()` reads that same
-`deduplication:<id>` key, matching BullMQ's `GET de:<id>` getter path. If the
-key points at a missing or mismatched job, Redis cleans up the stale key and
-reports no owner.
+add can claim the same id even while the old owner remains non-terminal. When a
+keep-last owner has a pending successor, the release also clears
+`deduplication_next:<id>` so the old active owner cannot materialize a stale
+duplicate after the id was manually released. The in-memory and local durable
+backends persist the same logical release by tracking the released owner id in
+their snapshots instead of relying on a client-side scan alone.
+`get_deduplication_job_id()` reads that same `deduplication:<id>` key, matching
+BullMQ's `GET de:<id>` getter path. If the key points at a missing or
+mismatched job, Redis cleans up the stale key and reports no owner.
 
 Redis flow submission is all-or-nothing: the flow add script first checks every
 parent and child job id, then writes the parent, children, and all state indexes

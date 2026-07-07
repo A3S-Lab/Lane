@@ -97,6 +97,21 @@ async fn redis_backend_keeps_latest_repeat_duplicate_against_real_server() {
 }
 
 #[tokio::test]
+async fn redis_backend_clears_keep_last_next_on_manual_release_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_keep_last_manual_release_cleanup(redis_url),
+    )
+    .await
+    .expect("Redis keep-last manual-release integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_upserts_repeat_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -995,6 +1010,117 @@ async fn run_lifo_waiting_order(redis_url: String) -> redis::RedisResult<()> {
     Ok(())
 }
 
+async fn run_keep_last_manual_release_cleanup(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    trace_stage("keep-last-release:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("keep-last-release:cleanup:done");
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "dedup")
+        .expect("valid Redis URL should build the dedup queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let key = format!("{namespace}:dedup:deduplication:tenant:keep-last-release");
+    let next_key = format!("{namespace}:dedup:deduplication_next:tenant:keep-last-release");
+
+    let owner = queue
+        .add_job(
+            "dedup-keep-last-release-owner".to_string(),
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("tenant:keep-last-release").keep_last_if_active(true),
+            ),
+        )
+        .await
+        .expect("keep-last release owner should be added");
+    let claimed = queue
+        .claim_next(
+            "worker-keep-last-release".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("keep-last release owner should be claimable")
+        .expect("keep-last release owner should be returned");
+    assert_eq!(claimed.id, owner.id);
+
+    let duplicate = queue
+        .add_job(
+            "dedup-keep-last-release-stale".to_string(),
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("tenant:keep-last-release").keep_last_if_active(true),
+            ),
+        )
+        .await
+        .expect("keep-last release duplicate should return owner");
+    assert_eq!(duplicate.id, owner.id);
+    let next_raw: String = conn.get(&next_key).await?;
+    let next: Job = serde_json::from_str(&next_raw).expect("stored next job should decode");
+    assert_eq!(next.name, "dedup-keep-last-release-stale");
+
+    assert!(queue
+        .remove_deduplication_key("tenant:keep-last-release")
+        .await
+        .expect("keep-last release key should be removable"));
+    let next_after_remove: Option<String> = conn.get(&next_key).await?;
+    assert!(next_after_remove.is_none());
+    let owner_after_remove: Option<String> = conn.get(&key).await?;
+    assert!(owner_after_remove.is_none());
+
+    let replacement = queue
+        .add_job(
+            "dedup-keep-last-release-replacement".to_string(),
+            serde_json::json!({ "version": 3 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("tenant:keep-last-release").keep_last_if_active(true),
+            ),
+        )
+        .await
+        .expect("keep-last release replacement should be added");
+    assert_ne!(replacement.id, owner.id);
+    assert_eq!(
+        queue
+            .get_deduplication_job_id("tenant:keep-last-release")
+            .await
+            .expect("keep-last release owner should load")
+            .as_deref(),
+        Some(replacement.id.as_str())
+    );
+
+    queue
+        .complete_job(
+            &claimed.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("keep-last release owner should complete");
+    assert_eq!(
+        queue
+            .get_deduplication_job_id("tenant:keep-last-release")
+            .await
+            .expect("keep-last release owner should remain replacement")
+            .as_deref(),
+        Some(replacement.id.as_str())
+    );
+    assert!(queue
+        .get_job(&next.id)
+        .await
+        .expect("stale keep-last next lookup should return")
+        .is_none());
+    let jobs = queue
+        .list_jobs(JobListOptions::new())
+        .await
+        .expect("keep-last release jobs should list");
+    assert!(!jobs.jobs.iter().any(|job| job.id == next.id));
+
+    cleanup_namespace(&redis_url, &namespace).await?;
+    Ok(())
+}
+
 async fn run_repeat_keep_last(redis_url: String) -> redis::RedisResult<()> {
     let namespace = unique_namespace();
     trace_stage("repeat-keep-last:cleanup:start");
@@ -1716,6 +1842,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
 
     let dedup_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "dedup")
         .expect("valid Redis URL should build the dedup queue");
+    trace_stage("dedup:queue-created");
     let first_dedup = dedup_queue
         .add_job(
             "dedup-sync".to_string(),
@@ -1724,6 +1851,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("dedup job should be added");
+    trace_stage("dedup:first-added");
     let duplicate_dedup = dedup_queue
         .add_job(
             "dedup-sync-duplicate".to_string(),
@@ -1732,14 +1860,17 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("duplicate dedup job should return existing job");
+    trace_stage("dedup:duplicate-added");
     assert_eq!(duplicate_dedup, first_dedup);
     let mut dedup_conn = redis::Client::open(redis_url.as_str())?
         .get_connection_manager()
         .await?;
+    trace_stage("dedup:conn-created");
     let dedup_owner: Option<String> = dedup_conn
         .get(format!("{namespace}:dedup:deduplication:tenant:42"))
         .await?;
     assert_eq!(dedup_owner.as_deref(), Some(first_dedup.id.as_str()));
+    trace_stage("dedup:owner-read");
 
     let first_dedup_claim = dedup_queue
         .claim_next(
@@ -1750,6 +1881,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect("dedup claim should return")
         .expect("dedup job should be claimable");
+    trace_stage("dedup:first-claimed");
     dedup_queue
         .complete_job(
             &first_dedup_claim.id,
@@ -1759,6 +1891,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("dedup job should complete");
+    trace_stage("dedup:first-completed");
     let released_dedup_owner: Option<String> = dedup_conn
         .get(format!("{namespace}:dedup:deduplication:tenant:42"))
         .await?;
@@ -2047,7 +2180,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             "dedup-ttl".to_string(),
             serde_json::json!({ "version": 6 }),
             JobOptions::new().with_deduplication(
-                DeduplicationOptions::new("tenant:ttl").with_ttl(Duration::from_secs(3)),
+                DeduplicationOptions::new("tenant:ttl").with_ttl(Duration::from_secs(30)),
             ),
         )
         .await
@@ -2057,7 +2190,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             "dedup-ttl-duplicate".to_string(),
             serde_json::json!({ "version": 7 }),
             JobOptions::new().with_deduplication(
-                DeduplicationOptions::new("tenant:ttl").with_ttl(Duration::from_secs(3)),
+                DeduplicationOptions::new("tenant:ttl").with_ttl(Duration::from_secs(30)),
             ),
         )
         .await
@@ -2068,7 +2201,13 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .query_async(&mut dedup_conn)
         .await?;
     assert!(ttl_dedup_pttl > 0);
-    tokio::time::sleep(Duration::from_millis(3_100)).await;
+    let ttl_shortened: bool = redis::cmd("PEXPIRE")
+        .arg(&ttl_dedup_key)
+        .arg(1_u16)
+        .query_async(&mut dedup_conn)
+        .await?;
+    assert!(ttl_shortened);
+    tokio::time::sleep(Duration::from_millis(20)).await;
     let ttl_after_expiration = dedup_queue
         .add_job(
             "dedup-ttl-after-expiration".to_string(),
@@ -2473,6 +2612,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("keep-last next should complete");
+
     trace_stage("dedup:done");
 
     let priority_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "priority")

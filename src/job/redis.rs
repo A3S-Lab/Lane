@@ -3985,6 +3985,14 @@ refresh_delay_marker(KEYS[#KEYS], KEYS[2])
 return promoted
 "#;
 
+const REMOVE_DEDUPLICATION_KEY_SCRIPT: &str = r#"
+local removed = redis.call('DEL', KEYS[1])
+if removed > 0 then
+  redis.call('DEL', KEYS[2])
+end
+return removed
+"#;
+
 const REMOVE_JOB_SCRIPT: &str = r#"
 local function waiting_score_for(priority, sequence, job, bucket)
   local bucket_value = tonumber(bucket)
@@ -7038,6 +7046,14 @@ impl RedisJobQueue {
         format!("{}:{}:deduplication_next:", self.namespace, self.queue)
     }
 
+    fn deduplication_next_key(&self, deduplication_id: &str) -> String {
+        format!(
+            "{}{}",
+            self.deduplication_next_key_prefix(),
+            deduplication_id
+        )
+    }
+
     fn repeat_key_prefix(&self) -> String {
         format!("{}:{}:repeat:", self.namespace, self.queue)
     }
@@ -7793,8 +7809,12 @@ impl JobQueueBackend for RedisJobQueue {
         }
 
         let mut conn = self.connection().await?;
-        let removed: usize = conn
-            .del(self.deduplication_key(deduplication_id))
+        let removed: usize = redis::cmd("EVAL")
+            .arg(REMOVE_DEDUPLICATION_KEY_SCRIPT)
+            .arg(2)
+            .arg(self.deduplication_key(deduplication_id))
+            .arg(self.deduplication_next_key(deduplication_id))
+            .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
         Ok(removed > 0)
