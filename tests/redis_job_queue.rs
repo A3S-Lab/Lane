@@ -758,6 +758,153 @@ async fn run_retry_restores_flow_dependency(redis_url: String) -> redis::RedisRe
 }
 
 #[tokio::test]
+async fn redis_backend_adds_dynamic_flow_children_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_dynamic_flow_children(redis_url),
+    )
+    .await
+    .expect("Redis dynamic flow children integration test timed out")
+    .unwrap();
+}
+
+async fn run_dynamic_flow_children(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-dynamic")
+        .expect("valid Redis URL should build the dynamic flow queue");
+    let worker = RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-dynamic")
+        .expect("valid Redis URL should build the dynamic flow worker");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let parent = queue
+        .add_job(
+            "planner".to_string(),
+            serde_json::json!({ "kind": "plan" }),
+            JobOptions::new().with_priority(1),
+        )
+        .await
+        .expect("dynamic flow parent should be added");
+    let active_parent = worker
+        .claim_next(
+            "worker-dynamic-parent".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("dynamic parent claim should return")
+        .expect("dynamic parent should be claimable");
+    assert_eq!(active_parent.id, parent.id);
+
+    let children = queue
+        .add_flow_children_at(
+            &active_parent.id,
+            lock_token(&active_parent),
+            vec![
+                JobSpec::new("planned-child-a", serde_json::json!({ "step": 1 }))
+                    .with_options(JobOptions::new().with_priority(1)),
+                JobSpec::new("planned-child-b", serde_json::json!({ "step": 2 }))
+                    .with_options(JobOptions::new().with_priority(2)),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("dynamic flow children should be added");
+    assert_eq!(children.len(), 2);
+
+    let dependency_key = format!("{namespace}:flow-dynamic:dependencies:{}", parent.id);
+    let pending_count: usize = conn.scard(&dependency_key).await?;
+    assert_eq!(pending_count, 2);
+    for child in &children {
+        let pending: bool = conn.sismember(&dependency_key, &child.id).await?;
+        assert!(pending);
+        assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
+    }
+
+    let parent_active_score: Option<f64> = conn
+        .zscore(format!("{namespace}:flow-dynamic:active"), &parent.id)
+        .await?;
+    assert!(parent_active_score.is_none());
+    let parent_waiting_children_score: Option<f64> = conn
+        .zscore(
+            format!("{namespace}:flow-dynamic:waiting_children"),
+            &parent.id,
+        )
+        .await?;
+    assert!(parent_waiting_children_score.is_some());
+    let parent_lock_exists: usize = conn
+        .exists(format!("{namespace}:flow-dynamic:locks:{}", parent.id))
+        .await?;
+    assert_eq!(parent_lock_exists, 0);
+
+    let waiting_parent = queue
+        .get_job(&parent.id)
+        .await
+        .expect("dynamic parent after fan-out should load")
+        .expect("dynamic parent should exist");
+    assert_eq!(waiting_parent.state, JobState::WaitingChildren);
+    assert!(waiting_parent.worker_id.is_none());
+    assert_eq!(
+        waiting_parent.child_ids,
+        children
+            .iter()
+            .map(|child| child.id.clone())
+            .collect::<Vec<_>>()
+    );
+
+    for (index, child) in children.iter().enumerate() {
+        let claimed = worker
+            .claim_next(
+                format!("worker-dynamic-child-{index}"),
+                Duration::from_secs(30),
+                Utc::now(),
+            )
+            .await
+            .expect("dynamic child claim should return")
+            .expect("dynamic child should be claimable");
+        assert_eq!(claimed.id, child.id);
+        worker
+            .complete_job(
+                &claimed.id,
+                lock_token(&claimed),
+                serde_json::json!({ "ok": index }),
+                Utc::now(),
+            )
+            .await
+            .expect("dynamic child should complete");
+    }
+
+    let dependency_exists: usize = conn.exists(&dependency_key).await?;
+    assert_eq!(dependency_exists, 0);
+    let released_parent = queue
+        .get_job(&parent.id)
+        .await
+        .expect("dynamic parent after children should load")
+        .expect("dynamic parent should exist");
+    assert_eq!(released_parent.state, JobState::Waiting);
+    let claimed_parent = worker
+        .claim_next(
+            "worker-dynamic-parent-after".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("dynamic parent claim after children should return")
+        .expect("dynamic parent should be claimable after children complete");
+    assert_eq!(claimed_parent.id, parent.id);
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
+#[tokio::test]
 async fn redis_backend_continues_flow_dependency_failure_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");

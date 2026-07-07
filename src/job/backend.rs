@@ -25,6 +25,20 @@ pub trait JobQueueBackend: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<JobFlow>;
 
+    /// Add children to an active parent and move that parent to `waiting_children`.
+    ///
+    /// This is the same-queue dynamic fan-out counterpart to BullMQ's
+    /// `moveToWaitingChildren()` flow path: the parent must be active and
+    /// token-owned, child jobs are added atomically, and the parent is parked
+    /// until its new dependencies resolve.
+    async fn add_flow_children(
+        &self,
+        parent_id: &str,
+        lock_token: &str,
+        children: Vec<JobSpec>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Job>>;
+
     async fn get_flow_dependencies(&self, parent_id: &str) -> Result<Option<JobFlowDependencies>>;
 
     async fn get_flow_dependency_counts(

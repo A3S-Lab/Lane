@@ -1396,6 +1396,347 @@ end
 return {'ok'}
 "#;
 
+const ADD_FLOW_CHILDREN_SCRIPT: &str = r#"
+local function waiting_score_for(priority, sequence, job, bucket)
+  local bucket_value = tonumber(bucket)
+  local half_bucket = math.floor(bucket_value / 2)
+  local sequence_index = sequence % half_bucket
+  if job["options"] and job["options"] ~= cjson.null and job["options"]["lifo"] == true then
+    return (priority * bucket_value) + (half_bucket - 1 - sequence_index)
+  end
+  return (priority * bucket_value) + half_bucket + sequence_index
+end
+
+local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket, marker_key)
+  local sequence = redis.call('INCR', sequence_key)
+  job["enqueued_seq"] = sequence
+  local waiting_score = waiting_score_for(priority, sequence, job, bucket)
+  local updated = cjson.encode(job)
+  redis.call('HSET', jobs_key, job_id, updated)
+  redis.call('ZADD', waiting_key, waiting_score, job_id)
+  if marker_key and marker_key ~= '' then
+    redis.call('ZADD', marker_key, 0, '0')
+  end
+  return updated
+end
+
+local function refresh_delay_marker(marker_key, delayed_key)
+  if not marker_key or marker_key == '' then
+    return
+  end
+  local next_delayed = redis.call('ZRANGE', delayed_key, 0, 0, 'WITHSCORES')
+  if next_delayed[2] then
+    redis.call('ZADD', marker_key, next_delayed[2], '1')
+  else
+    redis.call('ZREM', marker_key, '1')
+  end
+end
+
+local function active_deduplication_id(jobs_key, deduplication_prefix, deduplication_id)
+  if not deduplication_id or deduplication_id == '' then
+    return nil
+  end
+
+  local deduplication_key = deduplication_prefix .. deduplication_id
+  local existing_id = redis.call('GET', deduplication_key)
+  if not existing_id then
+    return nil
+  end
+
+  local existing_raw = redis.call('HGET', jobs_key, existing_id)
+  if not existing_raw then
+    redis.call('DEL', deduplication_key)
+    return nil
+  end
+
+  local existing_job = cjson.decode(existing_raw)
+  if existing_job["state"] == "completed" or existing_job["state"] == "failed" then
+    redis.call('DEL', deduplication_key)
+    return nil
+  end
+
+  return existing_id
+end
+
+local function duration_millis(duration)
+  if not duration or duration == cjson.null then
+    return nil
+  end
+  if type(duration) == 'number' then
+    return math.floor(duration)
+  end
+  local secs = tonumber(duration["secs"] or duration["seconds"] or 0) or 0
+  local nanos = tonumber(duration["nanos"] or duration["subsec_nanos"] or 0) or 0
+  local millis = (secs * 1000) + math.floor(nanos / 1000000)
+  if millis <= 0 then
+    return nil
+  end
+  return millis
+end
+
+local function deduplication_ttl_millis(job)
+  if not job["options"] or job["options"] == cjson.null then
+    return nil
+  end
+  local deduplication = job["options"]["deduplication"]
+  if not deduplication or deduplication == cjson.null then
+    return nil
+  end
+  if deduplication["keep_last_if_active"] == true then
+    return nil
+  end
+  return duration_millis(deduplication["ttl"])
+end
+
+local function set_deduplication_key(job, job_id, deduplication_prefix)
+  local ttl = deduplication_ttl_millis(job)
+  local id = job["options"]["deduplication"]["id"]
+  if ttl then
+    redis.call('SET', deduplication_prefix .. id, job_id, 'PX', ttl)
+  else
+    redis.call('SET', deduplication_prefix .. id, job_id)
+  end
+end
+
+local function active_repeat_id(jobs_key, repeat_prefix, repeat_key)
+  if not repeat_key or repeat_key == '' then
+    return nil
+  end
+
+  local owner_key = repeat_prefix .. repeat_key
+  local existing_id = redis.call('GET', owner_key)
+  if not existing_id then
+    return nil
+  end
+
+  local existing_raw = redis.call('HGET', jobs_key, existing_id)
+  if not existing_raw then
+    redis.call('DEL', owner_key)
+    return nil
+  end
+
+  local existing_job = cjson.decode(existing_raw)
+  if existing_job["state"] == "completed" or existing_job["state"] == "failed" then
+    redis.call('DEL', owner_key)
+    return nil
+  end
+
+  return existing_id
+end
+
+local function repeat_scheduler_key(repeat_prefix)
+  return string.sub(repeat_prefix, 1, -2)
+end
+
+local function repeat_scheduler_meta_key(repeat_prefix, repeat_key)
+  return string.sub(repeat_prefix, 1, -8) .. 'repeat_meta:' .. repeat_key
+end
+
+local function store_repeat_scheduler(job, job_id, repeat_prefix, scheduled_millis)
+  local key = job["repeat_key"]
+  if not key or key == cjson.null or key == '' then
+    return
+  end
+
+  local repeat_options = nil
+  if job["options"] and job["options"] ~= cjson.null then
+    repeat_options = job["options"]["repeat"]
+  end
+
+  local meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
+  local encoded_repeat_options = ''
+  if repeat_options and repeat_options ~= cjson.null then
+    encoded_repeat_options = cjson.encode(repeat_options)
+  end
+
+  redis.call('ZADD', repeat_scheduler_key(repeat_prefix), scheduled_millis, key)
+  redis.call('DEL', meta_key)
+  redis.call(
+    'HSET',
+    meta_key,
+    'jid',
+    job_id,
+    'name',
+    job["name"] or '',
+    'next',
+    scheduled_millis,
+    'state',
+    job["state"] or '',
+    'count',
+    job["repeat_count"] or 0,
+    'opts',
+    encoded_repeat_options,
+    'key',
+    key
+  )
+
+  if repeat_options and repeat_options ~= cjson.null then
+    if repeat_options["limit"] and repeat_options["limit"] ~= cjson.null then
+      redis.call('HSET', meta_key, 'limit', repeat_options["limit"])
+    end
+    if repeat_options["end_at"] and repeat_options["end_at"] ~= cjson.null then
+      redis.call('HSET', meta_key, 'endDate', repeat_options["end_at"])
+    end
+
+    local interval = repeat_options["interval"]
+    if interval and interval ~= cjson.null then
+      local every = nil
+      if type(interval) == 'number' then
+        every = math.floor(interval)
+      else
+        local secs = tonumber(interval["secs"] or interval["seconds"] or 0) or 0
+        local nanos = tonumber(interval["nanos"] or interval["subsec_nanos"] or 0) or 0
+        every = (secs * 1000) + math.floor(nanos / 1000000)
+      end
+      if every and every > 0 then
+        redis.call('HSET', meta_key, 'every', every)
+      end
+    end
+
+    local pattern = repeat_options["cron"]
+    if pattern and pattern ~= cjson.null then
+      redis.call('HSET', meta_key, 'pattern', pattern)
+    end
+  end
+end
+
+local parent_id = ARGV[1]
+local token = ARGV[2]
+local count = tonumber(ARGV[3])
+if not count or count < 1 then
+  return {'empty'}
+end
+
+local parent_raw = redis.call('HGET', KEYS[1], parent_id)
+if not parent_raw then
+  return {'missing', parent_id}
+end
+local parent = cjson.decode(parent_raw)
+if parent["state"] ~= "active" then
+  return {'state', parent["state"] or ''}
+end
+
+local lock_token = redis.call('GET', KEYS[10])
+if not lock_token then
+  return {'lock_missing'}
+end
+if lock_token ~= token then
+  return {'lock_mismatch'}
+end
+
+local offset = 4
+local per_job_args = 7
+local waiting_score_bucket = tonumber(ARGV[4 + count * per_job_args])
+local dependency_prefix = ARGV[5 + count * per_job_args]
+local deduplication_prefix = ARGV[6 + count * per_job_args]
+local repeat_prefix = ARGV[7 + count * per_job_args]
+local max_events = ARGV[8 + count * per_job_args]
+local dependency_key = dependency_prefix .. parent_id
+local staged_ids = {}
+local staged_deduplication_ids = {}
+local staged_repeat_keys = {}
+local existing_child_ids = {}
+
+for _, child_id in ipairs(parent["child_ids"] or {}) do
+  existing_child_ids[child_id] = true
+end
+
+for index = 1, count do
+  local id = ARGV[offset]
+  local deduplication_id = ARGV[offset + 5]
+  local repeat_key = ARGV[offset + 6]
+  if id == parent_id or staged_ids[id] or existing_child_ids[id] or redis.call('HGET', KEYS[1], id) then
+    return {'exists', id}
+  end
+  staged_ids[id] = true
+
+  local deduplicated_id = active_deduplication_id(KEYS[1], deduplication_prefix, deduplication_id)
+  if deduplicated_id then
+    return {'deduplicated', deduplicated_id}
+  end
+  if deduplication_id ~= '' then
+    if staged_deduplication_ids[deduplication_id] then
+      return {'deduplicated', staged_deduplication_ids[deduplication_id]}
+    end
+    staged_deduplication_ids[deduplication_id] = id
+  end
+
+  local repeat_owner_id = active_repeat_id(KEYS[1], repeat_prefix, repeat_key)
+  if repeat_owner_id then
+    return {'repeat', repeat_owner_id}
+  end
+  if repeat_key ~= '' then
+    if staged_repeat_keys[repeat_key] then
+      return {'repeat', staged_repeat_keys[repeat_key]}
+    end
+    staged_repeat_keys[repeat_key] = id
+  end
+
+  offset = offset + per_job_args
+end
+
+redis.call('DEL', KEYS[10])
+redis.call('SREM', KEYS[8], parent_id)
+redis.call('ZREM', KEYS[5], parent_id)
+
+parent["state"] = "waiting_children"
+parent["processed_at"] = cjson.null
+parent["finished_at"] = cjson.null
+parent["worker_id"] = cjson.null
+parent["lock_token"] = cjson.null
+parent["lease_expires_at"] = cjson.null
+parent["deferred_failure"] = cjson.null
+parent["failed_reason"] = cjson.null
+if not parent["child_ids"] or parent["child_ids"] == cjson.null then
+  parent["child_ids"] = {}
+end
+
+offset = 4
+for index = 1, count do
+  local id = ARGV[offset]
+  local raw = ARGV[offset + 1]
+  local state = ARGV[offset + 2]
+  local scheduled_score = ARGV[offset + 3]
+  local priority = tonumber(ARGV[offset + 4])
+  local deduplication_id = ARGV[offset + 5]
+  local repeat_key = ARGV[offset + 6]
+  local child = cjson.decode(raw)
+
+  table.insert(parent["child_ids"], id)
+  redis.call('HSET', KEYS[1], id, raw)
+  redis.call('SADD', dependency_key, id)
+  if state == 'waiting' then
+    enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[6], child, id, priority, waiting_score_bucket, KEYS[9])
+  elseif state == 'delayed' then
+    redis.call('ZADD', KEYS[3], scheduled_score, id)
+    refresh_delay_marker(KEYS[9], KEYS[3])
+  elseif state == 'waiting_children' then
+    redis.call('ZADD', KEYS[4], scheduled_score, id)
+  end
+  if deduplication_id ~= '' then
+    set_deduplication_key(child, id, deduplication_prefix)
+  end
+  if repeat_key ~= '' then
+    redis.call('SET', repeat_prefix .. repeat_key, id)
+    store_repeat_scheduler(child, id, repeat_prefix, scheduled_score)
+  end
+  redis.call('XADD', KEYS[7], 'MAXLEN', '~', max_events, '*', 'event', 'added', 'jobId', id, 'name', child["name"] or '')
+  local event_state = state
+  if event_state == 'waiting_children' then
+    event_state = 'waiting-children'
+  end
+  redis.call('XADD', KEYS[7], 'MAXLEN', '~', max_events, '*', 'event', event_state, 'jobId', id)
+
+  offset = offset + per_job_args
+end
+
+redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+redis.call('ZADD', KEYS[4], ARGV[9 + count * per_job_args], parent_id)
+redis.call('XADD', KEYS[7], 'MAXLEN', '~', max_events, '*', 'event', 'waiting-children', 'jobId', parent_id, 'prev', 'active')
+
+return {'ok'}
+"#;
+
 const CLAIM_SCRIPT: &str = r#"
 local function waiting_score_for(priority, sequence, job, bucket)
   local bucket_value = tonumber(bucket)
@@ -7312,6 +7653,59 @@ impl RedisJobQueue {
         Ok(JobFlow { parent, children })
     }
 
+    /// Add children to an active flow parent using the current wall-clock time.
+    pub async fn add_flow_children(
+        &self,
+        parent_id: &str,
+        lock_token: &str,
+        children: Vec<JobSpec>,
+    ) -> Result<Vec<Job>> {
+        self.add_flow_children_at(parent_id, lock_token, children, Utc::now())
+            .await
+    }
+
+    /// Add children to an active flow parent and move the parent to waiting-children.
+    pub async fn add_flow_children_at(
+        &self,
+        parent_id: &str,
+        lock_token: &str,
+        children: Vec<JobSpec>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Job>> {
+        if children.is_empty() {
+            return Err(LaneError::ConfigError(
+                "flow children cannot be empty".to_string(),
+            ));
+        }
+        for child in &children {
+            validate_job_options(&child.options)?;
+        }
+
+        let mut child_jobs = Vec::with_capacity(children.len());
+        for child in children {
+            let mut child_job = Job::new(
+                self.queue.clone(),
+                child.name,
+                child.payload,
+                child.options,
+                now,
+            );
+            child_job.parent_id = Some(parent_id.to_string());
+            child_jobs.push(child_job);
+        }
+        validate_flow_child_jobs(parent_id, &child_jobs)?;
+
+        let mut conn = self.connection().await?;
+        self.add_flow_children_jobs(&mut conn, parent_id, lock_token, &child_jobs, now)
+            .await?;
+
+        let mut children = Vec::with_capacity(child_jobs.len());
+        for child in child_jobs {
+            children.push(self.load_job(&mut conn, &child.id).await?.unwrap_or(child));
+        }
+        Ok(children)
+    }
+
     /// Return a parent flow's current child dependency snapshot.
     pub async fn get_flow_dependencies(
         &self,
@@ -7636,6 +8030,54 @@ impl RedisJobQueue {
         decode_add_flow_result(&result)
     }
 
+    async fn add_flow_children_jobs(
+        &self,
+        conn: &mut ConnectionManager,
+        parent_id: &str,
+        lock_token: &str,
+        children: &[Job],
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let mut command = redis::cmd("EVAL");
+        command
+            .arg(ADD_FLOW_CHILDREN_SCRIPT)
+            .arg(10)
+            .arg(self.jobs_key())
+            .arg(self.state_key(JobState::Waiting))
+            .arg(self.state_key(JobState::Delayed))
+            .arg(self.state_key(JobState::WaitingChildren))
+            .arg(self.state_key(JobState::Active))
+            .arg(self.sequence_key())
+            .arg(self.events_key())
+            .arg(self.stalled_key())
+            .arg(self.marker_key())
+            .arg(self.lock_key(parent_id))
+            .arg(parent_id)
+            .arg(lock_token)
+            .arg(children.len());
+
+        for job in children {
+            command
+                .arg(&job.id)
+                .arg(encode_job(job)?)
+                .arg(job_state_name(job.state))
+                .arg(millis(job.scheduled_at))
+                .arg(job.priority)
+                .arg(job_deduplication_id(job).unwrap_or(""))
+                .arg(job_repeat_key(job).unwrap_or(""));
+        }
+        command
+            .arg(WAITING_SCORE_BUCKET)
+            .arg(self.dependencies_key_prefix())
+            .arg(self.deduplication_key_prefix())
+            .arg(self.repeat_key_prefix())
+            .arg(DEFAULT_JOB_EVENT_RETENTION)
+            .arg(millis(now));
+
+        let result: Vec<String> = command.query_async(conn).await.map_err(redis_error)?;
+        decode_add_flow_children_result(&result, parent_id)
+    }
+
     async fn load_job(&self, conn: &mut ConnectionManager, job_id: &str) -> Result<Option<Job>> {
         let raw: Option<String> = conn
             .hget(self.jobs_key(), job_id)
@@ -7910,6 +8352,17 @@ impl JobQueueBackend for RedisJobQueue {
         now: DateTime<Utc>,
     ) -> Result<JobFlow> {
         self.add_flow_at(parent, children, now).await
+    }
+
+    async fn add_flow_children(
+        &self,
+        parent_id: &str,
+        lock_token: &str,
+        children: Vec<JobSpec>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Job>> {
+        self.add_flow_children_at(parent_id, lock_token, children, now)
+            .await
     }
 
     async fn get_flow_dependencies(&self, parent_id: &str) -> Result<Option<JobFlowDependencies>> {
@@ -8973,6 +9426,52 @@ fn decode_add_flow_result(result: &[String]) -> Result<()> {
     }
 }
 
+fn decode_add_flow_children_result(result: &[String], parent_id: &str) -> Result<()> {
+    match result.first().map(String::as_str) {
+        Some("ok") => Ok(()),
+        Some("empty") => Err(LaneError::ConfigError(
+            "flow children cannot be empty".to_string(),
+        )),
+        Some("missing") => Err(LaneError::JobNotFound(parent_id.to_string())),
+        Some("state") => {
+            let state = result.get(1).map(String::as_str).unwrap_or("unknown");
+            Err(LaneError::JobStateConflict(format!(
+                "cannot add flow children to job {parent_id}; expected active state, found {state}"
+            )))
+        }
+        Some("lock_missing") => Err(LaneError::JobLeaseConflict(format!(
+            "missing lock for job {parent_id}"
+        ))),
+        Some("lock_mismatch") => Err(LaneError::JobLeaseConflict(format!(
+            "lock token mismatch for job {parent_id}"
+        ))),
+        Some("exists") => {
+            let id = result.get(1).map(String::as_str).unwrap_or("unknown");
+            Err(LaneError::ConfigError(format!(
+                "flow child id `{id}` already exists"
+            )))
+        }
+        Some("deduplicated") => {
+            let id = result.get(1).map(String::as_str).unwrap_or("unknown");
+            Err(LaneError::ConfigError(format!(
+                "flow deduplication id is already active for job `{id}`"
+            )))
+        }
+        Some("repeat") => {
+            let id = result.get(1).map(String::as_str).unwrap_or("unknown");
+            Err(LaneError::ConfigError(format!(
+                "flow repeat key is already active for job `{id}`"
+            )))
+        }
+        Some(other) => Err(LaneError::Other(format!(
+            "unexpected Redis add flow children script status `{other}`"
+        ))),
+        None => Err(LaneError::Other(
+            "Redis add flow children script returned no status".to_string(),
+        )),
+    }
+}
+
 fn decode_priority_update_result(result: &[String], job_id: &str) -> Result<Job> {
     match result.first().map(String::as_str) {
         Some("ok") => {
@@ -9659,6 +10158,20 @@ fn validate_flow_job_ids(parent: &Job, children: &[Job]) -> Result<()> {
         if !ids.insert(id) {
             return Err(LaneError::ConfigError(format!(
                 "flow contains duplicate job id `{id}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_flow_child_jobs(parent_id: &str, children: &[Job]) -> Result<()> {
+    let mut ids = HashSet::with_capacity(children.len() + 1);
+    ids.insert(parent_id);
+    for child in children {
+        if !ids.insert(child.id.as_str()) {
+            return Err(LaneError::ConfigError(format!(
+                "flow contains duplicate job id `{}`",
+                child.id
             )));
         }
     }

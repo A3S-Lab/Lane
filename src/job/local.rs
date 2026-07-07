@@ -118,6 +118,33 @@ impl LocalJobQueue {
         Ok(flow)
     }
 
+    /// Add children to an active flow parent using the current wall-clock time.
+    pub async fn add_flow_children(
+        &self,
+        parent_id: &str,
+        lock_token: &str,
+        children: Vec<JobSpec>,
+    ) -> Result<Vec<Job>> {
+        self.add_flow_children_at(parent_id, lock_token, children, Utc::now())
+            .await
+    }
+
+    /// Add children to an active flow parent and move the parent to waiting-children.
+    pub async fn add_flow_children_at(
+        &self,
+        parent_id: &str,
+        lock_token: &str,
+        children: Vec<JobSpec>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Job>> {
+        let children = self
+            .inner
+            .add_flow_children_at(parent_id, lock_token, children, now)
+            .await?;
+        self.persist().await?;
+        Ok(children)
+    }
+
     /// Return a parent flow's current child dependency snapshot.
     pub async fn get_flow_dependencies(
         &self,
@@ -278,6 +305,17 @@ impl JobQueueBackend for LocalJobQueue {
         now: DateTime<Utc>,
     ) -> Result<JobFlow> {
         self.add_flow_at(parent, children, now).await
+    }
+
+    async fn add_flow_children(
+        &self,
+        parent_id: &str,
+        lock_token: &str,
+        children: Vec<JobSpec>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Job>> {
+        self.add_flow_children_at(parent_id, lock_token, children, now)
+            .await
     }
 
     async fn get_flow_dependencies(&self, parent_id: &str) -> Result<Option<JobFlowDependencies>> {

@@ -469,6 +469,141 @@ impl InMemoryJobQueue {
         })
     }
 
+    /// Add children to an active flow parent using the current wall-clock time.
+    pub async fn add_flow_children(
+        &self,
+        parent_id: &str,
+        lock_token: &str,
+        children: Vec<JobSpec>,
+    ) -> Result<Vec<Job>> {
+        self.add_flow_children_at(parent_id, lock_token, children, Utc::now())
+            .await
+    }
+
+    /// Add children to an active flow parent and move the parent to waiting-children.
+    pub async fn add_flow_children_at(
+        &self,
+        parent_id: &str,
+        lock_token: &str,
+        children: Vec<JobSpec>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Job>> {
+        if children.is_empty() {
+            return Err(LaneError::ConfigError(
+                "flow children cannot be empty".to_string(),
+            ));
+        }
+        for child in &children {
+            validate_job_options(&child.options)?;
+        }
+
+        let mut child_jobs = Vec::with_capacity(children.len());
+        for child in children {
+            let mut child_job = Job::new(
+                self.queue.clone(),
+                child.name,
+                child.payload,
+                child.options,
+                now,
+            );
+            child_job.parent_id = Some(parent_id.to_string());
+            child_jobs.push(child_job);
+        }
+        validate_flow_child_jobs(parent_id, &child_jobs)?;
+
+        let mut inner = self.inner.lock().await;
+        {
+            let parent = inner
+                .jobs
+                .get(parent_id)
+                .ok_or_else(|| LaneError::JobNotFound(parent_id.to_string()))?;
+            require_active(parent, "add flow children")?;
+            require_lock_token(parent, lock_token)?;
+        }
+
+        let existing_child_ids = inner
+            .jobs
+            .get(parent_id)
+            .map(|parent| parent.child_ids.iter().cloned().collect::<HashSet<_>>())
+            .unwrap_or_default();
+        for child in &child_jobs {
+            if inner.jobs.contains_key(&child.id) || existing_child_ids.contains(&child.id) {
+                return Err(LaneError::ConfigError(format!(
+                    "flow child id `{}` already exists",
+                    child.id
+                )));
+            }
+        }
+
+        let mut flow_deduplication_ids = HashSet::new();
+        for child in &child_jobs {
+            if let Some(deduplication_id) = active_deduplication_id(child, now) {
+                if find_active_deduplication_id(
+                    &inner.jobs,
+                    &inner.released_deduplication_owners,
+                    deduplication_id,
+                    now,
+                )
+                .is_some()
+                    || !flow_deduplication_ids.insert(deduplication_id.to_string())
+                {
+                    return Err(LaneError::ConfigError(format!(
+                        "flow deduplication id `{deduplication_id}` already active"
+                    )));
+                }
+            }
+        }
+
+        let mut flow_repeat_keys = HashSet::new();
+        for child in &child_jobs {
+            if let Some(repeat_key) = active_repeat_key(child) {
+                if find_active_repeat_key(&inner.jobs, repeat_key).is_some()
+                    || !flow_repeat_keys.insert(repeat_key.to_string())
+                {
+                    return Err(LaneError::ConfigError(format!(
+                        "flow repeat key `{repeat_key}` already active"
+                    )));
+                }
+            }
+        }
+
+        let parent = {
+            let parent = inner
+                .jobs
+                .get_mut(parent_id)
+                .ok_or_else(|| LaneError::JobNotFound(parent_id.to_string()))?;
+            parent.state = JobState::WaitingChildren;
+            parent.processed_at = None;
+            parent.finished_at = None;
+            parent.worker_id = None;
+            parent.lock_token = None;
+            parent.lease_expires_at = None;
+            parent.deferred_failure = None;
+            parent.failed_reason = None;
+            parent
+                .child_ids
+                .extend(child_jobs.iter().map(|child| child.id.clone()));
+            parent.clone()
+        };
+
+        for child in &mut child_jobs {
+            assign_waiting_order(&mut inner.sequence, child);
+            Self::forget_released_deduplication_owner_locked(&mut inner, child);
+            inner.jobs.insert(child.id.clone(), child.clone());
+            Self::emit_job_created_events_locked(&mut inner, child, now);
+        }
+        emit_event_locked(
+            &mut inner,
+            "waiting-children",
+            Some(&parent),
+            Some(JobState::Active),
+            now,
+            BTreeMap::new(),
+        );
+
+        Ok(child_jobs)
+    }
+
     /// Return a parent flow's current child dependency snapshot.
     pub async fn get_flow_dependencies(
         &self,
@@ -1729,6 +1864,17 @@ impl JobQueueBackend for InMemoryJobQueue {
         self.add_flow_at(parent, children, now).await
     }
 
+    async fn add_flow_children(
+        &self,
+        parent_id: &str,
+        lock_token: &str,
+        children: Vec<JobSpec>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Job>> {
+        self.add_flow_children_at(parent_id, lock_token, children, now)
+            .await
+    }
+
     async fn get_flow_dependencies(&self, parent_id: &str) -> Result<Option<JobFlowDependencies>> {
         InMemoryJobQueue::get_flow_dependencies(self, parent_id).await
     }
@@ -2792,6 +2938,20 @@ fn validate_flow_job_ids(parent: &Job, children: &[Job]) -> Result<()> {
         if !ids.insert(id) {
             return Err(LaneError::ConfigError(format!(
                 "flow contains duplicate job id `{id}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_flow_child_jobs(parent_id: &str, children: &[Job]) -> Result<()> {
+    let mut ids = HashSet::with_capacity(children.len() + 1);
+    ids.insert(parent_id);
+    for child in children {
+        if !ids.insert(child.id.as_str()) {
+            return Err(LaneError::ConfigError(format!(
+                "flow contains duplicate job id `{}`",
+                child.id
             )));
         }
     }

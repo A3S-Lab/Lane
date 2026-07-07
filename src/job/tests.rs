@@ -3699,6 +3699,109 @@ async fn flow_parent_waits_for_children_before_claiming() {
 }
 
 #[tokio::test]
+async fn active_parent_can_add_flow_children_and_wait() {
+    let queue = InMemoryJobQueue::new("dynamic-flow");
+    let parent = queue
+        .add_at(
+            "planner",
+            serde_json::json!({ "kind": "plan" }),
+            JobOptions::new().with_priority(1),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    let active_parent = queue
+        .claim_next(
+            "worker-planner".to_string(),
+            Duration::from_secs(30),
+            ts(1_100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active_parent.id, parent.id);
+
+    let children = queue
+        .add_flow_children_at(
+            &active_parent.id,
+            lock_token(&active_parent),
+            vec![
+                JobSpec::new("planned-child-a", serde_json::json!({ "step": 1 }))
+                    .with_options(JobOptions::new().with_priority(1)),
+                JobSpec::new("planned-child-b", serde_json::json!({ "step": 2 }))
+                    .with_options(JobOptions::new().with_priority(2)),
+            ],
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+    assert_eq!(children.len(), 2);
+    assert!(children
+        .iter()
+        .all(|child| child.parent_id.as_deref() == Some(parent.id.as_str())));
+
+    let waiting_parent = queue.get_job(&parent.id).await.unwrap().unwrap();
+    assert_eq!(waiting_parent.state, JobState::WaitingChildren);
+    assert!(waiting_parent.lock_token.is_none());
+    assert_eq!(
+        waiting_parent.child_ids,
+        children
+            .iter()
+            .map(|child| child.id.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        queue
+            .get_flow_dependency_counts(&parent.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        JobFlowDependencyCounts {
+            processed: 0,
+            unprocessed: 2,
+            failed: 0,
+            ignored: 0,
+            missing: 0,
+        }
+    );
+
+    for (index, child) in children.iter().enumerate() {
+        let claimed = queue
+            .claim_next(
+                format!("worker-child-{index}"),
+                Duration::from_secs(30),
+                ts(1_300 + index as i64),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, child.id);
+        queue
+            .complete_job(
+                &claimed.id,
+                lock_token(&claimed),
+                serde_json::json!({ "ok": index }),
+                ts(1_400 + index as i64),
+            )
+            .await
+            .unwrap();
+    }
+
+    let released_parent = queue.get_job(&parent.id).await.unwrap().unwrap();
+    assert_eq!(released_parent.state, JobState::Waiting);
+    let claimed_parent = queue
+        .claim_next(
+            "worker-parent".to_string(),
+            Duration::from_secs(30),
+            ts(1_500),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed_parent.id, parent.id);
+}
+
+#[tokio::test]
 async fn flow_parent_releases_when_pending_child_is_cleaned() {
     let queue = InMemoryJobQueue::new("flow-clean");
     let flow = queue
