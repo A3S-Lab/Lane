@@ -371,7 +371,7 @@ A3S stack and language SDKs.
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
 | Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, debounce TTL extension, delayed-owner replace, and keep-last-if-active requeue, repeat-key ownership and upsert, explicit job states, priority plus FIFO/LIFO same-priority ordering, finished-job retention by age/count/limit, retained queue event streams, delayed jobs, token-owned worker leases, active-to-wait/delayed movement, completion/failure snapshots, retry backoff, Redis-shared rate-limit and active-concurrency controls, BullMQ-style two-phase stalled recovery with repeat scheduler requeue handling, pause/resume. |
 | Job management API | In progress | Add/get/get-state/get-job-counts/get-job-count/count-pending/remove/remove-repeat/upsert-repeat/remove-deduplication-key/get-deduplication-job-id/list-repeats/get-repeat/count-repeats/list-repeats-page/get-flow-dependencies/get-flow-dependency-counts/remove-unprocessed-children/remove-child-dependency/promote/reschedule/delay-active/release-active/retry/update-priority/update-priority-with-lifo/update-data/pause/resume/is-paused/drain/clean/obliterate APIs, multi-state pagination, ascending/descending listing, waiting priority counts, add-log/get-logs/clear-job-logs, read-events/trim-events, progress updates, lease renewal. |
-| Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, and stalled recovery loops. |
+| Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, uses backend-native blocking claim hooks when available, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, and stalled recovery loops. |
 | Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, FIFO/LIFO waiting score ordering, BullMQ-style Redis worker marker zset updates, Redis marker-backed blocking claim, Redis stream queue events, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership, Redis-backed repeat scheduler zset/hash metadata, listing/removal/upsert/pagination, flow submission, flow dependency inspection, delayed promotion and rescheduling, active-to-wait/delayed movement, single-job promote, state-index queries, job count snapshots, manual retry, priority update, progress update, log append, list/stat snapshots, finished-job age/count retention during complete/fail/stalled scripts, drain, clean, obliterate, claim, Redis-shared rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled candidate-set recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, dependency inspection, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, end timestamps, repeat-key removal, upsert, single-key lookup, counts, and BullMQ-style next-time pagination are available across in-memory, local durable, and Redis backends. Redis additionally maintains scheduler zset/hash metadata in Lua so distributed readers and writers share one repeat-series state machine. |
@@ -993,9 +993,10 @@ marker only as a wake-up signal, and then reruns the normal Lua claim path so
 pause, rate-limit, max-active, delayed promotion, and lock ownership checks stay
 atomic. A successful claim rewrites the base marker to fan out multiple blocked
 workers over bulk-added jobs, and pause/resume updates the marker set so resumed
-queues wake sleeping Redis workers. The backend-agnostic `JobWorker` still uses
-trait-level `claim_next()` polling; Redis-specific worker code can call
-`RedisJobQueue::claim_next_blocking()` directly.
+queues wake sleeping Redis workers. `JobQueueBackend::claim_next_blocking()`
+exposes that wait path to the backend-agnostic `JobWorker`; non-blocking
+backends use the default immediate `claim_next()` fallback, while Redis workers
+use the marker-backed `BZPOPMIN` path.
 
 Redis adds are Lua-backed as well. The add scripts write job JSON and the
 waiting, delayed, or waiting-children index in the same Redis turn. If a custom
@@ -1391,13 +1392,21 @@ let processor = Arc::new(JobProcessorRouter::new().with_processor("send", send_p
 let worker = JobWorker::new(
     backend,
     processor,
-    JobWorkerConfig::new("worker-1").with_concurrency(4),
+    JobWorkerConfig::new("worker-1")
+        .with_concurrency(4)
+        .with_blocking_claim_timeout(Duration::from_secs(5)),
 );
 
 worker.run_until_idle(100).await?;
 # Ok(())
 # }
 ```
+
+Background `JobWorker` loops call `JobQueueBackend::claim_next_blocking()`.
+Redis backends use the queue marker zset to sleep until ready or delayed work
+wakes them, while in-memory and local durable backends keep the immediate claim
+fallback. `run_once()` remains non-blocking for deterministic manual work; use
+`run_once_blocking()` when a single worker iteration should wait for new work.
 
 `JobContext::has_lost_lease()` and `JobContext::ensure_lease()` let long-running
 processors stop before doing more external work after the worker observes a

@@ -47,6 +47,21 @@ pub trait JobQueueBackend: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<Option<Job>>;
 
+    /// Claim the next job, optionally waiting for backend-native work signals.
+    ///
+    /// Backends that do not have a blocking primitive fall back to one immediate
+    /// `claim_next()` attempt. Redis overrides this with its marker zset wait
+    /// path, where the blocking wake-up is only a signal and the actual claim
+    /// still runs through the normal atomic ownership script.
+    async fn claim_next_blocking(
+        &self,
+        worker_id: JobWorkerId,
+        lease_for: Duration,
+        _block_for: Duration,
+    ) -> Result<Option<Job>> {
+        self.claim_next(worker_id, lease_for, Utc::now()).await
+    }
+
     async fn complete_job(
         &self,
         job_id: &str,

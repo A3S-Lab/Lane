@@ -245,6 +245,7 @@ pub struct JobWorkerConfig {
     pub lease_duration: Duration,
     pub lease_renew_interval: Duration,
     pub poll_interval: Duration,
+    pub blocking_claim_timeout: Duration,
     pub stalled_check_interval: Duration,
     pub recover_stalled: bool,
     pub log_retention: usize,
@@ -259,6 +260,7 @@ impl JobWorkerConfig {
             lease_duration: Duration::from_secs(30),
             lease_renew_interval: Duration::from_secs(10),
             poll_interval: Duration::from_millis(250),
+            blocking_claim_timeout: Duration::from_secs(5),
             stalled_check_interval: Duration::from_secs(30),
             recover_stalled: true,
             log_retention: 1_000,
@@ -286,6 +288,16 @@ impl JobWorkerConfig {
     /// Configure polling interval when no job is ready.
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
+        self
+    }
+
+    /// Configure how long a background worker waits on backend-native signals.
+    ///
+    /// Redis uses this window with its marker zset `BZPOPMIN` wait path. Backends
+    /// without blocking support ignore the value and keep the normal immediate
+    /// claim behavior. Use `Duration::ZERO` to force polling-only loops.
+    pub fn with_blocking_claim_timeout(mut self, timeout: Duration) -> Self {
+        self.blocking_claim_timeout = timeout;
         self
     }
 
@@ -372,6 +384,24 @@ impl JobWorker {
         self.process_claimed(job).await
     }
 
+    /// Process at most one job, waiting on backend-native work signals first.
+    pub async fn run_once_blocking(&self, block_for: Duration) -> Result<JobRunOutcome> {
+        self.backend.promote_due_jobs(Utc::now()).await?;
+        let Some(job) = self
+            .backend
+            .claim_next_blocking(
+                self.config.worker_id.clone(),
+                self.config.lease_duration,
+                block_for,
+            )
+            .await?
+        else {
+            return Ok(JobRunOutcome::NoJob);
+        };
+
+        self.process_claimed(job).await
+    }
+
     /// Recover stalled jobs immediately.
     pub async fn recover_stalled(&self, now: DateTime<Utc>) -> Result<usize> {
         self.backend.recover_stalled_jobs(now).await
@@ -415,7 +445,10 @@ impl JobWorker {
 
     async fn run_loop(self) {
         while !self.shutdown.load(Ordering::Relaxed) {
-            match self.run_once(Utc::now()).await {
+            match self
+                .run_once_blocking(self.config.blocking_claim_timeout)
+                .await
+            {
                 Ok(JobRunOutcome::NoJob) => tokio::time::sleep(self.config.poll_interval).await,
                 Ok(JobRunOutcome::Completed(_)) | Ok(JobRunOutcome::Failed(_)) => {}
                 Err(error) => {

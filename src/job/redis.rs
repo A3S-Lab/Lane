@@ -7365,6 +7365,15 @@ impl JobQueueBackend for RedisJobQueue {
             .await
     }
 
+    async fn claim_next_blocking(
+        &self,
+        worker_id: JobWorkerId,
+        lease_for: Duration,
+        block_for: Duration,
+    ) -> Result<Option<Job>> {
+        RedisJobQueue::claim_next_blocking(self, worker_id, lease_for, block_for).await
+    }
+
     async fn complete_job(
         &self,
         job_id: &str,

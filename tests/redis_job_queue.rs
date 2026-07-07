@@ -1,14 +1,16 @@
 #![cfg(feature = "redis-backend")]
 
 use a3s_lane::{
-    DeduplicationOptions, Job, JobListOptions, JobLogEntry, JobOptions, JobPriorityCount,
-    JobQueueBackend, JobRateLimit, JobRepeatListOptions, JobRetention, JobSpec, JobState,
-    JobStateCount, LaneError, RedisJobQueue, RepeatOptions, RetryPolicy,
+    job_processor_fn, DeduplicationOptions, Job, JobContext, JobListOptions, JobLogEntry,
+    JobOptions, JobPriorityCount, JobProcessor, JobQueueBackend, JobRateLimit,
+    JobRepeatListOptions, JobRetention, JobRunOutcome, JobSpec, JobState, JobStateCount, JobWorker,
+    JobWorkerConfig, LaneError, RedisJobQueue, RepeatOptions, RetryPolicy,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use redis::AsyncCommands;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static NAMESPACE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -155,6 +157,18 @@ async fn redis_backend_blocks_on_worker_markers_against_real_server() {
     .await
     .expect("Redis blocking worker-marker integration test timed out")
     .unwrap();
+}
+
+#[tokio::test]
+async fn redis_backend_job_worker_uses_marker_blocking_claims_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    tokio::time::timeout(Duration::from_secs(120), run_blocking_job_worker(redis_url))
+        .await
+        .expect("Redis blocking JobWorker integration test timed out")
+        .unwrap();
 }
 
 #[tokio::test]
@@ -621,6 +635,70 @@ async fn run_blocking_worker_markers(redis_url: String) -> redis::RedisResult<()
         .expect("paused blocking claim should return")
         .expect("paused blocking claim should find a job after resume");
     assert_eq!(paused_claim.id, paused.id);
+
+    cleanup_namespace(&redis_url, &namespace).await?;
+    Ok(())
+}
+
+async fn run_blocking_job_worker(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = Arc::new(
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "blocking-worker")
+            .expect("valid Redis URL should build the blocking worker queue"),
+    );
+    let backend: Arc<dyn JobQueueBackend> = queue.clone();
+    let processor: Arc<dyn JobProcessor> = Arc::new(job_processor_fn(
+        |job: Job, context: JobContext| async move {
+            context.add_log("processed by blocking worker").await?;
+            Ok(serde_json::json!({ "name": job.name }))
+        },
+    ));
+    let worker = JobWorker::new(
+        backend,
+        processor,
+        JobWorkerConfig::new("worker-blocking-runtime")
+            .with_lease_renew_interval(Duration::ZERO)
+            .with_poll_interval(Duration::from_secs(30))
+            .with_blocking_claim_timeout(Duration::from_secs(5)),
+    );
+
+    let worker_run =
+        tokio::spawn(async move { worker.run_once_blocking(Duration::from_secs(5)).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let job = queue
+        .add_job(
+            "runtime-blocking".to_string(),
+            serde_json::json!({ "kind": "runtime" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("runtime blocking job should add");
+    let outcome = tokio::time::timeout(Duration::from_secs(15), worker_run)
+        .await
+        .expect("blocking worker should finish after marker wake-up")
+        .expect("blocking worker task should join")
+        .expect("blocking worker run should succeed");
+    let completed = match outcome {
+        JobRunOutcome::Completed(job) => job,
+        other => panic!("expected blocking worker to complete a job, got {other:?}"),
+    };
+    assert_eq!(completed.id, job.id);
+    assert_eq!(
+        completed.return_value,
+        Some(serde_json::json!({ "name": "runtime-blocking" }))
+    );
+
+    let stored = queue
+        .get_job(&job.id)
+        .await
+        .expect("completed job lookup should return")
+        .expect("completed job should remain stored");
+    assert_eq!(stored.state, JobState::Completed);
+    assert_eq!(stored.logs.len(), 1);
+    assert_eq!(stored.logs[0].line, "processed by blocking worker");
 
     cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())
