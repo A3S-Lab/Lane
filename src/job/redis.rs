@@ -217,23 +217,44 @@ local function active_repeat_raw(jobs_key, repeat_prefix, repeat_key)
 
   local owner_key = repeat_prefix .. repeat_key
   local existing_id = redis.call('GET', owner_key)
-  if not existing_id then
-    return nil
-  end
-
-  local existing_raw = redis.call('HGET', jobs_key, existing_id)
-  if not existing_raw then
+  if existing_id then
+    local existing_raw = redis.call('HGET', jobs_key, existing_id)
+    if existing_raw then
+      local existing_job = cjson.decode(existing_raw)
+      if existing_job["state"] ~= "completed"
+        and existing_job["state"] ~= "failed"
+        and existing_job["repeat_key"] == repeat_key then
+        return existing_raw
+      end
+    end
     redis.call('DEL', owner_key)
+  end
+
+  local scheduler_key = string.sub(repeat_prefix, 1, -2)
+  local scheduler_meta_key = string.sub(repeat_prefix, 1, -8) .. 'repeat_meta:' .. repeat_key
+  local scheduler_owner_id = redis.call('HGET', scheduler_meta_key, 'jid')
+  if not scheduler_owner_id then
     return nil
   end
 
-  local existing_job = cjson.decode(existing_raw)
-  if existing_job["state"] == "completed" or existing_job["state"] == "failed" then
-    redis.call('DEL', owner_key)
+  local scheduler_owner_raw = redis.call('HGET', jobs_key, scheduler_owner_id)
+  if not scheduler_owner_raw then
+    redis.call('ZREM', scheduler_key, repeat_key)
+    redis.call('DEL', scheduler_meta_key)
     return nil
   end
 
-  return existing_raw
+  local scheduler_owner_job = cjson.decode(scheduler_owner_raw)
+  if scheduler_owner_job["state"] == "completed"
+    or scheduler_owner_job["state"] == "failed"
+    or scheduler_owner_job["repeat_key"] ~= repeat_key then
+    redis.call('ZREM', scheduler_key, repeat_key)
+    redis.call('DEL', scheduler_meta_key)
+    return nil
+  end
+
+  redis.call('SET', owner_key, scheduler_owner_id, 'NX')
+  return scheduler_owner_raw
 end
 
 local function repeat_scheduler_key(repeat_prefix)
@@ -935,23 +956,44 @@ local function active_repeat_raw(jobs_key, repeat_prefix, repeat_key)
 
   local owner_key = repeat_prefix .. repeat_key
   local existing_id = redis.call('GET', owner_key)
-  if not existing_id then
-    return nil
-  end
-
-  local existing_raw = redis.call('HGET', jobs_key, existing_id)
-  if not existing_raw then
+  if existing_id then
+    local existing_raw = redis.call('HGET', jobs_key, existing_id)
+    if existing_raw then
+      local existing_job = cjson.decode(existing_raw)
+      if existing_job["state"] ~= "completed"
+        and existing_job["state"] ~= "failed"
+        and existing_job["repeat_key"] == repeat_key then
+        return existing_raw
+      end
+    end
     redis.call('DEL', owner_key)
+  end
+
+  local scheduler_key = string.sub(repeat_prefix, 1, -2)
+  local scheduler_meta_key = string.sub(repeat_prefix, 1, -8) .. 'repeat_meta:' .. repeat_key
+  local scheduler_owner_id = redis.call('HGET', scheduler_meta_key, 'jid')
+  if not scheduler_owner_id then
     return nil
   end
 
-  local existing_job = cjson.decode(existing_raw)
-  if existing_job["state"] == "completed" or existing_job["state"] == "failed" then
-    redis.call('DEL', owner_key)
+  local scheduler_owner_raw = redis.call('HGET', jobs_key, scheduler_owner_id)
+  if not scheduler_owner_raw then
+    redis.call('ZREM', scheduler_key, repeat_key)
+    redis.call('DEL', scheduler_meta_key)
     return nil
   end
 
-  return existing_raw
+  local scheduler_owner_job = cjson.decode(scheduler_owner_raw)
+  if scheduler_owner_job["state"] == "completed"
+    or scheduler_owner_job["state"] == "failed"
+    or scheduler_owner_job["repeat_key"] ~= repeat_key then
+    redis.call('ZREM', scheduler_key, repeat_key)
+    redis.call('DEL', scheduler_meta_key)
+    return nil
+  end
+
+  redis.call('SET', owner_key, scheduler_owner_id, 'NX')
+  return scheduler_owner_raw
 end
 
 local function repeat_scheduler_key(repeat_prefix)
@@ -1286,23 +1328,44 @@ local function active_repeat_id(jobs_key, repeat_prefix, repeat_key)
 
   local owner_key = repeat_prefix .. repeat_key
   local existing_id = redis.call('GET', owner_key)
-  if not existing_id then
-    return nil
-  end
-
-  local existing_raw = redis.call('HGET', jobs_key, existing_id)
-  if not existing_raw then
+  if existing_id then
+    local existing_raw = redis.call('HGET', jobs_key, existing_id)
+    if existing_raw then
+      local existing_job = cjson.decode(existing_raw)
+      if existing_job["state"] ~= "completed"
+        and existing_job["state"] ~= "failed"
+        and existing_job["repeat_key"] == repeat_key then
+        return existing_id
+      end
+    end
     redis.call('DEL', owner_key)
+  end
+
+  local scheduler_key = string.sub(repeat_prefix, 1, -2)
+  local scheduler_meta_key = string.sub(repeat_prefix, 1, -8) .. 'repeat_meta:' .. repeat_key
+  local scheduler_owner_id = redis.call('HGET', scheduler_meta_key, 'jid')
+  if not scheduler_owner_id then
     return nil
   end
 
-  local existing_job = cjson.decode(existing_raw)
-  if existing_job["state"] == "completed" or existing_job["state"] == "failed" then
-    redis.call('DEL', owner_key)
+  local scheduler_owner_raw = redis.call('HGET', jobs_key, scheduler_owner_id)
+  if not scheduler_owner_raw then
+    redis.call('ZREM', scheduler_key, repeat_key)
+    redis.call('DEL', scheduler_meta_key)
     return nil
   end
 
-  return existing_id
+  local scheduler_owner_job = cjson.decode(scheduler_owner_raw)
+  if scheduler_owner_job["state"] == "completed"
+    or scheduler_owner_job["state"] == "failed"
+    or scheduler_owner_job["repeat_key"] ~= repeat_key then
+    redis.call('ZREM', scheduler_key, repeat_key)
+    redis.call('DEL', scheduler_meta_key)
+    return nil
+  end
+
+  redis.call('SET', owner_key, scheduler_owner_id, 'NX')
+  return scheduler_owner_id
 end
 
 local function repeat_scheduler_key(repeat_prefix)
@@ -1605,23 +1668,44 @@ local function active_repeat_id(jobs_key, repeat_prefix, repeat_key)
 
   local owner_key = repeat_prefix .. repeat_key
   local existing_id = redis.call('GET', owner_key)
-  if not existing_id then
-    return nil
-  end
-
-  local existing_raw = redis.call('HGET', jobs_key, existing_id)
-  if not existing_raw then
+  if existing_id then
+    local existing_raw = redis.call('HGET', jobs_key, existing_id)
+    if existing_raw then
+      local existing_job = cjson.decode(existing_raw)
+      if existing_job["state"] ~= "completed"
+        and existing_job["state"] ~= "failed"
+        and existing_job["repeat_key"] == repeat_key then
+        return existing_id
+      end
+    end
     redis.call('DEL', owner_key)
+  end
+
+  local scheduler_key = string.sub(repeat_prefix, 1, -2)
+  local scheduler_meta_key = string.sub(repeat_prefix, 1, -8) .. 'repeat_meta:' .. repeat_key
+  local scheduler_owner_id = redis.call('HGET', scheduler_meta_key, 'jid')
+  if not scheduler_owner_id then
     return nil
   end
 
-  local existing_job = cjson.decode(existing_raw)
-  if existing_job["state"] == "completed" or existing_job["state"] == "failed" then
-    redis.call('DEL', owner_key)
+  local scheduler_owner_raw = redis.call('HGET', jobs_key, scheduler_owner_id)
+  if not scheduler_owner_raw then
+    redis.call('ZREM', scheduler_key, repeat_key)
+    redis.call('DEL', scheduler_meta_key)
     return nil
   end
 
-  return existing_id
+  local scheduler_owner_job = cjson.decode(scheduler_owner_raw)
+  if scheduler_owner_job["state"] == "completed"
+    or scheduler_owner_job["state"] == "failed"
+    or scheduler_owner_job["repeat_key"] ~= repeat_key then
+    redis.call('ZREM', scheduler_key, repeat_key)
+    redis.call('DEL', scheduler_meta_key)
+    return nil
+  end
+
+  redis.call('SET', owner_key, scheduler_owner_id, 'NX')
+  return scheduler_owner_id
 end
 
 local function repeat_scheduler_key(repeat_prefix)

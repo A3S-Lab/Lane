@@ -647,7 +647,10 @@ Repeat jobs schedule the next occurrence after a successful completion. Use
 seven-field UTC cron expression. The repeat `limit` counts total executions,
 including the first job. A custom repeat key also acts as a series owner: while a
 non-terminal occurrence with the same repeat key exists, duplicate adds return
-that owner instead of creating a parallel repeat chain:
+that owner instead of creating a parallel repeat chain. In Redis, duplicate
+repeat adds can recover from a missing fast owner key by validating
+`repeat_meta:<key>.jid` and restoring `repeat:<key>` before returning the
+current owner:
 
 ```rust
 use a3s_lane::{InMemoryJobQueue, JobOptions, JobSpec, RepeatOptions};
@@ -1235,11 +1238,12 @@ worker computes the next occurrence from `RepeatOptions`, then the Lua script
 finishes the current job and writes the next delayed or waiting occurrence in
 the same Redis turn. Redis keeps both a lightweight `repeat:<key>` owner key for
 fast collision checks and a scheduler index made of the queue-level `repeat`
-zset plus `repeat_meta:<key>` hashes. The add scripts check the owner key before
-inserting a new repeat job, the completion script transfers ownership and
-scheduler metadata to the successor before releasing the completed occurrence,
-and terminal failure, remove, clean, drain, and stalled terminal failure release
-both records only if they still point at the job being finalized or removed.
+zset plus `repeat_meta:<key>` hashes. The add scripts check the owner key and
+fall back to scheduler metadata before inserting a new repeat job, the
+completion script transfers ownership and scheduler metadata to the successor
+before releasing the completed occurrence, and terminal failure, remove, clean,
+drain, and stalled terminal failure release both records only if they still
+point at the job being finalized or removed.
 Manual retry reclaims the repeat key and scheduler metadata inside the retry
 script and rejects retry if another non-terminal occurrence already owns the
 series. `list_repeats()` reads the scheduler zset first, loads each owner job

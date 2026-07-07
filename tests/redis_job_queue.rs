@@ -784,6 +784,22 @@ async fn redis_backend_keeps_latest_repeat_duplicate_against_real_server() {
 }
 
 #[tokio::test]
+async fn redis_backend_adds_repeat_from_scheduler_metadata_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_repeat_add_scheduler_metadata(redis_url),
+    )
+    .await
+    .expect("Redis repeat scheduler metadata add integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_clears_keep_last_next_on_manual_release_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -3801,6 +3817,155 @@ async fn run_repeat_keep_last(redis_url: String) -> redis::RedisResult<()> {
 
     cleanup_namespace_with_conn(&mut conn, &namespace).await?;
     trace_stage("repeat-keep-last:cleanup-final:done");
+    Ok(())
+}
+
+async fn run_repeat_add_scheduler_metadata(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    trace_stage("repeat-add-scheduler:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("repeat-add-scheduler:cleanup:done");
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "repeat-add-scheduler")
+        .expect("valid Redis URL should build the repeat add scheduler queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let repeat_owner = queue
+        .add_job(
+            "scheduler-repeat-owner".to_string(),
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new()
+                .with_delay(Duration::from_secs(60))
+                .with_repeat(
+                    RepeatOptions::every(Duration::from_secs(60)).with_key("scheduler-add"),
+                ),
+        )
+        .await
+        .expect("scheduler-backed repeat owner should add");
+    let owner_key = format!("{namespace}:repeat-add-scheduler:repeat:scheduler-add");
+    let scheduler_meta_key = format!("{namespace}:repeat-add-scheduler:repeat_meta:scheduler-add");
+    let scheduler_owner_id: Option<String> = conn.hget(&scheduler_meta_key, "jid").await?;
+    assert_eq!(
+        scheduler_owner_id.as_deref(),
+        Some(repeat_owner.id.as_str())
+    );
+
+    let removed_owner_key: usize = conn.del(&owner_key).await?;
+    assert_eq!(removed_owner_key, 1);
+    let duplicate = queue
+        .add_job(
+            "scheduler-repeat-duplicate".to_string(),
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(60)).with_key("scheduler-add"),
+            ),
+        )
+        .await
+        .expect("repeat duplicate add should recover scheduler metadata owner");
+    trace_stage("repeat-add-scheduler:single-duplicate");
+    assert_eq!(duplicate.id, repeat_owner.id);
+    let restored_owner_after_add: Option<String> = conn.get(&owner_key).await?;
+    assert_eq!(
+        restored_owner_after_add.as_deref(),
+        Some(repeat_owner.id.as_str())
+    );
+
+    let removed_owner_key: usize = conn.del(&owner_key).await?;
+    assert_eq!(removed_owner_key, 1);
+    let bulk =
+        queue
+            .add_many(vec![JobSpec::new(
+                "scheduler-repeat-bulk-duplicate",
+                serde_json::json!({ "version": 3 }),
+            )
+            .with_options(JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(60)).with_key("scheduler-add"),
+            ))])
+            .await
+            .expect("repeat bulk add should recover scheduler metadata owner");
+    trace_stage("repeat-add-scheduler:bulk-duplicate");
+    assert_eq!(bulk.len(), 1);
+    assert_eq!(bulk[0].id, repeat_owner.id);
+    let restored_owner_after_bulk: Option<String> = conn.get(&owner_key).await?;
+    assert_eq!(
+        restored_owner_after_bulk.as_deref(),
+        Some(repeat_owner.id.as_str())
+    );
+
+    let removed_owner_key: usize = conn.del(&owner_key).await?;
+    assert_eq!(removed_owner_key, 1);
+    let flow_error = queue
+        .add_flow(
+            JobSpec::new("repeat-flow-parent", serde_json::json!({})),
+            vec![
+                JobSpec::new("repeat-flow-child", serde_json::json!({ "version": 4 }))
+                    .with_options(JobOptions::new().with_repeat(
+                        RepeatOptions::every(Duration::from_secs(60)).with_key("scheduler-add"),
+                    )),
+            ],
+        )
+        .await
+        .expect_err("flow repeat duplicate should reject scheduler metadata owner");
+    assert!(matches!(flow_error, LaneError::ConfigError(_)));
+    let restored_owner_after_flow: Option<String> = conn.get(&owner_key).await?;
+    assert_eq!(
+        restored_owner_after_flow.as_deref(),
+        Some(repeat_owner.id.as_str())
+    );
+
+    let parent = queue
+        .add_job(
+            "dynamic-repeat-parent".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("dynamic repeat parent should add");
+    let claimed_parent = queue
+        .claim_next(
+            "worker-dynamic-repeat-parent".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("dynamic repeat parent claim should return")
+        .expect("dynamic repeat parent should claim");
+    assert_eq!(claimed_parent.id, parent.id);
+
+    let removed_owner_key: usize = conn.del(&owner_key).await?;
+    assert_eq!(removed_owner_key, 1);
+    let dynamic_error = queue
+        .add_flow_children(
+            &claimed_parent.id,
+            lock_token(&claimed_parent),
+            vec![
+                JobSpec::new("dynamic-repeat-child", serde_json::json!({ "version": 5 }))
+                    .with_options(JobOptions::new().with_repeat(
+                        RepeatOptions::every(Duration::from_secs(60)).with_key("scheduler-add"),
+                    )),
+            ],
+        )
+        .await
+        .expect_err("dynamic flow repeat duplicate should reject scheduler metadata owner");
+    assert!(matches!(dynamic_error, LaneError::ConfigError(_)));
+    let restored_owner_after_dynamic: Option<String> = conn.get(&owner_key).await?;
+    assert_eq!(
+        restored_owner_after_dynamic.as_deref(),
+        Some(repeat_owner.id.as_str())
+    );
+
+    assert_eq!(
+        queue
+            .count_repeats()
+            .await
+            .expect("repeat count should load after scheduler add checks"),
+        1
+    );
+
+    cleanup_namespace_with_conn(&mut conn, &namespace).await?;
+    trace_stage("repeat-add-scheduler:cleanup-final:done");
     Ok(())
 }
 
