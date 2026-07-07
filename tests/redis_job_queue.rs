@@ -12,8 +12,14 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::{Mutex, MutexGuard};
 
 static NAMESPACE_COUNTER: AtomicU64 = AtomicU64::new(0);
+static REDIS_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+async fn redis_test_guard() -> MutexGuard<'static, ()> {
+    REDIS_TEST_LOCK.lock().await
+}
 
 fn lock_token(job: &a3s_lane::Job) -> &str {
     job.lock_token
@@ -37,6 +43,7 @@ fn redis_backend_runs_job_lifecycle_against_real_server() {
                 .build()
                 .expect("Redis lifecycle runtime should build");
             runtime.block_on(async move {
+                let _guard = redis_test_guard().await;
                 tokio::time::timeout(Duration::from_secs(900), run_job_lifecycle(redis_url))
                     .await
                     .expect("Redis job lifecycle integration test timed out")
@@ -54,6 +61,7 @@ async fn redis_backend_discards_configured_retry_against_real_server() {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
         return;
     };
+    let _guard = redis_test_guard().await;
     tokio::time::timeout(Duration::from_secs(120), run_discard_retry(redis_url))
         .await
         .expect("Redis discard retry integration test timed out")
@@ -66,6 +74,7 @@ async fn redis_backend_counts_states_against_real_server() {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
         return;
     };
+    let _guard = redis_test_guard().await;
     tokio::time::timeout(Duration::from_secs(120), run_state_count_indexes(redis_url))
         .await
         .expect("Redis state-count integration test timed out")
@@ -78,6 +87,7 @@ async fn redis_backend_obliterates_queue_against_real_server() {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
         return;
     };
+    let _guard = redis_test_guard().await;
     tokio::time::timeout(Duration::from_secs(120), run_queue_obliterate(redis_url))
         .await
         .expect("Redis queue obliterate integration test timed out")
@@ -90,6 +100,7 @@ async fn redis_backend_keeps_latest_repeat_duplicate_against_real_server() {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
         return;
     };
+    let _guard = redis_test_guard().await;
     tokio::time::timeout(Duration::from_secs(120), run_repeat_keep_last(redis_url))
         .await
         .expect("Redis repeat keep-last integration test timed out")
@@ -102,6 +113,7 @@ async fn redis_backend_clears_keep_last_next_on_manual_release_against_real_serv
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
         return;
     };
+    let _guard = redis_test_guard().await;
     tokio::time::timeout(
         Duration::from_secs(120),
         run_keep_last_manual_release_cleanup(redis_url),
@@ -117,6 +129,7 @@ async fn redis_backend_clears_keep_last_next_for_stale_dedup_owner_against_real_
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
         return;
     };
+    let _guard = redis_test_guard().await;
     tokio::time::timeout(
         Duration::from_secs(120),
         run_keep_last_stale_owner_cleanup(redis_url),
@@ -132,6 +145,7 @@ async fn redis_backend_upserts_repeat_against_real_server() {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
         return;
     };
+    let _guard = redis_test_guard().await;
     tokio::time::timeout(Duration::from_secs(120), run_repeat_upsert(redis_url))
         .await
         .expect("Redis repeat upsert integration test timed out")
@@ -144,6 +158,7 @@ async fn redis_backend_orders_lifo_waiting_jobs_against_real_server() {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
         return;
     };
+    let _guard = redis_test_guard().await;
     tokio::time::timeout(Duration::from_secs(120), run_lifo_waiting_order(redis_url))
         .await
         .expect("Redis lifo waiting-order integration test timed out")
@@ -156,6 +171,7 @@ async fn redis_backend_records_queue_events_against_real_server() {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
         return;
     };
+    let _guard = redis_test_guard().await;
     tokio::time::timeout(Duration::from_secs(120), run_queue_events(redis_url))
         .await
         .expect("Redis queue-events integration test timed out")
@@ -168,6 +184,7 @@ async fn redis_backend_updates_worker_markers_against_real_server() {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
         return;
     };
+    let _guard = redis_test_guard().await;
     tokio::time::timeout(Duration::from_secs(120), run_worker_markers(redis_url))
         .await
         .expect("Redis worker-marker integration test timed out")
@@ -180,6 +197,7 @@ async fn redis_backend_blocks_on_worker_markers_against_real_server() {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
         return;
     };
+    let _guard = redis_test_guard().await;
     tokio::time::timeout(
         Duration::from_secs(120),
         run_blocking_worker_markers(redis_url),
@@ -195,6 +213,7 @@ async fn redis_backend_job_worker_uses_marker_blocking_claims_against_real_serve
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
         return;
     };
+    let _guard = redis_test_guard().await;
     tokio::time::timeout(Duration::from_secs(120), run_blocking_job_worker(redis_url))
         .await
         .expect("Redis blocking JobWorker integration test timed out")
@@ -207,6 +226,7 @@ async fn redis_backend_applies_finished_retention_against_real_server() {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
         return;
     };
+    let _guard = redis_test_guard().await;
     tokio::time::timeout(Duration::from_secs(120), run_finished_retention(redis_url))
         .await
         .expect("Redis finished-retention integration test timed out")
