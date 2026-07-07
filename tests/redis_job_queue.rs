@@ -910,6 +910,22 @@ async fn redis_backend_upserts_repeat_from_scheduler_metadata_against_real_serve
 }
 
 #[tokio::test]
+async fn redis_backend_rejects_repeat_retry_from_scheduler_metadata_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_repeat_retry_scheduler_metadata(redis_url),
+    )
+    .await
+    .expect("Redis repeat scheduler metadata retry integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_removes_repeat_from_scheduler_metadata_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -4306,6 +4322,106 @@ async fn run_repeat_upsert_scheduler_metadata(redis_url: String) -> redis::Redis
 
     cleanup_namespace_with_conn(&mut conn, &namespace).await?;
     trace_stage("repeat-upsert-scheduler:cleanup-final:done");
+    Ok(())
+}
+
+async fn run_repeat_retry_scheduler_metadata(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    trace_stage("repeat-retry-scheduler:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("repeat-retry-scheduler:cleanup:done");
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "repeat-retry-scheduler")
+        .expect("valid Redis URL should build the repeat retry scheduler queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let failed_owner = queue
+        .add_job(
+            "scheduler-retry-old".to_string(),
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(60)).with_key("retry-scheduler"),
+            ),
+        )
+        .await
+        .expect("old repeat owner should add");
+    let claimed = queue
+        .claim_next(
+            "worker-repeat-retry-scheduler-old".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("old repeat owner claim should return")
+        .expect("old repeat owner should claim");
+    assert_eq!(claimed.id, failed_owner.id);
+    queue
+        .fail_job(
+            &claimed.id,
+            lock_token(&claimed),
+            "terminal old repeat failure".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("old repeat owner should fail terminally");
+
+    let current_owner = queue
+        .add_job(
+            "scheduler-retry-current".to_string(),
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(60)).with_key("retry-scheduler"),
+            ),
+        )
+        .await
+        .expect("current repeat owner should add after terminal failure");
+    assert_ne!(current_owner.id, failed_owner.id);
+    let owner_key = format!("{namespace}:repeat-retry-scheduler:repeat:retry-scheduler");
+    let scheduler_meta_key =
+        format!("{namespace}:repeat-retry-scheduler:repeat_meta:retry-scheduler");
+    let scheduler_owner_id: Option<String> = conn.hget(&scheduler_meta_key, "jid").await?;
+    assert_eq!(
+        scheduler_owner_id.as_deref(),
+        Some(current_owner.id.as_str())
+    );
+    let removed_owner_key: usize = conn.del(&owner_key).await?;
+    assert_eq!(removed_owner_key, 1);
+
+    let retry_error = queue
+        .retry_job(&failed_owner.id, Utc::now())
+        .await
+        .expect_err("retry should reject scheduler metadata repeat owner");
+    assert!(matches!(retry_error, LaneError::JobStateConflict(_)));
+    trace_stage("repeat-retry-scheduler:rejected");
+
+    let restored_owner: Option<String> = conn.get(&owner_key).await?;
+    assert_eq!(restored_owner.as_deref(), Some(current_owner.id.as_str()));
+    let failed_score: Option<f64> = conn
+        .zscore(
+            format!("{namespace}:repeat-retry-scheduler:failed"),
+            &failed_owner.id,
+        )
+        .await?;
+    assert!(failed_score.is_some());
+    let current_hash: Option<String> = conn
+        .hget(
+            format!("{namespace}:repeat-retry-scheduler:jobs"),
+            &current_owner.id,
+        )
+        .await?;
+    assert!(current_hash.is_some());
+    assert_eq!(
+        queue
+            .count_repeats()
+            .await
+            .expect("repeat count should load after rejected scheduler retry"),
+        1
+    );
+
+    cleanup_namespace_with_conn(&mut conn, &namespace).await?;
+    trace_stage("repeat-retry-scheduler:cleanup-final:done");
     Ok(())
 }
 

@@ -1324,13 +1324,16 @@ promotion, manual retry, stalled recovery, repeat successor enqueue, dedup
 keep-last enqueue, and flow parent release.
 `retry_job()` clears terminal failure metadata, treats the failed zset as the
 Redis movement gate, prunes orphaned or stale failed members, and moves valid
-failed jobs back to waiting inside one script. For deduplicated and repeat-keyed
-jobs, that same script reclaims the owner key before returning the job to
-waiting; deduplication TTL is re-applied during that same retry script. When the
-retried job is a retained flow child, retry restores the child into the parent's
-pending dependency set, clears stale deferred parent failure metadata, and moves
-a non-terminal parent back to `waiting_children`, matching BullMQ's
-`reprocessJob` dependency restoration path.
+failed jobs back to waiting inside one script. For deduplicated jobs, that same
+script reclaims the owner key and reapplies the deduplication TTL before
+returning the job to waiting. For repeat-keyed jobs, retry first checks both the
+fast `repeat:<key>` owner key and the scheduler `repeat_meta:<key>.jid` owner; if
+either points at another non-terminal occurrence, Redis restores the fast owner
+key when needed and rejects the retry. Only an uncontested failed owner reclaims
+the repeat key and scheduler metadata. When the retried job is a retained flow
+child, retry restores the child into the parent's pending dependency set, clears
+stale deferred parent failure metadata, and moves a non-terminal parent back to
+`waiting_children`, matching BullMQ's `reprocessJob` dependency restoration path.
 BullMQ's deprecated `job.discard()` is intentionally modeled as a current
 failure-path decision rather than stored job metadata: BullMQ sets an in-memory
 `discarded` flag, `shouldRetryJob()` checks that flag before `moveToFailed()`,
