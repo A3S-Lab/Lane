@@ -2646,7 +2646,6 @@ local function remove_finished_job(jobs_key, job_id, dependency_prefix, deduplic
   local raw = redis.call('HGET', jobs_key, job_id)
   if raw then
     local removed = cjson.decode(raw)
-    release_deduplication_key(removed, job_id, deduplication_prefix)
     release_repeat_key(removed, job_id, repeat_prefix)
   end
   redis.call('HDEL', jobs_key, job_id)
@@ -3430,7 +3429,6 @@ local function remove_finished_job(jobs_key, job_id, dependency_prefix, deduplic
   local raw = redis.call('HGET', jobs_key, job_id)
   if raw then
     local removed = cjson.decode(raw)
-    release_deduplication_key(removed, job_id, deduplication_prefix)
     release_repeat_key(removed, job_id, repeat_prefix)
   end
   redis.call('HDEL', jobs_key, job_id)
@@ -4665,7 +4663,6 @@ local function remove_finished_job(jobs_key, job_id, dependency_prefix, deduplic
   local raw = redis.call('HGET', jobs_key, job_id)
   if raw then
     local removed = cjson.decode(raw)
-    release_deduplication_key(removed, job_id, deduplication_prefix)
     release_repeat_key(removed, job_id, repeat_prefix)
   end
   redis.call('HDEL', jobs_key, job_id)

@@ -3557,6 +3557,170 @@ async fn run_ttl_dedup_finalization(redis_url: String) -> redis::RedisResult<()>
     assert_eq!(failed_duplicate.id, failed_owner.id);
     assert_eq!(failed_duplicate.state, JobState::Failed);
 
+    let removed_complete_dedup_key =
+        format!("{namespace}:dedup-ttl:deduplication:tenant:ttl-finalization-removed-complete");
+    let removed_complete_owner = queue
+        .add_job(
+            "dedup-ttl-removed-complete-owner".to_string(),
+            serde_json::json!({ "version": 6 }),
+            JobOptions::new()
+                .remove_on_complete(true)
+                .with_deduplication(
+                    DeduplicationOptions::new("tenant:ttl-finalization-removed-complete")
+                        .with_ttl(Duration::from_secs(30)),
+                ),
+        )
+        .await
+        .expect("remove-on-complete TTL owner should add");
+    let removed_complete_claim = queue
+        .claim_next(
+            "worker-ttl-finalization-removed-complete".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("remove-on-complete TTL owner should be claimable")
+        .expect("remove-on-complete TTL owner should be returned");
+    assert_eq!(removed_complete_claim.id, removed_complete_owner.id);
+    queue
+        .complete_job(
+            &removed_complete_claim.id,
+            lock_token(&removed_complete_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("remove-on-complete TTL owner should complete");
+    assert!(queue
+        .get_job(&removed_complete_owner.id)
+        .await
+        .expect("removed completed owner lookup should return")
+        .is_none());
+    let removed_complete_pttl: i64 = redis::cmd("PTTL")
+        .arg(&removed_complete_dedup_key)
+        .query_async(&mut conn)
+        .await?;
+    assert!(
+        removed_complete_pttl > 0,
+        "remove-on-complete should leave the TTL dedup key until Redis expiration, got {removed_complete_pttl}"
+    );
+    let removed_complete_key_owner: Option<String> = conn.get(&removed_complete_dedup_key).await?;
+    assert_eq!(
+        removed_complete_key_owner.as_deref(),
+        Some(removed_complete_owner.id.as_str())
+    );
+
+    let removed_fail_dedup_key =
+        format!("{namespace}:dedup-ttl:deduplication:tenant:ttl-finalization-removed-fail");
+    let removed_fail_owner = queue
+        .add_job(
+            "dedup-ttl-removed-fail-owner".to_string(),
+            serde_json::json!({ "version": 7 }),
+            JobOptions::new().remove_on_fail(true).with_deduplication(
+                DeduplicationOptions::new("tenant:ttl-finalization-removed-fail")
+                    .with_ttl(Duration::from_secs(30)),
+            ),
+        )
+        .await
+        .expect("remove-on-fail TTL owner should add");
+    let removed_fail_claim = queue
+        .claim_next(
+            "worker-ttl-finalization-removed-fail".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("remove-on-fail TTL owner should be claimable")
+        .expect("remove-on-fail TTL owner should be returned");
+    assert_eq!(removed_fail_claim.id, removed_fail_owner.id);
+    queue
+        .fail_job(
+            &removed_fail_claim.id,
+            lock_token(&removed_fail_claim),
+            "boom".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("remove-on-fail TTL owner should fail");
+    assert!(queue
+        .get_job(&removed_fail_owner.id)
+        .await
+        .expect("removed failed owner lookup should return")
+        .is_none());
+    let removed_fail_pttl: i64 = redis::cmd("PTTL")
+        .arg(&removed_fail_dedup_key)
+        .query_async(&mut conn)
+        .await?;
+    assert!(
+        removed_fail_pttl > 0,
+        "remove-on-fail should leave the TTL dedup key until Redis expiration, got {removed_fail_pttl}"
+    );
+    let removed_fail_key_owner: Option<String> = conn.get(&removed_fail_dedup_key).await?;
+    assert_eq!(
+        removed_fail_key_owner.as_deref(),
+        Some(removed_fail_owner.id.as_str())
+    );
+
+    let stalled_dedup_key =
+        format!("{namespace}:dedup-ttl:deduplication:tenant:ttl-finalization-stalled");
+    let stalled_owner = queue
+        .add_job(
+            "dedup-ttl-stalled-owner".to_string(),
+            serde_json::json!({ "version": 8 }),
+            JobOptions::new()
+                .remove_on_fail(true)
+                .with_max_stalled_count(0)
+                .with_deduplication(
+                    DeduplicationOptions::new("tenant:ttl-finalization-stalled")
+                        .with_ttl(Duration::from_secs(30)),
+                ),
+        )
+        .await
+        .expect("stalled TTL owner should add");
+    let stalled_claim = queue
+        .claim_next(
+            "worker-ttl-finalization-stalled".to_string(),
+            Duration::from_millis(20),
+            Utc::now(),
+        )
+        .await
+        .expect("stalled TTL owner should be claimable")
+        .expect("stalled TTL owner should be returned");
+    assert_eq!(stalled_claim.id, stalled_owner.id);
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(
+        queue
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("stalled TTL first recovery pass should run"),
+        0
+    );
+    assert_eq!(
+        queue
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("stalled TTL terminal recovery pass should run"),
+        1
+    );
+    assert!(queue
+        .get_job(&stalled_owner.id)
+        .await
+        .expect("removed stalled owner lookup should return")
+        .is_none());
+    let stalled_pttl: i64 = redis::cmd("PTTL")
+        .arg(&stalled_dedup_key)
+        .query_async(&mut conn)
+        .await?;
+    assert!(
+        stalled_pttl > 0,
+        "stalled terminal failure should leave the TTL dedup key until Redis expiration, got {stalled_pttl}"
+    );
+    let stalled_key_owner: Option<String> = conn.get(&stalled_dedup_key).await?;
+    assert_eq!(
+        stalled_key_owner.as_deref(),
+        Some(stalled_owner.id.as_str())
+    );
+
     cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())
 }
