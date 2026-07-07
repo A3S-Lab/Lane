@@ -2,8 +2,8 @@
 
 use a3s_lane::{
     DeduplicationOptions, Job, JobListOptions, JobLogEntry, JobOptions, JobPriorityCount,
-    JobQueueBackend, JobRateLimit, JobRetention, JobSpec, JobState, JobStateCount, LaneError,
-    RedisJobQueue, RepeatOptions, RetryPolicy,
+    JobQueueBackend, JobRateLimit, JobRepeatListOptions, JobRetention, JobSpec, JobState,
+    JobStateCount, LaneError, RedisJobQueue, RepeatOptions, RetryPolicy,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use redis::AsyncCommands;
@@ -5378,6 +5378,20 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .get(format!("{namespace}:jobs:repeat:heartbeat"))
         .await?;
     assert_eq!(repeat_owner.as_deref(), Some(repeat.id.as_str()));
+    let repeat_late = producer
+        .add_job(
+            "repeat-late".to_string(),
+            serde_json::json!({ "kind": "heartbeat", "late": true }),
+            JobOptions::new()
+                .with_delay(Duration::from_millis(500))
+                .with_repeat(
+                    RepeatOptions::every(Duration::from_millis(200))
+                        .with_limit(2)
+                        .with_key("heartbeat-late"),
+                ),
+        )
+        .await
+        .expect("late repeat job should be added");
     let repeat_entries = producer
         .list_repeats()
         .await
@@ -5389,6 +5403,61 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             && entry.state == JobState::Waiting
             && entry.repeat_count == 0
     }));
+    assert_eq!(
+        producer
+            .count_repeats()
+            .await
+            .expect("repeat scheduler count should load"),
+        2
+    );
+    assert_eq!(
+        producer
+            .get_repeat("heartbeat")
+            .await
+            .expect("repeat scheduler should load")
+            .map(|entry| entry.job_id),
+        Some(repeat.id.clone())
+    );
+    let repeat_page = producer
+        .list_repeats_page(JobRepeatListOptions::new().with_limit(2))
+        .await
+        .expect("repeat scheduler page should load");
+    assert_eq!(repeat_page.total, 2);
+    assert_eq!(
+        repeat_page
+            .repeats
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["heartbeat-late", "heartbeat"]
+    );
+    assert_eq!(repeat_page.repeats[0].job_id, repeat_late.id);
+    let repeat_page_asc = producer
+        .list_repeats_page(
+            JobRepeatListOptions::new()
+                .ascending()
+                .with_offset(1)
+                .with_limit(1),
+        )
+        .await
+        .expect("ascending repeat scheduler page should load");
+    assert_eq!(repeat_page_asc.total, 2);
+    assert_eq!(repeat_page_asc.repeats[0].key, "heartbeat-late");
+    assert_eq!(
+        producer
+            .remove_repeat("heartbeat-late")
+            .await
+            .expect("late repeat scheduler should remove")
+            .map(|job| job.id),
+        Some(repeat_late.id)
+    );
+    assert_eq!(
+        producer
+            .count_repeats()
+            .await
+            .expect("repeat scheduler count after remove should load"),
+        1
+    );
     let first_repeat = worker
         .claim_next(
             "worker-repeat-a".to_string(),

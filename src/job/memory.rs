@@ -1,9 +1,10 @@
 use super::backend::JobQueueBackend;
 use super::types::{
-    deduplication_expiration, Job, JobEvent, JobFlow, JobFlowDependencies, JobFlowDependencyCounts,
-    JobId, JobListOptions, JobListPage, JobLogEntry, JobLogPage, JobOptions, JobPriority,
-    JobPriorityCount, JobQueueSnapshot, JobQueueStats, JobRepeatEntry, JobRetention, JobSpec,
-    JobState, JobStateCount, JobWorkerId, QueueName, DEFAULT_JOB_EVENT_RETENTION,
+    deduplication_expiration, page_repeat_entries, Job, JobEvent, JobFlow, JobFlowDependencies,
+    JobFlowDependencyCounts, JobId, JobListOptions, JobListPage, JobLogEntry, JobLogPage,
+    JobOptions, JobPriority, JobPriorityCount, JobQueueSnapshot, JobQueueStats, JobRepeatEntry,
+    JobRepeatListOptions, JobRepeatPage, JobRetention, JobSpec, JobState, JobStateCount,
+    JobWorkerId, QueueName, DEFAULT_JOB_EVENT_RETENTION,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -625,6 +626,25 @@ impl InMemoryJobQueue {
             .collect::<Vec<_>>();
         repeats.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.job_id.cmp(&b.job_id)));
         Ok(repeats)
+    }
+
+    /// Return one repeat series / job scheduler by key.
+    pub async fn get_repeat(&self, repeat_key: &str) -> Result<Option<JobRepeatEntry>> {
+        Ok(self
+            .list_repeats()
+            .await?
+            .into_iter()
+            .find(|entry| entry.key == repeat_key))
+    }
+
+    /// Return the number of current repeat series / job schedulers.
+    pub async fn count_repeats(&self) -> Result<usize> {
+        Ok(self.list_repeats().await?.len())
+    }
+
+    /// Return repeat series / job schedulers ordered by next scheduled time.
+    pub async fn list_repeats_page(&self, options: JobRepeatListOptions) -> Result<JobRepeatPage> {
+        Ok(page_repeat_entries(self.list_repeats().await?, options))
     }
 
     /// Remove the current non-terminal occurrence for a repeat series.

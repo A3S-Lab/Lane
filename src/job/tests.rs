@@ -1783,6 +1783,86 @@ async fn list_repeats_returns_current_series_owners() {
 }
 
 #[tokio::test]
+async fn repeat_scheduler_management_paginates_by_next_scheduled_time() {
+    let queue = InMemoryJobQueue::new("repeat-page");
+    let now = ts(1_000);
+    let immediate = queue
+        .add_at(
+            "immediate",
+            serde_json::json!({ "target": "now" }),
+            JobOptions::new()
+                .with_repeat(RepeatOptions::every(Duration::from_secs(60)).with_key("immediate")),
+            now,
+        )
+        .await
+        .unwrap();
+    let middle = queue
+        .add_at(
+            "middle",
+            serde_json::json!({ "target": "middle" }),
+            JobOptions::new()
+                .with_delay(Duration::from_secs(5))
+                .with_repeat(RepeatOptions::every(Duration::from_secs(60)).with_key("middle")),
+            now,
+        )
+        .await
+        .unwrap();
+    let late = queue
+        .add_at(
+            "late",
+            serde_json::json!({ "target": "late" }),
+            JobOptions::new()
+                .with_delay(Duration::from_secs(10))
+                .with_repeat(RepeatOptions::every(Duration::from_secs(60)).with_key("late")),
+            now,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(queue.count_repeats().await.unwrap(), 3);
+    assert_eq!(
+        queue
+            .get_repeat("middle")
+            .await
+            .unwrap()
+            .map(|entry| entry.job_id),
+        Some(middle.id.clone())
+    );
+    assert!(queue.get_repeat("missing").await.unwrap().is_none());
+
+    let descending = queue
+        .list_repeats_page(JobRepeatListOptions::new().with_limit(2))
+        .await
+        .unwrap();
+    assert_eq!(descending.total, 3);
+    assert_eq!(descending.offset, 0);
+    assert_eq!(descending.limit, 2);
+    assert_eq!(
+        descending
+            .repeats
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["late", "middle"]
+    );
+    assert_eq!(descending.repeats[0].job_id, late.id);
+
+    let ascending = queue
+        .list_repeats_page(
+            JobRepeatListOptions::new()
+                .ascending()
+                .with_offset(1)
+                .with_limit(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ascending.total, 3);
+    assert_eq!(ascending.repeats[0].key, "middle");
+    assert_eq!(ascending.repeats[0].job_id, middle.id);
+    assert_eq!(immediate.scheduled_at, now);
+}
+
+#[tokio::test]
 async fn remove_repeat_removes_current_series_owner_by_key() {
     let queue = InMemoryJobQueue::new("repeat-remove-key");
     let now = ts(1_000);

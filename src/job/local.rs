@@ -3,7 +3,8 @@ use super::memory::InMemoryJobQueue;
 use super::types::{
     Job, JobEvent, JobFlow, JobFlowDependencies, JobFlowDependencyCounts, JobId, JobListOptions,
     JobListPage, JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueSnapshot,
-    JobQueueStats, JobRepeatEntry, JobSpec, JobState, JobStateCount, JobWorkerId,
+    JobQueueStats, JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobSpec, JobState,
+    JobStateCount, JobWorkerId,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -193,6 +194,21 @@ impl LocalJobQueue {
     /// List current non-terminal repeat series owners.
     pub async fn list_repeats(&self) -> Result<Vec<JobRepeatEntry>> {
         self.inner.list_repeats().await
+    }
+
+    /// Return one repeat series / job scheduler by key.
+    pub async fn get_repeat(&self, repeat_key: &str) -> Result<Option<JobRepeatEntry>> {
+        self.inner.get_repeat(repeat_key).await
+    }
+
+    /// Return the number of current repeat series / job schedulers.
+    pub async fn count_repeats(&self) -> Result<usize> {
+        self.inner.count_repeats().await
+    }
+
+    /// Return repeat series / job schedulers ordered by next scheduled time.
+    pub async fn list_repeats_page(&self, options: JobRepeatListOptions) -> Result<JobRepeatPage> {
+        self.inner.list_repeats_page(options).await
     }
 
     /// Clear retained log entries for a job. `keep == 0` clears all logs.

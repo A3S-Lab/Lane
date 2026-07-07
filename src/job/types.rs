@@ -272,6 +272,10 @@ fn default_list_ascending() -> bool {
     true
 }
 
+fn default_repeat_list_ascending() -> bool {
+    false
+}
+
 /// A page of jobs returned by a backend list operation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JobListPage {
@@ -489,6 +493,100 @@ pub struct JobRepeatEntry {
     pub repeat_count: u32,
     /// Repeat schedule and limits for the series.
     pub options: RepeatOptions,
+}
+
+/// Options for listing repeat series / job schedulers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobRepeatListOptions {
+    /// Number of matching repeat series to skip.
+    pub offset: usize,
+    /// Maximum number of repeat series to return.
+    pub limit: usize,
+    /// Return repeat series by next scheduled time ascending when true.
+    ///
+    /// The default is descending to match BullMQ's `getJobSchedulers()`.
+    #[serde(default = "default_repeat_list_ascending")]
+    pub ascending: bool,
+}
+
+impl Default for JobRepeatListOptions {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            limit: 100,
+            ascending: false,
+        }
+    }
+}
+
+impl JobRepeatListOptions {
+    /// Create default repeat-list options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the pagination offset.
+    pub fn with_offset(mut self, offset: usize) -> Self {
+        self.offset = offset;
+        self
+    }
+
+    /// Set the maximum result count.
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// Return repeat series by next scheduled time ascending.
+    pub fn ascending(mut self) -> Self {
+        self.ascending = true;
+        self
+    }
+
+    /// Return repeat series by next scheduled time descending.
+    pub fn descending(mut self) -> Self {
+        self.ascending = false;
+        self
+    }
+}
+
+/// A page of repeat series / job schedulers returned by a backend.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobRepeatPage {
+    pub repeats: Vec<JobRepeatEntry>,
+    pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+pub(crate) fn page_repeat_entries(
+    mut repeats: Vec<JobRepeatEntry>,
+    options: JobRepeatListOptions,
+) -> JobRepeatPage {
+    repeats.sort_by(|a, b| {
+        let order = a
+            .scheduled_at
+            .cmp(&b.scheduled_at)
+            .then_with(|| a.key.cmp(&b.key))
+            .then_with(|| a.job_id.cmp(&b.job_id));
+        if options.ascending {
+            order
+        } else {
+            order.reverse()
+        }
+    });
+    let total = repeats.len();
+    let page = repeats
+        .into_iter()
+        .skip(options.offset)
+        .take(options.limit)
+        .collect();
+    JobRepeatPage {
+        repeats: page,
+        total,
+        offset: options.offset,
+        limit: options.limit,
+    }
 }
 
 /// Simple deduplication settings for a generic job.

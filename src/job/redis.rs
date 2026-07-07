@@ -1,9 +1,10 @@
 use super::backend::JobQueueBackend;
 use super::types::{
-    add_duration, deduplication_expiration, Job, JobEvent, JobFlow, JobFlowDependencies,
-    JobFlowDependencyCounts, JobId, JobListOptions, JobListPage, JobLogEntry, JobLogPage,
-    JobOptions, JobPriority, JobPriorityCount, JobQueueStats, JobRateLimit, JobRepeatEntry,
-    JobSpec, JobState, JobStateCount, JobWorkerId, QueueName, DEFAULT_JOB_EVENT_RETENTION,
+    add_duration, deduplication_expiration, page_repeat_entries, Job, JobEvent, JobFlow,
+    JobFlowDependencies, JobFlowDependencyCounts, JobId, JobListOptions, JobListPage, JobLogEntry,
+    JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueStats, JobRateLimit,
+    JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobSpec, JobState, JobStateCount,
+    JobWorkerId, QueueName, DEFAULT_JOB_EVENT_RETENTION,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -5278,6 +5279,39 @@ impl RedisJobQueue {
 
         repeats.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.job_id.cmp(&b.job_id)));
         Ok(repeats)
+    }
+
+    /// Return one repeat series / job scheduler by key.
+    pub async fn get_repeat(&self, repeat_key: &str) -> Result<Option<JobRepeatEntry>> {
+        let mut conn = self.connection().await?;
+        let Some(owner_id): Option<String> = conn
+            .get(format!("{}{}", self.repeat_key_prefix(), repeat_key))
+            .await
+            .map_err(redis_error)?
+        else {
+            return Ok(None);
+        };
+        let Some(job) = self.load_job(&mut conn, &owner_id).await? else {
+            self.clear_repeat_owner_if_stale(&mut conn, repeat_key, &owner_id)
+                .await?;
+            return Ok(None);
+        };
+        if job.state.is_terminal() || job.repeat_key.as_deref() != Some(repeat_key) {
+            self.clear_repeat_owner_if_stale(&mut conn, repeat_key, &owner_id)
+                .await?;
+            return Ok(None);
+        }
+        Ok(repeat_entry(&job))
+    }
+
+    /// Return the number of current repeat series / job schedulers.
+    pub async fn count_repeats(&self) -> Result<usize> {
+        Ok(self.list_repeats().await?.len())
+    }
+
+    /// Return repeat series / job schedulers ordered by next scheduled time.
+    pub async fn list_repeats_page(&self, options: JobRepeatListOptions) -> Result<JobRepeatPage> {
+        Ok(page_repeat_entries(self.list_repeats().await?, options))
     }
 
     /// Add multiple jobs at an explicit timestamp.

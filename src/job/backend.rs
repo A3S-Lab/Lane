@@ -1,7 +1,8 @@
 use super::types::{
-    Job, JobEvent, JobFlow, JobFlowDependencies, JobFlowDependencyCounts, JobId, JobListOptions,
-    JobListPage, JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueStats,
-    JobRepeatEntry, JobSpec, JobState, JobStateCount, JobWorkerId,
+    page_repeat_entries, Job, JobEvent, JobFlow, JobFlowDependencies, JobFlowDependencyCounts,
+    JobId, JobListOptions, JobListPage, JobLogPage, JobOptions, JobPriority, JobPriorityCount,
+    JobQueueStats, JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobSpec, JobState,
+    JobStateCount, JobWorkerId,
 };
 use crate::error::Result;
 use async_trait::async_trait;
@@ -134,6 +135,28 @@ pub trait JobQueueBackend: Send + Sync {
     async fn get_deduplication_job_id(&self, deduplication_id: &str) -> Result<Option<JobId>>;
 
     async fn list_repeats(&self) -> Result<Vec<JobRepeatEntry>>;
+
+    /// Return one repeat series / job scheduler by key.
+    async fn get_repeat(&self, repeat_key: &str) -> Result<Option<JobRepeatEntry>> {
+        Ok(self
+            .list_repeats()
+            .await?
+            .into_iter()
+            .find(|entry| entry.key == repeat_key))
+    }
+
+    /// Return the number of current repeat series / job schedulers.
+    async fn count_repeats(&self) -> Result<usize> {
+        Ok(self.list_repeats().await?.len())
+    }
+
+    /// Return repeat series / job schedulers with BullMQ-style pagination.
+    ///
+    /// Results are ordered by next scheduled time; descending order is the
+    /// default, matching BullMQ's `getJobSchedulers()`.
+    async fn list_repeats_page(&self, options: JobRepeatListOptions) -> Result<JobRepeatPage> {
+        Ok(page_repeat_entries(self.list_repeats().await?, options))
+    }
 
     async fn clean_jobs(
         &self,
