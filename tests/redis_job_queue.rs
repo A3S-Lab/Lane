@@ -541,6 +541,51 @@ async fn run_continued_flow_dependency_failure(redis_url: String) -> redis::Redi
         .await?;
     assert!(required_still_pending);
 
+    let complete_error = worker
+        .complete_job(
+            &continued_parent.id,
+            lock_token(&continued_parent),
+            serde_json::json!({ "early": true }),
+            Utc::now(),
+        )
+        .await
+        .expect_err("continued parent should not complete with pending dependencies");
+    assert!(matches!(complete_error, LaneError::JobStateConflict(_)));
+
+    let required_child = worker
+        .claim_next(
+            "worker-continued-required".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("required child claim should return")
+        .expect("required child should still be claimable");
+    assert_eq!(required_child.id, flow.children[1].id);
+    worker
+        .complete_job(
+            &required_child.id,
+            lock_token(&required_child),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("required child should complete");
+
+    let pending_after_required: usize = conn.scard(&dependency_key).await?;
+    assert_eq!(pending_after_required, 0);
+
+    let completed_parent = worker
+        .complete_job(
+            &continued_parent.id,
+            lock_token(&continued_parent),
+            serde_json::json!({ "done": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("continued parent should complete after dependencies resolve");
+    assert_eq!(completed_parent.state, JobState::Completed);
+
     cleanup_namespace(&redis_url, &namespace).await
 }
 

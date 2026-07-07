@@ -2089,6 +2089,10 @@ if lock_token ~= ARGV[2] then
   return {'lock_mismatch'}
 end
 
+if redis.call('SCARD', ARGV[13] .. ARGV[1]) > 0 then
+  return {'pending_dependencies'}
+end
+
 redis.call('DEL', KEYS[4])
 redis.call('SREM', KEYS[11], ARGV[1])
 redis.call('ZREM', KEYS[2], ARGV[1])
@@ -2117,15 +2121,17 @@ if parent_id and parent_id ~= cjson.null then
   local parent_raw = redis.call('HGET', KEYS[1], parent_id)
   if parent_raw then
     local parent = cjson.decode(parent_raw)
+    local dependency_key = ARGV[13] .. parent_id
+    local had_dependency_set = redis.call('EXISTS', dependency_key) == 1
+    if had_dependency_set then
+      redis.call('SREM', dependency_key, ARGV[1])
+    end
     if parent["state"] == "waiting_children" then
       local all_done = true
       local failed_child_id = nil
       local failed_reason = nil
-      local dependency_key = ARGV[13] .. parent_id
-      local had_dependency_set = redis.call('EXISTS', dependency_key) == 1
 
       if had_dependency_set then
-        redis.call('SREM', dependency_key, ARGV[1])
         if redis.call('SCARD', dependency_key) > 0 then
           all_done = false
         end
@@ -9176,6 +9182,9 @@ fn decode_transition_result(result: &[String], job_id: &str, action: &str) -> Re
         Some("state") => Err(LaneError::JobStateConflict(format!(
             "cannot {action} job {job_id} from state {}",
             result.get(1).map(String::as_str).unwrap_or("unknown")
+        ))),
+        Some("pending_dependencies") => Err(LaneError::JobStateConflict(format!(
+            "cannot {action} job {job_id}; it has pending flow dependencies"
         ))),
         Some("lock_missing") => Err(LaneError::JobLeaseConflict(format!(
             "missing lock for job {job_id}"

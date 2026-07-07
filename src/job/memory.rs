@@ -1718,13 +1718,20 @@ impl JobQueueBackend for InMemoryJobQueue {
         now: DateTime<Utc>,
     ) -> Result<Job> {
         let mut inner = self.inner.lock().await;
+        {
+            let job = inner
+                .jobs
+                .get(job_id)
+                .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
+            require_active(job, "complete")?;
+            require_lock_token(job, lock_token)?;
+            ensure_flow_dependencies_are_resolved(job, &inner.jobs, "complete")?;
+        }
         let completed = {
             let job = inner
                 .jobs
                 .get_mut(job_id)
                 .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
-            require_active(job, "complete")?;
-            require_lock_token(job, lock_token)?;
             job.state = JobState::Completed;
             job.finished_at = Some(now);
             job.worker_id = None;
@@ -2728,6 +2735,27 @@ fn require_lock_token(job: &Job, lock_token: &str) -> Result<()> {
             job.id
         )))
     }
+}
+
+fn ensure_flow_dependencies_are_resolved(
+    job: &Job,
+    jobs: &HashMap<JobId, Job>,
+    action: &str,
+) -> Result<()> {
+    let counts = flow_dependency_counts(job, jobs);
+    if counts.unprocessed > 0 {
+        return Err(LaneError::JobStateConflict(format!(
+            "cannot {action} job {}; it has {} pending flow dependencies",
+            job.id, counts.unprocessed
+        )));
+    }
+    if counts.failed > 0 {
+        return Err(LaneError::JobStateConflict(format!(
+            "cannot {action} job {}; it has {} failed flow dependencies",
+            job.id, counts.failed
+        )));
+    }
+    Ok(())
 }
 
 fn require_removable(job: &Job) -> Result<()> {

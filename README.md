@@ -481,6 +481,7 @@ BullMQ-style default descending pagination,
 `get_flow_dependencies()` returns a flow parent's child snapshots plus pending
 and missing child ids, `get_flow_dependency_counts()` returns processed,
 unprocessed, failed, ignored, and missing child counts,
+flow parents cannot be completed while blocking child dependencies remain,
 `remove_unprocessed_children()`
 removes children that are still unprocessed and not active,
 `remove_child_dependency()` detaches one unfinished child from its parent without
@@ -1145,6 +1146,11 @@ one turn and returns processed, unprocessed, failed, ignored, and missing totals
 without returning every child snapshot to the client. Removed failed
 dependencies are intentionally omitted from the failed and ignored totals,
 matching BullMQ's `removeDependencyOnFailure` behavior.
+Completing a flow parent checks the Redis dependency set before leaving the
+active state, matching BullMQ's `moveToFinished` guard that rejects jobs with
+pending dependencies. When `continueParentOnFailure` releases a parent early,
+later child completion still removes that child from the dependency set so the
+parent can only finish after the remaining required fan-in has resolved.
 `get_flow_children_values()` and `get_flow_ignored_children_failures()` follow
 BullMQ's `getChildrenValues()` and `getIgnoredChildrenFailures()` fan-in
 semantics. BullMQ reads parent-scoped `:processed` and `:failed` hashes; Lane

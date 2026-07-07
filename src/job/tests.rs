@@ -4190,6 +4190,52 @@ async fn flow_parent_continues_configured_child_terminal_failure() {
         .unwrap()
         .unwrap();
     assert_eq!(continued_parent.id, flow.parent.id);
+
+    let complete_error = queue
+        .complete_job(
+            &continued_parent.id,
+            lock_token(&continued_parent),
+            serde_json::json!({ "early": true }),
+            ts(1_350),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(complete_error, LaneError::JobStateConflict(_)));
+
+    let required_child = queue
+        .claim_next(
+            "worker-required".to_string(),
+            Duration::from_secs(30),
+            ts(1_400),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(required_child.id, flow.children[1].id);
+    queue
+        .complete_job(
+            &required_child.id,
+            lock_token(&required_child),
+            serde_json::json!({ "ok": true }),
+            ts(1_500),
+        )
+        .await
+        .unwrap();
+
+    let completed_parent = queue
+        .complete_job(
+            &continued_parent.id,
+            lock_token(&continued_parent),
+            serde_json::json!({ "done": true }),
+            ts(1_600),
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed_parent.state, JobState::Completed);
+    assert_eq!(
+        completed_parent.return_value,
+        Some(serde_json::json!({ "done": true }))
+    );
 }
 
 #[tokio::test]
