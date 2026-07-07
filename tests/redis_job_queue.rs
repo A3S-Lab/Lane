@@ -233,6 +233,161 @@ async fn redis_backend_applies_finished_retention_against_real_server() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn redis_backend_ignores_flow_dependency_failure_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_ignored_flow_dependency_failure(redis_url),
+    )
+    .await
+    .expect("Redis ignored flow dependency failure integration test timed out")
+    .unwrap();
+}
+
+async fn run_ignored_flow_dependency_failure(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-ignore")
+        .expect("valid Redis URL should build the flow-ignore queue");
+    let worker = RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-ignore")
+        .expect("valid Redis URL should build the flow-ignore worker");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new(
+                "ignored-failure-parent",
+                serde_json::json!({ "kind": "aggregate" }),
+            )
+            .with_options(JobOptions::new().with_priority(1)),
+            vec![
+                JobSpec::new(
+                    "ignored-failure-optional-child",
+                    serde_json::json!({ "optional": true }),
+                )
+                .with_options(
+                    JobOptions::new()
+                        .with_priority(1)
+                        .with_ignore_dependency_on_failure(true),
+                ),
+                JobSpec::new(
+                    "ignored-failure-required-child",
+                    serde_json::json!({ "required": true }),
+                )
+                .with_options(JobOptions::new().with_priority(2)),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("ignored flow should be added");
+    let dependency_key = format!("{namespace}:flow-ignore:dependencies:{}", flow.parent.id);
+
+    let optional_child = worker
+        .claim_next(
+            "worker-ignored-optional".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("optional child claim should return")
+        .expect("optional child should be claimable");
+    assert_eq!(optional_child.id, flow.children[0].id);
+    worker
+        .fail_job(
+            &optional_child.id,
+            lock_token(&optional_child),
+            "optional child failed".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("optional child should fail");
+
+    let pending_count: usize = conn.scard(&dependency_key).await?;
+    assert_eq!(pending_count, 1);
+    let optional_pending: bool = conn
+        .sismember(&dependency_key, &flow.children[0].id)
+        .await?;
+    let required_pending: bool = conn
+        .sismember(&dependency_key, &flow.children[1].id)
+        .await?;
+    assert!(!optional_pending);
+    assert!(required_pending);
+    let parent_after_failure = queue
+        .get_job(&flow.parent.id)
+        .await
+        .expect("parent after ignored failure should load")
+        .expect("parent should exist");
+    assert_eq!(parent_after_failure.state, JobState::WaitingChildren);
+    assert!(parent_after_failure.failed_reason.is_none());
+    let counts_after_failure = queue
+        .get_flow_dependency_counts(&flow.parent.id)
+        .await
+        .expect("ignored failure counts should load")
+        .expect("ignored failure counts should exist");
+    assert_eq!(counts_after_failure.processed, 0);
+    assert_eq!(counts_after_failure.unprocessed, 1);
+    assert_eq!(counts_after_failure.failed, 0);
+    assert_eq!(counts_after_failure.ignored, 1);
+    assert_eq!(counts_after_failure.missing, 0);
+
+    let required_child = worker
+        .claim_next(
+            "worker-ignored-required".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("required child claim should return")
+        .expect("required child should be claimable");
+    assert_eq!(required_child.id, flow.children[1].id);
+    worker
+        .complete_job(
+            &required_child.id,
+            lock_token(&required_child),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("required child should complete");
+
+    let dependency_key_exists: bool = conn.exists(&dependency_key).await?;
+    assert!(!dependency_key_exists);
+    let parent_after_release = queue
+        .get_job(&flow.parent.id)
+        .await
+        .expect("parent after release should load")
+        .expect("parent should exist");
+    assert_eq!(parent_after_release.state, JobState::Waiting);
+    let parent_failed_score: Option<f64> = conn
+        .zscore(format!("{namespace}:flow-ignore:failed"), &flow.parent.id)
+        .await?;
+    assert!(parent_failed_score.is_none());
+    let parent_waiting_score: Option<f64> = conn
+        .zscore(format!("{namespace}:flow-ignore:waiting"), &flow.parent.id)
+        .await?;
+    assert!(parent_waiting_score.is_some());
+    let counts_after_release = queue
+        .get_flow_dependency_counts(&flow.parent.id)
+        .await
+        .expect("ignored release counts should load")
+        .expect("ignored release counts should exist");
+    assert_eq!(counts_after_release.processed, 1);
+    assert_eq!(counts_after_release.unprocessed, 0);
+    assert_eq!(counts_after_release.failed, 0);
+    assert_eq!(counts_after_release.ignored, 1);
+    assert_eq!(counts_after_release.missing, 0);
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
 async fn run_finished_retention(redis_url: String) -> redis::RedisResult<()> {
     let namespace = unique_namespace();
     cleanup_namespace(&redis_url, &namespace).await?;
@@ -6434,6 +6589,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await?;
     assert!(failed_parent_waiting_children_score.is_none());
+
     trace_stage("flow:done");
 
     let repeat = producer

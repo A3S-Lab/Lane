@@ -339,6 +339,8 @@ pub struct JobFlowDependencyCounts {
     pub unprocessed: usize,
     /// Retained children that failed terminally.
     pub failed: usize,
+    /// Retained failed children that no longer block the parent.
+    pub ignored: usize,
     /// Child ids recorded on the parent but no longer retained.
     pub missing: usize,
 }
@@ -801,6 +803,9 @@ pub struct JobOptions {
     /// Optional simple deduplication settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deduplication: Option<DeduplicationOptions>,
+    /// Do not fail the parent flow when this child reaches terminal failure.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ignore_dependency_on_failure: bool,
 }
 
 impl Default for JobOptions {
@@ -819,6 +824,7 @@ impl Default for JobOptions {
             max_stalled_count: 1,
             repeat: None,
             deduplication: None,
+            ignore_dependency_on_failure: false,
         }
     }
 }
@@ -914,6 +920,12 @@ impl JobOptions {
     /// Configure deduplication with explicit options such as TTL.
     pub fn with_deduplication(mut self, deduplication: DeduplicationOptions) -> Self {
         self.deduplication = Some(deduplication);
+        self
+    }
+
+    /// Configure BullMQ-style `ignoreDependencyOnFailure` for flow children.
+    pub fn with_ignore_dependency_on_failure(mut self, ignore: bool) -> Self {
+        self.ignore_dependency_on_failure = ignore;
         self
     }
 

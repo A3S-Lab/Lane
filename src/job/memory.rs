@@ -177,16 +177,20 @@ impl InMemoryJobQueue {
             }
             Self::enqueue_deduplicated_next_locked(&mut inner, &failed, now);
             if let Some(parent_id) = &failed.parent_id {
-                Self::fail_waiting_parent_locked(
-                    &mut inner,
-                    parent_id,
-                    format!(
-                        "child job {} failed: {}",
-                        failed.id,
-                        failed.failed_reason.as_deref().unwrap_or("unknown error")
-                    ),
-                    now,
-                );
+                if failed.options.ignore_dependency_on_failure {
+                    Self::release_parent_if_ready_locked(&mut inner, parent_id, now);
+                } else {
+                    Self::fail_waiting_parent_locked(
+                        &mut inner,
+                        parent_id,
+                        format!(
+                            "child job {} failed: {}",
+                            failed.id,
+                            failed.failed_reason.as_deref().unwrap_or("unknown error")
+                        ),
+                        now,
+                    );
+                }
             }
         }
         let mut fields = BTreeMap::new();
@@ -358,7 +362,7 @@ impl InMemoryJobQueue {
     }
 
     /// Add a parent-child flow. The parent remains blocked until every child is
-    /// completed; a terminal child failure fails the parent.
+    /// completed, removed, or ignored after terminal failure.
     pub async fn add_flow(&self, parent: JobSpec, children: Vec<JobSpec>) -> Result<JobFlow> {
         self.add_flow_at(parent, children, Utc::now()).await
     }
@@ -1452,6 +1456,7 @@ impl InMemoryJobQueue {
             };
             match child.state {
                 JobState::Completed => {}
+                JobState::Failed if child.options.ignore_dependency_on_failure => {}
                 JobState::Failed => {
                     child_failure = Some((child.id.clone(), child.failed_reason.clone()))
                 }
@@ -1881,6 +1886,7 @@ impl JobQueueBackend for InMemoryJobQueue {
         let mut inner = self.inner.lock().await;
         let mut recovered = 0;
         let mut remove_ids = Vec::new();
+        let mut ignored_failed_children = Vec::new();
         let mut failed_children = Vec::new();
         let mut terminal_failures = Vec::new();
         let mut recovered_events = Vec::new();
@@ -1916,11 +1922,15 @@ impl JobQueueBackend for InMemoryJobQueue {
                     job.state = JobState::Failed;
                     job.finished_at = Some(now);
                     if let Some(parent_id) = &job.parent_id {
-                        failed_children.push((
-                            parent_id.clone(),
-                            job.id.clone(),
-                            job.failed_reason.clone(),
-                        ));
+                        if job.options.ignore_dependency_on_failure {
+                            ignored_failed_children.push(parent_id.clone());
+                        } else {
+                            failed_children.push((
+                                parent_id.clone(),
+                                job.id.clone(),
+                                job.failed_reason.clone(),
+                            ));
+                        }
                     }
                     let failed = job.clone();
                     terminal_failures.push(failed.clone());
@@ -1953,6 +1963,9 @@ impl JobQueueBackend for InMemoryJobQueue {
             if let Some(retention) = failed.options.failed_retention() {
                 Self::apply_finished_retention_locked(&mut inner, JobState::Failed, retention, now);
             }
+        }
+        for parent_id in ignored_failed_children {
+            Self::release_parent_if_ready_locked(&mut inner, &parent_id, now);
         }
         for (parent_id, child_id, reason) in failed_children {
             Self::fail_waiting_parent_locked(
@@ -2251,13 +2264,20 @@ fn flow_dependency_counts(parent: &Job, jobs: &HashMap<JobId, Job>) -> JobFlowDe
         processed: 0,
         unprocessed: 0,
         failed: 0,
+        ignored: 0,
         missing: 0,
     };
 
     for child_id in &parent.child_ids {
-        match jobs.get(child_id).map(|child| child.state) {
-            Some(JobState::Completed) => counts.processed += 1,
-            Some(JobState::Failed) => counts.failed += 1,
+        match jobs.get(child_id) {
+            Some(child) if child.state == JobState::Completed => counts.processed += 1,
+            Some(child)
+                if child.state == JobState::Failed
+                    && child.options.ignore_dependency_on_failure =>
+            {
+                counts.ignored += 1
+            }
+            Some(child) if child.state == JobState::Failed => counts.failed += 1,
             Some(_) => counts.unprocessed += 1,
             None => counts.missing += 1,
         }

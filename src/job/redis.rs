@@ -2138,11 +2138,11 @@ if parent_id and parent_id ~= cjson.null then
           end
           if child_raw then
             local child = cjson.decode(child_raw)
-            if child["state"] == "failed" then
+            if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and child["options"]["ignore_dependency_on_failure"] == true) then
               failed_child_id = child_id
               failed_reason = child["failed_reason"] or "unknown error"
               break
-            elseif child["state"] ~= "completed" then
+            elseif child["state"] ~= "completed" and child["state"] ~= "failed" then
               all_done = false
               break
             end
@@ -2734,24 +2734,86 @@ if parent_id and parent_id ~= cjson.null then
   if parent_raw then
     local parent = cjson.decode(parent_raw)
     if parent["state"] == "waiting_children" then
-      redis.call('DEL', ARGV[10] .. parent_id)
-      redis.call('ZREM', KEYS[6], parent_id)
-      parent["state"] = "failed"
-      parent["finished_at"] = ARGV[3]
-      parent["worker_id"] = cjson.null
-      parent["lock_token"] = cjson.null
-      parent["lease_expires_at"] = cjson.null
-      parent["failed_reason"] = "child job " .. ARGV[1] .. " failed: " .. ARGV[4]
-      release_deduplication_key(parent, parent_id, ARGV[11])
-      release_repeat_key(parent, parent_id, ARGV[12])
-      local parent_failure_retention = retention_options(parent, 'remove_on_fail', 'failure_retention', false)
-      local parent_failure_max_count = retention_count(parent_failure_retention)
-      if parent_failure_max_count == 0 then
-        remove_finished_job(KEYS[1], parent_id, ARGV[10], ARGV[11], ARGV[12], ARGV[15])
+      local ignore_dependency_failure = job["options"] and job["options"] ~= cjson.null and job["options"]["ignore_dependency_on_failure"] == true
+      local dependency_key = ARGV[10] .. parent_id
+      local all_done = true
+      local failed_child_id = nil
+      local failed_reason = nil
+
+      if ignore_dependency_failure then
+        local had_dependency_set = redis.call('EXISTS', dependency_key) == 1
+        if had_dependency_set then
+          redis.call('SREM', dependency_key, ARGV[1])
+          if redis.call('SCARD', dependency_key) > 0 then
+            all_done = false
+          end
+        else
+          for _, child_id in ipairs(parent["child_ids"] or {}) do
+            local child_raw = nil
+            if child_id == ARGV[1] then
+              child_raw = updated
+            else
+              child_raw = redis.call('HGET', KEYS[1], child_id)
+            end
+            if child_raw then
+              local child = cjson.decode(child_raw)
+              if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and child["options"]["ignore_dependency_on_failure"] == true) then
+                failed_child_id = child_id
+                failed_reason = child["failed_reason"] or "unknown error"
+                break
+              elseif child["state"] ~= "completed" and child["state"] ~= "failed" then
+                all_done = false
+                break
+              end
+            end
+          end
+        end
       else
-        redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
-        redis.call('ZADD', KEYS[4], ARGV[8], parent_id)
-        apply_finished_retention(ARGV[8], parent_failure_retention, KEYS[4], KEYS[1], ARGV[10], ARGV[11], ARGV[12], ARGV[15])
+        failed_child_id = ARGV[1]
+        failed_reason = ARGV[4]
+      end
+
+      if failed_child_id then
+        redis.call('DEL', dependency_key)
+        redis.call('ZREM', KEYS[6], parent_id)
+        parent["state"] = "failed"
+        parent["finished_at"] = ARGV[3]
+        parent["worker_id"] = cjson.null
+        parent["lock_token"] = cjson.null
+        parent["lease_expires_at"] = cjson.null
+        parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
+        release_deduplication_key(parent, parent_id, ARGV[11])
+        release_repeat_key(parent, parent_id, ARGV[12])
+        local parent_failure_retention = retention_options(parent, 'remove_on_fail', 'failure_retention', false)
+        local parent_failure_max_count = retention_count(parent_failure_retention)
+        if parent_failure_max_count == 0 then
+          remove_finished_job(KEYS[1], parent_id, ARGV[10], ARGV[11], ARGV[12], ARGV[15])
+        else
+          redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+          redis.call('ZADD', KEYS[4], ARGV[8], parent_id)
+          apply_finished_retention(ARGV[8], parent_failure_retention, KEYS[4], KEYS[1], ARGV[10], ARGV[11], ARGV[12], ARGV[15])
+        end
+      elseif all_done then
+        redis.call('DEL', dependency_key)
+        redis.call('ZREM', KEYS[6], parent_id)
+        parent["processed_at"] = cjson.null
+        parent["finished_at"] = cjson.null
+        parent["worker_id"] = cjson.null
+        parent["lock_token"] = cjson.null
+        parent["lease_expires_at"] = cjson.null
+        parent["failed_reason"] = cjson.null
+
+        local parent_scheduled_millis = iso_to_millis(parent["scheduled_at"])
+        if parent_scheduled_millis <= tonumber(ARGV[8]) then
+          parent["state"] = "waiting"
+          local priority = tonumber(parent["priority"] or '1000') or 1000
+          enqueue_waiting_job(KEYS[1], KEYS[7], KEYS[8], parent, parent_id, priority, ARGV[13], KEYS[#KEYS])
+        else
+          parent["state"] = "delayed"
+          redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+          redis.call('ZADD', KEYS[3], parent_scheduled_millis, parent_id)
+          refresh_delay_marker(KEYS[#KEYS], KEYS[3])
+        end
       end
     end
   end
@@ -3455,24 +3517,87 @@ for _, id in ipairs(ids) do
             if parent_raw then
               local parent = cjson.decode(parent_raw)
               if parent["state"] == "waiting_children" then
-                redis.call('DEL', ARGV[6] .. parent_id)
-                redis.call('ZREM', KEYS[6], parent_id)
-                parent["state"] = "failed"
-                parent["finished_at"] = ARGV[2]
-                parent["worker_id"] = cjson.null
-                parent["lock_token"] = cjson.null
-                parent["lease_expires_at"] = cjson.null
-                parent["failed_reason"] = "child job " .. id .. " failed: " .. job["failed_reason"]
-                release_deduplication_key(parent, parent_id, ARGV[7])
-                release_repeat_key(parent, parent_id, ARGV[8])
-                local parent_failure_retention = retention_options(parent, 'remove_on_fail', 'failure_retention')
-                local parent_failure_max_count = retention_count(parent_failure_retention)
-                if parent_failure_max_count == 0 then
-                  remove_finished_job(KEYS[1], parent_id, ARGV[6], ARGV[7], ARGV[8], ARGV[10])
+                local ignore_dependency_failure = job["options"] and job["options"] ~= cjson.null and job["options"]["ignore_dependency_on_failure"] == true
+                local dependency_key = ARGV[6] .. parent_id
+                local all_done = true
+                local failed_child_id = nil
+                local failed_reason = nil
+
+                if ignore_dependency_failure then
+                  local had_dependency_set = redis.call('EXISTS', dependency_key) == 1
+                  if had_dependency_set then
+                    redis.call('SREM', dependency_key, id)
+                    if redis.call('SCARD', dependency_key) > 0 then
+                      all_done = false
+                    end
+                  else
+                    local updated = cjson.encode(job)
+                    for _, child_id in ipairs(parent["child_ids"] or {}) do
+                      local child_raw = nil
+                      if child_id == id then
+                        child_raw = updated
+                      else
+                        child_raw = redis.call('HGET', KEYS[1], child_id)
+                      end
+                      if child_raw then
+                        local child = cjson.decode(child_raw)
+                        if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and child["options"]["ignore_dependency_on_failure"] == true) then
+                          failed_child_id = child_id
+                          failed_reason = child["failed_reason"] or "unknown error"
+                          break
+                        elseif child["state"] ~= "completed" and child["state"] ~= "failed" then
+                          all_done = false
+                          break
+                        end
+                      end
+                    end
+                  end
                 else
-                  redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
-                  redis.call('ZADD', KEYS[4], ARGV[1], parent_id)
-                  apply_finished_retention(ARGV[1], parent_failure_retention, KEYS[4], KEYS[1], ARGV[6], ARGV[7], ARGV[8], ARGV[10])
+                  failed_child_id = id
+                  failed_reason = job["failed_reason"]
+                end
+
+                if failed_child_id then
+                  redis.call('DEL', dependency_key)
+                  redis.call('ZREM', KEYS[6], parent_id)
+                  parent["state"] = "failed"
+                  parent["finished_at"] = ARGV[2]
+                  parent["worker_id"] = cjson.null
+                  parent["lock_token"] = cjson.null
+                  parent["lease_expires_at"] = cjson.null
+                  parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
+                  release_deduplication_key(parent, parent_id, ARGV[7])
+                  release_repeat_key(parent, parent_id, ARGV[8])
+                  local parent_failure_retention = retention_options(parent, 'remove_on_fail', 'failure_retention')
+                  local parent_failure_max_count = retention_count(parent_failure_retention)
+                  if parent_failure_max_count == 0 then
+                    remove_finished_job(KEYS[1], parent_id, ARGV[6], ARGV[7], ARGV[8], ARGV[10])
+                  else
+                    redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+                    redis.call('ZADD', KEYS[4], ARGV[1], parent_id)
+                    apply_finished_retention(ARGV[1], parent_failure_retention, KEYS[4], KEYS[1], ARGV[6], ARGV[7], ARGV[8], ARGV[10])
+                  end
+                elseif all_done then
+                  redis.call('DEL', dependency_key)
+                  redis.call('ZREM', KEYS[6], parent_id)
+                  parent["processed_at"] = cjson.null
+                  parent["finished_at"] = cjson.null
+                  parent["worker_id"] = cjson.null
+                  parent["lock_token"] = cjson.null
+                  parent["lease_expires_at"] = cjson.null
+                  parent["failed_reason"] = cjson.null
+
+                  local parent_scheduled_millis = iso_to_millis(parent["scheduled_at"])
+                  if parent_scheduled_millis <= tonumber(ARGV[1]) then
+                    parent["state"] = "waiting"
+                    local priority = tonumber(parent["priority"] or '1000') or 1000
+                    enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[5], parent, parent_id, priority, ARGV[4], KEYS[#KEYS])
+                  else
+                    parent["state"] = "delayed"
+                    redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+                    redis.call('ZADD', KEYS[7], parent_scheduled_millis, parent_id)
+                    refresh_delay_marker(KEYS[#KEYS], KEYS[7])
+                  end
                 end
               end
             end
@@ -4319,11 +4444,11 @@ if parent_id and parent_id ~= cjson.null then
 
           if child_raw then
             local child = cjson.decode(child_raw)
-            if child["state"] == "failed" then
+            if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and child["options"]["ignore_dependency_on_failure"] == true) then
               failed_child_id = child_id
               failed_reason = child["failed_reason"] or "unknown error"
               break
-            elseif child["state"] ~= "completed" then
+            elseif child["state"] ~= "completed" and child["state"] ~= "failed" then
               all_done = false
               break
             end
@@ -4665,14 +4790,14 @@ local function release_parent_after_removed_child(job, removed_id)
 
       if child_raw then
         local child = cjson.decode(child_raw)
-        if child["state"] == "failed" then
+        if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and child["options"]["ignore_dependency_on_failure"] == true) then
           failed_child_id = child_id
           failed_reason = child["failed_reason"]
           if not failed_reason or failed_reason == cjson.null then
             failed_reason = "unknown error"
           end
           break
-        elseif child["state"] ~= "completed" then
+        elseif child["state"] ~= "completed" and child["state"] ~= "failed" then
           all_done = false
           break
         end
@@ -5100,14 +5225,14 @@ local function release_parent_after_removed_child(job, removed_id)
 
       if child_raw then
         local child = cjson.decode(child_raw)
-        if child["state"] == "failed" then
+        if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and child["options"]["ignore_dependency_on_failure"] == true) then
           failed_child_id = child_id
           failed_reason = child["failed_reason"]
           if not failed_reason or failed_reason == cjson.null then
             failed_reason = "unknown error"
           end
           break
-        elseif child["state"] ~= "completed" then
+        elseif child["state"] ~= "completed" and child["state"] ~= "failed" then
           all_done = false
           break
         end
@@ -5556,6 +5681,7 @@ end
 local processed = 0
 local unprocessed = 0
 local failed = 0
+local ignored = 0
 local missing = 0
 
 for _, child_id in ipairs(parent['child_ids'] or {}) do
@@ -5567,14 +5693,18 @@ for _, child_id in ipairs(parent['child_ids'] or {}) do
     if child["state"] == "completed" then
       processed = processed + 1
     elseif child["state"] == "failed" then
-      failed = failed + 1
+      if child["options"] and child["options"] ~= cjson.null and child["options"]["ignore_dependency_on_failure"] == true then
+        ignored = ignored + 1
+      else
+        failed = failed + 1
+      end
     elseif not has_dependency_set or pending_child_ids[child_id] then
       unprocessed = unprocessed + 1
     end
   end
 end
 
-return {'ok', tostring(processed), tostring(unprocessed), tostring(failed), tostring(missing)}
+return {'ok', tostring(processed), tostring(unprocessed), tostring(failed), tostring(ignored), tostring(missing)}
 "#;
 
 const REMOVE_UNPROCESSED_CHILDREN_SCRIPT: &str = r#"
@@ -5886,14 +6016,14 @@ local function release_parent_if_ready(parent_id, parent)
       local child_raw = redis.call('HGET', KEYS[1], child_id)
       if child_raw then
         local child = cjson.decode(child_raw)
-        if child["state"] == "failed" then
+        if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and child["options"]["ignore_dependency_on_failure"] == true) then
           failed_child_id = child_id
           failed_reason = child["failed_reason"]
           if not failed_reason or failed_reason == cjson.null then
             failed_reason = "unknown error"
           end
           break
-        elseif child["state"] ~= "completed" then
+        elseif child["state"] ~= "completed" and child["state"] ~= "failed" then
           all_done = false
           break
         end
@@ -6225,14 +6355,14 @@ local function release_parent_if_ready(parent_id, parent, dependency_key)
       local child_raw = redis.call('HGET', KEYS[1], child_id)
       if child_raw then
         local child = cjson.decode(child_raw)
-        if child["state"] == "failed" then
+        if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and child["options"]["ignore_dependency_on_failure"] == true) then
           failed_child_id = child_id
           failed_reason = child["failed_reason"]
           if not failed_reason or failed_reason == cjson.null then
             failed_reason = "unknown error"
           end
           break
-        elseif child["state"] ~= "completed" then
+        elseif child["state"] ~= "completed" and child["state"] ~= "failed" then
           all_done = false
           break
         end
@@ -8533,7 +8663,7 @@ fn decode_flow_dependency_counts_result(
     match result.first().map(String::as_str) {
         Some("missing") => Ok(None),
         Some("ok") => {
-            if result.len() != 5 {
+            if result.len() != 6 {
                 return Err(LaneError::Other(format!(
                     "Redis flow dependency count script returned {} fields for {parent_id}",
                     result.len()
@@ -8543,7 +8673,8 @@ fn decode_flow_dependency_counts_result(
                 processed: decode_usize_field(&result[1], "processed", parent_id)?,
                 unprocessed: decode_usize_field(&result[2], "unprocessed", parent_id)?,
                 failed: decode_usize_field(&result[3], "failed", parent_id)?,
-                missing: decode_usize_field(&result[4], "missing", parent_id)?,
+                ignored: decode_usize_field(&result[4], "ignored", parent_id)?,
+                missing: decode_usize_field(&result[5], "missing", parent_id)?,
             }))
         }
         Some(other) => Err(LaneError::Other(format!(
