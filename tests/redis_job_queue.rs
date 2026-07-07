@@ -5189,6 +5189,54 @@ async fn run_repeat_nonterminal_scheduler_metadata(redis_url: String) -> redis::
     )
     .await?;
 
+    let conflicting = queue
+        .add_job(
+            "scheduler-metadata-conflict".to_string(),
+            serde_json::json!({ "path": "conflict" }),
+            JobOptions::new().with_delay(Duration::from_secs(60)),
+        )
+        .await
+        .expect("repeat metadata conflict job should add");
+    let jobs_key = format!("{namespace}:repeat-metadata-moves:jobs");
+    let conflicting_raw: String = conn.hget(&jobs_key, &conflicting.id).await?;
+    let mut conflicting_json: serde_json::Value =
+        serde_json::from_str(&conflicting_raw).expect("conflict job JSON should decode");
+    conflicting_json["repeat_key"] = serde_json::Value::String("metadata-moves".to_string());
+    let conflicting_raw =
+        serde_json::to_string(&conflicting_json).expect("conflict job JSON should encode");
+    let _: usize = conn
+        .hset(&jobs_key, &conflicting.id, conflicting_raw)
+        .await?;
+
+    let removed_owner: usize = conn.del(&owner_key).await?;
+    assert_eq!(removed_owner, 1);
+    let moved_conflict = queue
+        .promote_job(&conflicting.id, Utc::now())
+        .await
+        .expect("conflicting repeat-keyed stale job should still move");
+    assert_eq!(moved_conflict.state, JobState::Waiting);
+    assert_eq!(moved_conflict.repeat_key.as_deref(), Some("metadata-moves"));
+    let scheduler_owner_after_conflict: Option<String> =
+        conn.hget(&scheduler_meta_key, "jid").await?;
+    assert_eq!(
+        scheduler_owner_after_conflict.as_deref(),
+        Some(promoted_due_job.id.as_str())
+    );
+    let owner_after_conflict: Option<String> = conn.get(&owner_key).await?;
+    assert!(owner_after_conflict.is_none());
+    let repeats_after_conflict = queue
+        .list_repeats()
+        .await
+        .expect("repeat metadata conflict list should repair owner key");
+    assert!(repeats_after_conflict
+        .iter()
+        .any(|entry| { entry.key == "metadata-moves" && entry.job_id == promoted_due_job.id }));
+    let restored_owner_after_list: Option<String> = conn.get(&owner_key).await?;
+    assert_eq!(
+        restored_owner_after_list.as_deref(),
+        Some(promoted_due_job.id.as_str())
+    );
+
     cleanup_namespace_with_conn(&mut conn, &namespace).await?;
     trace_stage("repeat-metadata-moves:cleanup-final:done");
     Ok(())

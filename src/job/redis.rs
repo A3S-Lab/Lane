@@ -2018,7 +2018,10 @@ local function sync_repeat_scheduler(job, job_id, repeat_prefix, scheduled_milli
   local owner_id = redis.call('GET', owner_key)
   local meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
   local scheduler_owner_id = redis.call('HGET', meta_key, 'jid')
-  if owner_id and owner_id ~= job_id and scheduler_owner_id ~= job_id then
+  if owner_id and owner_id ~= job_id then
+    return
+  end
+  if not owner_id and scheduler_owner_id and scheduler_owner_id ~= job_id then
     return
   end
   if not owner_id then
@@ -3978,7 +3981,10 @@ local function sync_repeat_scheduler(job, job_id, repeat_prefix, scheduled_milli
   local owner_id = redis.call('GET', owner_key)
   local meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
   local scheduler_owner_id = redis.call('HGET', meta_key, 'jid')
-  if owner_id and owner_id ~= job_id and scheduler_owner_id ~= job_id then
+  if owner_id and owner_id ~= job_id then
+    return
+  end
+  if not owner_id and scheduler_owner_id and scheduler_owner_id ~= job_id then
     return
   end
   if not owner_id then
@@ -4162,7 +4168,10 @@ local function sync_repeat_scheduler(job, job_id, repeat_prefix, scheduled_milli
   local owner_id = redis.call('GET', owner_key)
   local meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
   local scheduler_owner_id = redis.call('HGET', meta_key, 'jid')
-  if owner_id and owner_id ~= job_id and scheduler_owner_id ~= job_id then
+  if owner_id and owner_id ~= job_id then
+    return
+  end
+  if not owner_id and scheduler_owner_id and scheduler_owner_id ~= job_id then
     return
   end
   if not owner_id then
@@ -5142,7 +5151,10 @@ local function sync_repeat_scheduler(job, job_id, repeat_prefix, scheduled_milli
   local owner_id = redis.call('GET', owner_key)
   local meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
   local scheduler_owner_id = redis.call('HGET', meta_key, 'jid')
-  if owner_id and owner_id ~= job_id and scheduler_owner_id ~= job_id then
+  if owner_id and owner_id ~= job_id then
+    return
+  end
+  if not owner_id and scheduler_owner_id and scheduler_owner_id ~= job_id then
     return
   end
   if not owner_id then
@@ -5277,7 +5289,10 @@ local function sync_repeat_scheduler(job, job_id, repeat_prefix, scheduled_milli
   local owner_id = redis.call('GET', owner_key)
   local meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
   local scheduler_owner_id = redis.call('HGET', meta_key, 'jid')
-  if owner_id and owner_id ~= job_id and scheduler_owner_id ~= job_id then
+  if owner_id and owner_id ~= job_id then
+    return
+  end
+  if not owner_id and scheduler_owner_id and scheduler_owner_id ~= job_id then
     return
   end
   if not owner_id then
@@ -5860,7 +5875,10 @@ local function sync_repeat_scheduler(job, job_id, repeat_prefix, scheduled_milli
   local owner_id = redis.call('GET', owner_key)
   local meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
   local scheduler_owner_id = redis.call('HGET', meta_key, 'jid')
-  if owner_id and owner_id ~= job_id and scheduler_owner_id ~= job_id then
+  if owner_id and owner_id ~= job_id then
+    return
+  end
+  if not owner_id and scheduler_owner_id and scheduler_owner_id ~= job_id then
     return
   end
   if not owner_id then
