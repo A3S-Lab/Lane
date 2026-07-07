@@ -806,6 +806,9 @@ pub struct JobOptions {
     /// Do not fail the parent flow when this child reaches terminal failure.
     #[serde(default, skip_serializing_if = "is_false")]
     pub ignore_dependency_on_failure: bool,
+    /// Remove this child from its parent dependencies when it reaches terminal failure.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub remove_dependency_on_failure: bool,
 }
 
 impl Default for JobOptions {
@@ -825,6 +828,7 @@ impl Default for JobOptions {
             repeat: None,
             deduplication: None,
             ignore_dependency_on_failure: false,
+            remove_dependency_on_failure: false,
         }
     }
 }
@@ -926,6 +930,12 @@ impl JobOptions {
     /// Configure BullMQ-style `ignoreDependencyOnFailure` for flow children.
     pub fn with_ignore_dependency_on_failure(mut self, ignore: bool) -> Self {
         self.ignore_dependency_on_failure = ignore;
+        self
+    }
+
+    /// Configure BullMQ-style `removeDependencyOnFailure` for flow children.
+    pub fn with_remove_dependency_on_failure(mut self, remove: bool) -> Self {
+        self.remove_dependency_on_failure = remove;
         self
     }
 

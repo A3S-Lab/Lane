@@ -2138,7 +2138,7 @@ if parent_id and parent_id ~= cjson.null then
           end
           if child_raw then
             local child = cjson.decode(child_raw)
-            if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and child["options"]["ignore_dependency_on_failure"] == true) then
+            if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true)) then
               failed_child_id = child_id
               failed_reason = child["failed_reason"] or "unknown error"
               break
@@ -2734,13 +2734,13 @@ if parent_id and parent_id ~= cjson.null then
   if parent_raw then
     local parent = cjson.decode(parent_raw)
     if parent["state"] == "waiting_children" then
-      local ignore_dependency_failure = job["options"] and job["options"] ~= cjson.null and job["options"]["ignore_dependency_on_failure"] == true
+      local dependency_failure_releases_parent = job["options"] and job["options"] ~= cjson.null and (job["options"]["ignore_dependency_on_failure"] == true or job["options"]["remove_dependency_on_failure"] == true)
       local dependency_key = ARGV[10] .. parent_id
       local all_done = true
       local failed_child_id = nil
       local failed_reason = nil
 
-      if ignore_dependency_failure then
+      if dependency_failure_releases_parent then
         local had_dependency_set = redis.call('EXISTS', dependency_key) == 1
         if had_dependency_set then
           redis.call('SREM', dependency_key, ARGV[1])
@@ -2757,7 +2757,7 @@ if parent_id and parent_id ~= cjson.null then
             end
             if child_raw then
               local child = cjson.decode(child_raw)
-              if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and child["options"]["ignore_dependency_on_failure"] == true) then
+              if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true)) then
                 failed_child_id = child_id
                 failed_reason = child["failed_reason"] or "unknown error"
                 break
@@ -3517,13 +3517,13 @@ for _, id in ipairs(ids) do
             if parent_raw then
               local parent = cjson.decode(parent_raw)
               if parent["state"] == "waiting_children" then
-                local ignore_dependency_failure = job["options"] and job["options"] ~= cjson.null and job["options"]["ignore_dependency_on_failure"] == true
+                local dependency_failure_releases_parent = job["options"] and job["options"] ~= cjson.null and (job["options"]["ignore_dependency_on_failure"] == true or job["options"]["remove_dependency_on_failure"] == true)
                 local dependency_key = ARGV[6] .. parent_id
                 local all_done = true
                 local failed_child_id = nil
                 local failed_reason = nil
 
-                if ignore_dependency_failure then
+                if dependency_failure_releases_parent then
                   local had_dependency_set = redis.call('EXISTS', dependency_key) == 1
                   if had_dependency_set then
                     redis.call('SREM', dependency_key, id)
@@ -3541,7 +3541,7 @@ for _, id in ipairs(ids) do
                       end
                       if child_raw then
                         local child = cjson.decode(child_raw)
-                        if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and child["options"]["ignore_dependency_on_failure"] == true) then
+                        if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true)) then
                           failed_child_id = child_id
                           failed_reason = child["failed_reason"] or "unknown error"
                           break
@@ -4444,7 +4444,7 @@ if parent_id and parent_id ~= cjson.null then
 
           if child_raw then
             local child = cjson.decode(child_raw)
-            if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and child["options"]["ignore_dependency_on_failure"] == true) then
+            if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true)) then
               failed_child_id = child_id
               failed_reason = child["failed_reason"] or "unknown error"
               break
@@ -4790,7 +4790,7 @@ local function release_parent_after_removed_child(job, removed_id)
 
       if child_raw then
         local child = cjson.decode(child_raw)
-        if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and child["options"]["ignore_dependency_on_failure"] == true) then
+        if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true)) then
           failed_child_id = child_id
           failed_reason = child["failed_reason"]
           if not failed_reason or failed_reason == cjson.null then
@@ -5225,7 +5225,7 @@ local function release_parent_after_removed_child(job, removed_id)
 
       if child_raw then
         local child = cjson.decode(child_raw)
-        if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and child["options"]["ignore_dependency_on_failure"] == true) then
+        if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true)) then
           failed_child_id = child_id
           failed_reason = child["failed_reason"]
           if not failed_reason or failed_reason == cjson.null then
@@ -5695,6 +5695,8 @@ for _, child_id in ipairs(parent['child_ids'] or {}) do
     elseif child["state"] == "failed" then
       if child["options"] and child["options"] ~= cjson.null and child["options"]["ignore_dependency_on_failure"] == true then
         ignored = ignored + 1
+      elseif child["options"] and child["options"] ~= cjson.null and child["options"]["remove_dependency_on_failure"] == true then
+        -- Removed dependencies are intentionally omitted from dependency counts.
       else
         failed = failed + 1
       end
@@ -6016,7 +6018,7 @@ local function release_parent_if_ready(parent_id, parent)
       local child_raw = redis.call('HGET', KEYS[1], child_id)
       if child_raw then
         local child = cjson.decode(child_raw)
-        if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and child["options"]["ignore_dependency_on_failure"] == true) then
+        if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true)) then
           failed_child_id = child_id
           failed_reason = child["failed_reason"]
           if not failed_reason or failed_reason == cjson.null then
@@ -6355,7 +6357,7 @@ local function release_parent_if_ready(parent_id, parent, dependency_key)
       local child_raw = redis.call('HGET', KEYS[1], child_id)
       if child_raw then
         local child = cjson.decode(child_raw)
-        if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and child["options"]["ignore_dependency_on_failure"] == true) then
+        if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true)) then
           failed_child_id = child_id
           failed_reason = child["failed_reason"]
           if not failed_reason or failed_reason == cjson.null then

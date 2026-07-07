@@ -2810,6 +2810,59 @@ async fn flow_parent_ignores_configured_stalled_child_terminal_failure() {
 }
 
 #[tokio::test]
+async fn flow_parent_removes_configured_stalled_child_terminal_dependency() {
+    let queue = InMemoryJobQueue::new("flow-remove-stalled");
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({ "kind": "aggregate" }))
+                .with_options(JobOptions::new().with_priority(1)),
+            vec![
+                JobSpec::new("optional-child", serde_json::json!({ "optional": true }))
+                    .with_options(
+                        JobOptions::new()
+                            .with_priority(1)
+                            .with_max_stalled_count(0)
+                            .with_remove_dependency_on_failure(true),
+                    ),
+            ],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    let child = queue
+        .claim_next(
+            "worker-stalled".to_string(),
+            Duration::from_millis(50),
+            ts(1_100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child.id, flow.children[0].id);
+
+    assert_eq!(queue.recover_stalled_jobs(ts(1_200)).await.unwrap(), 1);
+    let failed_child = queue.get_job(&child.id).await.unwrap().unwrap();
+    assert_eq!(failed_child.state, JobState::Failed);
+    let parent = queue.get_job(&flow.parent.id).await.unwrap().unwrap();
+    assert_eq!(parent.state, JobState::Waiting);
+    assert!(parent.failed_reason.is_none());
+    assert_eq!(
+        queue
+            .get_flow_dependency_counts(&flow.parent.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        JobFlowDependencyCounts {
+            processed: 0,
+            unprocessed: 0,
+            failed: 0,
+            ignored: 0,
+            missing: 0,
+        }
+    );
+}
+
+#[tokio::test]
 async fn repeat_stalled_jobs_are_requeued_after_limit() {
     let queue = InMemoryJobQueue::new("repeat-stalled");
     let now = ts(1_000);
@@ -3976,6 +4029,104 @@ async fn flow_parent_ignores_configured_child_terminal_failure() {
             unprocessed: 0,
             failed: 0,
             ignored: 1,
+            missing: 0,
+        }
+    );
+}
+
+#[tokio::test]
+async fn flow_parent_removes_configured_child_terminal_dependency() {
+    let queue = InMemoryJobQueue::new("flow-remove-failure");
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({ "kind": "aggregate" }))
+                .with_options(JobOptions::new().with_priority(1)),
+            vec![
+                JobSpec::new("optional-child", serde_json::json!({ "optional": true }))
+                    .with_options(
+                        JobOptions::new()
+                            .with_priority(1)
+                            .with_remove_dependency_on_failure(true),
+                    ),
+                JobSpec::new("required-child", serde_json::json!({ "required": true }))
+                    .with_options(JobOptions::new().with_priority(2)),
+            ],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    let optional_child = queue
+        .claim_next(
+            "worker-optional".to_string(),
+            Duration::from_secs(30),
+            ts(1_100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(optional_child.id, flow.children[0].id);
+    queue
+        .fail_job(
+            &optional_child.id,
+            lock_token(&optional_child),
+            "optional source failed".to_string(),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+
+    let parent = queue.get_job(&flow.parent.id).await.unwrap().unwrap();
+    assert_eq!(parent.state, JobState::WaitingChildren);
+    assert!(parent.failed_reason.is_none());
+    assert_eq!(
+        queue
+            .get_flow_dependency_counts(&flow.parent.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        JobFlowDependencyCounts {
+            processed: 0,
+            unprocessed: 1,
+            failed: 0,
+            ignored: 0,
+            missing: 0,
+        }
+    );
+
+    let required_child = queue
+        .claim_next(
+            "worker-required".to_string(),
+            Duration::from_secs(30),
+            ts(1_300),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(required_child.id, flow.children[1].id);
+    queue
+        .complete_job(
+            &required_child.id,
+            lock_token(&required_child),
+            serde_json::json!({ "ok": true }),
+            ts(1_400),
+        )
+        .await
+        .unwrap();
+
+    let parent = queue.get_job(&flow.parent.id).await.unwrap().unwrap();
+    assert_eq!(parent.state, JobState::Waiting);
+    assert_eq!(
+        queue
+            .get_flow_dependency_counts(&flow.parent.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        JobFlowDependencyCounts {
+            processed: 1,
+            unprocessed: 0,
+            failed: 0,
+            ignored: 0,
             missing: 0,
         }
     );
