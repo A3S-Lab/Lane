@@ -9368,7 +9368,36 @@ impl JobQueueBackend for RedisJobQueue {
             .await
             .map_err(redis_error)?;
         let Some(owner_id) = owner_id else {
-            return Ok(None);
+            let scheduler_owner_id: Option<String> = conn
+                .hget(self.repeat_scheduler_meta_key(repeat_key), "jid")
+                .await
+                .map_err(redis_error)?;
+            let Some(scheduler_owner_id) = scheduler_owner_id else {
+                self.clear_repeat_scheduler_metadata(&mut conn, repeat_key)
+                    .await?;
+                return Ok(None);
+            };
+
+            let Some(scheduler_owner) = self.load_job(&mut conn, &scheduler_owner_id).await? else {
+                self.clear_repeat_scheduler_metadata(&mut conn, repeat_key)
+                    .await?;
+                return Ok(None);
+            };
+
+            if scheduler_owner.state.is_terminal()
+                || scheduler_owner.repeat_key.as_deref() != Some(repeat_key)
+            {
+                self.clear_repeat_scheduler_metadata(&mut conn, repeat_key)
+                    .await?;
+                return Ok(None);
+            }
+
+            let removed = self
+                .remove_job_with_conn(&mut conn, &scheduler_owner_id, Utc::now())
+                .await?;
+            self.clear_repeat_scheduler_metadata(&mut conn, repeat_key)
+                .await?;
+            return Ok(removed);
         };
 
         let removed = self

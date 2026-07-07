@@ -878,6 +878,22 @@ async fn redis_backend_upserts_repeat_against_real_server() {
 }
 
 #[tokio::test]
+async fn redis_backend_removes_repeat_from_scheduler_metadata_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_repeat_remove_scheduler_metadata(redis_url),
+    )
+    .await
+    .expect("Redis repeat scheduler metadata remove integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_orders_lifo_waiting_jobs_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -4003,6 +4019,102 @@ async fn run_repeat_upsert(redis_url: String) -> redis::RedisResult<()> {
 
     cleanup_namespace_with_conn(&mut conn, &namespace).await?;
     trace_stage("repeat-upsert:cleanup-final:done");
+    Ok(())
+}
+
+async fn run_repeat_remove_scheduler_metadata(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    trace_stage("repeat-remove-scheduler:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("repeat-remove-scheduler:cleanup:done");
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "repeat-remove-scheduler")
+        .expect("valid Redis URL should build the repeat remove scheduler queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let job = queue
+        .add_job(
+            "orphanable-repeat".to_string(),
+            serde_json::json!({ "kind": "scheduler-meta-owner" }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(60)).with_key("orphanable-repeat"),
+            ),
+        )
+        .await
+        .expect("repeat owner should add");
+    trace_stage("repeat-remove-scheduler:added");
+
+    let owner_key = format!("{namespace}:repeat-remove-scheduler:repeat:orphanable-repeat");
+    let scheduler_key = format!("{namespace}:repeat-remove-scheduler:repeat");
+    let scheduler_meta_key =
+        format!("{namespace}:repeat-remove-scheduler:repeat_meta:orphanable-repeat");
+    let removed_owner_key: usize = conn.del(&owner_key).await?;
+    assert_eq!(removed_owner_key, 1);
+    let scheduler_owner_id: Option<String> = conn.hget(&scheduler_meta_key, "jid").await?;
+    assert_eq!(scheduler_owner_id.as_deref(), Some(job.id.as_str()));
+
+    let removed = queue
+        .remove_repeat("orphanable-repeat")
+        .await
+        .expect("repeat removal should use scheduler metadata")
+        .expect("repeat removal should return the scheduler-owned job");
+    trace_stage("repeat-remove-scheduler:removed");
+    assert_eq!(removed.id, job.id);
+
+    let removed_hash: Option<String> = conn
+        .hget(format!("{namespace}:repeat-remove-scheduler:jobs"), &job.id)
+        .await?;
+    assert!(removed_hash.is_none());
+    let waiting_score: Option<f64> = conn
+        .zscore(
+            format!("{namespace}:repeat-remove-scheduler:waiting"),
+            &job.id,
+        )
+        .await?;
+    assert!(waiting_score.is_none());
+    let scheduler_score: Option<f64> = conn.zscore(&scheduler_key, "orphanable-repeat").await?;
+    assert!(scheduler_score.is_none());
+    let scheduler_meta_owner_after: Option<String> = conn.hget(&scheduler_meta_key, "jid").await?;
+    assert!(scheduler_meta_owner_after.is_none());
+    let owner_after: Option<String> = conn.get(&owner_key).await?;
+    assert!(owner_after.is_none());
+    assert_eq!(
+        queue
+            .count_repeats()
+            .await
+            .expect("repeat count should load after scheduler removal"),
+        0
+    );
+
+    let _: usize = conn
+        .zadd(&scheduler_key, "missing-orphanable-repeat", 1_i64)
+        .await?;
+    let missing_scheduler_meta_key =
+        format!("{namespace}:repeat-remove-scheduler:repeat_meta:missing-orphanable-repeat");
+    let _: usize = conn
+        .hset(
+            &missing_scheduler_meta_key,
+            "jid",
+            "missing-scheduler-owner",
+        )
+        .await?;
+    assert!(queue
+        .remove_repeat("missing-orphanable-repeat")
+        .await
+        .expect("stale scheduler metadata removal should return")
+        .is_none());
+    let stale_scheduler_score: Option<f64> = conn
+        .zscore(&scheduler_key, "missing-orphanable-repeat")
+        .await?;
+    assert!(stale_scheduler_score.is_none());
+    let stale_scheduler_owner: Option<String> =
+        conn.hget(&missing_scheduler_meta_key, "jid").await?;
+    assert!(stale_scheduler_owner.is_none());
+
+    cleanup_namespace_with_conn(&mut conn, &namespace).await?;
+    trace_stage("repeat-remove-scheduler:cleanup-final:done");
     Ok(())
 }
 

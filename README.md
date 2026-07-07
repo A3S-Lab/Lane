@@ -469,7 +469,9 @@ the same-priority waiting reinsert side, `renew_lease()` extends an active
 worker lease with the claim token, `renew_leases()` renews multiple claimed
 leases and returns the job ids that failed renewal,
 `remove_job()` removes non-active jobs,
-`remove_repeat()` removes the current non-active owner for a repeat key,
+`remove_repeat()` removes the current non-active owner for a repeat key and, in
+Redis, can fall back to scheduler metadata when the owner key is stale or
+missing,
 `upsert_repeat()` creates or replaces the current non-active owner for a repeat
 key,
 `remove_deduplication_key()` clears the active owner for a deduplication id,
@@ -1244,12 +1246,14 @@ series. `list_repeats()` reads the scheduler zset first, loads each owner job
 snapshot from the jobs hash, returns only non-terminal matching owners, clears
 stale scheduler/owner records that point at missing, terminal, or mismatched
 jobs, and scans legacy `repeat:<key>` owner keys as a migration fallback.
-`remove_repeat()` resolves the current `repeat:<key>` owner and then runs the
-same Redis-side removal path as `remove_job()`, so it rejects active leased
-owners, removes the job hash and state indexes, releases repeat and
-deduplication ownership, and can unblock flow parents. If the owner key points
-at a missing job, Redis clears that stale owner key and scheduler metadata only
-when they still point at the missing id. `upsert_repeat()` follows BullMQ's
+`remove_repeat()` resolves the current `repeat:<key>` owner, falls back to the
+`repeat_meta:<key>` scheduler owner id when the fast owner key is missing, and
+then runs the same Redis-side removal path as `remove_job()`, so it rejects
+active leased owners, removes the job hash and state indexes, releases repeat
+and deduplication ownership, and can unblock flow parents. If the owner key or
+scheduler metadata points at a missing job, Redis clears the stale owner key,
+zset entry, and metadata hash only when they still describe that missing owner.
+`upsert_repeat()` follows BullMQ's
 `upsertJobScheduler(..., override: true)` mechanism at Lane's current
 repeat-owner layer: the Redis script resolves the current `repeat:<key>` owner,
 rejects active leased owners, rejects flow-owned occurrences to avoid corrupting
