@@ -2685,6 +2685,40 @@ async fn stalled_jobs_are_recovered_until_limit() {
 }
 
 #[tokio::test]
+async fn repeat_stalled_jobs_are_requeued_after_limit() {
+    let queue = InMemoryJobQueue::new("repeat-stalled");
+    let now = ts(1_000);
+    let job = queue
+        .add_at(
+            "heartbeat",
+            serde_json::json!({}),
+            JobOptions::new().with_max_stalled_count(0).with_repeat(
+                RepeatOptions::every(Duration::from_secs(60))
+                    .with_limit(2)
+                    .with_key("heartbeat"),
+            ),
+            now,
+        )
+        .await
+        .unwrap();
+    queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(1), now)
+        .await
+        .unwrap();
+
+    assert_eq!(queue.recover_stalled_jobs(ts(2_001)).await.unwrap(), 1);
+    let recovered = queue.get_job(&job.id).await.unwrap().unwrap();
+    assert_eq!(recovered.state, JobState::Waiting);
+    assert_eq!(recovered.stalled_count, 1);
+    assert_eq!(recovered.repeat_key.as_deref(), Some("heartbeat"));
+
+    let repeats = queue.list_repeats().await.unwrap();
+    assert_eq!(repeats.len(), 1);
+    assert_eq!(repeats[0].job_id, job.id);
+    assert_eq!(repeats[0].state, JobState::Waiting);
+}
+
+#[tokio::test]
 async fn pause_blocks_claiming_without_rejecting_adds() {
     let queue = InMemoryJobQueue::new("paused");
     let now = ts(1_000);

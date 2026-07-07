@@ -1909,7 +1909,9 @@ impl JobQueueBackend for InMemoryJobQueue {
                 job.lock_token = None;
                 job.lease_expires_at = None;
                 job.failed_reason = Some("job stalled after worker lease expired".to_string());
-                if job.stalled_count > job.options.max_stalled_count {
+                if job.stalled_count > job.options.max_stalled_count
+                    && !is_repeat_scheduler_job(job)
+                {
                     job.state = JobState::Failed;
                     job.finished_at = Some(now);
                     if let Some(parent_id) = &job.parent_id {
@@ -2447,6 +2449,10 @@ fn active_repeat_key(job: &Job) -> Option<&str> {
     }
 
     job.repeat_key.as_deref()
+}
+
+fn is_repeat_scheduler_job(job: &Job) -> bool {
+    active_repeat_key(job).is_some() && job.options.repeat.is_some()
 }
 
 fn repeat_entry(job: &Job) -> Option<JobRepeatEntry> {

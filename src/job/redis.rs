@@ -2710,6 +2710,17 @@ local function set_repeat_key(job, job_id, repeat_prefix)
   end
 end
 
+local function is_current_repeat_scheduler_job(job, job_id, repeat_prefix)
+  local key = repeat_key(job)
+  if not key then
+    return false
+  end
+  if redis.call('GET', repeat_prefix .. key) == job_id then
+    return true
+  end
+  return redis.call('HGET', repeat_scheduler_meta_key(repeat_prefix, key), 'jid') == job_id
+end
+
 local function retention_options(job, remove_field, retention_field)
   if not job["options"] or job["options"] == cjson.null then
     return nil
@@ -2943,7 +2954,7 @@ for _, id in ipairs(ids) do
           max_stalled = tonumber(job["options"]["max_stalled_count"])
         end
 
-        if job["stalled_count"] > max_stalled then
+        if job["stalled_count"] > max_stalled and not is_current_repeat_scheduler_job(job, id, ARGV[8]) then
           job["state"] = "failed"
           job["finished_at"] = ARGV[2]
           redis.call('DEL', ARGV[6] .. id)

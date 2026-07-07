@@ -4118,6 +4118,88 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await?;
     assert!(terminal_active_score.is_none());
 
+    let repeat_stalled_queue =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "repeat-stalled")
+            .expect("valid Redis URL should build the repeat-stalled queue");
+    let mut repeat_stalled_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let repeat_stalled = repeat_stalled_queue
+        .add_job(
+            "repeat-stalled".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_max_stalled_count(0).with_repeat(
+                RepeatOptions::every(Duration::from_secs(60))
+                    .with_limit(2)
+                    .with_key("repeat-stalled"),
+            ),
+        )
+        .await
+        .expect("repeat-stalled job should be added");
+    let repeat_stalled_claim = repeat_stalled_queue
+        .claim_next(
+            "worker-repeat-stalled".to_string(),
+            Duration::from_millis(50),
+            Utc::now(),
+        )
+        .await
+        .expect("repeat-stalled claim should return")
+        .expect("repeat-stalled job should be claimable");
+    assert_eq!(repeat_stalled_claim.id, repeat_stalled.id);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        repeat_stalled_queue
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("repeat stalled recovery should mark candidates"),
+        0
+    );
+    assert_eq!(
+        repeat_stalled_queue
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("repeat stalled recovery should requeue"),
+        1
+    );
+    let repeat_stalled_recovered = repeat_stalled_queue
+        .get_job(&repeat_stalled.id)
+        .await
+        .expect("repeat-stalled job should load")
+        .expect("repeat-stalled job should still exist");
+    assert_eq!(repeat_stalled_recovered.state, JobState::Waiting);
+    assert_eq!(repeat_stalled_recovered.stalled_count, 1);
+    let repeat_stalled_failed_score: Option<f64> = repeat_stalled_conn
+        .zscore(
+            format!("{namespace}:repeat-stalled:failed"),
+            &repeat_stalled.id,
+        )
+        .await?;
+    assert!(repeat_stalled_failed_score.is_none());
+    let repeat_stalled_waiting_score: Option<f64> = repeat_stalled_conn
+        .zscore(
+            format!("{namespace}:repeat-stalled:waiting"),
+            &repeat_stalled.id,
+        )
+        .await?;
+    assert!(repeat_stalled_waiting_score.is_some());
+    let repeat_stalled_owner: Option<String> = repeat_stalled_conn
+        .get(format!("{namespace}:repeat-stalled:repeat:repeat-stalled"))
+        .await?;
+    assert_eq!(
+        repeat_stalled_owner.as_deref(),
+        Some(repeat_stalled.id.as_str())
+    );
+    let repeat_stalled_scheduler_owner: Option<String> = repeat_stalled_conn
+        .hget(
+            format!("{namespace}:repeat-stalled:repeat_meta:repeat-stalled"),
+            "jid",
+        )
+        .await?;
+    assert_eq!(
+        repeat_stalled_scheduler_owner.as_deref(),
+        Some(repeat_stalled.id.as_str())
+    );
+
     let stored_high = producer
         .get_job(&high.id)
         .await
