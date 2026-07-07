@@ -1550,6 +1550,33 @@ end
 return redis.call('PTTL', KEYS[1])
 "#;
 
+const ACTIVE_CLAIM_RATE_LIMIT_TTL_SCRIPT: &str = r#"
+local function rate_limit_ttl(max_jobs, rate_limit_key)
+  if max_jobs and max_jobs <= tonumber(redis.call('GET', rate_limit_key) or '0') then
+    local ttl = redis.call('PTTL', rate_limit_key)
+    if ttl == 0 then
+      redis.call('DEL', rate_limit_key)
+    end
+    if ttl > 0 then
+      return ttl
+    end
+  end
+  return 0
+end
+
+local max_jobs = tonumber(ARGV[1])
+if max_jobs and max_jobs > 0 then
+  return rate_limit_ttl(max_jobs, KEYS[1])
+end
+
+local configured_max = redis.call('HGET', KEYS[2], 'max')
+if configured_max then
+  return rate_limit_ttl(tonumber(configured_max), KEYS[1])
+end
+
+return 0
+"#;
+
 const COMPLETE_SCRIPT: &str = r#"
 local function waiting_score_for(priority, sequence, job, bucket)
   local bucket_value = tonumber(bucket)
@@ -6510,6 +6537,20 @@ impl RedisJobQueue {
                 return Ok(None);
             }
 
+            let rate_limit_ttl = self
+                .active_claim_rate_limit_ttl_with_conn(&mut claim_conn)
+                .await?;
+            if rate_limit_ttl > 0 {
+                let wait_for = Duration::from_millis(rate_limit_ttl as u64)
+                    .min(remaining)
+                    .min(MAX_MARKER_BLOCK_TIMEOUT);
+                if wait_for.is_zero() {
+                    continue;
+                }
+                tokio::time::sleep(wait_for).await;
+                continue;
+            }
+
             let wait_for = marker_block_timeout(block_until_millis, remaining, Utc::now());
             if wait_for.is_zero() {
                 block_until_millis = None;
@@ -6528,6 +6569,26 @@ impl RedisJobQueue {
                 };
             }
         }
+    }
+
+    async fn active_claim_rate_limit_ttl_with_conn(
+        &self,
+        conn: &mut ConnectionManager,
+    ) -> Result<i64> {
+        let rate_limit_max = self
+            .claim_rate_limit
+            .as_ref()
+            .map(|limit| limit.max_claims)
+            .unwrap_or_default();
+        redis::cmd("EVAL")
+            .arg(ACTIVE_CLAIM_RATE_LIMIT_TTL_SCRIPT)
+            .arg(2)
+            .arg(self.claim_rate_limit_key())
+            .arg(self.meta_key())
+            .arg(rate_limit_max)
+            .query_async(conn)
+            .await
+            .map_err(redis_error)
     }
 
     /// Queue name.

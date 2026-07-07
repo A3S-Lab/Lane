@@ -710,6 +710,83 @@ async fn run_blocking_worker_markers(redis_url: String) -> redis::RedisResult<()
         .await
         .expect("second max-active blocking job should complete");
 
+    let rate_limit_queue =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "blocking-rate-limit")
+            .expect("valid Redis URL should build the rate-limit blocking queue");
+    let rate_limit_worker =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "blocking-rate-limit")
+            .expect("valid Redis URL should build the rate-limit blocking worker")
+            .with_claim_rate_limit(JobRateLimit::new(1, Duration::from_millis(500)))
+            .expect("rate-limit blocking worker config should be valid");
+    let rate_limit_first = rate_limit_queue
+        .add_job(
+            "rate-limit-first".to_string(),
+            serde_json::json!({ "slot": "first" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("first rate-limit blocking job should add");
+    let rate_limit_second = rate_limit_queue
+        .add_job(
+            "rate-limit-second".to_string(),
+            serde_json::json!({ "slot": "second" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("second rate-limit blocking job should add");
+    let rate_limit_first_claim = rate_limit_worker
+        .claim_next(
+            "worker-blocking-rate-limit-a".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("first rate-limit blocking claim should return")
+        .expect("first rate-limit blocking job should claim");
+    assert_eq!(rate_limit_first_claim.id, rate_limit_first.id);
+
+    let rate_limit_blocking_worker =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "blocking-rate-limit")
+            .expect("valid Redis URL should build the blocking rate-limit worker")
+            .with_claim_rate_limit(JobRateLimit::new(1, Duration::from_millis(500)))
+            .expect("blocking rate-limit worker config should be valid");
+    let rate_limit_waiter = tokio::spawn(async move {
+        rate_limit_blocking_worker
+            .claim_next_blocking(
+                "worker-blocking-rate-limit-b".to_string(),
+                Duration::from_secs(30),
+                Duration::from_secs(2),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!rate_limit_waiter.is_finished());
+    let rate_limit_second_claim = tokio::time::timeout(Duration::from_secs(3), rate_limit_waiter)
+        .await
+        .expect("rate-limit blocking waiter should wake after limiter TTL")
+        .expect("rate-limit blocking waiter should join")
+        .expect("rate-limit blocking claim should return")
+        .expect("rate-limit blocking claim should find the waiting job");
+    assert_eq!(rate_limit_second_claim.id, rate_limit_second.id);
+    rate_limit_worker
+        .complete_job(
+            &rate_limit_first_claim.id,
+            lock_token(&rate_limit_first_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("first rate-limit blocking job should complete");
+    rate_limit_worker
+        .complete_job(
+            &rate_limit_second_claim.id,
+            lock_token(&rate_limit_second_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("second rate-limit blocking job should complete");
+
     cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())
 }

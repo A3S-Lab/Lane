@@ -965,7 +965,9 @@ configuration. `clear_claim_rate_limit()` removes the shared config fields. The
 Lua claim script prefers an explicit worker-local limit and otherwise reads the
 Redis meta values before checking the rate-limit counter. When the window is
 exhausted, `claim_next()` returns `None` and the job remains waiting for a later
-poll.
+poll. `claim_next_blocking()` mirrors BullMQ's worker-side limiter delay by
+checking the active limiter TTL after an empty claim and sleeping until the
+limiter window can admit another job, capped by the worker's blocking deadline.
 
 `set_max_active_jobs()` configures a Redis-shared active job ceiling for the
 queue. It stores the value in the queue meta hash as `concurrency`, matching
@@ -1000,7 +1002,7 @@ workers after a `set_max_active_jobs()` slot becomes available.
 `JobQueueBackend::claim_next_blocking()` exposes that wait path to the
 backend-agnostic `JobWorker`; non-blocking backends use the default immediate
 `claim_next()` fallback, while Redis workers use the marker-backed `BZPOPMIN`
-path.
+path when the queue is not currently rate-limited.
 
 Redis adds are Lua-backed as well. The add scripts write job JSON and the
 waiting, delayed, or waiting-children index in the same Redis turn. If a custom
