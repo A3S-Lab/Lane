@@ -276,6 +276,21 @@ impl LocalJobQueue {
         Ok(logs)
     }
 
+    /// Save retained failure diagnostics for a job.
+    pub async fn save_stacktrace(
+        &self,
+        job_id: &str,
+        stacktrace: Vec<String>,
+        failed_reason: String,
+    ) -> Result<Job> {
+        let job = self
+            .inner
+            .save_stacktrace(job_id, stacktrace, failed_reason)
+            .await?;
+        self.persist().await?;
+        Ok(job)
+    }
+
     /// Drain waiting jobs and optionally non-repeat delayed jobs.
     pub async fn drain(&self, include_delayed: bool) -> Result<Vec<Job>> {
         let jobs = self.inner.drain(include_delayed).await?;
@@ -572,6 +587,15 @@ impl JobQueueBackend for LocalJobQueue {
         let job = self.inner.update_progress(job_id, progress).await?;
         self.persist().await?;
         Ok(job)
+    }
+
+    async fn save_stacktrace(
+        &self,
+        job_id: &str,
+        stacktrace: Vec<String>,
+        failed_reason: String,
+    ) -> Result<Job> {
+        LocalJobQueue::save_stacktrace(self, job_id, stacktrace, failed_reason).await
     }
 
     async fn add_log(

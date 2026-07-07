@@ -204,6 +204,34 @@ async fn job_state_queries_follow_lifecycle() {
             failed_reason: Some("terminal failure".to_string()),
         })
     );
+    let traced = queue
+        .save_stacktrace(
+            &failed.id,
+            vec![
+                "Error: terminal failure".to_string(),
+                "at worker.rs:42:9".to_string(),
+            ],
+            "terminal failure with trace".to_string(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        traced.stacktrace,
+        vec![
+            "Error: terminal failure".to_string(),
+            "at worker.rs:42:9".to_string(),
+        ]
+    );
+    assert_eq!(
+        traced.failed_reason.as_deref(),
+        Some("terminal failure with trace")
+    );
+    assert!(matches!(
+        queue
+            .save_stacktrace("missing", Vec::new(), "missing".to_string())
+            .await,
+        Err(LaneError::JobNotFound(_))
+    ));
     assert_eq!(queue.get_job_state("missing").await.unwrap(), None);
     assert_eq!(
         queue.get_job_finished_result("missing").await.unwrap(),
@@ -5234,6 +5262,14 @@ async fn local_job_queue_persists_discarded_retry_failures() {
         .await
         .unwrap();
     assert_eq!(failed.state, JobState::Failed);
+    queue
+        .save_stacktrace(
+            &failed.id,
+            vec!["Error: do not retry".to_string()],
+            "do not retry with stacktrace".to_string(),
+        )
+        .await
+        .unwrap();
 
     let reopened = LocalJobQueue::open("durable-discard-retry", &snapshot_path)
         .await
@@ -5241,7 +5277,11 @@ async fn local_job_queue_persists_discarded_retry_failures() {
     let restored = reopened.get_job(&job.id).await.unwrap().unwrap();
     assert_eq!(restored.state, JobState::Failed);
     assert_eq!(restored.finished_at, Some(ts(1_200)));
-    assert_eq!(restored.failed_reason.as_deref(), Some("do not retry"));
+    assert_eq!(
+        restored.failed_reason.as_deref(),
+        Some("do not retry with stacktrace")
+    );
+    assert_eq!(restored.stacktrace, vec!["Error: do not retry".to_string()]);
 }
 
 #[tokio::test]

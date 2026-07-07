@@ -268,6 +268,18 @@ pub trait JobQueueBackend: Send + Sync {
 
     async fn update_progress(&self, job_id: &str, progress: Value) -> Result<Job>;
 
+    /// Save retained failure diagnostics for a job.
+    ///
+    /// This mirrors BullMQ's `saveStacktrace` script shape: any retained job can
+    /// be updated, the stacktrace replaces the previous retained stacktrace
+    /// array, and missing job records return `JobNotFound`.
+    async fn save_stacktrace(
+        &self,
+        job_id: &str,
+        stacktrace: Vec<String>,
+        failed_reason: String,
+    ) -> Result<Job>;
+
     async fn add_log(
         &self,
         job_id: &str,

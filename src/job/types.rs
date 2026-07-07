@@ -1085,6 +1085,9 @@ pub struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deferred_failure: Option<String>,
     pub failed_reason: Option<String>,
+    /// Retained failure stack traces, matching BullMQ's JSON stacktrace array shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stacktrace: Vec<String>,
     pub return_value: Option<Value>,
     pub progress: Option<Value>,
     pub logs: Vec<JobLogEntry>,
@@ -1147,6 +1150,7 @@ impl Job {
             lease_expires_at: None,
             deferred_failure: None,
             failed_reason: None,
+            stacktrace: Vec::new(),
             return_value: None,
             progress: None,
             logs: Vec::new(),

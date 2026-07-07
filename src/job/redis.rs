@@ -6110,6 +6110,21 @@ redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[3], '*', 'event', 'progress', 'j
 return {'ok', updated}
 "#;
 
+const SAVE_STACKTRACE_SCRIPT: &str = r#"
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not raw then
+  return {'missing'}
+end
+
+local job = cjson.decode(raw)
+job["stacktrace"] = cjson.decode(ARGV[2])
+job["failed_reason"] = ARGV[3]
+local updated = cjson.encode(job)
+redis.call('HSET', KEYS[1], ARGV[1], updated)
+
+return {'ok', updated}
+"#;
+
 const ADD_LOG_SCRIPT: &str = r#"
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
@@ -9023,6 +9038,29 @@ impl JobQueueBackend for RedisJobQueue {
         decode_transition_result(&result, job_id, "update progress")
     }
 
+    async fn save_stacktrace(
+        &self,
+        job_id: &str,
+        stacktrace: Vec<String>,
+        failed_reason: String,
+    ) -> Result<Job> {
+        let mut conn = self.connection().await?;
+        let stacktrace = serde_json::to_string(&stacktrace).map_err(|error| {
+            LaneError::Other(format!("failed to encode Redis job stacktrace: {error}"))
+        })?;
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(SAVE_STACKTRACE_SCRIPT)
+            .arg(1)
+            .arg(self.jobs_key())
+            .arg(job_id)
+            .arg(stacktrace)
+            .arg(failed_reason)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_transition_result(&result, job_id, "save stacktrace")
+    }
+
     async fn add_log(
         &self,
         job_id: &str,
@@ -9362,6 +9400,7 @@ fn decode_job(raw: &str) -> Result<Job> {
         .map_err(|error| LaneError::Other(format!("failed to decode Redis job: {error}")))?;
     normalize_lua_empty_array(&mut value, "logs");
     normalize_lua_empty_array(&mut value, "child_ids");
+    normalize_lua_empty_array(&mut value, "stacktrace");
     serde_json::from_value(value)
         .map_err(|error| LaneError::Other(format!("failed to decode Redis job: {error}")))
 }

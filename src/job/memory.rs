@@ -1400,6 +1400,23 @@ impl InMemoryJobQueue {
         Ok(job)
     }
 
+    /// Save retained failure diagnostics for a job.
+    pub async fn save_stacktrace(
+        &self,
+        job_id: &str,
+        stacktrace: Vec<String>,
+        failed_reason: String,
+    ) -> Result<Job> {
+        let mut inner = self.inner.lock().await;
+        let job = inner
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
+        job.stacktrace = stacktrace;
+        job.failed_reason = Some(failed_reason);
+        Ok(job.clone())
+    }
+
     /// Append a log line. `keep == 0` retains all log lines.
     pub async fn log(
         &self,
@@ -2176,6 +2193,15 @@ impl JobQueueBackend for InMemoryJobQueue {
 
     async fn update_progress(&self, job_id: &str, progress: Value) -> Result<Job> {
         self.set_progress(job_id, progress).await
+    }
+
+    async fn save_stacktrace(
+        &self,
+        job_id: &str,
+        stacktrace: Vec<String>,
+        failed_reason: String,
+    ) -> Result<Job> {
+        InMemoryJobQueue::save_stacktrace(self, job_id, stacktrace, failed_reason).await
     }
 
     async fn add_log(

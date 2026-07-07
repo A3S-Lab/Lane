@@ -97,6 +97,76 @@ async fn redis_backend_reads_job_finished_results_against_real_server() {
     .unwrap();
 }
 
+#[tokio::test]
+async fn redis_backend_saves_stacktrace_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(Duration::from_secs(120), run_save_stacktrace(redis_url))
+        .await
+        .expect("Redis save stacktrace integration test timed out")
+        .unwrap();
+}
+
+async fn run_save_stacktrace(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "save-stacktrace")
+        .expect("valid Redis URL should build the save-stacktrace queue");
+    let job = queue
+        .add_job(
+            "waiting".to_string(),
+            serde_json::json!({ "kind": "diagnostic" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("diagnostic job should add");
+
+    let empty_trace = queue
+        .save_stacktrace(&job.id, Vec::new(), "empty trace".to_string())
+        .await
+        .expect("empty stacktrace should save");
+    assert!(empty_trace.stacktrace.is_empty());
+    assert_eq!(empty_trace.failed_reason.as_deref(), Some("empty trace"));
+
+    let stacktrace = vec![
+        "Error: diagnostic failure".to_string(),
+        "at worker.rs:42:9".to_string(),
+    ];
+    let traced = queue
+        .save_stacktrace(
+            &job.id,
+            stacktrace.clone(),
+            "diagnostic failure".to_string(),
+        )
+        .await
+        .expect("stacktrace should save");
+    assert_eq!(traced.stacktrace, stacktrace);
+    assert_eq!(traced.failed_reason.as_deref(), Some("diagnostic failure"));
+
+    let restored = queue
+        .get_job(&job.id)
+        .await
+        .expect("traced job should load")
+        .expect("traced job should exist");
+    assert_eq!(restored.stacktrace, stacktrace);
+    assert_eq!(
+        restored.failed_reason.as_deref(),
+        Some("diagnostic failure")
+    );
+
+    let missing = queue
+        .save_stacktrace("missing-stacktrace-job", Vec::new(), "missing".to_string())
+        .await
+        .expect_err("missing stacktrace job should fail");
+    assert!(matches!(missing, LaneError::JobNotFound(_)));
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
 async fn run_job_finished_results(redis_url: String) -> redis::RedisResult<()> {
     let namespace = unique_namespace();
     cleanup_namespace(&redis_url, &namespace).await?;
