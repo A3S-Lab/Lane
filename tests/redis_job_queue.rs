@@ -878,6 +878,22 @@ async fn redis_backend_upserts_repeat_against_real_server() {
 }
 
 #[tokio::test]
+async fn redis_backend_upserts_repeat_from_scheduler_metadata_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_repeat_upsert_scheduler_metadata(redis_url),
+    )
+    .await
+    .expect("Redis repeat scheduler metadata upsert integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_removes_repeat_from_scheduler_metadata_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -4035,6 +4051,96 @@ async fn run_repeat_upsert(redis_url: String) -> redis::RedisResult<()> {
 
     cleanup_namespace_with_conn(&mut conn, &namespace).await?;
     trace_stage("repeat-upsert:cleanup-final:done");
+    Ok(())
+}
+
+async fn run_repeat_upsert_scheduler_metadata(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    trace_stage("repeat-upsert-scheduler:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("repeat-upsert-scheduler:cleanup:done");
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "repeat-upsert-scheduler")
+        .expect("valid Redis URL should build the repeat upsert scheduler queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let first = queue
+        .add_job(
+            "scheduler-owned-repeat".to_string(),
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new()
+                .with_delay(Duration::from_secs(30))
+                .with_repeat(
+                    RepeatOptions::every(Duration::from_secs(60)).with_key("scheduler-owned"),
+                ),
+        )
+        .await
+        .expect("scheduler-owned repeat should add");
+    let owner_key = format!("{namespace}:repeat-upsert-scheduler:repeat:scheduler-owned");
+    let scheduler_key = format!("{namespace}:repeat-upsert-scheduler:repeat");
+    let scheduler_meta_key =
+        format!("{namespace}:repeat-upsert-scheduler:repeat_meta:scheduler-owned");
+    let removed_owner_key: usize = conn.del(&owner_key).await?;
+    assert_eq!(removed_owner_key, 1);
+    let scheduler_owner_id: Option<String> = conn.hget(&scheduler_meta_key, "jid").await?;
+    assert_eq!(scheduler_owner_id.as_deref(), Some(first.id.as_str()));
+
+    let replacement = queue
+        .upsert_repeat(
+            JobSpec::new(
+                "scheduler-owned-repeat-v2",
+                serde_json::json!({ "version": 2 }),
+            )
+            .with_options(
+                JobOptions::new()
+                    .with_delay(Duration::from_secs(60))
+                    .with_repeat(
+                        RepeatOptions::every(Duration::from_secs(90)).with_key("scheduler-owned"),
+                    ),
+            ),
+            Utc::now(),
+        )
+        .await
+        .expect("repeat upsert should replace scheduler metadata owner");
+    trace_stage("repeat-upsert-scheduler:replaced");
+    assert_ne!(replacement.id, first.id);
+    assert_eq!(replacement.name, "scheduler-owned-repeat-v2");
+
+    let old_hash: Option<String> = conn
+        .hget(
+            format!("{namespace}:repeat-upsert-scheduler:jobs"),
+            &first.id,
+        )
+        .await?;
+    assert!(old_hash.is_none());
+    let old_delayed_score: Option<f64> = conn
+        .zscore(
+            format!("{namespace}:repeat-upsert-scheduler:delayed"),
+            &first.id,
+        )
+        .await?;
+    assert!(old_delayed_score.is_none());
+    let owner_after: Option<String> = conn.get(&owner_key).await?;
+    assert_eq!(owner_after.as_deref(), Some(replacement.id.as_str()));
+    let scheduler_owner_after: Option<String> = conn.hget(&scheduler_meta_key, "jid").await?;
+    assert_eq!(
+        scheduler_owner_after.as_deref(),
+        Some(replacement.id.as_str())
+    );
+    let scheduler_score_after: Option<f64> = conn.zscore(&scheduler_key, "scheduler-owned").await?;
+    assert!(scheduler_score_after.is_some());
+    assert_eq!(
+        queue
+            .count_repeats()
+            .await
+            .expect("repeat count should load after scheduler upsert"),
+        1
+    );
+
+    cleanup_namespace_with_conn(&mut conn, &namespace).await?;
+    trace_stage("repeat-upsert-scheduler:cleanup-final:done");
     Ok(())
 }
 

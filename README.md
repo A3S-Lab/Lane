@@ -1261,13 +1261,15 @@ zset entry, and metadata hash only when they still describe that missing owner.
 `upsert_repeat()` follows BullMQ's
 `upsertJobScheduler(..., override: true)` mechanism at Lane's current
 repeat-owner layer: the Redis script resolves the current `repeat:<key>` owner,
-rejects active leased owners, rejects flow-owned occurrences to avoid corrupting
-parent dependencies, checks job-id and deduplication-owner collisions, removes
-the old non-active owner from the jobs hash and state indexes, clears its lock,
-logs, dependency key, deduplication owner, and repeat owner only when they still
-point at that job, then writes the replacement job, its waiting/delayed index,
-events, deduplication key, `repeat:<key>` owner, and scheduler metadata in the
-same Redis turn.
+falls back to `repeat_meta:<key>.jid` when the fast owner key is missing,
+repairs that owner key when the scheduler owner is still valid, rejects active
+leased owners, rejects flow-owned occurrences to avoid corrupting parent
+dependencies, checks job-id and deduplication-owner collisions, removes the old
+non-active owner from the jobs hash and state indexes, clears its lock, logs,
+dependency key, deduplication owner, and repeat owner only when they still point
+at that job, then writes the replacement job, its waiting/delayed index, events,
+deduplication key, `repeat:<key>` owner, and scheduler metadata in the same
+Redis turn.
 
 This is intentionally a script-level mechanism, not just API-field parity. It is
 inspired by BullMQ's use of Lua scripts to maintain repeat scheduler records,

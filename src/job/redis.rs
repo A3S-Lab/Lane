@@ -636,6 +636,7 @@ if ARGV[9] == '' then
 end
 
 local owner_key = ARGV[10] .. ARGV[9]
+local scheduler_meta_key = repeat_scheduler_meta_key(ARGV[10], ARGV[9])
 local current_owner_id = redis.call('GET', owner_key)
 local current_owner_job = nil
 if current_owner_id then
@@ -654,6 +655,36 @@ if current_owner_id then
     elseif (current_owner_job["parent_id"] and current_owner_job["parent_id"] ~= cjson.null) or
       (current_owner_job["child_ids"] and current_owner_job["child_ids"] ~= cjson.null and #current_owner_job["child_ids"] > 0) then
       return {'flow', current_owner_id}
+    end
+  end
+end
+
+if not current_owner_id then
+  local scheduler_owner_id = redis.call('HGET', scheduler_meta_key, 'jid')
+  if scheduler_owner_id then
+    local scheduler_owner_raw = redis.call('HGET', KEYS[1], scheduler_owner_id)
+    if not scheduler_owner_raw then
+      redis.call('ZREM', repeat_scheduler_key(ARGV[10]), ARGV[9])
+      redis.call('DEL', scheduler_meta_key)
+    else
+      local scheduler_owner_job = cjson.decode(scheduler_owner_raw)
+      if scheduler_owner_job["state"] == "completed"
+        or scheduler_owner_job["state"] == "failed"
+        or repeat_key(scheduler_owner_job) ~= ARGV[9] then
+        redis.call('ZREM', repeat_scheduler_key(ARGV[10]), ARGV[9])
+        redis.call('DEL', scheduler_meta_key)
+      elseif scheduler_owner_job["state"] == "active" then
+        redis.call('SET', owner_key, scheduler_owner_id, 'NX')
+        return {'active', scheduler_owner_id}
+      elseif (scheduler_owner_job["parent_id"] and scheduler_owner_job["parent_id"] ~= cjson.null) or
+        (scheduler_owner_job["child_ids"] and scheduler_owner_job["child_ids"] ~= cjson.null and #scheduler_owner_job["child_ids"] > 0) then
+        redis.call('SET', owner_key, scheduler_owner_id, 'NX')
+        return {'flow', scheduler_owner_id}
+      else
+        current_owner_id = scheduler_owner_id
+        current_owner_job = scheduler_owner_job
+        redis.call('SET', owner_key, scheduler_owner_id, 'NX')
+      end
     end
   end
 end
