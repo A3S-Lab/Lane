@@ -238,6 +238,9 @@ impl InMemoryJobQueue {
             now,
             fields,
         );
+        if retries_exhausted(&failed) {
+            emit_retries_exhausted_event_locked(&mut inner, &failed, now);
+        }
         Ok(failed)
     }
 
@@ -2593,6 +2596,26 @@ fn emit_event_locked(
     trim_events_locked(inner, DEFAULT_JOB_EVENT_RETENTION);
 }
 
+fn emit_retries_exhausted_event_locked(
+    inner: &mut InMemoryJobQueueState,
+    job: &Job,
+    timestamp: DateTime<Utc>,
+) {
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "attemptsMade".to_string(),
+        Value::from(u64::from(job.attempts_made)),
+    );
+    emit_event_locked(
+        inner,
+        "retries-exhausted",
+        Some(job),
+        None,
+        timestamp,
+        fields,
+    );
+}
+
 fn trim_events_locked(inner: &mut InMemoryJobQueueState, max_len: usize) -> usize {
     if inner.events.len() <= max_len {
         return 0;
@@ -3238,6 +3261,10 @@ fn job_reference_time(job: &Job) -> DateTime<Utc> {
 fn should_retry(job: &Job) -> bool {
     job.options.retry_policy.max_retries > 0
         && job.attempts_made <= job.options.retry_policy.max_retries
+}
+
+fn retries_exhausted(job: &Job) -> bool {
+    job.state == JobState::Failed && job.attempts_made > job.options.retry_policy.max_retries
 }
 
 fn add_duration(at: DateTime<Utc>, duration: Duration) -> DateTime<Utc> {

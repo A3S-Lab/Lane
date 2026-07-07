@@ -3916,6 +3916,27 @@ end
 
 add_base_marker_if_waiting(KEYS[#KEYS], KEYS[7])
 redis.call('XADD', KEYS[9], 'MAXLEN', '~', ARGV[16], '*', 'event', 'failed', 'jobId', ARGV[1], 'failedReason', ARGV[4], 'prev', 'active')
+local max_retries = 0
+if job["options"] and job["options"] ~= cjson.null and job["options"]["retry_policy"] and job["options"]["retry_policy"] ~= cjson.null then
+  max_retries = tonumber(job["options"]["retry_policy"]["max_retries"] or '0') or 0
+end
+local attempts_made = tonumber(job["attempts_made"] or '0') or 0
+if attempts_made > max_retries then
+  redis.call(
+    'XADD',
+    KEYS[9],
+    'MAXLEN',
+    '~',
+    ARGV[16],
+    '*',
+    'event',
+    'retries-exhausted',
+    'jobId',
+    ARGV[1],
+    'attemptsMade',
+    attempts_made
+  )
+end
 
 return {'ok', updated}
 "#;

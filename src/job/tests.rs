@@ -2861,6 +2861,28 @@ async fn failed_jobs_retry_with_backoff_then_terminal_failure() {
         .unwrap();
     assert_eq!(failed.state, JobState::Failed);
     assert_eq!(failed.failed_reason.as_deref(), Some("still down"));
+
+    let events = queue.read_events("-", "+", 20).await.unwrap();
+    let names = events
+        .iter()
+        .map(|event| event.event.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "added",
+            "waiting",
+            "active",
+            "delayed",
+            "waiting",
+            "active",
+            "failed",
+            "retries-exhausted"
+        ]
+    );
+    let exhausted = events.last().unwrap();
+    assert_eq!(exhausted.job_id.as_deref(), Some(job.id.as_str()));
+    assert_eq!(exhausted.fields.get("attemptsMade"), Some(&Value::from(2)));
 }
 
 #[tokio::test]
@@ -2901,6 +2923,11 @@ async fn failed_jobs_can_discard_configured_retry() {
     let stats = queue.stats().await.unwrap();
     assert_eq!(stats.delayed, 0);
     assert_eq!(stats.failed, 1);
+
+    let events = queue.read_events("-", "+", 20).await.unwrap();
+    assert!(!events
+        .iter()
+        .any(|event| event.event == "retries-exhausted"));
 }
 
 #[tokio::test]

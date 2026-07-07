@@ -1157,13 +1157,15 @@ Redis backend with an `events` stream per queue. Lua state transitions write the
 event in the same Redis turn as the job mutation: add writes `added` followed by
 `waiting`, `delayed`, or `waiting-children`; claim writes `active prev=waiting`;
 completion writes `completed prev=active` with `returnvalue`; failure writes
-`failed` or retry `delayed` with `failedReason`; progress writes
-`progress data=<json>`; pause/resume write queue-level events. `read_events()`
-uses `XRANGE` over stream ids, and `trim_events()` uses BullMQ-style
-`XTRIM MAXLEN ~`. The in-memory and local durable backends keep the same
-retained event entries in their snapshots so tests and embedded runtimes expose
-the same contract without Redis. Like BullMQ's `addLog` script, Lane job logs
-remain a retained log list and do not emit queue events; progress updates do.
+`failed` or retry `delayed` with `failedReason`, and terminal failures whose
+attempt count is exhausted also write BullMQ-style `retries-exhausted` with
+`attemptsMade`; progress writes `progress data=<json>`; pause/resume write
+queue-level events. `read_events()` uses `XRANGE` over stream ids, and
+`trim_events()` uses BullMQ-style `XTRIM MAXLEN ~`. The in-memory and local
+durable backends keep the same retained event entries in their snapshots so
+tests and embedded runtimes expose the same contract without Redis. Like
+BullMQ's `addLog` script, Lane job logs remain a retained log list and do not
+emit queue events; progress updates do.
 
 Completion, terminal failure, and stalled terminal failure scripts use
 BullMQ-style finalization semantics for deduplication keys: a matching owner key
@@ -1381,6 +1383,10 @@ the repeat key and scheduler metadata. When the retried job is a retained flow
 child, retry restores the child into the parent's pending dependency set, clears
 stale deferred parent failure metadata, and moves a non-terminal parent back to
 `waiting_children`, matching BullMQ's `reprocessJob` dependency restoration path.
+When a processing failure reaches terminal failed state because its configured
+retry attempts are exhausted, Lane emits `retries-exhausted` after `failed`,
+matching BullMQ's `moveToFinished` event order. Manual retry-discard paths only
+emit that event if the job had actually reached the configured retry limit.
 BullMQ's deprecated `job.discard()` is intentionally modeled as a current
 failure-path decision rather than stored job metadata: BullMQ sets an in-memory
 `discarded` flag, `shouldRetryJob()` checks that flag before `moveToFailed()`,

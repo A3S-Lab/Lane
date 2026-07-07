@@ -1096,6 +1096,22 @@ async fn redis_backend_records_queue_events_against_real_server() {
 }
 
 #[tokio::test]
+async fn redis_backend_emits_retries_exhausted_event_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_retries_exhausted_event(redis_url),
+    )
+    .await
+    .expect("Redis retries-exhausted event integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_updates_worker_markers_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -2411,6 +2427,96 @@ async fn run_queue_events(redis_url: String) -> redis::RedisResult<()> {
     assert_eq!(
         events[4].fields.get("returnvalue"),
         Some(&serde_json::json!({ "ok": true }))
+    );
+
+    cleanup_namespace(&redis_url, &namespace).await?;
+    Ok(())
+}
+
+async fn run_retries_exhausted_event(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "retry-events")
+        .expect("valid Redis URL should build the retry-events queue");
+    let job = queue
+        .add_job(
+            "retry-event".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_retry_policy(RetryPolicy::fixed(1, Duration::from_millis(5))),
+        )
+        .await
+        .expect("retry event job should add");
+    let first = queue
+        .claim_next(
+            "worker-retry-event-a".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("retry event first claim should return")
+        .expect("retry event job should be claimable");
+    assert_eq!(first.id, job.id);
+    queue
+        .fail_job(
+            &first.id,
+            lock_token(&first),
+            "temporary".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("first failure should schedule retry");
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let second = queue
+        .claim_next(
+            "worker-retry-event-b".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("retry event second claim should return")
+        .expect("retry event job should be claimable after delay");
+    assert_eq!(second.id, job.id);
+    assert_eq!(second.attempts_made, 2);
+    queue
+        .fail_job(
+            &second.id,
+            lock_token(&second),
+            "terminal".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("second failure should be terminal");
+
+    let events = queue
+        .read_events("-", "+", 20)
+        .await
+        .expect("retry events should read");
+    let names = events
+        .iter()
+        .map(|event| event.event.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "added",
+            "waiting",
+            "active",
+            "delayed",
+            "waiting",
+            "active",
+            "failed",
+            "retries-exhausted"
+        ]
+    );
+    let exhausted = events
+        .last()
+        .expect("retries-exhausted event should be present");
+    assert_eq!(exhausted.job_id.as_deref(), Some(job.id.as_str()));
+    assert_eq!(
+        exhausted.fields.get("attemptsMade"),
+        Some(&serde_json::json!(2))
     );
 
     cleanup_namespace(&redis_url, &namespace).await?;
