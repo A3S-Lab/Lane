@@ -733,6 +733,27 @@ async fn run_repeat_upsert(redis_url: String) -> redis::RedisResult<()> {
         .get(format!("{namespace}:repeat-upsert:repeat:heartbeat-series"))
         .await?;
     assert_eq!(owner_id.as_deref(), Some(replacement.id.as_str()));
+    let scheduler_score: Option<f64> = conn
+        .zscore(
+            format!("{namespace}:repeat-upsert:repeat"),
+            "heartbeat-series",
+        )
+        .await?;
+    assert!(scheduler_score.is_some());
+    let scheduler_job_id: Option<String> = conn
+        .hget(
+            format!("{namespace}:repeat-upsert:repeat_meta:heartbeat-series"),
+            "jid",
+        )
+        .await?;
+    assert_eq!(scheduler_job_id.as_deref(), Some(replacement.id.as_str()));
+    let scheduler_name: Option<String> = conn
+        .hget(
+            format!("{namespace}:repeat-upsert:repeat_meta:heartbeat-series"),
+            "name",
+        )
+        .await?;
+    assert_eq!(scheduler_name.as_deref(), Some("heartbeat-v2"));
 
     let entry = queue
         .get_repeat("heartbeat-series")
@@ -2401,7 +2422,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             serde_json::json!({}),
             JobOptions::new()
                 .with_priority(7)
-                .with_delay(Duration::from_secs(2)),
+                .with_delay(Duration::from_secs(10)),
         )
         .await
         .expect("claim-promoted delayed job should be added");
@@ -2414,7 +2435,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect("early claim-promote claim should return")
         .is_none());
-    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    tokio::time::sleep(Duration::from_millis(10_100)).await;
     let claim_promoted_claim = claim_promote_queue
         .claim_next(
             "worker-claim-promote".to_string(),
@@ -5668,6 +5689,13 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         repeat_successor_owner.as_deref(),
         Some(repeat_successor.id.as_str())
     );
+    let repeat_scheduler_owner: Option<String> = flow_index_conn
+        .hget(format!("{namespace}:jobs:repeat_meta:heartbeat"), "jid")
+        .await?;
+    assert_eq!(
+        repeat_scheduler_owner.as_deref(),
+        Some(repeat_successor.id.as_str())
+    );
     let repeat_entries_after_successor = producer
         .list_repeats()
         .await
@@ -5726,6 +5754,14 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .get(format!("{namespace}:jobs:repeat:heartbeat"))
         .await?;
     assert!(repeat_owner_after_limit.is_none());
+    let repeat_scheduler_after_limit: Option<String> = flow_index_conn
+        .hget(format!("{namespace}:jobs:repeat_meta:heartbeat"), "jid")
+        .await?;
+    assert!(repeat_scheduler_after_limit.is_none());
+    let repeat_scheduler_score_after_limit: Option<f64> = flow_index_conn
+        .zscore(format!("{namespace}:jobs:repeat"), "heartbeat")
+        .await?;
+    assert!(repeat_scheduler_score_after_limit.is_none());
     let repeat_entries_after_limit = producer
         .list_repeats()
         .await
@@ -6029,6 +6065,16 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         repeat_remove_owner.as_deref(),
         Some(repeat_remove_successor.id.as_str())
     );
+    let repeat_remove_scheduler_owner: Option<String> = repeat_remove_conn
+        .hget(
+            format!("{namespace}:repeat-remove:repeat_meta:ephemeral-heartbeat"),
+            "jid",
+        )
+        .await?;
+    assert_eq!(
+        repeat_remove_scheduler_owner.as_deref(),
+        Some(repeat_remove_successor.id.as_str())
+    );
     let repeat_removed_by_key = repeat_remove_queue
         .remove_repeat("ephemeral-heartbeat")
         .await
@@ -6055,6 +6101,20 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         ))
         .await?;
     assert!(repeat_remove_owner_after_remove.is_none());
+    let repeat_remove_scheduler_after_remove: Option<String> = repeat_remove_conn
+        .hget(
+            format!("{namespace}:repeat-remove:repeat_meta:ephemeral-heartbeat"),
+            "jid",
+        )
+        .await?;
+    assert!(repeat_remove_scheduler_after_remove.is_none());
+    let repeat_remove_scheduler_score_after_remove: Option<f64> = repeat_remove_conn
+        .zscore(
+            format!("{namespace}:repeat-remove:repeat"),
+            "ephemeral-heartbeat",
+        )
+        .await?;
+    assert!(repeat_remove_scheduler_score_after_remove.is_none());
     assert!(repeat_remove_queue
         .remove_repeat("ephemeral-heartbeat")
         .await
@@ -6066,10 +6126,24 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             "missing-repeat-owner",
         )
         .await?;
+    let _: usize = repeat_remove_conn
+        .zadd(
+            format!("{namespace}:repeat-remove:repeat"),
+            "stale-heartbeat",
+            1_i64,
+        )
+        .await?;
+    let _: usize = repeat_remove_conn
+        .hset(
+            format!("{namespace}:repeat-remove:repeat_meta:stale-heartbeat"),
+            "jid",
+            "missing-repeat-owner",
+        )
+        .await?;
     let repeat_remove_entries_after_stale = repeat_remove_queue
         .list_repeats()
         .await
-        .expect("repeat list should prune stale owner keys");
+        .expect("repeat list should prune stale scheduler and owner keys");
     assert!(!repeat_remove_entries_after_stale
         .iter()
         .any(|entry| entry.key == "stale-heartbeat"));
@@ -6077,6 +6151,20 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .get(format!("{namespace}:repeat-remove:repeat:stale-heartbeat"))
         .await?;
     assert!(stale_repeat_owner_after_list.is_none());
+    let stale_repeat_scheduler_after_list: Option<f64> = repeat_remove_conn
+        .zscore(
+            format!("{namespace}:repeat-remove:repeat"),
+            "stale-heartbeat",
+        )
+        .await?;
+    assert!(stale_repeat_scheduler_after_list.is_none());
+    let stale_repeat_meta_after_list: Option<String> = repeat_remove_conn
+        .hget(
+            format!("{namespace}:repeat-remove:repeat_meta:stale-heartbeat"),
+            "jid",
+        )
+        .await?;
+    assert!(stale_repeat_meta_after_list.is_none());
     assert!(repeat_remove_queue
         .remove_repeat("stale-heartbeat")
         .await
@@ -6265,22 +6353,11 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await?;
     assert!(atomic_delayed_score.is_some());
 
-    trace_stage("cleanup:final:start");
-    match tokio::time::timeout(
-        Duration::from_secs(5),
-        cleanup_namespace_with_conn(&mut atomic_add_conn, &namespace),
-    )
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            eprintln!("warning: final Redis cleanup failed for {namespace}: {error}");
-        }
-        Err(_) => {
-            eprintln!("warning: final Redis cleanup timed out for {namespace}");
-        }
-    }
-    trace_stage("cleanup:final:done");
+    // This lifecycle scenario intentionally exercises large cleanup/drain paths.
+    // The namespace is unique per run, and a blocking final namespace scan can
+    // make the shared Redis integration instance unavailable for following
+    // tests, so leave final disposal to the test Redis process lifecycle.
+    trace_stage("cleanup:final:skipped");
     Ok(())
 }
 
@@ -6565,11 +6642,15 @@ async fn cleanup_namespace_with_conn(
             .arg("MATCH")
             .arg(format!("{namespace}:*"))
             .arg("COUNT")
-            .arg(100_u16)
+            .arg(1000_u16)
             .query_async(conn)
             .await?;
         if !keys.is_empty() {
-            let _: usize = conn.del(keys).await?;
+            let removed: redis::RedisResult<usize> =
+                redis::cmd("UNLINK").arg(&keys).query_async(conn).await;
+            if removed.is_err() {
+                let _: usize = conn.del(keys).await?;
+            }
         }
         if next_cursor == 0 {
             break;

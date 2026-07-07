@@ -372,9 +372,9 @@ A3S stack and language SDKs.
 | Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, debounce TTL extension, delayed-owner replace, and keep-last-if-active requeue, repeat-key ownership and upsert, explicit job states, priority plus FIFO/LIFO same-priority ordering, finished-job retention by age/count/limit, retained queue event streams, delayed jobs, token-owned worker leases, active-to-wait/delayed movement, completion/failure snapshots, retry backoff, Redis-shared rate-limit and active-concurrency controls, BullMQ-style two-phase stalled recovery, pause/resume. |
 | Job management API | In progress | Add/get/get-state/get-job-counts/get-job-count/count-pending/remove/remove-repeat/upsert-repeat/remove-deduplication-key/get-deduplication-job-id/list-repeats/get-repeat/count-repeats/list-repeats-page/get-flow-dependencies/get-flow-dependency-counts/remove-unprocessed-children/remove-child-dependency/promote/reschedule/delay-active/release-active/retry/update-priority/update-priority-with-lifo/update-data/pause/resume/is-paused/drain/clean/obliterate APIs, multi-state pagination, ascending/descending listing, waiting priority counts, add-log/get-logs/clear-job-logs, read-events/trim-events, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, and stalled recovery loops. |
-| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, FIFO/LIFO waiting score ordering, Redis stream queue events, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership/listing/removal/upsert/pagination, flow submission, flow dependency inspection, delayed promotion and rescheduling, active-to-wait/delayed movement, single-job promote, state-index queries, job count snapshots, manual retry, priority update, progress update, log append, list/stat snapshots, finished-job age/count retention during complete/fail/stalled scripts, drain, clean, obliterate, claim, Redis-shared rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled candidate-set recovery semantics. Postgres/NATS backends remain planned. |
+| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, FIFO/LIFO waiting score ordering, Redis stream queue events, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership, Redis-backed repeat scheduler zset/hash metadata, listing/removal/upsert/pagination, flow submission, flow dependency inspection, delayed promotion and rescheduling, active-to-wait/delayed movement, single-job promote, state-index queries, job count snapshots, manual retry, priority update, progress update, log append, list/stat snapshots, finished-job age/count retention during complete/fail/stalled scripts, drain, clean, obliterate, claim, Redis-shared rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled candidate-set recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, dependency inspection, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
-| Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, end timestamps, repeat-key removal, upsert, single-key lookup, counts, and BullMQ-style next-time pagination are available across in-memory, local durable, and Redis backends. |
+| Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, end timestamps, repeat-key removal, upsert, single-key lookup, counts, and BullMQ-style next-time pagination are available across in-memory, local durable, and Redis backends. Redis additionally maintains scheduler zset/hash metadata in Lua so distributed readers and writers share one repeat-series state machine. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
 
 The generic job runtime is exposed through the `JobQueueBackend` trait.
@@ -1013,7 +1013,7 @@ mechanism, where the dedup-next record is consumed during job finalization rathe
 than by a later client-side pass.
 
 Waiting order is modeled after BullMQ's Redis-level mechanism rather than only
-matching its option names. In BullMQ 5.79.2, standard jobs use a Redis list:
+matching its option names. In BullMQ 5.79.3, standard jobs use a Redis list:
 `opts.lifo` selects `RPUSH`, FIFO uses `LPUSH`, and workers consume from the
 tail with `RPOPLPUSH`; prioritized jobs use a sorted set whose score is
 `priority * 0x100000000 + counter`, and `changePriority(..., lifo: true)` puts
@@ -1029,7 +1029,7 @@ same priority, and oldest FIFO before newer FIFO, while preserving
 
 Finished-job retention follows BullMQ's underlying `moveToFinished` mechanism
 rather than only matching the `removeOnComplete` and `removeOnFail` option
-names. In BullMQ 5.79.2, those options are normalized to `keepJobs`; `true`
+names. In BullMQ 5.79.3, those options are normalized to `keepJobs`; `true`
 becomes `{ count: 0 }`, `false` becomes unlimited retention, a number becomes
 `{ count: number }`, and an object may carry `age`, `count`, and `limit`. The
 `moveToFinished-14.lua` script writes the current job to the completed or failed
@@ -1085,7 +1085,7 @@ created. `get_flow_dependencies()` uses a Redis-side read script to load the
 parent and every retained child snapshot from the jobs hash in one turn, and
 returns the child ids that are still pending or missing from retention.
 `get_flow_dependency_counts()` follows BullMQ's `getDependencyCounts` Redis/Lua
-mechanism instead of only copying the API names. BullMQ 5.79.2 counts
+mechanism instead of only copying the API names. BullMQ 5.79.3 counts
 parent-scoped `:processed`, `:dependencies`, `:failed`, and `:unsuccessful`
 structures with `HLEN`, `SCARD`, `HLEN`, and `ZCARD`. Lane keeps child snapshots
 in the queue jobs hash and keeps the still-blocking children in
@@ -1120,22 +1120,25 @@ pass.
 Repeat successors are created during the Redis completion script too. The
 worker computes the next occurrence from `RepeatOptions`, then the Lua script
 finishes the current job and writes the next delayed or waiting occurrence in
-the same Redis turn. Redis also keeps a lightweight `repeat:<key>` owner key for
-each active repeat series. The add scripts check that key before inserting a new
-repeat job, the completion script transfers ownership to the successor before
-releasing the completed occurrence, and terminal failure, remove, clean, and
-stalled terminal failure release the key only if it still points at the job being
-finalized or removed. Manual retry reclaims the repeat key inside the retry
+the same Redis turn. Redis keeps both a lightweight `repeat:<key>` owner key for
+fast collision checks and a scheduler index made of the queue-level `repeat`
+zset plus `repeat_meta:<key>` hashes. The add scripts check the owner key before
+inserting a new repeat job, the completion script transfers ownership and
+scheduler metadata to the successor before releasing the completed occurrence,
+and terminal failure, remove, clean, drain, and stalled terminal failure release
+both records only if they still point at the job being finalized or removed.
+Manual retry reclaims the repeat key and scheduler metadata inside the retry
 script and rejects retry if another non-terminal occurrence already owns the
-series. `list_repeats()` scans the queue's `repeat:<key>` owner keys, loads
-each owner job snapshot from the jobs hash, returns only non-terminal matching
-owners, and clears stale owner keys that point at missing, terminal, or
-mismatched jobs. `remove_repeat()` resolves the current `repeat:<key>` owner and
-then runs the same Redis-side removal path as `remove_job()`, so it rejects
-active leased owners, removes the job hash and state indexes, releases repeat
-and deduplication ownership, and can unblock flow parents. If the owner key
-points at a missing job, Redis clears that stale owner key only when it still
-points at the missing id. `upsert_repeat()` follows BullMQ's
+series. `list_repeats()` reads the scheduler zset first, loads each owner job
+snapshot from the jobs hash, returns only non-terminal matching owners, clears
+stale scheduler/owner records that point at missing, terminal, or mismatched
+jobs, and scans legacy `repeat:<key>` owner keys as a migration fallback.
+`remove_repeat()` resolves the current `repeat:<key>` owner and then runs the
+same Redis-side removal path as `remove_job()`, so it rejects active leased
+owners, removes the job hash and state indexes, releases repeat and
+deduplication ownership, and can unblock flow parents. If the owner key points
+at a missing job, Redis clears that stale owner key and scheduler metadata only
+when they still point at the missing id. `upsert_repeat()` follows BullMQ's
 `upsertJobScheduler(..., override: true)` mechanism at Lane's current
 repeat-owner layer: the Redis script resolves the current `repeat:<key>` owner,
 rejects active leased owners, rejects flow-owned occurrences to avoid corrupting
@@ -1143,23 +1146,30 @@ parent dependencies, checks job-id and deduplication-owner collisions, removes
 the old non-active owner from the jobs hash and state indexes, clears its lock,
 logs, dependency key, deduplication owner, and repeat owner only when they still
 point at that job, then writes the replacement job, its waiting/delayed index,
-events, deduplication key, and `repeat:<key>` owner in the same Redis turn.
+events, deduplication key, `repeat:<key>` owner, and scheduler metadata in the
+same Redis turn.
 
 This is intentionally a script-level mechanism, not just API-field parity. It is
 inspired by BullMQ's use of Lua scripts to maintain repeat scheduler records,
-deduplication keys, locks, and state indexes atomically. In BullMQ 5.79.2,
+deduplication keys, locks, and state indexes atomically. In BullMQ 5.79.3,
 `addJobScheduler-11.lua` stores scheduler metadata in the repeat zset/hash and,
 when overriding, removes the previous delayed, prioritized, waiting, or paused
 next job before creating the new scheduled job; active/completed/failed
-collisions are not blindly overwritten. Lane does not yet store the full
-BullMQ scheduler zset/hash metadata, but it preserves the same atomic
-replace-or-reject invariant for the current repeat owner. `get_repeat()`,
-`count_repeats()`, and `list_repeats_page()` mirror BullMQ's
-`getJobScheduler`, `getJobSchedulersCount`, and `getJobSchedulers(start, end,
-asc)` read side: entries are ordered by next scheduled time, defaulting to
-descending order. A3S Lane's current repeat support is still a lightweight
-repeat-series owner and successor enqueue model; richer BullMQ scheduler
-metadata remains a later SDK/runtime parity item.
+collisions are not blindly overwritten. Lane now keeps the existing
+`repeat:<key>` owner key for fast collision checks and also writes a
+BullMQ-style scheduler zset at the queue's `repeat` key plus
+`repeat_meta:<key>` hashes containing the current owner id, name, next
+timestamp, state, count, and repeat options. Add, bulk add, flow add, repeat
+upsert, repeat successor enqueue, retry, remove, clean, drain, and stalled
+terminal cleanup update those records inside the same Redis script that mutates
+the job state. `get_repeat()`, `count_repeats()`, and `list_repeats_page()`
+read through the scheduler zset, validate the owner job snapshot, prune stale
+metadata, and mirror BullMQ's `getJobScheduler`, `getJobSchedulersCount`, and
+`getJobSchedulers(start, end, asc)` read side: entries are ordered by next
+scheduled time, defaulting to descending order. Lane still models repeat work as
+a Rust-native repeat-series owner and successor enqueue flow rather than a full
+BullMQ JS template engine, so exact BullMQ scheduler field-for-field parity
+remains a later SDK/runtime compatibility item.
 
 Manual lifecycle management follows the same Redis-side state movement rule:
 `promote_job()` removes a delayed job from the delayed zset and inserts it into
@@ -1305,6 +1315,12 @@ turn. At the end of the script it marks the current active index members in the
 BullMQ's `extendLock` and `removeLock` helpers. If an active sorted-set member
 points at a job that has already moved to a different state, a later recovery
 pass prunes that stale active index instead of treating it as recoverable work.
+BullMQ 5.79.3 also special-cases repeatable scheduler jobs in
+`moveStalledJobsToWait-9.lua`: if the scheduler record still exists, the stalled
+occurrence is requeued even after the ordinary stalled limit is exceeded. Lane
+still applies `max_stalled_count` uniformly to repeat and non-repeat jobs, so
+that repeat-stalled branch remains a runtime parity item rather than an API
+field-mapping task.
 
 `remove_job()` uses a Redis script to reject active jobs and remove the job
 hash, lock key, all state indexes, retained log list, and any child dependency
