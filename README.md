@@ -1292,12 +1292,13 @@ timestamp, state, count, repeat options, and the schedule-facing fields `key`,
 them. Scheduler writes delete and rebuild the metadata hash before `HSET`, so
 an overwrite from an interval schedule to a cron schedule cannot leave stale
 `every` or `endDate` fields behind. Add, bulk add, flow add, repeat upsert,
-repeat successor enqueue, claim, promote, reschedule, active delay/release,
-retry, remove, clean, drain, and stalled terminal cleanup update those records
-inside the same Redis script that mutates the job state. Non-terminal movement
-scripts refresh `repeat_meta:<key>.state` and `repeat_meta:<key>.next`, update
-the scheduler zset score, and restore a missing fast `repeat:<key>` owner key
-with `SET NX` when the scheduler metadata still points at the moved job.
+repeat successor enqueue, claim-time due promotion, `promote_due_jobs()`,
+manual promote, reschedule, active delay/release, retry, remove, clean, drain,
+and stalled terminal cleanup update those records inside the same Redis script
+that mutates the job state. Non-terminal movement scripts refresh
+`repeat_meta:<key>.state` and `repeat_meta:<key>.next`, update the scheduler
+zset score, and restore a missing fast `repeat:<key>` owner key with `SET NX`
+when the scheduler metadata still points at the moved job.
 `get_repeat()`, `count_repeats()`, and `list_repeats_page()` read through the
 scheduler zset, validate the owner job snapshot, repair missing fast owner keys
 from scheduler metadata, prune stale metadata, and mirror BullMQ's
@@ -1328,10 +1329,11 @@ with its priority score in the same Redis turn.
 That waiting write uses the same FIFO/LIFO score helper as initial add, delayed
 promotion, manual retry, stalled recovery, repeat successor enqueue, dedup
 keep-last enqueue, and flow parent release. When the moved job is the current
-repeat-series owner, claim, delayed promotion, manual promote, reschedule,
-active delay, and active release also refresh the scheduler hash/zset in the
-same script and repair a missing fast owner key from scheduler metadata instead
-of leaving the repeat series split across stale Redis keys.
+repeat-series owner, claim, claim-time delayed promotion, `promote_due_jobs()`,
+manual promote, reschedule, active delay, and active release also refresh the
+scheduler hash/zset in the same script and repair a missing fast owner key from
+scheduler metadata instead of leaving the repeat series split across stale Redis
+keys.
 `retry_job()` clears terminal failure metadata, treats the failed zset as the
 Redis movement gate, prunes orphaned or stale failed members, and moves valid
 failed jobs back to waiting inside one script. For deduplicated jobs, that same

@@ -5159,6 +5159,29 @@ async fn run_repeat_nonterminal_scheduler_metadata(redis_url: String) -> redis::
     )
     .await?;
 
+    let removed_owner: usize = conn.del(&owner_key).await?;
+    assert_eq!(removed_owner, 1);
+    let promoted_due = queue
+        .promote_due_jobs(rescheduled.scheduled_at + chrono::Duration::seconds(1))
+        .await
+        .expect("repeat metadata due owner should promote");
+    assert_eq!(promoted_due, 1);
+    let promoted_due_job = queue
+        .get_job(&rescheduled.id)
+        .await
+        .expect("repeat metadata due-promoted owner lookup should return")
+        .expect("repeat metadata due-promoted owner should remain");
+    assert_eq!(promoted_due_job.state, JobState::Waiting);
+    assert_repeat_scheduler_metadata(
+        &mut conn,
+        &namespace,
+        "repeat-metadata-moves",
+        "metadata-moves",
+        &promoted_due_job,
+        "waiting",
+    )
+    .await?;
+
     cleanup_namespace_with_conn(&mut conn, &namespace).await?;
     trace_stage("repeat-metadata-moves:cleanup-final:done");
     Ok(())

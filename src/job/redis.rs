@@ -5583,6 +5583,99 @@ local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job
   return updated
 end
 
+local function days_from_civil(year, month, day)
+  if month <= 2 then
+    year = year - 1
+  end
+  local era = math.floor(year / 400)
+  local yoe = year - era * 400
+  local shifted_month = month
+  if month > 2 then
+    shifted_month = month - 3
+  else
+    shifted_month = month + 9
+  end
+  local doy = math.floor((153 * shifted_month + 2) / 5) + day - 1
+  local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+  return era * 146097 + doe - 719468
+end
+
+local function iso_to_millis(value)
+  local year = tonumber(string.sub(value, 1, 4))
+  local month = tonumber(string.sub(value, 6, 7))
+  local day = tonumber(string.sub(value, 9, 10))
+  local hour = tonumber(string.sub(value, 12, 13))
+  local minute = tonumber(string.sub(value, 15, 16))
+  local second = tonumber(string.sub(value, 18, 19))
+  if not year or not month or not day or not hour or not minute or not second then
+    return 0
+  end
+
+  local millis = 0
+  if string.sub(value, 20, 20) == "." then
+    local digits = string.match(string.sub(value, 21), "^(%d+)")
+    if digits then
+      digits = string.sub(digits .. "000", 1, 3)
+      millis = tonumber(digits) or 0
+    end
+  end
+
+  local days = days_from_civil(year, month, day)
+  return (((days * 24 + hour) * 60 + minute) * 60 + second) * 1000 + millis
+end
+
+local function repeat_key(job)
+  local key = job["repeat_key"]
+  if not key or key == cjson.null or key == '' then
+    return nil
+  end
+  return key
+end
+
+local function repeat_scheduler_key(repeat_prefix)
+  return string.sub(repeat_prefix, 1, -2)
+end
+
+local function repeat_scheduler_meta_key(repeat_prefix, repeat_key_value)
+  return string.sub(repeat_prefix, 1, -8) .. 'repeat_meta:' .. repeat_key_value
+end
+
+local function sync_repeat_scheduler(job, job_id, repeat_prefix, scheduled_millis)
+  local key = repeat_key(job)
+  if not key or not repeat_prefix or repeat_prefix == '' then
+    return
+  end
+
+  local owner_key = repeat_prefix .. key
+  local owner_id = redis.call('GET', owner_key)
+  local meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
+  local scheduler_owner_id = redis.call('HGET', meta_key, 'jid')
+  if owner_id and owner_id ~= job_id and scheduler_owner_id ~= job_id then
+    return
+  end
+  if not owner_id then
+    redis.call('SET', owner_key, job_id, 'NX')
+  end
+
+  redis.call('ZADD', repeat_scheduler_key(repeat_prefix), scheduled_millis, key)
+  redis.call(
+    'HSET',
+    meta_key,
+    'jid',
+    job_id,
+    'name',
+    job["name"] or '',
+    'next',
+    scheduled_millis,
+    'state',
+    job["state"] or '',
+    'count',
+    job["repeat_count"] or 0,
+    'key',
+    key
+  )
+end
+
 local function refresh_delay_marker(marker_key, delayed_key)
   if not marker_key or marker_key == '' then
     return
@@ -5607,6 +5700,7 @@ for _, id in ipairs(ids) do
       job["state"] = "waiting"
       local priority = tonumber(job["priority"] or '1000') or 1000
       enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[4], job, id, priority, ARGV[2], KEYS[#KEYS])
+      sync_repeat_scheduler(job, id, ARGV[5], iso_to_millis(job["scheduled_at"]))
       redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[4], '*', 'event', 'waiting', 'jobId', id, 'prev', 'delayed')
       promoted = promoted + 1
     end
@@ -10418,6 +10512,7 @@ impl JobQueueBackend for RedisJobQueue {
                 .arg(WAITING_SCORE_BUCKET)
                 .arg(1_000_u16)
                 .arg(DEFAULT_JOB_EVENT_RETENTION)
+                .arg(self.repeat_key_prefix())
                 .query_async(&mut conn)
                 .await
                 .map_err(redis_error)?;
