@@ -1162,7 +1162,8 @@ attempt count is exhausted also write BullMQ-style `retries-exhausted` with
 `attemptsMade`; flow child completion, terminal failure, and stalled terminal
 failure paths also emit parent `waiting`, `delayed`, or `failed` events with
 `prev=waiting-children` when that same Lua turn releases or fails the parent;
-progress writes `progress data=<json>`; pause/resume write queue-level events.
+explicit removal writes `removed prev=<state>` for the removed job; progress
+writes `progress data=<json>`; pause/resume write queue-level events.
 `read_events()` uses `XRANGE` over stream ids, and
 `trim_events()` uses BullMQ-style `XTRIM MAXLEN ~`. The in-memory and local
 durable backends keep the same retained event entries in their snapshots so

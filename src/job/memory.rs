@@ -791,12 +791,16 @@ impl InMemoryJobQueue {
     /// Remove a job from the queue.
     pub async fn remove(&self, job_id: &str) -> Result<Option<Job>> {
         let mut inner = self.inner.lock().await;
+        let now = Utc::now();
         if let Some(job) = inner.jobs.get(job_id) {
             require_removable(job)?;
         }
         let removed = Self::remove_job_record_locked(&mut inner, job_id);
         if let Some(parent_id) = removed.as_ref().and_then(|job| job.parent_id.clone()) {
-            Self::release_parent_if_ready_locked(&mut inner, &parent_id, Utc::now());
+            Self::release_parent_if_ready_locked(&mut inner, &parent_id, now);
+        }
+        if let Some(removed) = &removed {
+            emit_removed_event_locked(&mut inner, removed, now);
         }
         Ok(removed)
     }
@@ -958,7 +962,13 @@ impl InMemoryJobQueue {
         }
         let removed = Self::remove_job_record_locked(&mut inner, &job_id);
         if let Some(parent_id) = removed.as_ref().and_then(|job| job.parent_id.clone()) {
-            Self::release_parent_if_ready_locked(&mut inner, &parent_id, Utc::now());
+            let now = Utc::now();
+            Self::release_parent_if_ready_locked(&mut inner, &parent_id, now);
+            if let Some(removed) = &removed {
+                emit_removed_event_locked(&mut inner, removed, now);
+            }
+        } else if let Some(removed) = &removed {
+            emit_removed_event_locked(&mut inner, removed, Utc::now());
         }
         Ok(removed)
     }
@@ -2613,6 +2623,21 @@ fn emit_retries_exhausted_event_locked(
         None,
         timestamp,
         fields,
+    );
+}
+
+fn emit_removed_event_locked(
+    inner: &mut InMemoryJobQueueState,
+    job: &Job,
+    timestamp: DateTime<Utc>,
+) {
+    emit_event_locked(
+        inner,
+        "removed",
+        Some(job),
+        Some(job.state),
+        timestamp,
+        BTreeMap::new(),
     );
 }
 

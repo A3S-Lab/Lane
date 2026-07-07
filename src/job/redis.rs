@@ -6464,6 +6464,21 @@ local function apply_failed_retention(timestamp, retention)
   remove_finished_jobs_by_max_count(retention_count(retention))
 end
 
+local function event_state_name(state)
+  if state == 'waiting_children' then
+    return 'waiting-children'
+  end
+  return state or ''
+end
+
+local function emit_parent_waiting_children_transition_event(events_key, max_events, event, job_id, failed_reason)
+  if event == 'failed' then
+    redis.call('XADD', events_key, 'MAXLEN', '~', max_events, '*', 'event', 'failed', 'jobId', job_id, 'failedReason', failed_reason, 'prev', 'waiting-children')
+  else
+    redis.call('XADD', events_key, 'MAXLEN', '~', max_events, '*', 'event', event, 'jobId', job_id, 'prev', 'waiting-children')
+  end
+end
+
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
   redis.call('DEL', KEYS[2])
@@ -6549,6 +6564,7 @@ if parent_id and parent_id ~= cjson.null then
           redis.call('ZADD', KEYS[8], ARGV[3], parent_id)
           apply_failed_retention(ARGV[3], parent_failure_retention)
         end
+        emit_parent_waiting_children_transition_event(KEYS[11], ARGV[10], 'failed', parent_id, parent["failed_reason"])
       elseif all_done then
         redis.call('DEL', dependency_key)
         redis.call('ZREM', KEYS[6], parent_id)
@@ -6564,17 +6580,20 @@ if parent_id and parent_id ~= cjson.null then
         if parent_scheduled_millis <= tonumber(ARGV[3]) then
           parent["state"] = "waiting"
           local priority = tonumber(parent["priority"] or '1000') or 1000
-          enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[9], parent, parent_id, priority, ARGV[4], KEYS[#KEYS])
+          enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[9], parent, parent_id, priority, ARGV[4], KEYS[10])
         else
           parent["state"] = "delayed"
           redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
           redis.call('ZADD', KEYS[4], parent_scheduled_millis, parent_id)
-      refresh_delay_marker(KEYS[#KEYS], KEYS[4])
+          refresh_delay_marker(KEYS[10], KEYS[4])
         end
+        emit_parent_waiting_children_transition_event(KEYS[11], ARGV[10], parent["state"], parent_id)
       end
     end
   end
 end
+
+redis.call('XADD', KEYS[11], 'MAXLEN', '~', ARGV[10], '*', 'event', 'removed', 'jobId', ARGV[1], 'prev', event_state_name(job["state"]))
 
 return {'ok', raw}
 "#;
@@ -9871,7 +9890,7 @@ impl RedisJobQueue {
     ) -> Result<Option<Job>> {
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(REMOVE_JOB_SCRIPT)
-            .arg(10)
+            .arg(11)
             .arg(self.jobs_key())
             .arg(self.lock_key(job_id))
             .arg(self.state_key(JobState::Waiting))
@@ -9882,6 +9901,7 @@ impl RedisJobQueue {
             .arg(self.state_key(JobState::Failed))
             .arg(self.sequence_key())
             .arg(self.marker_key())
+            .arg(self.events_key())
             .arg(job_id)
             .arg(now.to_rfc3339())
             .arg(millis(now))
@@ -9891,6 +9911,7 @@ impl RedisJobQueue {
             .arg(self.repeat_key_prefix())
             .arg(self.logs_key_prefix())
             .arg(self.deduplication_next_key_prefix())
+            .arg(DEFAULT_JOB_EVENT_RETENTION)
             .query_async(conn)
             .await
             .map_err(redis_error)?;

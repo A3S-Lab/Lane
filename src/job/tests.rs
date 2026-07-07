@@ -6596,6 +6596,32 @@ async fn job_event_stream_records_core_lifecycle() {
 }
 
 #[tokio::test]
+async fn removed_jobs_emit_removed_event() {
+    let queue = InMemoryJobQueue::new("removed-events");
+    let job = queue
+        .add_at(
+            "cleanup",
+            serde_json::json!({}),
+            JobOptions::new(),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    let removed = queue.remove(&job.id).await.unwrap().unwrap();
+    assert_eq!(removed.id, job.id);
+
+    let events = queue.read_events("-", "+", 20).await.unwrap();
+    let names = events
+        .iter()
+        .map(|event| event.event.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["added", "waiting", "removed"]);
+    assert_eq!(events[2].job_id.as_deref(), Some(job.id.as_str()));
+    assert_eq!(events[2].prev, Some(JobState::Waiting));
+}
+
+#[tokio::test]
 async fn local_job_queue_persists_event_stream() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let snapshot_path = temp_dir.path().join("jobs").join("events.json");

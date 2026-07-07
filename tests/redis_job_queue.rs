@@ -2422,6 +2422,20 @@ async fn run_queue_events(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("event test job should complete");
+    let removed_job = queue
+        .add_job(
+            "removed-task".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_job_id("events:removed-task"),
+        )
+        .await
+        .expect("removed event test job should add");
+    let removed = queue
+        .remove_job(&removed_job.id)
+        .await
+        .expect("removed event test job should remove")
+        .expect("removed event test job should exist");
+    assert_eq!(removed.id, removed_job.id);
     queue.pause().await.expect("queue should pause");
     queue.resume().await.expect("queue should resume");
 
@@ -2441,6 +2455,9 @@ async fn run_queue_events(redis_url: String) -> redis::RedisResult<()> {
             "active",
             "progress",
             "completed",
+            "added",
+            "waiting",
+            "removed",
             "paused",
             "resumed"
         ]
@@ -2460,6 +2477,8 @@ async fn run_queue_events(redis_url: String) -> redis::RedisResult<()> {
         events[4].fields.get("returnvalue"),
         Some(&serde_json::json!({ "ok": true }))
     );
+    assert_eq!(events[7].job_id.as_deref(), Some(removed_job.id.as_str()));
+    assert_eq!(events[7].prev, Some(JobState::Waiting));
 
     cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())
