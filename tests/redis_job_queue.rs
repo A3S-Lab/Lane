@@ -681,6 +681,7 @@ async fn run_repeat_upsert(redis_url: String) -> redis::RedisResult<()> {
     let mut conn = redis::Client::open(redis_url.as_str())?
         .get_connection_manager()
         .await?;
+    let replacement_end_at = Utc::now() + chrono::Duration::days(1);
 
     let first = queue
         .add_job(
@@ -700,7 +701,10 @@ async fn run_repeat_upsert(redis_url: String) -> redis::RedisResult<()> {
                 JobOptions::new()
                     .with_delay(Duration::from_secs(30))
                     .with_repeat(
-                        RepeatOptions::every(Duration::from_secs(30)).with_key("heartbeat-series"),
+                        RepeatOptions::every(Duration::from_secs(30))
+                            .with_limit(5)
+                            .until(replacement_end_at)
+                            .with_key("heartbeat-series"),
                     ),
             ),
             Utc::now(),
@@ -754,15 +758,113 @@ async fn run_repeat_upsert(redis_url: String) -> redis::RedisResult<()> {
         )
         .await?;
     assert_eq!(scheduler_name.as_deref(), Some("heartbeat-v2"));
+    let scheduler_key: Option<String> = conn
+        .hget(
+            format!("{namespace}:repeat-upsert:repeat_meta:heartbeat-series"),
+            "key",
+        )
+        .await?;
+    assert_eq!(scheduler_key.as_deref(), Some("heartbeat-series"));
+    let scheduler_every: Option<u64> = conn
+        .hget(
+            format!("{namespace}:repeat-upsert:repeat_meta:heartbeat-series"),
+            "every",
+        )
+        .await?;
+    assert_eq!(scheduler_every, Some(30_000));
+    let scheduler_limit: Option<u32> = conn
+        .hget(
+            format!("{namespace}:repeat-upsert:repeat_meta:heartbeat-series"),
+            "limit",
+        )
+        .await?;
+    assert_eq!(scheduler_limit, Some(5));
+    let scheduler_end_date: Option<String> = conn
+        .hget(
+            format!("{namespace}:repeat-upsert:repeat_meta:heartbeat-series"),
+            "endDate",
+        )
+        .await?;
+    let expected_end_date = serde_json::to_value(replacement_end_at)
+        .expect("replacement end timestamp should serialize")
+        .as_str()
+        .expect("replacement end timestamp should serialize as a string")
+        .to_string();
+    assert_eq!(
+        scheduler_end_date.as_deref(),
+        Some(expected_end_date.as_str())
+    );
+
+    let cron_replacement = queue
+        .upsert_repeat(
+            JobSpec::new("heartbeat-cron", serde_json::json!({ "version": 3 })).with_options(
+                JobOptions::new().with_repeat(
+                    RepeatOptions::cron("0/1 * * * * * *")
+                        .with_limit(7)
+                        .with_key("heartbeat-series"),
+                ),
+            ),
+            Utc::now(),
+        )
+        .await
+        .expect("repeat upsert should rewrite scheduler metadata");
+    trace_stage("repeat-upsert:rewrote-metadata");
+    assert_ne!(cron_replacement.id, replacement.id);
+    assert_eq!(cron_replacement.name, "heartbeat-cron");
+    let replacement_hash: Option<String> = conn
+        .hget(format!("{namespace}:repeat-upsert:jobs"), &replacement.id)
+        .await?;
+    assert!(replacement_hash.is_none());
+    let rewritten_scheduler_job_id: Option<String> = conn
+        .hget(
+            format!("{namespace}:repeat-upsert:repeat_meta:heartbeat-series"),
+            "jid",
+        )
+        .await?;
+    assert_eq!(
+        rewritten_scheduler_job_id.as_deref(),
+        Some(cron_replacement.id.as_str())
+    );
+    let rewritten_scheduler_pattern: Option<String> = conn
+        .hget(
+            format!("{namespace}:repeat-upsert:repeat_meta:heartbeat-series"),
+            "pattern",
+        )
+        .await?;
+    assert_eq!(
+        rewritten_scheduler_pattern.as_deref(),
+        Some("0/1 * * * * * *")
+    );
+    let stale_scheduler_every: Option<u64> = conn
+        .hget(
+            format!("{namespace}:repeat-upsert:repeat_meta:heartbeat-series"),
+            "every",
+        )
+        .await?;
+    assert!(stale_scheduler_every.is_none());
+    let stale_scheduler_end_date: Option<String> = conn
+        .hget(
+            format!("{namespace}:repeat-upsert:repeat_meta:heartbeat-series"),
+            "endDate",
+        )
+        .await?;
+    assert!(stale_scheduler_end_date.is_none());
+    let rewritten_scheduler_limit: Option<u32> = conn
+        .hget(
+            format!("{namespace}:repeat-upsert:repeat_meta:heartbeat-series"),
+            "limit",
+        )
+        .await?;
+    assert_eq!(rewritten_scheduler_limit, Some(7));
 
     let entry = queue
         .get_repeat("heartbeat-series")
         .await
         .expect("repeat upsert entry should load")
         .expect("repeat upsert entry should exist");
-    assert_eq!(entry.job_id, replacement.id);
-    assert_eq!(entry.name, "heartbeat-v2");
-    assert_eq!(entry.options.interval(), Some(Duration::from_secs(30)));
+    assert_eq!(entry.job_id, cron_replacement.id);
+    assert_eq!(entry.name, "heartbeat-cron");
+    assert_eq!(entry.options.cron_expression(), Some("0/1 * * * * * *"));
     assert_eq!(
         queue
             .count_repeats()
@@ -5778,6 +5880,18 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         repeat_scheduler_owner.as_deref(),
         Some(repeat_successor.id.as_str())
     );
+    let repeat_scheduler_key: Option<String> = flow_index_conn
+        .hget(format!("{namespace}:jobs:repeat_meta:heartbeat"), "key")
+        .await?;
+    assert_eq!(repeat_scheduler_key.as_deref(), Some("heartbeat"));
+    let repeat_scheduler_every: Option<u64> = flow_index_conn
+        .hget(format!("{namespace}:jobs:repeat_meta:heartbeat"), "every")
+        .await?;
+    assert_eq!(repeat_scheduler_every, Some(200));
+    let repeat_scheduler_limit: Option<u32> = flow_index_conn
+        .hget(format!("{namespace}:jobs:repeat_meta:heartbeat"), "limit")
+        .await?;
+    assert_eq!(repeat_scheduler_limit, Some(2));
     let repeat_entries_after_successor = producer
         .list_repeats()
         .await
@@ -6039,6 +6153,20 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("cron repeat successor should be delayed");
     assert_eq!(cron_successor.repeat_count, 1);
     assert!(cron_successor.scheduled_at > cron_completed_at);
+    let cron_scheduler_pattern: Option<String> = flow_index_conn
+        .hget(
+            format!("{namespace}:jobs:repeat_meta:cron-heartbeat"),
+            "pattern",
+        )
+        .await?;
+    assert_eq!(cron_scheduler_pattern.as_deref(), Some("0/1 * * * * * *"));
+    let cron_scheduler_every: Option<u64> = flow_index_conn
+        .hget(
+            format!("{namespace}:jobs:repeat_meta:cron-heartbeat"),
+            "every",
+        )
+        .await?;
+    assert!(cron_scheduler_every.is_none());
 
     sleep_until_due(cron_successor.scheduled_at).await;
     producer

@@ -236,10 +236,17 @@ local function store_repeat_scheduler(job, job_id, repeat_prefix, scheduled_mill
     repeat_options = job["options"]["repeat"]
   end
 
+  local meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
+  local encoded_repeat_options = ''
+  if repeat_options and repeat_options ~= cjson.null then
+    encoded_repeat_options = cjson.encode(repeat_options)
+  end
+
   redis.call('ZADD', repeat_scheduler_key(repeat_prefix), scheduled_millis, key)
+  redis.call('DEL', meta_key)
   redis.call(
     'HSET',
-    repeat_scheduler_meta_key(repeat_prefix, key),
+    meta_key,
     'jid',
     job_id,
     'name',
@@ -251,8 +258,39 @@ local function store_repeat_scheduler(job, job_id, repeat_prefix, scheduled_mill
     'count',
     job["repeat_count"] or 0,
     'opts',
-    repeat_options and repeat_options ~= cjson.null and cjson.encode(repeat_options) or ''
+    encoded_repeat_options,
+    'key',
+    key
   )
+
+  if repeat_options and repeat_options ~= cjson.null then
+    if repeat_options["limit"] and repeat_options["limit"] ~= cjson.null then
+      redis.call('HSET', meta_key, 'limit', repeat_options["limit"])
+    end
+    if repeat_options["end_at"] and repeat_options["end_at"] ~= cjson.null then
+      redis.call('HSET', meta_key, 'endDate', repeat_options["end_at"])
+    end
+
+    local interval = repeat_options["interval"]
+    if interval and interval ~= cjson.null then
+      local every = nil
+      if type(interval) == 'number' then
+        every = math.floor(interval)
+      else
+        local secs = tonumber(interval["secs"] or interval["seconds"] or 0) or 0
+        local nanos = tonumber(interval["nanos"] or interval["subsec_nanos"] or 0) or 0
+        every = (secs * 1000) + math.floor(nanos / 1000000)
+      end
+      if every and every > 0 then
+        redis.call('HSET', meta_key, 'every', every)
+      end
+    end
+
+    local pattern = repeat_options["cron"]
+    if pattern and pattern ~= cjson.null then
+      redis.call('HSET', meta_key, 'pattern', pattern)
+    end
+  end
 end
 
 local existing = redis.call('HGET', KEYS[1], ARGV[1])
@@ -441,10 +479,17 @@ local function store_repeat_scheduler(job, job_id, repeat_prefix, scheduled_mill
     repeat_options = job["options"]["repeat"]
   end
 
+  local meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
+  local encoded_repeat_options = ''
+  if repeat_options and repeat_options ~= cjson.null then
+    encoded_repeat_options = cjson.encode(repeat_options)
+  end
+
   redis.call('ZADD', repeat_scheduler_key(repeat_prefix), scheduled_millis, key)
+  redis.call('DEL', meta_key)
   redis.call(
     'HSET',
-    repeat_scheduler_meta_key(repeat_prefix, key),
+    meta_key,
     'jid',
     job_id,
     'name',
@@ -456,8 +501,39 @@ local function store_repeat_scheduler(job, job_id, repeat_prefix, scheduled_mill
     'count',
     job["repeat_count"] or 0,
     'opts',
-    repeat_options and repeat_options ~= cjson.null and cjson.encode(repeat_options) or ''
+    encoded_repeat_options,
+    'key',
+    key
   )
+
+  if repeat_options and repeat_options ~= cjson.null then
+    if repeat_options["limit"] and repeat_options["limit"] ~= cjson.null then
+      redis.call('HSET', meta_key, 'limit', repeat_options["limit"])
+    end
+    if repeat_options["end_at"] and repeat_options["end_at"] ~= cjson.null then
+      redis.call('HSET', meta_key, 'endDate', repeat_options["end_at"])
+    end
+
+    local interval = repeat_options["interval"]
+    if interval and interval ~= cjson.null then
+      local every = nil
+      if type(interval) == 'number' then
+        every = math.floor(interval)
+      else
+        local secs = tonumber(interval["secs"] or interval["seconds"] or 0) or 0
+        local nanos = tonumber(interval["nanos"] or interval["subsec_nanos"] or 0) or 0
+        every = (secs * 1000) + math.floor(nanos / 1000000)
+      end
+      if every and every > 0 then
+        redis.call('HSET', meta_key, 'every', every)
+      end
+    end
+
+    local pattern = repeat_options["cron"]
+    if pattern and pattern ~= cjson.null then
+      redis.call('HSET', meta_key, 'pattern', pattern)
+    end
+  end
 end
 
 local function release_repeat_key(job, job_id, repeat_prefix)
@@ -815,10 +891,17 @@ local function store_repeat_scheduler(job, job_id, repeat_prefix, scheduled_mill
     repeat_options = job["options"]["repeat"]
   end
 
+  local meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
+  local encoded_repeat_options = ''
+  if repeat_options and repeat_options ~= cjson.null then
+    encoded_repeat_options = cjson.encode(repeat_options)
+  end
+
   redis.call('ZADD', repeat_scheduler_key(repeat_prefix), scheduled_millis, key)
+  redis.call('DEL', meta_key)
   redis.call(
     'HSET',
-    repeat_scheduler_meta_key(repeat_prefix, key),
+    meta_key,
     'jid',
     job_id,
     'name',
@@ -830,8 +913,39 @@ local function store_repeat_scheduler(job, job_id, repeat_prefix, scheduled_mill
     'count',
     job["repeat_count"] or 0,
     'opts',
-    repeat_options and repeat_options ~= cjson.null and cjson.encode(repeat_options) or ''
+    encoded_repeat_options,
+    'key',
+    key
   )
+
+  if repeat_options and repeat_options ~= cjson.null then
+    if repeat_options["limit"] and repeat_options["limit"] ~= cjson.null then
+      redis.call('HSET', meta_key, 'limit', repeat_options["limit"])
+    end
+    if repeat_options["end_at"] and repeat_options["end_at"] ~= cjson.null then
+      redis.call('HSET', meta_key, 'endDate', repeat_options["end_at"])
+    end
+
+    local interval = repeat_options["interval"]
+    if interval and interval ~= cjson.null then
+      local every = nil
+      if type(interval) == 'number' then
+        every = math.floor(interval)
+      else
+        local secs = tonumber(interval["secs"] or interval["seconds"] or 0) or 0
+        local nanos = tonumber(interval["nanos"] or interval["subsec_nanos"] or 0) or 0
+        every = (secs * 1000) + math.floor(nanos / 1000000)
+      end
+      if every and every > 0 then
+        redis.call('HSET', meta_key, 'every', every)
+      end
+    end
+
+    local pattern = repeat_options["cron"]
+    if pattern and pattern ~= cjson.null then
+      redis.call('HSET', meta_key, 'pattern', pattern)
+    end
+  end
 end
 
 local count = tonumber(ARGV[1])
@@ -1066,10 +1180,17 @@ local function store_repeat_scheduler(job, job_id, repeat_prefix, scheduled_mill
     repeat_options = job["options"]["repeat"]
   end
 
+  local meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
+  local encoded_repeat_options = ''
+  if repeat_options and repeat_options ~= cjson.null then
+    encoded_repeat_options = cjson.encode(repeat_options)
+  end
+
   redis.call('ZADD', repeat_scheduler_key(repeat_prefix), scheduled_millis, key)
+  redis.call('DEL', meta_key)
   redis.call(
     'HSET',
-    repeat_scheduler_meta_key(repeat_prefix, key),
+    meta_key,
     'jid',
     job_id,
     'name',
@@ -1081,8 +1202,39 @@ local function store_repeat_scheduler(job, job_id, repeat_prefix, scheduled_mill
     'count',
     job["repeat_count"] or 0,
     'opts',
-    repeat_options and repeat_options ~= cjson.null and cjson.encode(repeat_options) or ''
+    encoded_repeat_options,
+    'key',
+    key
   )
+
+  if repeat_options and repeat_options ~= cjson.null then
+    if repeat_options["limit"] and repeat_options["limit"] ~= cjson.null then
+      redis.call('HSET', meta_key, 'limit', repeat_options["limit"])
+    end
+    if repeat_options["end_at"] and repeat_options["end_at"] ~= cjson.null then
+      redis.call('HSET', meta_key, 'endDate', repeat_options["end_at"])
+    end
+
+    local interval = repeat_options["interval"]
+    if interval and interval ~= cjson.null then
+      local every = nil
+      if type(interval) == 'number' then
+        every = math.floor(interval)
+      else
+        local secs = tonumber(interval["secs"] or interval["seconds"] or 0) or 0
+        local nanos = tonumber(interval["nanos"] or interval["subsec_nanos"] or 0) or 0
+        every = (secs * 1000) + math.floor(nanos / 1000000)
+      end
+      if every and every > 0 then
+        redis.call('HSET', meta_key, 'every', every)
+      end
+    end
+
+    local pattern = repeat_options["cron"]
+    if pattern and pattern ~= cjson.null then
+      redis.call('HSET', meta_key, 'pattern', pattern)
+    end
+  end
 end
 
 local count = tonumber(ARGV[1])
@@ -1509,10 +1661,17 @@ local function store_repeat_scheduler(job, job_id, repeat_prefix)
   end
   local scheduled_millis = iso_to_millis(job["scheduled_at"])
 
+  local meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
+  local encoded_repeat_options = ''
+  if repeat_options and repeat_options ~= cjson.null then
+    encoded_repeat_options = cjson.encode(repeat_options)
+  end
+
   redis.call('ZADD', repeat_scheduler_key(repeat_prefix), scheduled_millis, key)
+  redis.call('DEL', meta_key)
   redis.call(
     'HSET',
-    repeat_scheduler_meta_key(repeat_prefix, key),
+    meta_key,
     'jid',
     job_id,
     'name',
@@ -1524,8 +1683,39 @@ local function store_repeat_scheduler(job, job_id, repeat_prefix)
     'count',
     job["repeat_count"] or 0,
     'opts',
-    repeat_options and repeat_options ~= cjson.null and cjson.encode(repeat_options) or ''
+    encoded_repeat_options,
+    'key',
+    key
   )
+
+  if repeat_options and repeat_options ~= cjson.null then
+    if repeat_options["limit"] and repeat_options["limit"] ~= cjson.null then
+      redis.call('HSET', meta_key, 'limit', repeat_options["limit"])
+    end
+    if repeat_options["end_at"] and repeat_options["end_at"] ~= cjson.null then
+      redis.call('HSET', meta_key, 'endDate', repeat_options["end_at"])
+    end
+
+    local interval = repeat_options["interval"]
+    if interval and interval ~= cjson.null then
+      local every = nil
+      if type(interval) == 'number' then
+        every = math.floor(interval)
+      else
+        local secs = tonumber(interval["secs"] or interval["seconds"] or 0) or 0
+        local nanos = tonumber(interval["nanos"] or interval["subsec_nanos"] or 0) or 0
+        every = (secs * 1000) + math.floor(nanos / 1000000)
+      end
+      if every and every > 0 then
+        redis.call('HSET', meta_key, 'every', every)
+      end
+    end
+
+    local pattern = repeat_options["cron"]
+    if pattern and pattern ~= cjson.null then
+      redis.call('HSET', meta_key, 'pattern', pattern)
+    end
+  end
 end
 
 local function release_repeat_key(job, job_id, repeat_prefix)
@@ -2050,10 +2240,17 @@ local function store_repeat_scheduler(job, job_id, repeat_prefix, scheduled_mill
     repeat_options = job["options"]["repeat"]
   end
 
+  local meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
+  local encoded_repeat_options = ''
+  if repeat_options and repeat_options ~= cjson.null then
+    encoded_repeat_options = cjson.encode(repeat_options)
+  end
+
   redis.call('ZADD', repeat_scheduler_key(repeat_prefix), scheduled_millis, key)
+  redis.call('DEL', meta_key)
   redis.call(
     'HSET',
-    repeat_scheduler_meta_key(repeat_prefix, key),
+    meta_key,
     'jid',
     job_id,
     'name',
@@ -2065,8 +2262,39 @@ local function store_repeat_scheduler(job, job_id, repeat_prefix, scheduled_mill
     'count',
     job["repeat_count"] or 0,
     'opts',
-    repeat_options and repeat_options ~= cjson.null and cjson.encode(repeat_options) or ''
+    encoded_repeat_options,
+    'key',
+    key
   )
+
+  if repeat_options and repeat_options ~= cjson.null then
+    if repeat_options["limit"] and repeat_options["limit"] ~= cjson.null then
+      redis.call('HSET', meta_key, 'limit', repeat_options["limit"])
+    end
+    if repeat_options["end_at"] and repeat_options["end_at"] ~= cjson.null then
+      redis.call('HSET', meta_key, 'endDate', repeat_options["end_at"])
+    end
+
+    local interval = repeat_options["interval"]
+    if interval and interval ~= cjson.null then
+      local every = nil
+      if type(interval) == 'number' then
+        every = math.floor(interval)
+      else
+        local secs = tonumber(interval["secs"] or interval["seconds"] or 0) or 0
+        local nanos = tonumber(interval["nanos"] or interval["subsec_nanos"] or 0) or 0
+        every = (secs * 1000) + math.floor(nanos / 1000000)
+      end
+      if every and every > 0 then
+        redis.call('HSET', meta_key, 'every', every)
+      end
+    end
+
+    local pattern = repeat_options["cron"]
+    if pattern and pattern ~= cjson.null then
+      redis.call('HSET', meta_key, 'pattern', pattern)
+    end
+  end
 end
 
 local function release_repeat_key(job, job_id, repeat_prefix)
@@ -2672,10 +2900,17 @@ local function store_repeat_scheduler(job, job_id, repeat_prefix, scheduled_mill
     repeat_options = job["options"]["repeat"]
   end
 
+  local meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
+  local encoded_repeat_options = ''
+  if repeat_options and repeat_options ~= cjson.null then
+    encoded_repeat_options = cjson.encode(repeat_options)
+  end
+
   redis.call('ZADD', repeat_scheduler_key(repeat_prefix), scheduled_millis, key)
+  redis.call('DEL', meta_key)
   redis.call(
     'HSET',
-    repeat_scheduler_meta_key(repeat_prefix, key),
+    meta_key,
     'jid',
     job_id,
     'name',
@@ -2687,8 +2922,39 @@ local function store_repeat_scheduler(job, job_id, repeat_prefix, scheduled_mill
     'count',
     job["repeat_count"] or 0,
     'opts',
-    repeat_options and repeat_options ~= cjson.null and cjson.encode(repeat_options) or ''
+    encoded_repeat_options,
+    'key',
+    key
   )
+
+  if repeat_options and repeat_options ~= cjson.null then
+    if repeat_options["limit"] and repeat_options["limit"] ~= cjson.null then
+      redis.call('HSET', meta_key, 'limit', repeat_options["limit"])
+    end
+    if repeat_options["end_at"] and repeat_options["end_at"] ~= cjson.null then
+      redis.call('HSET', meta_key, 'endDate', repeat_options["end_at"])
+    end
+
+    local interval = repeat_options["interval"]
+    if interval and interval ~= cjson.null then
+      local every = nil
+      if type(interval) == 'number' then
+        every = math.floor(interval)
+      else
+        local secs = tonumber(interval["secs"] or interval["seconds"] or 0) or 0
+        local nanos = tonumber(interval["nanos"] or interval["subsec_nanos"] or 0) or 0
+        every = (secs * 1000) + math.floor(nanos / 1000000)
+      end
+      if every and every > 0 then
+        redis.call('HSET', meta_key, 'every', every)
+      end
+    end
+
+    local pattern = repeat_options["cron"]
+    if pattern and pattern ~= cjson.null then
+      redis.call('HSET', meta_key, 'pattern', pattern)
+    end
+  end
 end
 
 local function release_repeat_key(job, job_id, repeat_prefix)
@@ -3187,10 +3453,17 @@ local function store_repeat_scheduler(job, job_id, repeat_prefix, scheduled_mill
     repeat_options = job["options"]["repeat"]
   end
 
+  local meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
+  local encoded_repeat_options = ''
+  if repeat_options and repeat_options ~= cjson.null then
+    encoded_repeat_options = cjson.encode(repeat_options)
+  end
+
   redis.call('ZADD', repeat_scheduler_key(repeat_prefix), scheduled_millis, key)
+  redis.call('DEL', meta_key)
   redis.call(
     'HSET',
-    repeat_scheduler_meta_key(repeat_prefix, key),
+    meta_key,
     'jid',
     job_id,
     'name',
@@ -3202,8 +3475,39 @@ local function store_repeat_scheduler(job, job_id, repeat_prefix, scheduled_mill
     'count',
     job["repeat_count"] or 0,
     'opts',
-    repeat_options and repeat_options ~= cjson.null and cjson.encode(repeat_options) or ''
+    encoded_repeat_options,
+    'key',
+    key
   )
+
+  if repeat_options and repeat_options ~= cjson.null then
+    if repeat_options["limit"] and repeat_options["limit"] ~= cjson.null then
+      redis.call('HSET', meta_key, 'limit', repeat_options["limit"])
+    end
+    if repeat_options["end_at"] and repeat_options["end_at"] ~= cjson.null then
+      redis.call('HSET', meta_key, 'endDate', repeat_options["end_at"])
+    end
+
+    local interval = repeat_options["interval"]
+    if interval and interval ~= cjson.null then
+      local every = nil
+      if type(interval) == 'number' then
+        every = math.floor(interval)
+      else
+        local secs = tonumber(interval["secs"] or interval["seconds"] or 0) or 0
+        local nanos = tonumber(interval["nanos"] or interval["subsec_nanos"] or 0) or 0
+        every = (secs * 1000) + math.floor(nanos / 1000000)
+      end
+      if every and every > 0 then
+        redis.call('HSET', meta_key, 'every', every)
+      end
+    end
+
+    local pattern = repeat_options["cron"]
+    if pattern and pattern ~= cjson.null then
+      redis.call('HSET', meta_key, 'pattern', pattern)
+    end
+  end
 end
 
 local function active_repeat_owner(jobs_key, repeat_prefix, repeat_key, job_id)

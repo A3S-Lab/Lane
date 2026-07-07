@@ -1159,11 +1159,15 @@ collisions are not blindly overwritten. Lane now keeps the existing
 `repeat:<key>` owner key for fast collision checks and also writes a
 BullMQ-style scheduler zset at the queue's `repeat` key plus
 `repeat_meta:<key>` hashes containing the current owner id, name, next
-timestamp, state, count, and repeat options. Add, bulk add, flow add, repeat
-upsert, repeat successor enqueue, retry, remove, clean, drain, and stalled
-terminal cleanup update those records inside the same Redis script that mutates
-the job state. `get_repeat()`, `count_repeats()`, and `list_repeats_page()`
-read through the scheduler zset, validate the owner job snapshot, prune stale
+timestamp, state, count, repeat options, and the schedule-facing fields `key`,
+`every`, `pattern`, `limit`, and `endDate` when the Rust repeat options provide
+them. Scheduler writes delete and rebuild the metadata hash before `HSET`, so
+an overwrite from an interval schedule to a cron schedule cannot leave stale
+`every` or `endDate` fields behind. Add, bulk add, flow add, repeat upsert,
+repeat successor enqueue, retry, remove, clean, drain, and stalled terminal
+cleanup update those records inside the same Redis script that mutates the job
+state. `get_repeat()`, `count_repeats()`, and `list_repeats_page()` read
+through the scheduler zset, validate the owner job snapshot, prune stale
 metadata, and mirror BullMQ's `getJobScheduler`, `getJobSchedulersCount`, and
 `getJobSchedulers(start, end, asc)` read side: entries are ordered by next
 scheduled time, defaulting to descending order. Lane still models repeat work as
