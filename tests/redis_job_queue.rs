@@ -848,6 +848,23 @@ async fn redis_backend_materializes_flow_keep_last_after_parent_failure_against_
 }
 
 #[tokio::test]
+async fn redis_backend_materializes_flow_keep_last_after_parent_stalled_failure_against_real_server(
+) {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_flow_keep_last_parent_stalled_failure(redis_url),
+    )
+    .await
+    .expect("Redis flow keep-last stalled integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_upserts_repeat_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -3375,6 +3392,224 @@ async fn run_flow_keep_last_parent_failure(redis_url: String) -> redis::RedisRes
 
     cleanup_namespace_with_conn(&mut conn, &namespace).await?;
     trace_stage("flow-keep-last-fail:cleanup-final:done");
+    Ok(())
+}
+
+async fn run_flow_keep_last_parent_stalled_failure(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    trace_stage("flow-keep-last-stalled:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("flow-keep-last-stalled:cleanup:done");
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-keep-last-stalled")
+        .expect("valid Redis URL should build the flow keep-last stalled queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let deduplication =
+        DeduplicationOptions::new("tenant:flow-keep-last-stalled").keep_last_if_active(true);
+    let next_key = format!(
+        "{namespace}:flow-keep-last-stalled:deduplication_next:tenant:flow-keep-last-stalled"
+    );
+
+    let owner_flow = queue
+        .add_flow_at(
+            JobSpec::new(
+                "flow-stalled-owner-parent",
+                serde_json::json!({ "version": 1 }),
+            )
+            .with_options(
+                JobOptions::new()
+                    .with_max_stalled_count(0)
+                    .with_deduplication(deduplication.clone()),
+            ),
+            vec![JobSpec::new(
+                "flow-stalled-owner-child",
+                serde_json::json!({ "version": 1 }),
+            )],
+            Utc::now(),
+        )
+        .await
+        .expect("owner stalled flow should be added");
+
+    let owner_child = queue
+        .claim_next(
+            "worker-flow-stalled-owner-child".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("owner stalled child claim should return")
+        .expect("owner stalled child should be claimable");
+    assert_eq!(owner_child.id, owner_flow.children[0].id);
+    queue
+        .complete_job(
+            &owner_child.id,
+            lock_token(&owner_child),
+            serde_json::json!({ "child": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("owner stalled child should complete");
+
+    let owner_parent = queue
+        .claim_next(
+            "worker-flow-stalled-owner-parent".to_string(),
+            Duration::from_millis(50),
+            Utc::now(),
+        )
+        .await
+        .expect("owner stalled parent claim should return")
+        .expect("owner stalled parent should be claimable");
+    assert_eq!(owner_parent.id, owner_flow.parent.id);
+
+    let stale_duplicate = queue
+        .add_flow_at(
+            JobSpec::new(
+                "flow-stalled-stale-parent",
+                serde_json::json!({ "version": 2 }),
+            )
+            .with_options(
+                JobOptions::new()
+                    .with_job_id("flow-stalled-stale-parent-id")
+                    .with_deduplication(deduplication.clone()),
+            ),
+            vec![JobSpec::new(
+                "flow-stalled-stale-child",
+                serde_json::json!({ "version": 2 }),
+            )
+            .with_options(JobOptions::new().with_job_id("flow-stalled-stale-child-id"))],
+            Utc::now(),
+        )
+        .await
+        .expect("stale stalled duplicate flow should return owner");
+    assert_eq!(stale_duplicate.parent.id, owner_flow.parent.id);
+
+    let latest_duplicate = queue
+        .add_flow_at(
+            JobSpec::new(
+                "flow-stalled-latest-parent",
+                serde_json::json!({ "version": 3 }),
+            )
+            .with_options(
+                JobOptions::new()
+                    .with_job_id("flow-stalled-latest-parent-id")
+                    .with_deduplication(deduplication),
+            ),
+            vec![JobSpec::new(
+                "flow-stalled-latest-child",
+                serde_json::json!({ "version": 3 }),
+            )
+            .with_options(JobOptions::new().with_job_id("flow-stalled-latest-child-id"))],
+            Utc::now(),
+        )
+        .await
+        .expect("latest stalled duplicate flow should return owner");
+    assert_eq!(latest_duplicate.parent.id, owner_flow.parent.id);
+
+    let next_raw: String = conn.get(&next_key).await?;
+    let next_payload: serde_json::Value =
+        serde_json::from_str(&next_raw).expect("stored stalled next flow should decode");
+    assert_eq!(
+        next_payload
+            .get("parent")
+            .and_then(|value| value.get("name"))
+            .and_then(|value| value.as_str()),
+        Some("flow-stalled-latest-parent")
+    );
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        queue
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("stalled flow recovery should mark candidates"),
+        0
+    );
+    assert_eq!(
+        queue
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("stalled flow recovery should terminally fail owner"),
+        1
+    );
+
+    let next_after: Option<String> = conn.get(&next_key).await?;
+    assert!(next_after.is_none());
+    assert!(queue
+        .get_job("flow-stalled-stale-parent-id")
+        .await
+        .expect("stale stalled parent lookup should return")
+        .is_none());
+    assert!(queue
+        .get_job("flow-stalled-stale-child-id")
+        .await
+        .expect("stale stalled child lookup should return")
+        .is_none());
+
+    let latest_parent = queue
+        .get_job("flow-stalled-latest-parent-id")
+        .await
+        .expect("latest stalled parent lookup should return")
+        .expect("latest stalled parent should exist");
+    assert_eq!(latest_parent.name, "flow-stalled-latest-parent");
+    assert_eq!(latest_parent.state, JobState::WaitingChildren);
+    assert_eq!(
+        latest_parent.child_ids,
+        vec!["flow-stalled-latest-child-id"]
+    );
+    let latest_child = queue
+        .get_job("flow-stalled-latest-child-id")
+        .await
+        .expect("latest stalled child lookup should return")
+        .expect("latest stalled child should exist");
+    assert_eq!(latest_child.name, "flow-stalled-latest-child");
+    assert_eq!(latest_child.state, JobState::Waiting);
+    assert_eq!(
+        latest_child.parent_id.as_deref(),
+        Some("flow-stalled-latest-parent-id")
+    );
+    assert_eq!(
+        queue
+            .get_deduplication_job_id("tenant:flow-keep-last-stalled")
+            .await
+            .expect("stalled flow keep-last owner should load")
+            .as_deref(),
+        Some("flow-stalled-latest-parent-id")
+    );
+
+    let latest_child_claim = queue
+        .claim_next(
+            "worker-flow-stalled-latest-child".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("latest stalled child claim should return")
+        .expect("latest stalled child should be claimable");
+    assert_eq!(latest_child_claim.id, "flow-stalled-latest-child-id");
+    queue
+        .complete_job(
+            &latest_child_claim.id,
+            lock_token(&latest_child_claim),
+            serde_json::json!({ "child": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("latest stalled child should complete");
+    let latest_parent_claim = queue
+        .claim_next(
+            "worker-flow-stalled-latest-parent".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("latest stalled parent claim should return")
+        .expect("latest stalled parent should be claimable");
+    assert_eq!(latest_parent_claim.id, "flow-stalled-latest-parent-id");
+
+    cleanup_namespace_with_conn(&mut conn, &namespace).await?;
+    trace_stage("flow-keep-last-stalled:cleanup-final:done");
     Ok(())
 }
 

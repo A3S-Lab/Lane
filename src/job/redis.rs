@@ -4198,7 +4198,111 @@ local function repeat_keep_last_next_count(owner_job, next_job)
   return next_count
 end
 
-local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delayed_key, sequence_key, deduplication_prefix, deduplication_next_prefix, repeat_prefix, now_iso, now_millis, waiting_score_bucket)
+local function prepare_deduplicated_next_job(job, now_iso, now_millis)
+  local now_value = tonumber(now_millis)
+  local delay = nil
+  if job["options"] and job["options"] ~= cjson.null then
+    delay = duration_millis(job["options"]["delay"])
+  end
+  local scheduled_millis = now_value
+  if delay then
+    scheduled_millis = scheduled_millis + delay
+  end
+  job["created_at"] = now_iso
+  job["scheduled_at"] = millis_to_iso(scheduled_millis)
+  if scheduled_millis > now_value then
+    job["state"] = "delayed"
+  else
+    job["state"] = "waiting"
+  end
+  job["attempts_made"] = 0
+  job["stalled_count"] = 0
+  job["processed_at"] = cjson.null
+  job["finished_at"] = cjson.null
+  job["worker_id"] = cjson.null
+  job["lock_token"] = cjson.null
+  job["lease_expires_at"] = cjson.null
+  job["deferred_failure"] = cjson.null
+  job["failed_reason"] = cjson.null
+  job["return_value"] = cjson.null
+  job["progress"] = cjson.null
+  job["logs"] = {}
+
+  local deduplication_ttl = deduplication_ttl_millis(job)
+  if deduplication_ttl then
+    job["deduplication_expires_at"] = millis_to_iso(now_value + deduplication_ttl)
+  else
+    job["deduplication_expires_at"] = cjson.null
+  end
+  return scheduled_millis
+end
+
+local function enqueue_prepared_job(jobs_key, waiting_key, waiting_children_key, delayed_key, sequence_key, job, scheduled_millis, waiting_score_bucket, marker_key)
+  if job["state"] == "waiting" then
+    local priority = tonumber(job["priority"] or '1000') or 1000
+    enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job["id"], priority, waiting_score_bucket, marker_key)
+  elseif job["state"] == "delayed" then
+    redis.call('HSET', jobs_key, job["id"], cjson.encode(job))
+    redis.call('ZADD', delayed_key, scheduled_millis, job["id"])
+    refresh_delay_marker(marker_key, delayed_key)
+  elseif job["state"] == "waiting_children" then
+    redis.call('HSET', jobs_key, job["id"], cjson.encode(job))
+    redis.call('ZADD', waiting_children_key, scheduled_millis, job["id"])
+  else
+    redis.call('HSET', jobs_key, job["id"], cjson.encode(job))
+  end
+end
+
+local function enqueue_deduplicated_next_flow(next_key, next_payload, jobs_key, waiting_key, waiting_children_key, delayed_key, sequence_key, deduplication_prefix, dependency_prefix, now_iso, now_millis, waiting_score_bucket, marker_key)
+  local parent = next_payload["parent"]
+  if not parent or parent == cjson.null then
+    redis.call('DEL', next_key)
+    return false
+  end
+  local children = next_payload["children"] or {}
+  if redis.call('HEXISTS', jobs_key, parent["id"]) == 1 then
+    redis.call('DEL', next_key)
+    return false
+  end
+  for _, child in ipairs(children) do
+    if redis.call('HEXISTS', jobs_key, child["id"]) == 1 then
+      redis.call('DEL', next_key)
+      return false
+    end
+  end
+
+  local child_ids = {}
+  for _, child in ipairs(children) do
+    child_ids[#child_ids + 1] = child["id"]
+  end
+
+  local parent_scheduled_millis = prepare_deduplicated_next_job(parent, now_iso, now_millis)
+  parent["parent_id"] = cjson.null
+  parent["child_ids"] = child_ids
+  if #children > 0 then
+    parent["state"] = "waiting_children"
+  end
+  set_deduplication_key(parent, parent["id"], deduplication_prefix)
+  enqueue_prepared_job(jobs_key, waiting_key, waiting_children_key, delayed_key, sequence_key, parent, parent_scheduled_millis, waiting_score_bucket, marker_key)
+
+  if #children > 0 then
+    local dependency_key = dependency_prefix .. parent["id"]
+    redis.call('DEL', dependency_key)
+    for _, child in ipairs(children) do
+      local child_scheduled_millis = prepare_deduplicated_next_job(child, now_iso, now_millis)
+      child["parent_id"] = parent["id"]
+      child["child_ids"] = {}
+      redis.call('SADD', dependency_key, child["id"])
+      set_deduplication_key(child, child["id"], deduplication_prefix)
+      enqueue_prepared_job(jobs_key, waiting_key, waiting_children_key, delayed_key, sequence_key, child, child_scheduled_millis, waiting_score_bucket, marker_key)
+    end
+  end
+
+  redis.call('DEL', next_key)
+  return true
+end
+
+local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, waiting_children_key, delayed_key, sequence_key, deduplication_prefix, deduplication_next_prefix, repeat_prefix, dependency_prefix, now_iso, now_millis, waiting_score_bucket, marker_key)
   local id = deduplication_id(owner_job)
   if not id then
     return false
@@ -4209,6 +4313,9 @@ local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delay
     return false
   end
   local next_job = cjson.decode(next_raw)
+  if next_job["kind"] == "flow" then
+    return enqueue_deduplicated_next_flow(next_key, next_job, jobs_key, waiting_key, waiting_children_key, delayed_key, sequence_key, deduplication_prefix, dependency_prefix, now_iso, now_millis, waiting_score_bucket, marker_key)
+  end
   if redis.call('HEXISTS', jobs_key, next_job["id"]) == 1 then
     redis.call('DEL', next_key)
     return false
@@ -4220,52 +4327,18 @@ local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delay
     return false
   end
 
-  local delay = nil
-  if next_job["options"] and next_job["options"] ~= cjson.null then
-    delay = duration_millis(next_job["options"]["delay"])
-  end
-  local scheduled_millis = tonumber(now_millis)
-  if delay then
-    scheduled_millis = scheduled_millis + delay
-  end
-  next_job["created_at"] = now_iso
-  next_job["scheduled_at"] = millis_to_iso(scheduled_millis)
-  if scheduled_millis > tonumber(now_millis) then
-    next_job["state"] = "delayed"
-  else
-    next_job["state"] = "waiting"
-  end
+  local scheduled_millis = prepare_deduplicated_next_job(next_job, now_iso, now_millis)
   if repeat_next_count then
     next_job["repeat_key"] = owner_job["repeat_key"]
     next_job["repeat_count"] = repeat_next_count
   end
-  next_job["attempts_made"] = 0
-  next_job["stalled_count"] = 0
-  next_job["processed_at"] = cjson.null
-  next_job["finished_at"] = cjson.null
-  next_job["worker_id"] = cjson.null
-  next_job["lock_token"] = cjson.null
-  next_job["lease_expires_at"] = cjson.null
-  next_job["deferred_failure"] = cjson.null
-  next_job["failed_reason"] = cjson.null
-  next_job["return_value"] = cjson.null
-  next_job["progress"] = cjson.null
-  next_job["logs"] = {}
-  next_job["deduplication_expires_at"] = cjson.null
 
-  redis.call('HSET', jobs_key, next_job["id"], cjson.encode(next_job))
   set_deduplication_key(next_job, next_job["id"], deduplication_prefix)
   if repeat_next_count then
     set_repeat_key(next_job, next_job["id"], repeat_prefix)
     store_repeat_scheduler(next_job, next_job["id"], repeat_prefix, scheduled_millis)
   end
-  if next_job["state"] == "waiting" then
-    local priority = tonumber(next_job["priority"] or '1000') or 1000
-    enqueue_waiting_job(jobs_key, waiting_key, sequence_key, next_job, next_job["id"], priority, waiting_score_bucket, KEYS[#KEYS])
-  else
-    redis.call('ZADD', delayed_key, scheduled_millis, next_job["id"])
-    refresh_delay_marker(KEYS[#KEYS], delayed_key)
-  end
+  enqueue_prepared_job(jobs_key, waiting_key, waiting_children_key, delayed_key, sequence_key, next_job, scheduled_millis, waiting_score_bucket, marker_key)
   redis.call('DEL', next_key)
   return true
 end
@@ -4348,7 +4421,7 @@ for _, id in ipairs(ids) do
           redis.call('DEL', ARGV[6] .. id)
           release_deduplication_key(job, id, ARGV[7])
           release_repeat_key(job, id, ARGV[8])
-          enqueue_deduplicated_next(job, KEYS[1], KEYS[3], KEYS[7], KEYS[5], ARGV[7], ARGV[9], ARGV[8], ARGV[2], ARGV[1], ARGV[4])
+          enqueue_deduplicated_next(job, KEYS[1], KEYS[3], KEYS[6], KEYS[7], KEYS[5], ARGV[7], ARGV[9], ARGV[8], ARGV[6], ARGV[2], ARGV[1], ARGV[4], KEYS[#KEYS])
 
           local failure_retention = retention_options(job, 'remove_on_fail', 'failure_retention')
           local failure_max_count = retention_count(failure_retention)
