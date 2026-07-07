@@ -1375,7 +1375,11 @@ the retained entries into the job JSON snapshot for Lane compatibility without
 emitting a queue event. `clean_jobs()` filters retained records by the parsed
 millisecond reference time, removes their lock keys, hash entries, state indexes,
 dependency sets, and log lists atomically, updates flow parents for removed
-child jobs, and returns the removed snapshots.
+child jobs, and returns the removed snapshots. For non-terminal repeat owners,
+the clean script mirrors BullMQ's scheduler-job guard: it checks both
+`repeat:<key>` and `repeat_meta:<key>.jid`, restores the fast owner key from
+valid scheduler metadata, and skips the current series owner instead of deleting
+it through broad cleanup.
 
 Queue draining follows the same rule. `drain_jobs(false)` removes waiting jobs
 and `drain_jobs(true)` also removes ordinary delayed jobs in one Redis turn,

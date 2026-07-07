@@ -5849,6 +5849,29 @@ local function release_repeat_key(job, job_id, repeat_prefix)
   end
 end
 
+local function is_current_repeat_owner(job, job_id, repeat_prefix)
+  if job["state"] == "completed" or job["state"] == "failed" then
+    return false
+  end
+  local key = repeat_key(job)
+  if not key then
+    return false
+  end
+
+  local owner_key = repeat_prefix .. key
+  local owner_id = redis.call('GET', owner_key)
+  if owner_id == job_id then
+    return true
+  end
+  if redis.call('HGET', repeat_scheduler_meta_key(repeat_prefix, key), 'jid') == job_id then
+    if not owner_id then
+      redis.call('SET', owner_key, job_id, 'NX')
+    end
+    return true
+  end
+  return false
+end
+
 local function duration_millis(duration)
   if not duration or duration == cjson.null then
     return nil
@@ -6110,7 +6133,8 @@ for _, id in ipairs(ids) do
 
       if reference and reference ~= cjson.null then
         local reference_millis = iso_to_millis(reference)
-        if reference_millis <= cutoff_millis then
+        if reference_millis <= cutoff_millis
+          and not is_current_repeat_owner(job, id, ARGV[11]) then
           table.insert(candidates, { id = id, reference_millis = reference_millis, raw = raw, job = job })
         end
       end

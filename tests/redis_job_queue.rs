@@ -974,6 +974,22 @@ async fn redis_backend_preserves_drained_repeat_from_scheduler_metadata_against_
 }
 
 #[tokio::test]
+async fn redis_backend_preserves_cleaned_repeat_from_scheduler_metadata_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_repeat_clean_scheduler_metadata(redis_url),
+    )
+    .await
+    .expect("Redis repeat scheduler metadata clean integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_removes_repeat_from_scheduler_metadata_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -4829,6 +4845,129 @@ async fn run_repeat_drain_scheduler_metadata(redis_url: String) -> redis::RedisR
 
     cleanup_namespace_with_conn(&mut conn, &namespace).await?;
     trace_stage("repeat-drain-scheduler:cleanup-final:done");
+    Ok(())
+}
+
+async fn run_repeat_clean_scheduler_metadata(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    trace_stage("repeat-clean-scheduler:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("repeat-clean-scheduler:cleanup:done");
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "repeat-clean-scheduler")
+        .expect("valid Redis URL should build the repeat clean scheduler queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let repeat_owner = queue
+        .add_job(
+            "scheduler-clean-owner".to_string(),
+            serde_json::json!({ "path": "clean" }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(60))
+                    .with_limit(2)
+                    .with_key("clean-scheduler"),
+            ),
+        )
+        .await
+        .expect("repeat clean owner should add");
+    let claimed = queue
+        .claim_next(
+            "worker-repeat-clean-scheduler".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("repeat clean owner claim should return")
+        .expect("repeat clean owner should claim");
+    assert_eq!(claimed.id, repeat_owner.id);
+    queue
+        .complete_job(
+            &claimed.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("repeat clean owner should complete");
+
+    let repeat_successor = queue
+        .list_jobs(JobListOptions::new().with_state(JobState::Delayed))
+        .await
+        .expect("repeat clean delayed jobs should list")
+        .jobs
+        .into_iter()
+        .find(|job| job.repeat_key.as_deref() == Some("clean-scheduler"))
+        .expect("repeat clean successor should be delayed");
+    let owner_key = format!("{namespace}:repeat-clean-scheduler:repeat:clean-scheduler");
+    let scheduler_meta_key =
+        format!("{namespace}:repeat-clean-scheduler:repeat_meta:clean-scheduler");
+    let scheduler_owner_id: Option<String> = conn.hget(&scheduler_meta_key, "jid").await?;
+    assert_eq!(
+        scheduler_owner_id.as_deref(),
+        Some(repeat_successor.id.as_str())
+    );
+    let removed_owner_key: usize = conn.del(&owner_key).await?;
+    assert_eq!(removed_owner_key, 1);
+
+    let ordinary_delayed = queue
+        .add_job(
+            "ordinary-delayed-clean".to_string(),
+            serde_json::json!({ "path": "ordinary" }),
+            JobOptions::new().with_delay(Duration::from_secs(60)),
+        )
+        .await
+        .expect("ordinary delayed job should add");
+    let clean_now = Utc::now() + chrono::Duration::seconds(120);
+    let cleaned = queue
+        .clean_jobs(JobState::Delayed, Duration::ZERO, 10, clean_now)
+        .await
+        .expect("clean should preserve scheduler metadata repeat owner");
+    assert_eq!(cleaned.len(), 1);
+    assert_eq!(cleaned[0].id, ordinary_delayed.id);
+    trace_stage("repeat-clean-scheduler:cleaned");
+
+    let repeat_successor_after = queue
+        .get_job(&repeat_successor.id)
+        .await
+        .expect("repeat clean successor lookup should return")
+        .expect("repeat clean successor should remain");
+    assert_eq!(repeat_successor_after.state, JobState::Delayed);
+    let repeat_delayed_score: Option<f64> = conn
+        .zscore(
+            format!("{namespace}:repeat-clean-scheduler:delayed"),
+            &repeat_successor.id,
+        )
+        .await?;
+    assert!(repeat_delayed_score.is_some());
+    let ordinary_hash: Option<String> = conn
+        .hget(
+            format!("{namespace}:repeat-clean-scheduler:jobs"),
+            &ordinary_delayed.id,
+        )
+        .await?;
+    assert!(ordinary_hash.is_none());
+    let restored_owner: Option<String> = conn.get(&owner_key).await?;
+    assert_eq!(
+        restored_owner.as_deref(),
+        Some(repeat_successor.id.as_str())
+    );
+    let scheduler_owner_after: Option<String> = conn.hget(&scheduler_meta_key, "jid").await?;
+    assert_eq!(
+        scheduler_owner_after.as_deref(),
+        Some(repeat_successor.id.as_str())
+    );
+    assert_eq!(
+        queue
+            .count_repeats()
+            .await
+            .expect("repeat count should load after clean recovery"),
+        1
+    );
+
+    cleanup_namespace_with_conn(&mut conn, &namespace).await?;
+    trace_stage("repeat-clean-scheduler:cleanup-final:done");
     Ok(())
 }
 
