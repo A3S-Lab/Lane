@@ -816,6 +816,22 @@ async fn redis_backend_clears_keep_last_next_on_manual_release_against_real_serv
 }
 
 #[tokio::test]
+async fn redis_backend_clears_keep_last_next_on_owner_removal_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_keep_last_owner_removal_cleanup(redis_url),
+    )
+    .await
+    .expect("Redis keep-last owner-removal integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_clears_keep_last_next_for_stale_dedup_owner_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -3057,6 +3073,239 @@ async fn run_keep_last_manual_release_cleanup(redis_url: String) -> redis::Redis
         .await
         .expect("keep-last release jobs should list");
     assert!(!jobs.jobs.iter().any(|job| job.id == next.id));
+
+    cleanup_namespace(&redis_url, &namespace).await?;
+    Ok(())
+}
+
+async fn run_keep_last_owner_removal_cleanup(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    trace_stage("keep-last-owner-removal:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("keep-last-owner-removal:cleanup:done");
+
+    let remove_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "dedup-remove")
+        .expect("valid Redis URL should build the dedup removal queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let remove_deduplication =
+        DeduplicationOptions::new("tenant:keep-last-remove").keep_last_if_active(true);
+    let remove_key = format!("{namespace}:dedup-remove:deduplication:tenant:keep-last-remove");
+    let remove_next_key =
+        format!("{namespace}:dedup-remove:deduplication_next:tenant:keep-last-remove");
+    let remove_owner = remove_queue
+        .add_job(
+            "dedup-keep-last-remove-owner".to_string(),
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new().with_deduplication(remove_deduplication.clone()),
+        )
+        .await
+        .expect("keep-last remove owner should add");
+    let remove_claim = remove_queue
+        .claim_next(
+            "worker-keep-last-remove".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("keep-last remove claim should return")
+        .expect("keep-last remove owner should claim");
+    assert_eq!(remove_claim.id, remove_owner.id);
+    let remove_duplicate = remove_queue
+        .add_job(
+            "dedup-keep-last-remove-next".to_string(),
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new().with_deduplication(remove_deduplication),
+        )
+        .await
+        .expect("keep-last remove duplicate should return owner");
+    assert_eq!(remove_duplicate.id, remove_owner.id);
+    let remove_next_before: Option<String> = conn.get(&remove_next_key).await?;
+    assert!(remove_next_before.is_some());
+    remove_queue
+        .release_active_job(&remove_claim.id, lock_token(&remove_claim), Utc::now())
+        .await
+        .expect("keep-last remove owner should release to waiting");
+    let remove_next_after_release: Option<String> = conn.get(&remove_next_key).await?;
+    assert!(remove_next_after_release.is_some());
+    let removed_owner = remove_queue
+        .remove_job(&remove_owner.id)
+        .await
+        .expect("keep-last waiting owner should remove")
+        .expect("keep-last waiting owner should be returned");
+    assert_eq!(removed_owner.id, remove_owner.id);
+    let remove_next_after: Option<String> = conn.get(&remove_next_key).await?;
+    assert!(remove_next_after.is_none());
+    let remove_owner_after: Option<String> = conn.get(&remove_key).await?;
+    assert!(remove_owner_after.is_none());
+
+    let clean_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "dedup-clean")
+        .expect("valid Redis URL should build the dedup clean queue");
+    let clean_deduplication =
+        DeduplicationOptions::new("tenant:keep-last-clean").keep_last_if_active(true);
+    let clean_key = format!("{namespace}:dedup-clean:deduplication:tenant:keep-last-clean");
+    let clean_next_key =
+        format!("{namespace}:dedup-clean:deduplication_next:tenant:keep-last-clean");
+    let clean_owner = clean_queue
+        .add_job(
+            "dedup-keep-last-clean-owner".to_string(),
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new().with_deduplication(clean_deduplication.clone()),
+        )
+        .await
+        .expect("keep-last clean owner should add");
+    let clean_claim = clean_queue
+        .claim_next(
+            "worker-keep-last-clean".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("keep-last clean claim should return")
+        .expect("keep-last clean owner should claim");
+    assert_eq!(clean_claim.id, clean_owner.id);
+    let clean_duplicate = clean_queue
+        .add_job(
+            "dedup-keep-last-clean-next".to_string(),
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new().with_deduplication(clean_deduplication),
+        )
+        .await
+        .expect("keep-last clean duplicate should return owner");
+    assert_eq!(clean_duplicate.id, clean_owner.id);
+    let clean_next_before: Option<String> = conn.get(&clean_next_key).await?;
+    assert!(clean_next_before.is_some());
+    clean_queue
+        .release_active_job(&clean_claim.id, lock_token(&clean_claim), Utc::now())
+        .await
+        .expect("keep-last clean owner should release to waiting");
+    let cleaned = clean_queue
+        .clean_jobs(JobState::Waiting, Duration::from_millis(0), 10, Utc::now())
+        .await
+        .expect("keep-last waiting owner should clean");
+    assert!(cleaned.iter().any(|job| job.id == clean_owner.id));
+    let clean_next_after: Option<String> = conn.get(&clean_next_key).await?;
+    assert!(clean_next_after.is_none());
+    let clean_owner_after: Option<String> = conn.get(&clean_key).await?;
+    assert!(clean_owner_after.is_none());
+
+    let drain_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "dedup-drain")
+        .expect("valid Redis URL should build the dedup drain queue");
+    let drain_deduplication =
+        DeduplicationOptions::new("tenant:keep-last-drain").keep_last_if_active(true);
+    let drain_key = format!("{namespace}:dedup-drain:deduplication:tenant:keep-last-drain");
+    let drain_next_key =
+        format!("{namespace}:dedup-drain:deduplication_next:tenant:keep-last-drain");
+    let drain_owner = drain_queue
+        .add_job(
+            "dedup-keep-last-drain-owner".to_string(),
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new().with_deduplication(drain_deduplication.clone()),
+        )
+        .await
+        .expect("keep-last drain owner should add");
+    let drain_claim = drain_queue
+        .claim_next(
+            "worker-keep-last-drain".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("keep-last drain claim should return")
+        .expect("keep-last drain owner should claim");
+    assert_eq!(drain_claim.id, drain_owner.id);
+    let drain_duplicate = drain_queue
+        .add_job(
+            "dedup-keep-last-drain-next".to_string(),
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new().with_deduplication(drain_deduplication),
+        )
+        .await
+        .expect("keep-last drain duplicate should return owner");
+    assert_eq!(drain_duplicate.id, drain_owner.id);
+    let drain_next_before: Option<String> = conn.get(&drain_next_key).await?;
+    assert!(drain_next_before.is_some());
+    drain_queue
+        .release_active_job(&drain_claim.id, lock_token(&drain_claim), Utc::now())
+        .await
+        .expect("keep-last drain owner should release to waiting");
+    let drained = drain_queue
+        .drain_jobs(false)
+        .await
+        .expect("keep-last waiting owner should drain");
+    assert!(drained.iter().any(|job| job.id == drain_owner.id));
+    let drain_next_after: Option<String> = conn.get(&drain_next_key).await?;
+    assert!(drain_next_after.is_none());
+    let drain_owner_after: Option<String> = conn.get(&drain_key).await?;
+    assert!(drain_owner_after.is_none());
+
+    let flow_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "dedup-flow-remove")
+        .expect("valid Redis URL should build the dedup flow removal queue");
+    let flow_deduplication =
+        DeduplicationOptions::new("tenant:keep-last-flow-child").keep_last_if_active(true);
+    let flow_key =
+        format!("{namespace}:dedup-flow-remove:deduplication:tenant:keep-last-flow-child");
+    let flow_next_key =
+        format!("{namespace}:dedup-flow-remove:deduplication_next:tenant:keep-last-flow-child");
+    let flow = flow_queue
+        .add_flow_at(
+            JobSpec::new(
+                "dedup-flow-remove-parent",
+                serde_json::json!({ "kind": "aggregate" }),
+            )
+            .with_options(JobOptions::new().with_priority(1)),
+            vec![JobSpec::new(
+                "dedup-flow-remove-child",
+                serde_json::json!({ "version": 1 }),
+            )
+            .with_options(JobOptions::new().with_deduplication(flow_deduplication.clone()))],
+            Utc::now(),
+        )
+        .await
+        .expect("keep-last flow should add");
+    let flow_child_claim = flow_queue
+        .claim_next(
+            "worker-keep-last-flow-child".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("keep-last flow child claim should return")
+        .expect("keep-last flow child should claim");
+    assert_eq!(flow_child_claim.id, flow.children[0].id);
+    let flow_duplicate = flow_queue
+        .add_job(
+            "dedup-flow-remove-child-next".to_string(),
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new().with_deduplication(flow_deduplication),
+        )
+        .await
+        .expect("keep-last flow child duplicate should return owner");
+    assert_eq!(flow_duplicate.id, flow.children[0].id);
+    let flow_next_before: Option<String> = conn.get(&flow_next_key).await?;
+    assert!(flow_next_before.is_some());
+    flow_queue
+        .release_active_job(
+            &flow_child_claim.id,
+            lock_token(&flow_child_claim),
+            Utc::now(),
+        )
+        .await
+        .expect("keep-last flow child should release to waiting");
+    let removed_children = flow_queue
+        .remove_unprocessed_children(&flow.parent.id, Utc::now())
+        .await
+        .expect("keep-last flow child removal should run")
+        .expect("keep-last flow parent should exist");
+    assert!(removed_children
+        .iter()
+        .any(|job| job.id == flow.children[0].id));
+    let flow_next_after: Option<String> = conn.get(&flow_next_key).await?;
+    assert!(flow_next_after.is_none());
+    let flow_owner_after: Option<String> = conn.get(&flow_key).await?;
+    assert!(flow_owner_after.is_none());
 
     cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())

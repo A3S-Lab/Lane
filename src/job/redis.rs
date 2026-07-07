@@ -498,12 +498,15 @@ local function set_deduplication_key(job, job_id, deduplication_prefix)
   end
 end
 
-local function release_deduplication_key(job, job_id, deduplication_prefix)
+local function release_deduplication_key(job, job_id, deduplication_prefix, deduplication_next_prefix)
   local id = deduplication_id(job)
   if id then
     local key = deduplication_prefix .. id
     if redis.call('GET', key) == job_id then
       redis.call('DEL', key)
+      if deduplication_next_prefix and deduplication_next_prefix ~= '' then
+        redis.call('DEL', deduplication_next_prefix .. id)
+      end
     end
   end
 end
@@ -649,7 +652,7 @@ local function remove_state_indexes(job_id)
 end
 
 local function remove_non_active_job(job, job_id)
-  release_deduplication_key(job, job_id, ARGV[8])
+  release_deduplication_key(job, job_id, ARGV[8], ARGV[11])
   release_repeat_key(job, job_id, ARGV[10])
   remove_state_indexes(job_id)
   redis.call('HDEL', KEYS[1], job_id)
@@ -2428,12 +2431,15 @@ local function deduplication_ttl_millis(job)
   return duration_millis(deduplication["ttl"])
 end
 
-local function release_deduplication_key(job, job_id, deduplication_prefix)
+local function release_deduplication_key(job, job_id, deduplication_prefix, deduplication_next_prefix)
   local id = deduplication_id(job)
   if id then
     local key = deduplication_prefix .. id
     if redis.call('GET', key) == job_id then
       redis.call('DEL', key)
+      if deduplication_next_prefix and deduplication_next_prefix ~= '' then
+        redis.call('DEL', deduplication_next_prefix .. id)
+      end
     end
   end
 end
@@ -3209,12 +3215,15 @@ local function deduplication_ttl_millis(job)
   return duration_millis(deduplication["ttl"])
 end
 
-local function release_deduplication_key(job, job_id, deduplication_prefix)
+local function release_deduplication_key(job, job_id, deduplication_prefix, deduplication_next_prefix)
   local id = deduplication_id(job)
   if id then
     local key = deduplication_prefix .. id
     if redis.call('GET', key) == job_id then
       redis.call('DEL', key)
+      if deduplication_next_prefix and deduplication_next_prefix ~= '' then
+        redis.call('DEL', deduplication_next_prefix .. id)
+      end
     end
   end
 end
@@ -4404,12 +4413,15 @@ local function deduplication_ttl_millis(job)
   return duration_millis(deduplication["ttl"])
 end
 
-local function release_deduplication_key(job, job_id, deduplication_prefix)
+local function release_deduplication_key(job, job_id, deduplication_prefix, deduplication_next_prefix)
   local id = deduplication_id(job)
   if id then
     local key = deduplication_prefix .. id
     if redis.call('GET', key) == job_id then
       redis.call('DEL', key)
+      if deduplication_next_prefix and deduplication_next_prefix ~= '' then
+        redis.call('DEL', deduplication_next_prefix .. id)
+      end
     end
   end
 end
@@ -6110,12 +6122,15 @@ local function deduplication_id(job)
   return id
 end
 
-local function release_deduplication_key(job, job_id, deduplication_prefix)
+local function release_deduplication_key(job, job_id, deduplication_prefix, deduplication_next_prefix)
   local id = deduplication_id(job)
   if id then
     local key = deduplication_prefix .. id
     if redis.call('GET', key) == job_id then
       redis.call('DEL', key)
+      if deduplication_next_prefix and deduplication_next_prefix ~= '' then
+        redis.call('DEL', deduplication_next_prefix .. id)
+      end
     end
   end
 end
@@ -6217,7 +6232,7 @@ local function remove_finished_job(job_id)
   local removed_raw = redis.call('HGET', KEYS[1], job_id)
   if removed_raw then
     local removed = cjson.decode(removed_raw)
-    release_deduplication_key(removed, job_id, ARGV[6])
+    release_deduplication_key(removed, job_id, ARGV[6], ARGV[9])
     release_repeat_key(removed, job_id, ARGV[7])
   end
   for index = 3, 8 do
@@ -6286,7 +6301,7 @@ if job["state"] == "active" then
 end
 
 redis.call('DEL', KEYS[2])
-release_deduplication_key(job, ARGV[1], ARGV[6])
+release_deduplication_key(job, ARGV[1], ARGV[6], ARGV[9])
 release_repeat_key(job, ARGV[1], ARGV[7])
 for index = 3, 8 do
   redis.call('ZREM', KEYS[index], ARGV[1])
@@ -6343,7 +6358,7 @@ if parent_id and parent_id ~= cjson.null then
         parent["lease_expires_at"] = cjson.null
         parent["deferred_failure"] = cjson.null
         parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
-        release_deduplication_key(parent, parent_id, ARGV[6])
+        release_deduplication_key(parent, parent_id, ARGV[6], ARGV[9])
         release_repeat_key(parent, parent_id, ARGV[7])
         local parent_failure_retention = retention_options(parent)
         local parent_failure_max_count = retention_count(parent_failure_retention)
@@ -6476,12 +6491,15 @@ local function deduplication_id(job)
   return id
 end
 
-local function release_deduplication_key(job, job_id, deduplication_prefix)
+local function release_deduplication_key(job, job_id, deduplication_prefix, deduplication_next_prefix)
   local id = deduplication_id(job)
   if id then
     local key = deduplication_prefix .. id
     if redis.call('GET', key) == job_id then
       redis.call('DEL', key)
+      if deduplication_next_prefix and deduplication_next_prefix ~= '' then
+        redis.call('DEL', deduplication_next_prefix .. id)
+      end
     end
   end
 end
@@ -6612,7 +6630,7 @@ local function remove_finished_job(job_id)
   local removed_raw = redis.call('HGET', KEYS[1], job_id)
   if removed_raw then
     local removed = cjson.decode(removed_raw)
-    release_deduplication_key(removed, job_id, ARGV[10])
+    release_deduplication_key(removed, job_id, ARGV[10], ARGV[13])
     release_repeat_key(removed, job_id, ARGV[11])
   end
   remove_state_indexes(job_id)
@@ -6723,7 +6741,7 @@ local function release_parent_after_removed_child(job, removed_id)
     parent["lease_expires_at"] = cjson.null
     parent["deferred_failure"] = cjson.null
     parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
-    release_deduplication_key(parent, parent_id, ARGV[10])
+    release_deduplication_key(parent, parent_id, ARGV[10], ARGV[13])
     release_repeat_key(parent, parent_id, ARGV[11])
     local parent_failure_retention = retention_options(parent)
     local parent_failure_max_count = retention_count(parent_failure_retention)
@@ -6834,7 +6852,7 @@ for index = 1, count do
   end
   redis.call('DEL', ARGV[8] .. candidate.id)
   redis.call('DEL', ARGV[12] .. candidate.id)
-  release_deduplication_key(candidate.job, candidate.id, ARGV[10])
+  release_deduplication_key(candidate.job, candidate.id, ARGV[10], ARGV[13])
   release_repeat_key(candidate.job, candidate.id, ARGV[11])
   redis.call('HDEL', KEYS[1], candidate.id)
   release_parent_after_removed_child(candidate.job, candidate.id)
@@ -6932,12 +6950,15 @@ local function deduplication_id(job)
   return id
 end
 
-local function release_deduplication_key(job, job_id, deduplication_prefix)
+local function release_deduplication_key(job, job_id, deduplication_prefix, deduplication_next_prefix)
   local id = deduplication_id(job)
   if id then
     local key = deduplication_prefix .. id
     if redis.call('GET', key) == job_id then
       redis.call('DEL', key)
+      if deduplication_next_prefix and deduplication_next_prefix ~= '' then
+        redis.call('DEL', deduplication_next_prefix .. id)
+      end
     end
   end
 end
@@ -7045,7 +7066,7 @@ local function remove_finished_job(job_id)
   local removed_raw = redis.call('HGET', KEYS[1], job_id)
   if removed_raw then
     local removed = cjson.decode(removed_raw)
-    release_deduplication_key(removed, job_id, ARGV[7])
+    release_deduplication_key(removed, job_id, ARGV[7], ARGV[10])
     release_repeat_key(removed, job_id, ARGV[8])
   end
   remove_state_indexes(job_id)
@@ -7178,7 +7199,7 @@ local function release_parent_after_removed_child(job, removed_id)
     parent["lease_expires_at"] = cjson.null
     parent["deferred_failure"] = cjson.null
     parent["failed_reason"] = "child job " .. failed_child_id .. " failed: " .. failed_reason
-    release_deduplication_key(parent, parent_id, ARGV[7])
+    release_deduplication_key(parent, parent_id, ARGV[7], ARGV[10])
     release_repeat_key(parent, parent_id, ARGV[8])
     local parent_failure_retention = retention_options(parent)
     local parent_failure_max_count = retention_count(parent_failure_retention)
@@ -7245,7 +7266,7 @@ for index, candidate in ipairs(candidates) do
   remove_state_indexes(candidate.id)
   redis.call('DEL', ARGV[6] .. candidate.id)
   redis.call('DEL', ARGV[9] .. candidate.id)
-  release_deduplication_key(candidate.job, candidate.id, ARGV[7])
+  release_deduplication_key(candidate.job, candidate.id, ARGV[7], ARGV[10])
   release_repeat_key(candidate.job, candidate.id, ARGV[8])
   redis.call('HDEL', KEYS[1], candidate.id)
   release_parent_after_removed_child(candidate.job, candidate.id)
@@ -7833,6 +7854,9 @@ local function release_deduplication_key(job, job_id)
     local key = ARGV[7] .. id
     if redis.call('GET', key) == job_id then
       redis.call('DEL', key)
+      if ARGV[10] and ARGV[10] ~= '' then
+        redis.call('DEL', ARGV[10] .. id)
+      end
     end
   end
 end
@@ -8226,6 +8250,9 @@ local function release_deduplication_key(job, job_id)
     local key = ARGV[6] .. id
     if redis.call('GET', key) == job_id then
       redis.call('DEL', key)
+      if ARGV[9] and ARGV[9] ~= '' then
+        redis.call('DEL', ARGV[9] .. id)
+      end
     end
   end
 end
@@ -9246,6 +9273,7 @@ impl RedisJobQueue {
             .arg(self.deduplication_key_prefix())
             .arg(self.repeat_key_prefix())
             .arg(self.logs_key_prefix())
+            .arg(self.deduplication_next_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -9279,6 +9307,7 @@ impl RedisJobQueue {
             .arg(self.deduplication_key_prefix())
             .arg(self.repeat_key_prefix())
             .arg(self.logs_key_prefix())
+            .arg(self.deduplication_next_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -9681,6 +9710,7 @@ impl RedisJobQueue {
             .arg(self.deduplication_key_prefix())
             .arg(self.repeat_key_prefix())
             .arg(self.logs_key_prefix())
+            .arg(self.deduplication_next_key_prefix())
             .query_async(conn)
             .await
             .map_err(redis_error)?;
@@ -10481,6 +10511,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.deduplication_key_prefix())
             .arg(self.repeat_key_prefix())
             .arg(self.logs_key_prefix())
+            .arg(self.deduplication_next_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -10511,6 +10542,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.deduplication_key_prefix())
             .arg(self.repeat_key_prefix())
             .arg(self.logs_key_prefix())
+            .arg(self.deduplication_next_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;

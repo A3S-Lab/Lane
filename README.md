@@ -1090,7 +1090,10 @@ mechanism, where the dedup-next record is consumed during job finalization rathe
 than by a later client-side pass. Flow keep-last uses the same
 `deduplication_next:<id>` key with a flow envelope; Redis currently materializes
 that envelope on active parent completion, terminal failure, or stalled terminal
-failure.
+failure. Redis removal paths mirror BullMQ's removal helper too: when remove,
+clean, drain, repeat upsert, or flow unprocessed-child removal deletes the job
+that still owns `deduplication:<id>`, it also clears `deduplication_next:<id>` so
+a previously active owner cannot leave a stale shadow job behind.
 
 Waiting order is modeled after BullMQ's Redis-level mechanism rather than only
 matching its option names. In BullMQ 5.79.3, standard jobs use a Redis list:
@@ -1142,9 +1145,11 @@ retained event entries in their snapshots so tests and embedded runtimes expose
 the same contract without Redis. Like BullMQ's `addLog` script, Lane job logs
 remain a retained log list and do not emit queue events; progress updates do.
 
-Completion, terminal failure, remove, clean, and stalled terminal failure scripts
-release deduplication keys only when they still point at the job being finalized
-or removed.
+Completion, terminal failure, remove, clean, drain, and stalled terminal failure
+scripts release deduplication keys only when they still point at the job being
+finalized or removed. Removal-style scripts also clear the paired
+`deduplication_next:<id>` shadow record when they clear that owner key, matching
+BullMQ's removal cleanup for keep-last deduplication.
 Manual retry reclaims the key inside the retry script, reapplies the TTL, and
 refuses to move the failed job back to waiting if a newer non-terminal job
 already owns the same deduplication id.
