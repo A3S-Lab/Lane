@@ -27,6 +27,10 @@ fn lock_token(job: &a3s_lane::Job) -> &str {
         .expect("claimed job should carry a lock token")
 }
 
+fn ts(ms: i64) -> DateTime<Utc> {
+    Utc.timestamp_millis_opt(ms).unwrap()
+}
+
 #[test]
 fn redis_backend_runs_job_lifecycle_against_real_server() {
     let Some(redis_url) = redis_url() else {
@@ -108,6 +112,116 @@ async fn redis_backend_saves_stacktrace_against_real_server() {
         .await
         .expect("Redis save stacktrace integration test timed out")
         .unwrap();
+}
+
+#[tokio::test]
+async fn redis_backend_records_job_metrics_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(Duration::from_secs(120), run_job_metrics(redis_url))
+        .await
+        .expect("Redis job metrics integration test timed out")
+        .unwrap();
+}
+
+async fn run_job_metrics(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "job-metrics")
+        .expect("valid Redis URL should build the job-metrics queue");
+    let empty = queue
+        .get_metrics(JobState::Completed, 0, -1)
+        .await
+        .expect("empty completed metrics should load");
+    assert_eq!(empty.meta.count, 0);
+    assert_eq!(empty.meta.previous_timestamp_millis, 0);
+    assert_eq!(empty.meta.previous_count, 0);
+    assert!(empty.data.is_empty());
+    assert_eq!(empty.count, 0);
+
+    let bad_state = queue
+        .get_metrics(JobState::Waiting, 0, -1)
+        .await
+        .expect_err("non-terminal metrics should be rejected");
+    assert!(matches!(bad_state, LaneError::ConfigError(_)));
+
+    for (name, finished_at) in [
+        ("complete-a", ts(1_000)),
+        ("complete-b", ts(2_000)),
+        ("complete-c", ts(61_000)),
+    ] {
+        let job = queue
+            .add_job(name.to_string(), serde_json::json!({}), JobOptions::new())
+            .await
+            .expect("completed metric job should add");
+        let claimed = queue
+            .claim_next(
+                format!("worker-{name}"),
+                Duration::from_secs(30),
+                finished_at,
+            )
+            .await
+            .expect("completed metric claim should return")
+            .expect("completed metric job should claim");
+        assert_eq!(claimed.id, job.id);
+        queue
+            .complete_job(
+                &claimed.id,
+                lock_token(&claimed),
+                serde_json::json!({ "ok": name }),
+                finished_at,
+            )
+            .await
+            .expect("completed metric job should complete");
+    }
+
+    let completed_metrics = queue
+        .get_metrics(JobState::Completed, 0, -1)
+        .await
+        .expect("completed metrics should load");
+    assert_eq!(completed_metrics.meta.count, 3);
+    assert_eq!(completed_metrics.meta.previous_timestamp_millis, 61_000);
+    assert_eq!(completed_metrics.meta.previous_count, 2);
+    assert_eq!(completed_metrics.data, vec![2]);
+    assert_eq!(completed_metrics.count, 1);
+
+    for (name, failed_at) in [("fail-a", ts(1_000)), ("fail-b", ts(61_000))] {
+        let job = queue
+            .add_job(name.to_string(), serde_json::json!({}), JobOptions::new())
+            .await
+            .expect("failed metric job should add");
+        let claimed = queue
+            .claim_next(format!("worker-{name}"), Duration::from_secs(30), failed_at)
+            .await
+            .expect("failed metric claim should return")
+            .expect("failed metric job should claim");
+        assert_eq!(claimed.id, job.id);
+        queue
+            .fail_job(
+                &claimed.id,
+                lock_token(&claimed),
+                format!("{name} failed"),
+                failed_at,
+            )
+            .await
+            .expect("failed metric job should fail");
+    }
+
+    let failed_metrics = queue
+        .get_metrics(JobState::Failed, 0, -1)
+        .await
+        .expect("failed metrics should load");
+    assert_eq!(failed_metrics.meta.count, 2);
+    assert_eq!(failed_metrics.meta.previous_timestamp_millis, 61_000);
+    assert_eq!(failed_metrics.meta.previous_count, 1);
+    assert_eq!(failed_metrics.data, vec![1]);
+    assert_eq!(failed_metrics.count, 1);
+
+    cleanup_namespace(&redis_url, &namespace).await
 }
 
 async fn run_save_stacktrace(redis_url: String) -> redis::RedisResult<()> {

@@ -3,9 +3,10 @@ use super::types::{
     add_duration, deduplication_expiration, page_repeat_entries, Job, JobEvent, JobFinishedResult,
     JobFlow, JobFlowChildValues, JobFlowDependencies, JobFlowDependencyCounts,
     JobFlowIgnoredFailures, JobId, JobListOptions, JobListPage, JobLogEntry, JobLogPage,
-    JobOptions, JobPriority, JobPriorityCount, JobQueueStats, JobRateLimit, JobRepeatEntry,
-    JobRepeatListOptions, JobRepeatPage, JobSpec, JobState, JobStateCount, JobWorkerId, QueueName,
-    DEFAULT_JOB_EVENT_RETENTION,
+    JobMetrics, JobMetricsMeta, JobOptions, JobPriority, JobPriorityCount, JobQueueStats,
+    JobRateLimit, JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobSpec, JobState,
+    JobStateCount, JobWorkerId, QueueName, DEFAULT_JOB_EVENT_RETENTION,
+    DEFAULT_JOB_METRICS_RETENTION,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -2413,6 +2414,41 @@ local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delay
   return true
 end
 
+local function collect_metrics(meta_key, data_key, max_points, timestamp)
+  local max_data_points = tonumber(max_points)
+  if not max_data_points or max_data_points <= 0 then
+    return
+  end
+
+  local count = redis.call('HINCRBY', meta_key, 'count', 1) - 1
+  local prev_ts = redis.call('HGET', meta_key, 'prevTS')
+  if not prev_ts then
+    redis.call('HSET', meta_key, 'prevTS', timestamp, 'prevCount', 0)
+    return
+  end
+
+  local n = math.min(math.floor(tonumber(timestamp) / 60000) - math.floor(tonumber(prev_ts) / 60000), max_data_points)
+  if n > 0 then
+    local prev_count = tonumber(redis.call('HGET', meta_key, 'prevCount') or '0') or 0
+    local delta = count - prev_count
+    if n > 1 then
+      local points = {}
+      points[1] = delta
+      for i = 2, n do
+        points[i] = 0
+      end
+      for i = 1, #points, 7000 do
+        local last = math.min(i + 6999, #points)
+        redis.call('LPUSH', data_key, unpack(points, i, last))
+      end
+    else
+      redis.call('LPUSH', data_key, delta)
+    end
+    redis.call('LTRIM', data_key, 0, max_data_points - 1)
+    redis.call('HSET', meta_key, 'prevCount', count, 'prevTS', timestamp)
+  end
+end
+
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
   return {'missing'}
@@ -2468,6 +2504,7 @@ else
   redis.call('ZADD', KEYS[3], ARGV[5], ARGV[1])
   apply_finished_retention(ARGV[5], completion_retention, KEYS[3], KEYS[1], ARGV[13], ARGV[14], ARGV[15], ARGV[17])
 end
+collect_metrics(KEYS[12], KEYS[13], ARGV[19], ARGV[5])
 
 local parent_id = job["parent_id"]
 if parent_id and parent_id ~= cjson.null then
@@ -2531,6 +2568,7 @@ if parent_id and parent_id ~= cjson.null then
           redis.call('ZADD', KEYS[8], ARGV[5], parent_id)
           apply_finished_retention(ARGV[5], parent_failure_retention, KEYS[8], KEYS[1], ARGV[13], ARGV[14], ARGV[15], ARGV[17])
         end
+        collect_metrics(KEYS[14], KEYS[15], ARGV[19], ARGV[5])
       elseif all_done then
         redis.call('DEL', dependency_key)
         redis.call('ZREM', KEYS[6], parent_id)
@@ -3077,6 +3115,41 @@ local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delay
   return true
 end
 
+local function collect_metrics(meta_key, data_key, max_points, timestamp)
+  local max_data_points = tonumber(max_points)
+  if not max_data_points or max_data_points <= 0 then
+    return
+  end
+
+  local count = redis.call('HINCRBY', meta_key, 'count', 1) - 1
+  local prev_ts = redis.call('HGET', meta_key, 'prevTS')
+  if not prev_ts then
+    redis.call('HSET', meta_key, 'prevTS', timestamp, 'prevCount', 0)
+    return
+  end
+
+  local n = math.min(math.floor(tonumber(timestamp) / 60000) - math.floor(tonumber(prev_ts) / 60000), max_data_points)
+  if n > 0 then
+    local prev_count = tonumber(redis.call('HGET', meta_key, 'prevCount') or '0') or 0
+    local delta = count - prev_count
+    if n > 1 then
+      local points = {}
+      points[1] = delta
+      for i = 2, n do
+        points[i] = 0
+      end
+      for i = 1, #points, 7000 do
+        local last = math.min(i + 6999, #points)
+        redis.call('LPUSH', data_key, unpack(points, i, last))
+      end
+    else
+      redis.call('LPUSH', data_key, delta)
+    end
+    redis.call('LTRIM', data_key, 0, max_data_points - 1)
+    redis.call('HSET', meta_key, 'prevCount', count, 'prevTS', timestamp)
+  end
+end
+
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
   return {'missing'}
@@ -3132,6 +3205,7 @@ else
   redis.call('ZADD', KEYS[4], ARGV[8], ARGV[1])
   apply_finished_retention(ARGV[8], failure_retention, KEYS[4], KEYS[1], ARGV[10], ARGV[11], ARGV[12], ARGV[15])
 end
+collect_metrics(KEYS[11], KEYS[12], ARGV[17], ARGV[8])
 
 local parent_id = job["parent_id"]
 if parent_id and parent_id ~= cjson.null then
@@ -3215,6 +3289,7 @@ if parent_id and parent_id ~= cjson.null then
           redis.call('ZADD', KEYS[4], ARGV[8], parent_id)
           apply_finished_retention(ARGV[8], parent_failure_retention, KEYS[4], KEYS[1], ARGV[10], ARGV[11], ARGV[12], ARGV[15])
         end
+        collect_metrics(KEYS[11], KEYS[12], ARGV[17], ARGV[8])
       elseif fail_parent then
         redis.call('ZREM', KEYS[6], parent_id)
         parent["processed_at"] = cjson.null
@@ -3933,6 +4008,41 @@ local function mark_active_jobs_stalled(active_key, stalled_key)
   end
 end
 
+local function collect_metrics(meta_key, data_key, max_points, timestamp)
+  local max_data_points = tonumber(max_points)
+  if not max_data_points or max_data_points <= 0 then
+    return
+  end
+
+  local count = redis.call('HINCRBY', meta_key, 'count', 1) - 1
+  local prev_ts = redis.call('HGET', meta_key, 'prevTS')
+  if not prev_ts then
+    redis.call('HSET', meta_key, 'prevTS', timestamp, 'prevCount', 0)
+    return
+  end
+
+  local n = math.min(math.floor(tonumber(timestamp) / 60000) - math.floor(tonumber(prev_ts) / 60000), max_data_points)
+  if n > 0 then
+    local prev_count = tonumber(redis.call('HGET', meta_key, 'prevCount') or '0') or 0
+    local delta = count - prev_count
+    if n > 1 then
+      local points = {}
+      points[1] = delta
+      for i = 2, n do
+        points[i] = 0
+      end
+      for i = 1, #points, 7000 do
+        local last = math.min(i + 6999, #points)
+        redis.call('LPUSH', data_key, unpack(points, i, last))
+      end
+    else
+      redis.call('LPUSH', data_key, delta)
+    end
+    redis.call('LTRIM', data_key, 0, max_data_points - 1)
+    redis.call('HSET', meta_key, 'prevCount', count, 'prevTS', timestamp)
+  end
+end
+
 local candidate_limit = tonumber(ARGV[5]) or 1000
 local ids = redis.call('SPOP', KEYS[8], candidate_limit)
 if not ids then
@@ -3979,6 +4089,7 @@ for _, id in ipairs(ids) do
             redis.call('ZADD', KEYS[4], ARGV[1], id)
             apply_finished_retention(ARGV[1], failure_retention, KEYS[4], KEYS[1], ARGV[6], ARGV[7], ARGV[8], ARGV[10])
           end
+          collect_metrics(KEYS[9], KEYS[10], ARGV[11], ARGV[1])
 
           local parent_id = job["parent_id"]
           if parent_id and parent_id ~= cjson.null then
@@ -4063,6 +4174,7 @@ for _, id in ipairs(ids) do
                     redis.call('ZADD', KEYS[4], ARGV[1], parent_id)
                     apply_finished_retention(ARGV[1], parent_failure_retention, KEYS[4], KEYS[1], ARGV[6], ARGV[7], ARGV[8], ARGV[10])
                   end
+                  collect_metrics(KEYS[9], KEYS[10], ARGV[11], ARGV[1])
                 elseif fail_parent then
                   redis.call('ZREM', KEYS[6], parent_id)
                   parent["processed_at"] = cjson.null
@@ -6247,6 +6359,13 @@ end
 return {'not_finished'}
 "#;
 
+const GET_METRICS_SCRIPT: &str = r#"
+local metrics = redis.call('HMGET', KEYS[1], 'count', 'prevTS', 'prevCount')
+local data = redis.call('LRANGE', KEYS[2], tonumber(ARGV[1]), tonumber(ARGV[2]))
+local num_points = redis.call('LLEN', KEYS[2])
+return {metrics, data, num_points}
+"#;
+
 const STATS_SCRIPT: &str = r#"
 local paused_value = 0
 local paused = redis.call('HGET', KEYS[1], 'paused')
@@ -7890,6 +8009,30 @@ impl RedisJobQueue {
         decode_remove_child_dependency_result(&result, child_id)
     }
 
+    /// Return BullMQ-style per-minute terminal job metrics.
+    ///
+    /// Only `JobState::Completed` and `JobState::Failed` have Redis metrics.
+    /// Data points are returned newest first, matching BullMQ's `getMetrics`.
+    pub async fn get_metrics(
+        &self,
+        state: JobState,
+        start: isize,
+        end: isize,
+    ) -> Result<JobMetrics> {
+        let mut conn = self.connection().await?;
+        let result: redis::Value = redis::cmd("EVAL")
+            .arg(GET_METRICS_SCRIPT)
+            .arg(2)
+            .arg(self.metrics_key(state)?)
+            .arg(self.metrics_data_key(state)?)
+            .arg(start)
+            .arg(end)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_metrics_result(&result, state)
+    }
+
     async fn connection(&self) -> Result<ConnectionManager> {
         self.client
             .get_connection_manager()
@@ -7923,6 +8066,16 @@ impl RedisJobQueue {
 
     fn marker_key(&self) -> String {
         self.key("marker")
+    }
+
+    fn metrics_key(&self, state: JobState) -> Result<String> {
+        let suffix = terminal_metrics_suffix(state)?;
+        Ok(self.key(&format!("metrics:{suffix}")))
+    }
+
+    fn metrics_data_key(&self, state: JobState) -> Result<String> {
+        let suffix = terminal_metrics_suffix(state)?;
+        Ok(self.key(&format!("metrics:{suffix}:data")))
     }
 
     fn claim_rate_limit_key(&self) -> String {
@@ -8343,7 +8496,7 @@ impl RedisJobQueue {
         let scheduled_at = retry_at.unwrap_or(now);
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(FAIL_SCRIPT)
-            .arg(11)
+            .arg(13)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.state_key(JobState::Delayed))
@@ -8354,6 +8507,8 @@ impl RedisJobQueue {
             .arg(self.sequence_key())
             .arg(self.events_key())
             .arg(self.stalled_key())
+            .arg(self.metrics_key(JobState::Failed)?)
+            .arg(self.metrics_data_key(JobState::Failed)?)
             .arg(self.marker_key())
             .arg(job_id)
             .arg(lock_token)
@@ -8362,7 +8517,7 @@ impl RedisJobQueue {
             .arg(if retry_at.is_some() { "1" } else { "0" })
             .arg(scheduled_at.to_rfc3339())
             .arg(millis(scheduled_at))
-            .arg(millis(now))
+            .arg(now.timestamp_millis())
             .arg(if job.options.remove_on_fail { "1" } else { "0" })
             .arg(self.dependencies_key_prefix())
             .arg(self.deduplication_key_prefix())
@@ -8371,6 +8526,7 @@ impl RedisJobQueue {
             .arg(self.deduplication_next_key_prefix())
             .arg(self.logs_key_prefix())
             .arg(DEFAULT_JOB_EVENT_RETENTION)
+            .arg(DEFAULT_JOB_METRICS_RETENTION)
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -8482,7 +8638,7 @@ impl JobQueueBackend for RedisJobQueue {
         let next_repeat = next_repeat_job(&active_job, now)?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(COMPLETE_SCRIPT)
-            .arg(12)
+            .arg(16)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.state_key(JobState::Completed))
@@ -8494,6 +8650,10 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.state_key(JobState::Delayed))
             .arg(self.events_key())
             .arg(self.stalled_key())
+            .arg(self.metrics_key(JobState::Completed)?)
+            .arg(self.metrics_data_key(JobState::Completed)?)
+            .arg(self.metrics_key(JobState::Failed)?)
+            .arg(self.metrics_data_key(JobState::Failed)?)
             .arg(self.marker_key())
             .arg(job_id)
             .arg(lock_token)
@@ -8503,7 +8663,7 @@ impl JobQueueBackend for RedisJobQueue {
                     "failed to encode Redis job completion value: {error}"
                 ))
             })?)
-            .arg(millis(now))
+            .arg(now.timestamp_millis())
             .arg(if remove_on_complete { "1" } else { "0" })
             .arg(WAITING_SCORE_BUCKET)
             .arg(
@@ -8543,6 +8703,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.deduplication_next_key_prefix())
             .arg(self.logs_key_prefix())
             .arg(DEFAULT_JOB_EVENT_RETENTION)
+            .arg(DEFAULT_JOB_METRICS_RETENTION)
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -9198,7 +9359,7 @@ impl JobQueueBackend for RedisJobQueue {
         let mut conn = self.connection().await?;
         redis::cmd("EVAL")
             .arg(RECOVER_STALLED_SCRIPT)
-            .arg(9)
+            .arg(11)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.state_key(JobState::Waiting))
@@ -9207,8 +9368,10 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.state_key(JobState::WaitingChildren))
             .arg(self.state_key(JobState::Delayed))
             .arg(self.stalled_key())
+            .arg(self.metrics_key(JobState::Failed)?)
+            .arg(self.metrics_data_key(JobState::Failed)?)
             .arg(self.marker_key())
-            .arg(millis(now))
+            .arg(now.timestamp_millis())
             .arg(now.to_rfc3339())
             .arg(self.lock_key_prefix())
             .arg(WAITING_SCORE_BUCKET)
@@ -9218,6 +9381,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.repeat_key_prefix())
             .arg(self.deduplication_next_key_prefix())
             .arg(self.logs_key_prefix())
+            .arg(DEFAULT_JOB_METRICS_RETENTION)
             .query_async(&mut conn)
             .await
             .map_err(redis_error)
@@ -10115,6 +10279,71 @@ fn decode_priority_counts(
         .collect()
 }
 
+fn decode_metrics_result(value: &redis::Value, state: JobState) -> Result<JobMetrics> {
+    terminal_metrics_suffix(state)?;
+    let redis::Value::Array(items) = value else {
+        return Err(LaneError::Other(
+            "Redis metrics script returned a non-array payload".to_string(),
+        ));
+    };
+    if items.len() != 3 {
+        return Err(LaneError::Other(format!(
+            "Redis metrics script returned {} values, expected 3",
+            items.len()
+        )));
+    }
+
+    let redis::Value::Array(meta_values) = &items[0] else {
+        return Err(LaneError::Other(
+            "Redis metrics script returned non-array metadata".to_string(),
+        ));
+    };
+    if meta_values.len() != 3 {
+        return Err(LaneError::Other(format!(
+            "Redis metrics metadata returned {} values, expected 3",
+            meta_values.len()
+        )));
+    }
+
+    let redis::Value::Array(data_values) = &items[1] else {
+        return Err(LaneError::Other(
+            "Redis metrics script returned non-array data points".to_string(),
+        ));
+    };
+
+    let meta = JobMetricsMeta {
+        count: decode_optional_usize_value(&meta_values[0], "metrics count")?,
+        previous_timestamp_millis: decode_optional_i64_value(
+            &meta_values[1],
+            "metrics previous timestamp",
+        )?,
+        previous_count: decode_optional_usize_value(&meta_values[2], "metrics previous count")?,
+    };
+    let data = data_values
+        .iter()
+        .map(|value| decode_optional_usize_value(value, "metrics data point"))
+        .collect::<Result<Vec<_>>>()?;
+    let count = redis::from_redis_value::<usize>(&items[2]).map_err(redis_error)?;
+
+    Ok(JobMetrics { meta, data, count })
+}
+
+fn decode_optional_usize_value(value: &redis::Value, field: &str) -> Result<usize> {
+    match value {
+        redis::Value::Nil => Ok(0),
+        _ => redis::from_redis_value::<usize>(value)
+            .map_err(|error| LaneError::Other(format!("failed to decode Redis {field}: {error}"))),
+    }
+}
+
+fn decode_optional_i64_value(value: &redis::Value, field: &str) -> Result<i64> {
+    match value {
+        redis::Value::Nil => Ok(0),
+        _ => redis::from_redis_value::<i64>(value)
+            .map_err(|error| LaneError::Other(format!("failed to decode Redis {field}: {error}"))),
+    }
+}
+
 fn decode_state_counts(states: &[JobState], result: &[i64]) -> Result<Vec<JobStateCount>> {
     if result.len() != states.len() {
         return Err(LaneError::Other(format!(
@@ -10242,6 +10471,17 @@ fn job_state_name(state: JobState) -> &'static str {
         JobState::WaitingChildren => "waiting_children",
         JobState::Completed => "completed",
         JobState::Failed => "failed",
+    }
+}
+
+fn terminal_metrics_suffix(state: JobState) -> Result<&'static str> {
+    match state {
+        JobState::Completed => Ok("completed"),
+        JobState::Failed => Ok("failed"),
+        other => Err(LaneError::ConfigError(format!(
+            "job metrics are only available for completed or failed jobs, got {}",
+            job_state_name(other)
+        ))),
     }
 }
 
@@ -10416,6 +10656,20 @@ mod tests {
     }
 
     #[test]
+    fn metrics_scripts_follow_bullmq_minute_window_shape() {
+        assert!(GET_METRICS_SCRIPT.contains("HMGET', KEYS[1], 'count', 'prevTS', 'prevCount'"));
+        assert!(GET_METRICS_SCRIPT.contains("LRANGE', KEYS[2]"));
+        assert!(GET_METRICS_SCRIPT.contains("LLEN', KEYS[2]"));
+        for script in [COMPLETE_SCRIPT, FAIL_SCRIPT, RECOVER_STALLED_SCRIPT] {
+            assert!(script.contains("local function collect_metrics"));
+            assert!(script.contains("HINCRBY', meta_key, 'count', 1"));
+            assert!(script.contains("math.floor(tonumber(timestamp) / 60000)"));
+            assert!(script.contains("LPUSH', data_key"));
+            assert!(script.contains("LTRIM', data_key"));
+        }
+    }
+
+    #[test]
     fn decode_job_accepts_lua_empty_arrays_as_empty_sequences() {
         let job = Job::new(
             "jobs".to_string(),
@@ -10428,12 +10682,56 @@ mod tests {
             .unwrap()
             .replace("\"logs\":[]", "\"logs\":{}")
             .replace("\"child_ids\":[]", "\"child_ids\":{}");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&raw).expect("encoded job should be valid JSON");
+        value["stacktrace"] = serde_json::json!({});
+        let raw = serde_json::to_string(&value).expect("job JSON should re-encode");
 
         let decoded = decode_job(&raw).expect("Lua-shaped JSON should decode");
 
         assert!(decoded.logs.is_empty());
         assert!(decoded.child_ids.is_empty());
+        assert!(decoded.stacktrace.is_empty());
         assert_eq!(decoded.payload, serde_json::json!({ "n": 1 }));
+    }
+
+    #[test]
+    fn decode_metrics_result_builds_job_metrics() {
+        let raw = redis::Value::Array(vec![
+            redis::Value::Array(vec![
+                redis::Value::BulkString(b"3".to_vec()),
+                redis::Value::BulkString(b"61000".to_vec()),
+                redis::Value::BulkString(b"2".to_vec()),
+            ]),
+            redis::Value::Array(vec![redis::Value::BulkString(b"2".to_vec())]),
+            redis::Value::Int(1),
+        ]);
+
+        let metrics =
+            decode_metrics_result(&raw, JobState::Completed).expect("metrics result should decode");
+
+        assert_eq!(metrics.meta.count, 3);
+        assert_eq!(metrics.meta.previous_timestamp_millis, 61_000);
+        assert_eq!(metrics.meta.previous_count, 2);
+        assert_eq!(metrics.data, vec![2]);
+        assert_eq!(metrics.count, 1);
+    }
+
+    #[test]
+    fn decode_metrics_result_rejects_non_terminal_state() {
+        let raw = redis::Value::Array(vec![
+            redis::Value::Array(vec![
+                redis::Value::Nil,
+                redis::Value::Nil,
+                redis::Value::Nil,
+            ]),
+            redis::Value::Array(Vec::new()),
+            redis::Value::Int(0),
+        ]);
+
+        let error = decode_metrics_result(&raw, JobState::Waiting)
+            .expect_err("waiting metrics should be rejected");
+        assert!(matches!(error, LaneError::ConfigError(_)));
     }
 
     #[test]

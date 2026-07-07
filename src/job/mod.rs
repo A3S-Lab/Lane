@@ -22,10 +22,11 @@ pub use redis::RedisJobQueue;
 pub use types::{
     DeduplicationOptions, Job, JobEvent, JobFinishedResult, JobFlow, JobFlowChildValues,
     JobFlowDependencies, JobFlowDependencyCounts, JobFlowIgnoredFailures, JobId, JobListOptions,
-    JobListPage, JobLockToken, JobLogEntry, JobLogPage, JobOptions, JobPriority, JobPriorityCount,
-    JobQueueSnapshot, JobQueueStats, JobRateLimit, JobRepeatEntry, JobRepeatListOptions,
-    JobRepeatPage, JobRetention, JobSpec, JobState, JobStateCount, JobWorkerId, QueueName,
-    RepeatOptions, RepeatSchedule, DEFAULT_JOB_EVENT_RETENTION, DEFAULT_JOB_PRIORITY,
+    JobListPage, JobLockToken, JobLogEntry, JobLogPage, JobMetrics, JobMetricsMeta, JobOptions,
+    JobPriority, JobPriorityCount, JobQueueSnapshot, JobQueueStats, JobRateLimit, JobRepeatEntry,
+    JobRepeatListOptions, JobRepeatPage, JobRetention, JobSpec, JobState, JobStateCount,
+    JobWorkerId, QueueName, RepeatOptions, RepeatSchedule, DEFAULT_JOB_EVENT_RETENTION,
+    DEFAULT_JOB_METRICS_RETENTION, DEFAULT_JOB_PRIORITY,
 };
 pub use worker::{
     job_processor_fn, JobContext, JobProcessor, JobProcessorFn, JobProcessorRouter, JobRunOutcome,

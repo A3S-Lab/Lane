@@ -30,10 +30,34 @@ pub const DEFAULT_JOB_PRIORITY: JobPriority = 1000;
 /// Default retained queue event count, matching BullMQ's default stream length.
 pub const DEFAULT_JOB_EVENT_RETENTION: usize = 10_000;
 
+/// Default retained Redis job metric data points.
+pub const DEFAULT_JOB_METRICS_RETENTION: usize = 10_000;
+
 /// Waiting-job count for a priority value.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JobPriorityCount {
     pub priority: JobPriority,
+    pub count: usize,
+}
+
+/// BullMQ-style terminal job metrics metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobMetricsMeta {
+    /// Total number of terminal transitions recorded for the metric type.
+    pub count: usize,
+    /// Previous closed metric timestamp in milliseconds, or `0` before one exists.
+    pub previous_timestamp_millis: i64,
+    /// Counter value at the previous closed metric timestamp.
+    pub previous_count: usize,
+}
+
+/// BullMQ-style per-minute terminal job metrics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobMetrics {
+    pub meta: JobMetricsMeta,
+    /// Newest-to-oldest per-minute closed-window counts.
+    pub data: Vec<usize>,
+    /// Total number of retained data points.
     pub count: usize,
 }
 
