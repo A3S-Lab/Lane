@@ -337,6 +337,18 @@ async fn run_ignored_flow_dependency_failure(redis_url: String) -> redis::RedisR
     assert_eq!(counts_after_failure.failed, 0);
     assert_eq!(counts_after_failure.ignored, 1);
     assert_eq!(counts_after_failure.missing, 0);
+    let ignored_failures = queue
+        .get_flow_ignored_children_failures(&flow.parent.id)
+        .await
+        .expect("ignored failure map should load")
+        .expect("ignored failure map should exist");
+    assert_eq!(ignored_failures.len(), 1);
+    assert_eq!(
+        ignored_failures
+            .get(&flow.children[0].id)
+            .map(String::as_str),
+        Some("optional child failed")
+    );
 
     let required_child = worker
         .claim_next(
@@ -384,6 +396,16 @@ async fn run_ignored_flow_dependency_failure(redis_url: String) -> redis::RedisR
     assert_eq!(counts_after_release.failed, 0);
     assert_eq!(counts_after_release.ignored, 1);
     assert_eq!(counts_after_release.missing, 0);
+    let child_values = queue
+        .get_flow_children_values(&flow.parent.id)
+        .await
+        .expect("child values should load")
+        .expect("child values should exist");
+    assert_eq!(child_values.len(), 1);
+    assert_eq!(
+        child_values.get(&flow.children[1].id),
+        Some(&serde_json::json!({ "ok": true }))
+    );
 
     cleanup_namespace(&redis_url, &namespace).await
 }
@@ -492,6 +514,12 @@ async fn run_removed_flow_dependency_failure(redis_url: String) -> redis::RedisR
     assert_eq!(counts_after_failure.failed, 0);
     assert_eq!(counts_after_failure.ignored, 0);
     assert_eq!(counts_after_failure.missing, 0);
+    let ignored_failures = queue
+        .get_flow_ignored_children_failures(&flow.parent.id)
+        .await
+        .expect("removed failure ignored map should load")
+        .expect("removed failure ignored map should exist");
+    assert!(ignored_failures.is_empty());
 
     let required_child = worker
         .claim_next(
@@ -539,6 +567,16 @@ async fn run_removed_flow_dependency_failure(redis_url: String) -> redis::RedisR
     assert_eq!(counts_after_release.failed, 0);
     assert_eq!(counts_after_release.ignored, 0);
     assert_eq!(counts_after_release.missing, 0);
+    let child_values = queue
+        .get_flow_children_values(&flow.parent.id)
+        .await
+        .expect("removed flow child values should load")
+        .expect("removed flow child values should exist");
+    assert_eq!(child_values.len(), 1);
+    assert_eq!(
+        child_values.get(&flow.children[1].id),
+        Some(&serde_json::json!({ "ok": true }))
+    );
 
     cleanup_namespace(&redis_url, &namespace).await
 }

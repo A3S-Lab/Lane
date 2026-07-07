@@ -1,10 +1,10 @@
 use super::backend::JobQueueBackend;
 use super::memory::InMemoryJobQueue;
 use super::types::{
-    Job, JobEvent, JobFlow, JobFlowDependencies, JobFlowDependencyCounts, JobId, JobListOptions,
-    JobListPage, JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueSnapshot,
-    JobQueueStats, JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobSpec, JobState,
-    JobStateCount, JobWorkerId,
+    Job, JobEvent, JobFlow, JobFlowChildValues, JobFlowDependencies, JobFlowDependencyCounts,
+    JobFlowIgnoredFailures, JobId, JobListOptions, JobListPage, JobLogPage, JobOptions,
+    JobPriority, JobPriorityCount, JobQueueSnapshot, JobQueueStats, JobRepeatEntry,
+    JobRepeatListOptions, JobRepeatPage, JobSpec, JobState, JobStateCount, JobWorkerId,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -132,6 +132,24 @@ impl LocalJobQueue {
         parent_id: &str,
     ) -> Result<Option<JobFlowDependencyCounts>> {
         self.inner.get_flow_dependency_counts(parent_id).await
+    }
+
+    /// Return completed child result values for a flow parent.
+    pub async fn get_flow_children_values(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowChildValues>> {
+        self.inner.get_flow_children_values(parent_id).await
+    }
+
+    /// Return ignored child failure reasons for a flow parent.
+    pub async fn get_flow_ignored_children_failures(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowIgnoredFailures>> {
+        self.inner
+            .get_flow_ignored_children_failures(parent_id)
+            .await
     }
 
     /// Remove children that are still unprocessed and not active.
@@ -271,6 +289,20 @@ impl JobQueueBackend for LocalJobQueue {
         parent_id: &str,
     ) -> Result<Option<JobFlowDependencyCounts>> {
         LocalJobQueue::get_flow_dependency_counts(self, parent_id).await
+    }
+
+    async fn get_flow_children_values(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowChildValues>> {
+        LocalJobQueue::get_flow_children_values(self, parent_id).await
+    }
+
+    async fn get_flow_ignored_children_failures(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowIgnoredFailures>> {
+        LocalJobQueue::get_flow_ignored_children_failures(self, parent_id).await
     }
 
     async fn remove_unprocessed_children(

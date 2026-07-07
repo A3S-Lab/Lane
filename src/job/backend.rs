@@ -1,8 +1,8 @@
 use super::types::{
-    page_repeat_entries, Job, JobEvent, JobFlow, JobFlowDependencies, JobFlowDependencyCounts,
-    JobId, JobListOptions, JobListPage, JobLogPage, JobOptions, JobPriority, JobPriorityCount,
-    JobQueueStats, JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobSpec, JobState,
-    JobStateCount, JobWorkerId,
+    page_repeat_entries, Job, JobEvent, JobFlow, JobFlowChildValues, JobFlowDependencies,
+    JobFlowDependencyCounts, JobFlowIgnoredFailures, JobId, JobListOptions, JobListPage,
+    JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueStats, JobRepeatEntry,
+    JobRepeatListOptions, JobRepeatPage, JobSpec, JobState, JobStateCount, JobWorkerId,
 };
 use crate::error::Result;
 use async_trait::async_trait;
@@ -31,6 +31,22 @@ pub trait JobQueueBackend: Send + Sync {
         &self,
         parent_id: &str,
     ) -> Result<Option<JobFlowDependencyCounts>>;
+
+    /// Return completed child result values for a flow parent.
+    ///
+    /// This mirrors BullMQ's `getChildrenValues()` fan-in getter: only completed
+    /// children with retained return values are included.
+    async fn get_flow_children_values(&self, parent_id: &str)
+        -> Result<Option<JobFlowChildValues>>;
+
+    /// Return ignored child failure reasons for a flow parent.
+    ///
+    /// This mirrors BullMQ's `getIgnoredChildrenFailures()` getter: only failed
+    /// children configured with `ignoreDependencyOnFailure` are included.
+    async fn get_flow_ignored_children_failures(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowIgnoredFailures>>;
 
     async fn remove_unprocessed_children(
         &self,

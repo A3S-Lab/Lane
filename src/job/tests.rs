@@ -3985,6 +3985,18 @@ async fn flow_parent_ignores_configured_child_terminal_failure() {
             missing: 0,
         }
     );
+    let ignored_failures = queue
+        .get_flow_ignored_children_failures(&flow.parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ignored_failures.len(), 1);
+    assert_eq!(
+        ignored_failures
+            .get(&flow.children[0].id)
+            .map(String::as_str),
+        Some("optional source failed")
+    );
     let dependencies = queue
         .get_flow_dependencies(&flow.parent.id)
         .await
@@ -4031,6 +4043,16 @@ async fn flow_parent_ignores_configured_child_terminal_failure() {
             ignored: 1,
             missing: 0,
         }
+    );
+    let child_values = queue
+        .get_flow_children_values(&flow.parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child_values.len(), 1);
+    assert_eq!(
+        child_values.get(&flow.children[1].id),
+        Some(&serde_json::json!({ "ok": true }))
     );
 }
 
@@ -4093,6 +4115,12 @@ async fn flow_parent_removes_configured_child_terminal_dependency() {
             missing: 0,
         }
     );
+    let ignored_failures = queue
+        .get_flow_ignored_children_failures(&flow.parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ignored_failures.is_empty());
 
     let required_child = queue
         .claim_next(
@@ -4129,6 +4157,16 @@ async fn flow_parent_removes_configured_child_terminal_dependency() {
             ignored: 0,
             missing: 0,
         }
+    );
+    let child_values = queue
+        .get_flow_children_values(&flow.parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child_values.len(), 1);
+    assert_eq!(
+        child_values.get(&flow.children[1].id),
+        Some(&serde_json::json!({ "ok": true }))
     );
 }
 

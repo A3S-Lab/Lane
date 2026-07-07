@@ -345,6 +345,12 @@ pub struct JobFlowDependencyCounts {
     pub missing: usize,
 }
 
+/// Completed child return values keyed by child job id.
+pub type JobFlowChildValues = BTreeMap<JobId, Value>;
+
+/// Ignored child failure reasons keyed by child job id.
+pub type JobFlowIgnoredFailures = BTreeMap<JobId, String>;
+
 /// Repeat schedule used by a generic job.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]

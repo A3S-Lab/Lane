@@ -1,10 +1,11 @@
 use super::backend::JobQueueBackend;
 use super::types::{
-    deduplication_expiration, page_repeat_entries, Job, JobEvent, JobFlow, JobFlowDependencies,
-    JobFlowDependencyCounts, JobId, JobListOptions, JobListPage, JobLogEntry, JobLogPage,
-    JobOptions, JobPriority, JobPriorityCount, JobQueueSnapshot, JobQueueStats, JobRepeatEntry,
-    JobRepeatListOptions, JobRepeatPage, JobRetention, JobSpec, JobState, JobStateCount,
-    JobWorkerId, QueueName, DEFAULT_JOB_EVENT_RETENTION,
+    deduplication_expiration, page_repeat_entries, Job, JobEvent, JobFlow, JobFlowChildValues,
+    JobFlowDependencies, JobFlowDependencyCounts, JobFlowIgnoredFailures, JobId, JobListOptions,
+    JobListPage, JobLogEntry, JobLogPage, JobOptions, JobPriority, JobPriorityCount,
+    JobQueueSnapshot, JobQueueStats, JobRepeatEntry, JobRepeatListOptions, JobRepeatPage,
+    JobRetention, JobSpec, JobState, JobStateCount, JobWorkerId, QueueName,
+    DEFAULT_JOB_EVENT_RETENTION,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -505,6 +506,32 @@ impl InMemoryJobQueue {
         };
 
         Ok(Some(flow_dependency_counts(parent, &inner.jobs)))
+    }
+
+    /// Return completed child result values for a flow parent.
+    pub async fn get_flow_children_values(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowChildValues>> {
+        let inner = self.inner.lock().await;
+        let Some(parent) = inner.jobs.get(parent_id) else {
+            return Ok(None);
+        };
+
+        Ok(Some(flow_children_values(parent, &inner.jobs)))
+    }
+
+    /// Return ignored child failure reasons for a flow parent.
+    pub async fn get_flow_ignored_children_failures(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowIgnoredFailures>> {
+        let inner = self.inner.lock().await;
+        let Some(parent) = inner.jobs.get(parent_id) else {
+            return Ok(None);
+        };
+
+        Ok(Some(flow_ignored_children_failures(parent, &inner.jobs)))
     }
 
     /// Remove children that are still unprocessed and not active.
@@ -1570,6 +1597,20 @@ impl JobQueueBackend for InMemoryJobQueue {
         InMemoryJobQueue::get_flow_dependency_counts(self, parent_id).await
     }
 
+    async fn get_flow_children_values(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowChildValues>> {
+        InMemoryJobQueue::get_flow_children_values(self, parent_id).await
+    }
+
+    async fn get_flow_ignored_children_failures(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowIgnoredFailures>> {
+        InMemoryJobQueue::get_flow_ignored_children_failures(self, parent_id).await
+    }
+
     async fn remove_unprocessed_children(
         &self,
         parent_id: &str,
@@ -2287,6 +2328,40 @@ fn flow_dependency_counts(parent: &Job, jobs: &HashMap<JobId, Job>) -> JobFlowDe
     }
 
     counts
+}
+
+fn flow_children_values(parent: &Job, jobs: &HashMap<JobId, Job>) -> JobFlowChildValues {
+    let mut values = BTreeMap::new();
+    for child_id in &parent.child_ids {
+        let Some(child) = jobs.get(child_id) else {
+            continue;
+        };
+        if child.state == JobState::Completed {
+            if let Some(return_value) = &child.return_value {
+                values.insert(child.id.clone(), return_value.clone());
+            }
+        }
+    }
+    values
+}
+
+fn flow_ignored_children_failures(
+    parent: &Job,
+    jobs: &HashMap<JobId, Job>,
+) -> JobFlowIgnoredFailures {
+    let mut failures = BTreeMap::new();
+    for child_id in &parent.child_ids {
+        let Some(child) = jobs.get(child_id) else {
+            continue;
+        };
+        if child.state == JobState::Failed && child.options.ignore_dependency_on_failure {
+            failures.insert(
+                child.id.clone(),
+                child.failed_reason.clone().unwrap_or_default(),
+            );
+        }
+    }
+    failures
 }
 
 fn child_failure_releases_dependency(child: &Job) -> bool {

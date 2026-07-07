@@ -1,10 +1,11 @@
 use super::backend::JobQueueBackend;
 use super::types::{
     add_duration, deduplication_expiration, page_repeat_entries, Job, JobEvent, JobFlow,
-    JobFlowDependencies, JobFlowDependencyCounts, JobId, JobListOptions, JobListPage, JobLogEntry,
-    JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueStats, JobRateLimit,
-    JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobSpec, JobState, JobStateCount,
-    JobWorkerId, QueueName, DEFAULT_JOB_EVENT_RETENTION,
+    JobFlowChildValues, JobFlowDependencies, JobFlowDependencyCounts, JobFlowIgnoredFailures,
+    JobId, JobListOptions, JobListPage, JobLogEntry, JobLogPage, JobOptions, JobPriority,
+    JobPriorityCount, JobQueueStats, JobRateLimit, JobRepeatEntry, JobRepeatListOptions,
+    JobRepeatPage, JobSpec, JobState, JobStateCount, JobWorkerId, QueueName,
+    DEFAULT_JOB_EVENT_RETENTION,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -5709,6 +5710,50 @@ end
 return {'ok', tostring(processed), tostring(unprocessed), tostring(failed), tostring(ignored), tostring(missing)}
 "#;
 
+const FLOW_CHILDREN_VALUES_SCRIPT: &str = r#"
+local parent_raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not parent_raw then
+  return {'missing'}
+end
+
+local parent = cjson.decode(parent_raw)
+local result = {'ok'}
+for _, child_id in ipairs(parent['child_ids'] or {}) do
+  local child_raw = redis.call('HGET', KEYS[1], child_id)
+  if child_raw then
+    local child = cjson.decode(child_raw)
+    if child["state"] == "completed" and child["return_value"] ~= nil and child["return_value"] ~= cjson.null then
+      table.insert(result, child_id)
+      table.insert(result, cjson.encode(child["return_value"]))
+    end
+  end
+end
+
+return result
+"#;
+
+const FLOW_IGNORED_CHILDREN_FAILURES_SCRIPT: &str = r#"
+local parent_raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not parent_raw then
+  return {'missing'}
+end
+
+local parent = cjson.decode(parent_raw)
+local result = {'ok'}
+for _, child_id in ipairs(parent['child_ids'] or {}) do
+  local child_raw = redis.call('HGET', KEYS[1], child_id)
+  if child_raw then
+    local child = cjson.decode(child_raw)
+    if child["state"] == "failed" and child["options"] and child["options"] ~= cjson.null and child["options"]["ignore_dependency_on_failure"] == true then
+      table.insert(result, child_id)
+      table.insert(result, child["failed_reason"] or "")
+    end
+  end
+end
+
+return result
+"#;
+
 const REMOVE_UNPROCESSED_CHILDREN_SCRIPT: &str = r#"
 local function waiting_score_for(priority, sequence, job, bucket)
   local bucket_value = tonumber(bucket)
@@ -7060,6 +7105,40 @@ impl RedisJobQueue {
         decode_flow_dependency_counts_result(&result, parent_id)
     }
 
+    /// Return completed child result values for a flow parent.
+    pub async fn get_flow_children_values(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowChildValues>> {
+        let mut conn = self.connection().await?;
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(FLOW_CHILDREN_VALUES_SCRIPT)
+            .arg(1)
+            .arg(self.jobs_key())
+            .arg(parent_id)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_flow_children_values_result(&result, parent_id)
+    }
+
+    /// Return ignored child failure reasons for a flow parent.
+    pub async fn get_flow_ignored_children_failures(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowIgnoredFailures>> {
+        let mut conn = self.connection().await?;
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(FLOW_IGNORED_CHILDREN_FAILURES_SCRIPT)
+            .arg(1)
+            .arg(self.jobs_key())
+            .arg(parent_id)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_flow_ignored_children_failures_result(&result, parent_id)
+    }
+
     /// Remove children that are still unprocessed and not active.
     pub async fn remove_unprocessed_children(
         &self,
@@ -7600,6 +7679,20 @@ impl JobQueueBackend for RedisJobQueue {
         parent_id: &str,
     ) -> Result<Option<JobFlowDependencyCounts>> {
         RedisJobQueue::get_flow_dependency_counts(self, parent_id).await
+    }
+
+    async fn get_flow_children_values(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowChildValues>> {
+        RedisJobQueue::get_flow_children_values(self, parent_id).await
+    }
+
+    async fn get_flow_ignored_children_failures(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowIgnoredFailures>> {
+        RedisJobQueue::get_flow_ignored_children_failures(self, parent_id).await
     }
 
     async fn remove_unprocessed_children(
@@ -8684,6 +8777,66 @@ fn decode_flow_dependency_counts_result(
         ))),
         None => Err(LaneError::Other(format!(
             "Redis flow dependency count script returned no status for {parent_id}"
+        ))),
+    }
+}
+
+fn decode_flow_children_values_result(
+    result: &[String],
+    parent_id: &str,
+) -> Result<Option<JobFlowChildValues>> {
+    match result.first().map(String::as_str) {
+        Some("missing") => Ok(None),
+        Some("ok") => {
+            if result.len().is_multiple_of(2) {
+                return Err(LaneError::Other(format!(
+                    "Redis flow child values script returned an odd pair count for {parent_id}"
+                )));
+            }
+            let mut values = BTreeMap::new();
+            for pair in result[1..].chunks_exact(2) {
+                let value = serde_json::from_str(&pair[1]).map_err(|error| {
+                    LaneError::Other(format!(
+                        "failed to decode Redis flow child value for {} on {parent_id}: {error}",
+                        pair[0]
+                    ))
+                })?;
+                values.insert(pair[0].clone(), value);
+            }
+            Ok(Some(values))
+        }
+        Some(other) => Err(LaneError::Other(format!(
+            "unexpected Redis flow child values script status `{other}` for {parent_id}"
+        ))),
+        None => Err(LaneError::Other(format!(
+            "Redis flow child values script returned no status for {parent_id}"
+        ))),
+    }
+}
+
+fn decode_flow_ignored_children_failures_result(
+    result: &[String],
+    parent_id: &str,
+) -> Result<Option<JobFlowIgnoredFailures>> {
+    match result.first().map(String::as_str) {
+        Some("missing") => Ok(None),
+        Some("ok") => {
+            if result.len().is_multiple_of(2) {
+                return Err(LaneError::Other(format!(
+                    "Redis flow ignored child failures script returned an odd pair count for {parent_id}"
+                )));
+            }
+            let mut failures = BTreeMap::new();
+            for pair in result[1..].chunks_exact(2) {
+                failures.insert(pair[0].clone(), pair[1].clone());
+            }
+            Ok(Some(failures))
+        }
+        Some(other) => Err(LaneError::Other(format!(
+            "unexpected Redis flow ignored child failures script status `{other}` for {parent_id}"
+        ))),
+        None => Err(LaneError::Other(format!(
+            "Redis flow ignored child failures script returned no status for {parent_id}"
         ))),
     }
 }
