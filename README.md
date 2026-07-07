@@ -1383,10 +1383,11 @@ while deleting each removed job's retained log list and leaving active,
 completed, failed, and waiting-children jobs in place. Like BullMQ's `drain`
 script, Lane protects the current delayed repeat
 occurrence: BullMQ derives that set from job scheduler records, while Lane
-checks the `repeat:<key>` owner key and skips the delayed job when it is still
-the current series owner. Removed children update their parent dependency set in
-the same script, so a parent can move from `waiting_children` to `waiting`,
-`delayed`, or `failed` without a follow-up client pass.
+checks the `repeat:<key>` owner key, falls back to `repeat_meta:<key>.jid`, and
+restores the fast owner key when scheduler metadata still names the delayed
+owner. Removed children update their parent dependency set in the same script,
+so a parent can move from `waiting_children` to `waiting`, `delayed`, or `failed`
+without a follow-up client pass.
 
 Queue obliteration follows BullMQ's underlying pause-first mechanism rather
 than only matching the public method name. BullMQ's public `obliterate()` calls

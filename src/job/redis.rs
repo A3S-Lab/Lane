@@ -6408,7 +6408,18 @@ local function is_current_delayed_repeat_owner(job, job_id)
   if not key then
     return false
   end
-  return redis.call('GET', ARGV[8] .. key) == job_id
+  local owner_key = ARGV[8] .. key
+  local owner_id = redis.call('GET', owner_key)
+  if owner_id == job_id then
+    return true
+  end
+  if redis.call('HGET', repeat_scheduler_meta_key(ARGV[8], key), 'jid') == job_id then
+    if not owner_id then
+      redis.call('SET', owner_key, job_id, 'NX')
+    end
+    return true
+  end
+  return false
 end
 
 local function release_parent_after_removed_child(job, removed_id)
