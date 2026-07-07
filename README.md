@@ -1295,10 +1295,11 @@ an overwrite from an interval schedule to a cron schedule cannot leave stale
 repeat successor enqueue, claim-time due promotion, `promote_due_jobs()`,
 manual promote, reschedule, active delay/release, retry, remove, clean, drain,
 and stalled terminal cleanup update those records inside the same Redis script
-that mutates the job state. Non-terminal movement scripts refresh
-`repeat_meta:<key>.state` and `repeat_meta:<key>.next`, update the scheduler
-zset score, and restore a missing fast `repeat:<key>` owner key with `SET NX`
-when the scheduler metadata still points at the moved job.
+that mutates the job state. Non-terminal movement scripts rebuild the
+`repeat_meta:<key>` hash from the moved job snapshot, including schedule-facing
+fields such as `opts`, `every`, `pattern`, `limit`, and `endDate`; they also
+update the scheduler zset score and restore a missing fast `repeat:<key>` owner
+key with `SET NX` when the moved job still owns the series.
 `get_repeat()`, `count_repeats()`, and `list_repeats_page()` read through the
 scheduler zset, validate the owner job snapshot, repair missing fast owner keys
 from scheduler metadata, prune stale metadata, and mirror BullMQ's
@@ -1330,10 +1331,9 @@ That waiting write uses the same FIFO/LIFO score helper as initial add, delayed
 promotion, manual retry, stalled recovery, repeat successor enqueue, dedup
 keep-last enqueue, and flow parent release. When the moved job is the current
 repeat-series owner, claim, claim-time delayed promotion, `promote_due_jobs()`,
-manual promote, reschedule, active delay, and active release also refresh the
-scheduler hash/zset in the same script and repair a missing fast owner key from
-scheduler metadata instead of leaving the repeat series split across stale Redis
-keys.
+manual promote, reschedule, active delay, and active release also rebuild the
+scheduler hash/zset in the same script and repair a missing fast owner key
+instead of leaving the repeat series split across stale Redis keys.
 `retry_job()` clears terminal failure metadata, treats the failed zset as the
 Redis movement gate, prunes orphaned or stale failed members, and moves valid
 failed jobs back to waiting inside one script. For deduplicated jobs, that same

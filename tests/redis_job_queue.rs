@@ -4999,6 +4999,9 @@ async fn run_repeat_nonterminal_scheduler_metadata(redis_url: String) -> redis::
         .get_connection_manager()
         .await?;
     let owner_key = format!("{namespace}:repeat-metadata-moves:repeat:metadata-moves");
+    let scheduler_key = format!("{namespace}:repeat-metadata-moves:repeat");
+    let scheduler_meta_key =
+        format!("{namespace}:repeat-metadata-moves:repeat_meta:metadata-moves");
 
     let added = queue
         .add_job(
@@ -5024,6 +5027,10 @@ async fn run_repeat_nonterminal_scheduler_metadata(redis_url: String) -> redis::
 
     let removed_owner: usize = conn.del(&owner_key).await?;
     assert_eq!(removed_owner, 1);
+    let removed_scheduler_hash: usize = conn.del(&scheduler_meta_key).await?;
+    assert_eq!(removed_scheduler_hash, 1);
+    let removed_scheduler_score: usize = conn.zrem(&scheduler_key, "metadata-moves").await?;
+    assert_eq!(removed_scheduler_score, 1);
     let first_claim = queue
         .claim_next(
             "worker-repeat-metadata-a".to_string(),
@@ -5199,6 +5206,11 @@ async fn assert_repeat_scheduler_metadata(
     let scheduler_key = format!("{namespace}:{queue}:repeat");
     let scheduler_meta_key = format!("{namespace}:{queue}:repeat_meta:{repeat_key}");
     let expected_next = job.scheduled_at.timestamp_millis();
+    let repeat_options = job
+        .options
+        .repeat
+        .as_ref()
+        .expect("repeat metadata test jobs should carry repeat options");
 
     let owner_id: Option<String> = conn.get(&owner_key).await?;
     assert_eq!(owner_id.as_deref(), Some(job.id.as_str()));
@@ -5213,6 +5225,28 @@ async fn assert_repeat_scheduler_metadata(
     assert_eq!(meta_next, Some(expected_next as f64));
     let scheduler_score: Option<f64> = conn.zscore(&scheduler_key, repeat_key).await?;
     assert_eq!(scheduler_score, Some(expected_next as f64));
+    let meta_opts: Option<String> = conn.hget(&scheduler_meta_key, "opts").await?;
+    assert!(meta_opts.as_deref().is_some_and(|opts| !opts.is_empty()));
+    let meta_limit: Option<u32> = conn.hget(&scheduler_meta_key, "limit").await?;
+    assert_eq!(meta_limit, repeat_options.limit);
+    let meta_end_at: Option<String> = conn.hget(&scheduler_meta_key, "endDate").await?;
+    assert_eq!(
+        meta_end_at.as_deref(),
+        repeat_options
+            .end_at
+            .as_ref()
+            .map(DateTime::to_rfc3339)
+            .as_deref()
+    );
+    let meta_every: Option<u64> = conn.hget(&scheduler_meta_key, "every").await?;
+    assert_eq!(
+        meta_every,
+        repeat_options
+            .interval()
+            .and_then(|interval| u64::try_from(interval.as_millis()).ok())
+    );
+    let meta_pattern: Option<String> = conn.hget(&scheduler_meta_key, "pattern").await?;
+    assert_eq!(meta_pattern.as_deref(), repeat_options.cron_expression());
     Ok(())
 }
 
