@@ -1096,6 +1096,22 @@ async fn redis_backend_records_queue_events_against_real_server() {
 }
 
 #[tokio::test]
+async fn redis_backend_emits_flow_parent_transition_events_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_flow_parent_transition_events(redis_url),
+    )
+    .await
+    .expect("Redis flow parent transition events integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_emits_retries_exhausted_event_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -2446,6 +2462,145 @@ async fn run_queue_events(redis_url: String) -> redis::RedisResult<()> {
     );
 
     cleanup_namespace(&redis_url, &namespace).await?;
+    Ok(())
+}
+
+async fn run_flow_parent_transition_events(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    trace_stage("flow-parent-events:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("flow-parent-events:cleanup:done");
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-parent-events")
+        .expect("valid Redis URL should build the flow parent events queue");
+
+    let complete_flow = queue
+        .add_flow_at(
+            JobSpec::new(
+                "event-complete-parent",
+                serde_json::json!({ "kind": "aggregate" }),
+            ),
+            vec![
+                JobSpec::new("event-complete-child-a", serde_json::json!({ "n": 1 })),
+                JobSpec::new("event-complete-child-b", serde_json::json!({ "n": 2 })),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("complete flow should add");
+    trace_stage("flow-parent-events:complete-flow-added");
+    for (index, child) in complete_flow.children.iter().enumerate() {
+        let claimed = queue
+            .claim_next(
+                format!("worker-complete-child-{index}"),
+                Duration::from_secs(30),
+                Utc::now(),
+            )
+            .await
+            .expect("complete flow child claim should return")
+            .expect("complete flow child should be claimable");
+        assert_eq!(claimed.id, child.id);
+        queue
+            .complete_job(
+                &claimed.id,
+                lock_token(&claimed),
+                serde_json::json!({ "ok": index }),
+                Utc::now(),
+            )
+            .await
+            .expect("complete flow child should complete");
+    }
+    trace_stage("flow-parent-events:complete-flow-completed");
+    let complete_parent = queue
+        .claim_next(
+            "worker-complete-parent".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("complete flow parent claim should return")
+        .expect("complete flow parent should be claimable");
+    assert_eq!(complete_parent.id, complete_flow.parent.id);
+    queue
+        .complete_job(
+            &complete_parent.id,
+            lock_token(&complete_parent),
+            serde_json::json!({ "done": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("complete flow parent should complete");
+
+    let failed_flow = queue
+        .add_flow_at(
+            JobSpec::new(
+                "event-failed-parent",
+                serde_json::json!({ "kind": "aggregate" }),
+            ),
+            vec![JobSpec::new(
+                "event-failed-child",
+                serde_json::json!({ "critical": true }),
+            )],
+            Utc::now(),
+        )
+        .await
+        .expect("failed flow should add");
+    trace_stage("flow-parent-events:failed-flow-added");
+    let failed_child = queue
+        .claim_next(
+            "worker-failed-child".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("failed flow child claim should return")
+        .expect("failed flow child should be claimable");
+    assert_eq!(failed_child.id, failed_flow.children[0].id);
+    queue
+        .fail_job(
+            &failed_child.id,
+            lock_token(&failed_child),
+            "child exploded".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("failed flow child should fail terminally");
+    trace_stage("flow-parent-events:failed-flow-failed");
+
+    let events = queue
+        .read_events("-", "+", 100)
+        .await
+        .expect("flow parent events should read");
+    let complete_parent_waiting = events
+        .iter()
+        .find(|event| {
+            event.job_id.as_deref() == Some(complete_flow.parent.id.as_str())
+                && event.event == "waiting"
+        })
+        .expect("complete flow parent waiting event should be emitted");
+    assert_eq!(
+        complete_parent_waiting.prev,
+        Some(JobState::WaitingChildren)
+    );
+    let failed_parent_event = events
+        .iter()
+        .find(|event| {
+            event.job_id.as_deref() == Some(failed_flow.parent.id.as_str())
+                && event.event == "failed"
+        })
+        .expect("failed flow parent failed event should be emitted");
+    assert_eq!(failed_parent_event.prev, Some(JobState::WaitingChildren));
+    assert_eq!(
+        failed_parent_event.fields.get("failedReason"),
+        Some(&serde_json::Value::String(format!(
+            "child job {} failed: child exploded",
+            failed_flow.children[0].id
+        )))
+    );
+
+    trace_stage("flow-parent-events:cleanup-final:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("flow-parent-events:cleanup-final:done");
     Ok(())
 }
 

@@ -2908,6 +2908,14 @@ local function collect_metrics(meta_key, data_key, max_points, timestamp)
   end
 end
 
+local function emit_parent_waiting_children_transition_event(events_key, max_events, event, job_id, failed_reason)
+  if event == 'failed' then
+    redis.call('XADD', events_key, 'MAXLEN', '~', max_events, '*', 'event', 'failed', 'jobId', job_id, 'failedReason', failed_reason, 'prev', 'waiting-children')
+  else
+    redis.call('XADD', events_key, 'MAXLEN', '~', max_events, '*', 'event', event, 'jobId', job_id, 'prev', 'waiting-children')
+  end
+end
+
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
   return {'missing'}
@@ -3029,6 +3037,7 @@ if parent_id and parent_id ~= cjson.null then
           apply_finished_retention(ARGV[5], parent_failure_retention, KEYS[8], KEYS[1], ARGV[13], ARGV[14], ARGV[15], ARGV[17])
         end
         collect_metrics(KEYS[14], KEYS[15], ARGV[19], ARGV[5])
+        emit_parent_waiting_children_transition_event(KEYS[10], ARGV[18], 'failed', parent_id, parent["failed_reason"])
       elseif all_done then
         redis.call('DEL', dependency_key)
         redis.call('ZREM', KEYS[6], parent_id)
@@ -3051,6 +3060,7 @@ if parent_id and parent_id ~= cjson.null then
           redis.call('ZADD', KEYS[9], parent_scheduled_millis, parent_id)
           refresh_delay_marker(KEYS[#KEYS], KEYS[9])
         end
+        emit_parent_waiting_children_transition_event(KEYS[10], ARGV[18], parent["state"], parent_id)
       end
     end
   end
@@ -3691,6 +3701,14 @@ local function collect_metrics(meta_key, data_key, max_points, timestamp)
   end
 end
 
+local function emit_parent_waiting_children_transition_event(events_key, max_events, event, job_id, failed_reason)
+  if event == 'failed' then
+    redis.call('XADD', events_key, 'MAXLEN', '~', max_events, '*', 'event', 'failed', 'jobId', job_id, 'failedReason', failed_reason, 'prev', 'waiting-children')
+  else
+    redis.call('XADD', events_key, 'MAXLEN', '~', max_events, '*', 'event', event, 'jobId', job_id, 'prev', 'waiting-children')
+  end
+end
+
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
   return {'missing'}
@@ -3845,6 +3863,7 @@ if parent_id and parent_id ~= cjson.null then
           apply_finished_retention(ARGV[8], parent_failure_retention, KEYS[4], KEYS[1], ARGV[10], ARGV[11], ARGV[12], ARGV[15])
         end
         collect_metrics(KEYS[11], KEYS[12], ARGV[17], ARGV[8])
+        emit_parent_waiting_children_transition_event(KEYS[9], ARGV[16], 'failed', parent_id, parent["failed_reason"])
       elseif fail_parent then
         redis.call('ZREM', KEYS[6], parent_id)
         parent["processed_at"] = cjson.null
@@ -3866,6 +3885,7 @@ if parent_id and parent_id ~= cjson.null then
           redis.call('ZADD', KEYS[3], parent_scheduled_millis, parent_id)
           refresh_delay_marker(KEYS[#KEYS], KEYS[3])
         end
+        emit_parent_waiting_children_transition_event(KEYS[9], ARGV[16], parent["state"], parent_id)
       elseif continue_parent then
         redis.call('ZREM', KEYS[6], parent_id)
         parent["processed_at"] = cjson.null
@@ -3887,6 +3907,7 @@ if parent_id and parent_id ~= cjson.null then
           redis.call('ZADD', KEYS[3], parent_scheduled_millis, parent_id)
           refresh_delay_marker(KEYS[#KEYS], KEYS[3])
         end
+        emit_parent_waiting_children_transition_event(KEYS[9], ARGV[16], parent["state"], parent_id)
       elseif all_done then
         redis.call('DEL', dependency_key)
         redis.call('ZREM', KEYS[6], parent_id)
@@ -3909,6 +3930,7 @@ if parent_id and parent_id ~= cjson.null then
           redis.call('ZADD', KEYS[3], parent_scheduled_millis, parent_id)
           refresh_delay_marker(KEYS[#KEYS], KEYS[3])
         end
+        emit_parent_waiting_children_transition_event(KEYS[9], ARGV[16], parent["state"], parent_id)
       end
     end
   end
@@ -5000,6 +5022,14 @@ local function emit_failed_event(events_key, max_events, job_id, failed_reason)
   )
 end
 
+local function emit_parent_waiting_children_transition_event(events_key, max_events, event, job_id, failed_reason)
+  if event == 'failed' then
+    redis.call('XADD', events_key, 'MAXLEN', '~', max_events, '*', 'event', 'failed', 'jobId', job_id, 'failedReason', failed_reason, 'prev', 'waiting-children')
+  else
+    redis.call('XADD', events_key, 'MAXLEN', '~', max_events, '*', 'event', event, 'jobId', job_id, 'prev', 'waiting-children')
+  end
+end
+
 local candidate_limit = tonumber(ARGV[5]) or 1000
 local ids = redis.call('SPOP', KEYS[8], candidate_limit)
 if not ids then
@@ -5147,6 +5177,7 @@ for _, id in ipairs(ids) do
                     apply_finished_retention(ARGV[1], parent_failure_retention, KEYS[4], KEYS[1], ARGV[6], ARGV[7], ARGV[8], ARGV[10])
                   end
                   collect_metrics(KEYS[9], KEYS[10], ARGV[11], ARGV[1])
+                  emit_parent_waiting_children_transition_event(KEYS[12], ARGV[12], 'failed', parent_id, parent["failed_reason"])
                 elseif fail_parent then
                   redis.call('ZREM', KEYS[6], parent_id)
                   parent["processed_at"] = cjson.null
@@ -5168,6 +5199,7 @@ for _, id in ipairs(ids) do
                     redis.call('ZADD', KEYS[7], parent_scheduled_millis, parent_id)
                     refresh_delay_marker(KEYS[11], KEYS[7])
                   end
+                  emit_parent_waiting_children_transition_event(KEYS[12], ARGV[12], parent["state"], parent_id)
                 elseif continue_parent then
                   redis.call('ZREM', KEYS[6], parent_id)
                   parent["processed_at"] = cjson.null
@@ -5189,6 +5221,7 @@ for _, id in ipairs(ids) do
                     redis.call('ZADD', KEYS[7], parent_scheduled_millis, parent_id)
                     refresh_delay_marker(KEYS[11], KEYS[7])
                   end
+                  emit_parent_waiting_children_transition_event(KEYS[12], ARGV[12], parent["state"], parent_id)
                 elseif all_done then
                   redis.call('DEL', dependency_key)
                   redis.call('ZREM', KEYS[6], parent_id)
@@ -5211,6 +5244,7 @@ for _, id in ipairs(ids) do
                     redis.call('ZADD', KEYS[7], parent_scheduled_millis, parent_id)
                     refresh_delay_marker(KEYS[11], KEYS[7])
                   end
+                  emit_parent_waiting_children_transition_event(KEYS[12], ARGV[12], parent["state"], parent_id)
                 end
               end
             end
@@ -12279,6 +12313,8 @@ mod tests {
         assert!(FAIL_SCRIPT.contains("redis.call('SREM', KEYS[10], ARGV[1])"));
         assert!(DELAY_ACTIVE_JOB_SCRIPT.contains("redis.call('SREM', KEYS[6], ARGV[1])"));
         assert!(RELEASE_ACTIVE_JOB_SCRIPT.contains("redis.call('SREM', KEYS[7], ARGV[1])"));
+        assert!(RECOVER_STALLED_SCRIPT
+            .contains("emit_parent_waiting_children_transition_event(KEYS[12], ARGV[12]"));
     }
 
     #[test]
