@@ -1101,8 +1101,10 @@ duplicate after the id was manually released. The in-memory and local durable
 backends persist the same logical release by tracking the released owner id in
 their snapshots instead of relying on a client-side scan alone.
 `get_deduplication_job_id()` reads that same `deduplication:<id>` key, matching
-BullMQ's `GET de:<id>` getter path. If the key points at a missing or
-mismatched job, Redis cleans up the stale key and reports no owner.
+BullMQ's `GET de:<id>` getter path. Redis performs that getter through Lua so if
+the key points at a missing, terminal, or mismatched job, it clears both the
+stale owner key and any orphaned `deduplication_next:<id>` record before
+reporting no owner.
 
 Redis flow submission is all-or-nothing: the flow add script first checks every
 parent and child job id, then writes the parent, children, and all state indexes

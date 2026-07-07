@@ -112,6 +112,21 @@ async fn redis_backend_clears_keep_last_next_on_manual_release_against_real_serv
 }
 
 #[tokio::test]
+async fn redis_backend_clears_keep_last_next_for_stale_dedup_owner_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_keep_last_stale_owner_cleanup(redis_url),
+    )
+    .await
+    .expect("Redis keep-last stale-owner integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_upserts_repeat_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -1116,6 +1131,72 @@ async fn run_keep_last_manual_release_cleanup(redis_url: String) -> redis::Redis
         .await
         .expect("keep-last release jobs should list");
     assert!(!jobs.jobs.iter().any(|job| job.id == next.id));
+
+    cleanup_namespace(&redis_url, &namespace).await?;
+    Ok(())
+}
+
+async fn run_keep_last_stale_owner_cleanup(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    trace_stage("keep-last-stale-owner:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("keep-last-stale-owner:cleanup:done");
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "dedup")
+        .expect("valid Redis URL should build the dedup queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let key = format!("{namespace}:dedup:deduplication:tenant:keep-last-stale-owner");
+    let next_key = format!("{namespace}:dedup:deduplication_next:tenant:keep-last-stale-owner");
+    let jobs_key = format!("{namespace}:dedup:jobs");
+
+    let owner = queue
+        .add_job(
+            "dedup-keep-last-stale-owner".to_string(),
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("tenant:keep-last-stale-owner").keep_last_if_active(true),
+            ),
+        )
+        .await
+        .expect("keep-last stale owner should be added");
+    let claimed = queue
+        .claim_next(
+            "worker-keep-last-stale-owner".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("keep-last stale owner should be claimable")
+        .expect("keep-last stale owner should be returned");
+    assert_eq!(claimed.id, owner.id);
+
+    let duplicate = queue
+        .add_job(
+            "dedup-keep-last-stale-next".to_string(),
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new().with_deduplication(
+                DeduplicationOptions::new("tenant:keep-last-stale-owner").keep_last_if_active(true),
+            ),
+        )
+        .await
+        .expect("keep-last stale duplicate should return owner");
+    assert_eq!(duplicate.id, owner.id);
+    let next_raw: Option<String> = conn.get(&next_key).await?;
+    assert!(next_raw.is_some());
+
+    let removed: usize = conn.hdel(&jobs_key, &owner.id).await?;
+    assert_eq!(removed, 1);
+    assert!(queue
+        .get_deduplication_job_id("tenant:keep-last-stale-owner")
+        .await
+        .expect("stale keep-last owner getter should return")
+        .is_none());
+    let owner_after_stale_get: Option<String> = conn.get(&key).await?;
+    assert!(owner_after_stale_get.is_none());
+    let next_after_stale_get: Option<String> = conn.get(&next_key).await?;
+    assert!(next_after_stale_get.is_none());
 
     cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())

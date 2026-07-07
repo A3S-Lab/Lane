@@ -3993,6 +3993,35 @@ end
 return removed
 "#;
 
+const GET_DEDUPLICATION_JOB_ID_SCRIPT: &str = r#"
+local job_id = redis.call('GET', KEYS[2])
+if not job_id then
+  return nil
+end
+
+local raw = redis.call('HGET', KEYS[1], job_id)
+if not raw then
+  redis.call('DEL', KEYS[2], KEYS[3])
+  return nil
+end
+
+local job = cjson.decode(raw)
+local deduplication = nil
+if job["options"] and job["options"] ~= cjson.null then
+  deduplication = job["options"]["deduplication"]
+end
+if job["state"] == "completed"
+  or job["state"] == "failed"
+  or not deduplication
+  or deduplication == cjson.null
+  or deduplication["id"] ~= ARGV[1] then
+  redis.call('DEL', KEYS[2], KEYS[3])
+  return nil
+end
+
+return job_id
+"#;
+
 const REMOVE_JOB_SCRIPT: &str = r#"
 local function waiting_score_for(priority, sequence, job, bucket)
   local bucket_value = tonumber(bucket)
@@ -7826,20 +7855,16 @@ impl JobQueueBackend for RedisJobQueue {
         }
 
         let mut conn = self.connection().await?;
-        let key = self.deduplication_key(deduplication_id);
-        let Some(job_id): Option<JobId> = conn.get(&key).await.map_err(redis_error)? else {
-            return Ok(None);
-        };
-
-        let Some(job) = self.load_job(&mut conn, &job_id).await? else {
-            let _: usize = conn.del(&key).await.map_err(redis_error)?;
-            return Ok(None);
-        };
-        if job.state.is_terminal() || job_deduplication_id(&job) != Some(deduplication_id) {
-            let _: usize = conn.del(&key).await.map_err(redis_error)?;
-            return Ok(None);
-        }
-        Ok(Some(job_id))
+        redis::cmd("EVAL")
+            .arg(GET_DEDUPLICATION_JOB_ID_SCRIPT)
+            .arg(3)
+            .arg(self.jobs_key())
+            .arg(self.deduplication_key(deduplication_id))
+            .arg(self.deduplication_next_key(deduplication_id))
+            .arg(deduplication_id)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)
     }
 
     async fn list_repeats(&self) -> Result<Vec<JobRepeatEntry>> {
