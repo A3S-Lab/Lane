@@ -4153,6 +4153,50 @@ end
 local priority = tonumber(job["priority"] or '1000') or 1000
 local updated = enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[4], job, ARGV[1], priority, ARGV[3], KEYS[#KEYS])
 redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[8], '*', 'event', 'waiting', 'jobId', ARGV[1], 'prev', 'failed')
+
+local parent_id = job["parent_id"]
+if parent_id and parent_id ~= cjson.null then
+  local parent_raw = redis.call('HGET', KEYS[1], parent_id)
+  if parent_raw then
+    local parent = cjson.decode(parent_raw)
+    local owns_child = false
+    for _, child_id in ipairs(parent["child_ids"] or {}) do
+      if child_id == ARGV[1] then
+        owns_child = true
+        break
+      end
+    end
+
+    if owns_child and parent["state"] ~= "completed" and parent["state"] ~= "failed" and parent["state"] ~= "active" then
+      local parent_previous_state = parent["state"] or ""
+      redis.call('SADD', ARGV[10] .. parent_id, ARGV[1])
+      redis.call('ZREM', KEYS[3], parent_id)
+      redis.call('ZREM', KEYS[6], parent_id)
+      redis.call('ZREM', KEYS[7], parent_id)
+      if parent_previous_state == "delayed" then
+        refresh_delay_marker(KEYS[#KEYS], KEYS[7])
+      end
+      parent["state"] = "waiting_children"
+      parent["processed_at"] = cjson.null
+      parent["finished_at"] = cjson.null
+      parent["worker_id"] = cjson.null
+      parent["lock_token"] = cjson.null
+      parent["lease_expires_at"] = cjson.null
+      parent["deferred_failure"] = cjson.null
+      parent["failed_reason"] = cjson.null
+      redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+      redis.call('ZADD', KEYS[6], ARGV[9], parent_id)
+      if parent_previous_state ~= "waiting_children" then
+        local prev_event_state = parent_previous_state
+        if prev_event_state == "waiting_children" then
+          prev_event_state = "waiting-children"
+        end
+        redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[8], '*', 'event', 'waiting-children', 'jobId', parent_id, 'prev', prev_event_state)
+      end
+    end
+  end
+end
+
 if retry_deduplication_id then
   if ARGV[7] ~= '' then
     redis.call('SET', ARGV[4] .. retry_deduplication_id, ARGV[1], 'PX', ARGV[7])
@@ -8189,12 +8233,14 @@ impl JobQueueBackend for RedisJobQueue {
             .unwrap_or_default();
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(RETRY_JOB_SCRIPT)
-            .arg(6)
+            .arg(8)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Failed))
             .arg(self.state_key(JobState::Waiting))
             .arg(self.sequence_key())
             .arg(self.events_key())
+            .arg(self.state_key(JobState::WaitingChildren))
+            .arg(self.state_key(JobState::Delayed))
             .arg(self.marker_key())
             .arg(job_id)
             .arg(now.to_rfc3339())
@@ -8205,6 +8251,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(deduplication_ttl_millis)
             .arg(DEFAULT_JOB_EVENT_RETENTION)
             .arg(millis(now))
+            .arg(self.dependencies_key_prefix())
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;

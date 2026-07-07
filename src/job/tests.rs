@@ -4137,6 +4137,128 @@ async fn flow_parent_defers_configured_child_terminal_failure() {
 }
 
 #[tokio::test]
+async fn flow_retry_restores_parent_dependency_after_deferred_failure() {
+    let queue = InMemoryJobQueue::new("flow-retry-deferred-parent");
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({ "kind": "aggregate" }))
+                .with_options(JobOptions::new().with_priority(1)),
+            vec![
+                JobSpec::new("retryable-child", serde_json::json!({ "retryable": true }))
+                    .with_options(
+                        JobOptions::new()
+                            .with_priority(2)
+                            .with_fail_parent_on_failure(true),
+                    ),
+                JobSpec::new("required-child", serde_json::json!({ "required": true }))
+                    .with_options(JobOptions::new().with_priority(1)),
+            ],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    let required_child = queue
+        .claim_next(
+            "worker-required".to_string(),
+            Duration::from_secs(30),
+            ts(1_100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(required_child.id, flow.children[1].id);
+    queue
+        .complete_job(
+            &required_child.id,
+            lock_token(&required_child),
+            serde_json::json!({ "required": "done" }),
+            ts(1_150),
+        )
+        .await
+        .unwrap();
+
+    let retryable_child = queue
+        .claim_next(
+            "worker-retryable".to_string(),
+            Duration::from_secs(30),
+            ts(1_200),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retryable_child.id, flow.children[0].id);
+    queue
+        .fail_job(
+            &retryable_child.id,
+            lock_token(&retryable_child),
+            "retryable source failed".to_string(),
+            ts(1_300),
+        )
+        .await
+        .unwrap();
+
+    let parent_after_failure = queue.get_job(&flow.parent.id).await.unwrap().unwrap();
+    assert_eq!(parent_after_failure.state, JobState::Waiting);
+    assert!(parent_after_failure.deferred_failure.is_some());
+
+    let retried_child = queue
+        .retry_job(&flow.children[0].id, ts(1_300))
+        .await
+        .unwrap();
+    assert_eq!(retried_child.state, JobState::Waiting);
+    let parent_after_retry = queue.get_job(&flow.parent.id).await.unwrap().unwrap();
+    assert_eq!(parent_after_retry.state, JobState::WaitingChildren);
+    assert!(parent_after_retry.deferred_failure.is_none());
+    assert!(parent_after_retry.failed_reason.is_none());
+    assert_eq!(
+        queue
+            .get_flow_dependency_counts(&flow.parent.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        JobFlowDependencyCounts {
+            processed: 1,
+            unprocessed: 1,
+            failed: 0,
+            ignored: 0,
+            missing: 0,
+        }
+    );
+
+    let claimed = queue
+        .claim_next(
+            "worker-after-retry".to_string(),
+            Duration::from_secs(30),
+            ts(1_400),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, flow.children[0].id);
+    queue
+        .complete_job(
+            &claimed.id,
+            lock_token(&claimed),
+            serde_json::json!({ "retryable": "done" }),
+            ts(1_500),
+        )
+        .await
+        .unwrap();
+
+    let parent = queue
+        .claim_next(
+            "worker-parent-after-retry".to_string(),
+            Duration::from_secs(30),
+            ts(1_600),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(parent.id, flow.parent.id);
+}
+
+#[tokio::test]
 async fn flow_parent_ignores_configured_child_terminal_failure() {
     let queue = InMemoryJobQueue::new("flow-ignore-failure");
     let flow = queue

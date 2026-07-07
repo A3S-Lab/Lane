@@ -557,6 +557,207 @@ async fn run_deferred_flow_parent_failure(redis_url: String) -> redis::RedisResu
 }
 
 #[tokio::test]
+async fn redis_backend_restores_flow_dependency_on_retry_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_retry_restores_flow_dependency(redis_url),
+    )
+    .await
+    .expect("Redis retry flow dependency restoration integration test timed out")
+    .unwrap();
+}
+
+async fn run_retry_restores_flow_dependency(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-retry-restore")
+        .expect("valid Redis URL should build the flow-retry-restore queue");
+    let worker = RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-retry-restore")
+        .expect("valid Redis URL should build the flow-retry-restore worker");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new(
+                "retry-restore-parent",
+                serde_json::json!({ "kind": "aggregate" }),
+            )
+            .with_options(JobOptions::new().with_priority(1)),
+            vec![
+                JobSpec::new(
+                    "retry-restore-child",
+                    serde_json::json!({ "retryable": true }),
+                )
+                .with_options(
+                    JobOptions::new()
+                        .with_priority(2)
+                        .with_fail_parent_on_failure(true),
+                ),
+                JobSpec::new(
+                    "retry-restore-required-child",
+                    serde_json::json!({ "required": true }),
+                )
+                .with_options(JobOptions::new().with_priority(1)),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("retry restoration flow should be added");
+    let dependency_key = format!(
+        "{namespace}:flow-retry-restore:dependencies:{}",
+        flow.parent.id
+    );
+
+    let required_child = worker
+        .claim_next(
+            "worker-retry-restore-required".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("required child claim should return")
+        .expect("required child should be claimable");
+    assert_eq!(required_child.id, flow.children[1].id);
+    worker
+        .complete_job(
+            &required_child.id,
+            lock_token(&required_child),
+            serde_json::json!({ "required": "done" }),
+            Utc::now(),
+        )
+        .await
+        .expect("required child should complete before retryable child fails");
+    let required_child_pending: bool = conn
+        .sismember(&dependency_key, &flow.children[1].id)
+        .await?;
+    assert!(!required_child_pending);
+
+    let retryable_child = worker
+        .claim_next(
+            "worker-retry-restore-child".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("retryable child claim should return")
+        .expect("retryable child should be claimable");
+    assert_eq!(retryable_child.id, flow.children[0].id);
+    worker
+        .fail_job(
+            &retryable_child.id,
+            lock_token(&retryable_child),
+            "retryable child failed".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("retryable child should fail");
+
+    let failed_child_pending: bool = conn
+        .sismember(&dependency_key, &flow.children[0].id)
+        .await?;
+    let required_child_pending: bool = conn
+        .sismember(&dependency_key, &flow.children[1].id)
+        .await?;
+    assert!(!failed_child_pending);
+    assert!(!required_child_pending);
+    let parent_after_failure = queue
+        .get_job(&flow.parent.id)
+        .await
+        .expect("parent after deferred failure should load")
+        .expect("parent should exist");
+    assert_eq!(parent_after_failure.state, JobState::Waiting);
+    assert!(parent_after_failure.deferred_failure.is_some());
+
+    let retried_child = queue
+        .retry_job(&flow.children[0].id, Utc::now())
+        .await
+        .expect("failed child should retry");
+    assert_eq!(retried_child.state, JobState::Waiting);
+    let retried_child_pending: bool = conn
+        .sismember(&dependency_key, &flow.children[0].id)
+        .await?;
+    let required_child_pending: bool = conn
+        .sismember(&dependency_key, &flow.children[1].id)
+        .await?;
+    assert!(retried_child_pending);
+    assert!(!required_child_pending);
+
+    let parent_after_retry = queue
+        .get_job(&flow.parent.id)
+        .await
+        .expect("parent after child retry should load")
+        .expect("parent should exist");
+    assert_eq!(parent_after_retry.state, JobState::WaitingChildren);
+    assert!(parent_after_retry.deferred_failure.is_none());
+    assert!(parent_after_retry.failed_reason.is_none());
+    let parent_waiting_score: Option<f64> = conn
+        .zscore(
+            format!("{namespace}:flow-retry-restore:waiting"),
+            &flow.parent.id,
+        )
+        .await?;
+    assert!(parent_waiting_score.is_none());
+    let parent_waiting_children_score: Option<f64> = conn
+        .zscore(
+            format!("{namespace}:flow-retry-restore:waiting_children"),
+            &flow.parent.id,
+        )
+        .await?;
+    assert!(parent_waiting_children_score.is_some());
+    let counts_after_retry = queue
+        .get_flow_dependency_counts(&flow.parent.id)
+        .await
+        .expect("retry restoration counts should load")
+        .expect("retry restoration counts should exist");
+    assert_eq!(counts_after_retry.processed, 1);
+    assert_eq!(counts_after_retry.unprocessed, 1);
+    assert_eq!(counts_after_retry.failed, 0);
+    assert_eq!(counts_after_retry.ignored, 0);
+    assert_eq!(counts_after_retry.missing, 0);
+
+    let next_job = worker
+        .claim_next(
+            "worker-retry-restore-after".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("claim after retry should return")
+        .expect("retried child should be claimable");
+    assert_eq!(next_job.id, flow.children[0].id);
+    worker
+        .complete_job(
+            &next_job.id,
+            lock_token(&next_job),
+            serde_json::json!({ "retryable": "done" }),
+            Utc::now(),
+        )
+        .await
+        .expect("retried child should complete");
+
+    let parent = worker
+        .claim_next(
+            "worker-retry-restore-parent".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("parent claim after retry restoration should return")
+        .expect("parent should be claimable after retried child completes");
+    assert_eq!(parent.id, flow.parent.id);
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
+#[tokio::test]
 async fn redis_backend_continues_flow_dependency_failure_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");

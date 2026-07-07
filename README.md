@@ -1282,7 +1282,11 @@ keep-last enqueue, and flow parent release.
 Redis movement gate, prunes orphaned or stale failed members, and moves valid
 failed jobs back to waiting inside one script. For deduplicated and repeat-keyed
 jobs, that same script reclaims the owner key before returning the job to
-waiting; deduplication TTL is re-applied during that same retry script.
+waiting; deduplication TTL is re-applied during that same retry script. When the
+retried job is a retained flow child, retry restores the child into the parent's
+pending dependency set, clears stale deferred parent failure metadata, and moves
+a non-terminal parent back to `waiting_children`, matching BullMQ's
+`reprocessJob` dependency restoration path.
 BullMQ's deprecated `job.discard()` is intentionally modeled as a current
 failure-path decision rather than stored job metadata: BullMQ sets an in-memory
 `discarded` flag, `shouldRetryJob()` checks that flag before `moveToFailed()`,

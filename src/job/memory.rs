@@ -859,6 +859,7 @@ impl InMemoryJobQueue {
             .as_ref()
             .map(|value| value.id.clone());
         let retry_repeat_key = current.repeat_key.clone();
+        let parent_id = current.parent_id.clone();
 
         if let Some(deduplication_id) = retry_deduplication_id.as_deref() {
             if let Some(existing) = find_active_deduplication_id_except(
@@ -913,6 +914,11 @@ impl InMemoryJobQueue {
             now,
             BTreeMap::new(),
         );
+        if let Some(parent_id) = parent_id {
+            Self::restore_parent_dependency_after_child_retry_locked(
+                &mut inner, &parent_id, job_id, now,
+            );
+        }
         Ok(job)
     }
 
@@ -1663,6 +1669,44 @@ impl InMemoryJobQueue {
             now,
             BTreeMap::new(),
         );
+        Some(parent)
+    }
+
+    fn restore_parent_dependency_after_child_retry_locked(
+        inner: &mut InMemoryJobQueueState,
+        parent_id: &str,
+        child_id: &str,
+        now: DateTime<Utc>,
+    ) -> Option<Job> {
+        let parent = inner.jobs.get(parent_id)?;
+        if parent.state.is_terminal() || parent.state == JobState::Active {
+            return Some(parent.clone());
+        }
+        if !parent.child_ids.iter().any(|id| id == child_id) {
+            return Some(parent.clone());
+        }
+
+        let previous_state = parent.state;
+        let parent = inner.jobs.get_mut(parent_id)?;
+        parent.state = JobState::WaitingChildren;
+        parent.processed_at = None;
+        parent.finished_at = None;
+        parent.worker_id = None;
+        parent.lock_token = None;
+        parent.lease_expires_at = None;
+        parent.deferred_failure = None;
+        parent.failed_reason = None;
+        let parent = parent.clone();
+        if previous_state != JobState::WaitingChildren {
+            emit_event_locked(
+                inner,
+                "waiting-children",
+                Some(&parent),
+                Some(previous_state),
+                now,
+                BTreeMap::new(),
+            );
+        }
         Some(parent)
     }
 }
