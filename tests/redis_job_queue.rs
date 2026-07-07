@@ -3749,6 +3749,13 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             .recover_stalled_jobs(Utc::now())
             .await
             .expect("remove-on-stalled-fail recovery should run"),
+        0
+    );
+    assert_eq!(
+        auto_remove_queue
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("remove-on-stalled-fail recovery should confirm"),
         1
     );
     assert!(auto_remove_queue
@@ -3823,6 +3830,13 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             .expect("stale active index recovery should run"),
         0
     );
+    assert_eq!(
+        producer
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("stale active index recovery should confirm"),
+        0
+    );
     let stale_completed_active_score: Option<f64> = stalled_index_conn
         .zscore(format!("{namespace}:jobs:active"), &locked_stalled.id)
         .await?;
@@ -3859,6 +3873,13 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             .recover_stalled_jobs(Utc::now())
             .await
             .expect("stalled recovery should run"),
+        0
+    );
+    assert_eq!(
+        producer
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("stalled recovery should confirm"),
         1
     );
     let reclaimed = worker
@@ -3915,6 +3936,13 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             .recover_stalled_jobs(Utc::now())
             .await
             .expect("terminal stalled recovery should run"),
+        0
+    );
+    assert_eq!(
+        producer
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("terminal stalled recovery should confirm"),
         1
     );
     let terminal_failed = producer

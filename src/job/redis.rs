@@ -1336,6 +1336,7 @@ if lock_token ~= ARGV[2] then
 end
 
 redis.call('DEL', KEYS[4])
+redis.call('SREM', KEYS[11], ARGV[1])
 redis.call('ZREM', KEYS[2], ARGV[1])
 
 job["state"] = "completed"
@@ -1834,6 +1835,7 @@ if lock_token ~= ARGV[2] then
 end
 
 redis.call('DEL', KEYS[5])
+redis.call('SREM', KEYS[10], ARGV[1])
 redis.call('ZREM', KEYS[2], ARGV[1])
 
 job["worker_id"] = cjson.null
@@ -1921,6 +1923,7 @@ if lock_token ~= ARGV[2] then
 end
 
 redis.call('SET', KEYS[3], ARGV[2], 'PX', ARGV[5])
+redis.call('SREM', KEYS[4], ARGV[1])
 job["lease_expires_at"] = ARGV[3]
 local updated = cjson.encode(job)
 redis.call('HSET', KEYS[1], ARGV[1], updated)
@@ -1933,6 +1936,7 @@ local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
   redis.call('ZREM', KEYS[2], ARGV[1])
   redis.call('DEL', KEYS[4])
+  redis.call('SREM', KEYS[6], ARGV[1])
   return {'missing'}
 end
 
@@ -1956,6 +1960,7 @@ if removed_from_active == 0 then
 end
 
 redis.call('DEL', KEYS[4])
+redis.call('SREM', KEYS[6], ARGV[1])
 
 job["state"] = "delayed"
 job["scheduled_at"] = ARGV[3]
@@ -2002,6 +2007,7 @@ local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
   redis.call('ZREM', KEYS[2], ARGV[1])
   redis.call('DEL', KEYS[5])
+  redis.call('SREM', KEYS[7], ARGV[1])
   return {'missing'}
 end
 
@@ -2025,6 +2031,7 @@ if removed_from_active == 0 then
 end
 
 redis.call('DEL', KEYS[5])
+redis.call('SREM', KEYS[7], ARGV[1])
 
 job["state"] = "waiting"
 job["scheduled_at"] = ARGV[3]
@@ -2387,7 +2394,19 @@ local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, delay
   return true
 end
 
-local ids = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1], 'LIMIT', 0, ARGV[5])
+local function mark_active_jobs_stalled(active_key, stalled_key)
+  local active_ids = redis.call('ZRANGE', active_key, 0, -1)
+  for i = 1, #active_ids, 7000 do
+    local last = math.min(i + 6999, #active_ids)
+    redis.call('SADD', stalled_key, unpack(active_ids, i, last))
+  end
+end
+
+local candidate_limit = tonumber(ARGV[5]) or 1000
+local ids = redis.call('SPOP', KEYS[8], candidate_limit)
+if not ids then
+  ids = {}
+end
 local recovered = 0
 
 for _, id in ipairs(ids) do
@@ -2471,6 +2490,8 @@ for _, id in ipairs(ids) do
     end
   end
 end
+
+mark_active_jobs_stalled(KEYS[2], KEYS[8])
 
 return recovered
 "#;
@@ -5508,6 +5529,10 @@ impl RedisJobQueue {
         self.key("claim_rate_limit")
     }
 
+    fn stalled_key(&self) -> String {
+        self.key("stalled")
+    }
+
     fn lock_key(&self, job_id: &str) -> String {
         format!("{}:{}:locks:{}", self.namespace, self.queue, job_id)
     }
@@ -5743,7 +5768,7 @@ impl RedisJobQueue {
         let scheduled_at = retry_at.unwrap_or(now);
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(FAIL_SCRIPT)
-            .arg(9)
+            .arg(10)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.state_key(JobState::Delayed))
@@ -5753,6 +5778,7 @@ impl RedisJobQueue {
             .arg(self.state_key(JobState::Waiting))
             .arg(self.sequence_key())
             .arg(self.events_key())
+            .arg(self.stalled_key())
             .arg(job_id)
             .arg(lock_token)
             .arg(now.to_rfc3339())
@@ -5887,7 +5913,7 @@ impl JobQueueBackend for RedisJobQueue {
         let next_repeat = next_repeat_job(&active_job, now)?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(COMPLETE_SCRIPT)
-            .arg(10)
+            .arg(11)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.state_key(JobState::Completed))
@@ -5898,6 +5924,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.state_key(JobState::Failed))
             .arg(self.state_key(JobState::Delayed))
             .arg(self.events_key())
+            .arg(self.stalled_key())
             .arg(job_id)
             .arg(lock_token)
             .arg(now.to_rfc3339())
@@ -5985,10 +6012,11 @@ impl JobQueueBackend for RedisJobQueue {
         let lease_expires_at = add_duration(now, lease_for);
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(RENEW_LEASE_SCRIPT)
-            .arg(3)
+            .arg(4)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.lock_key(job_id))
+            .arg(self.stalled_key())
             .arg(job_id)
             .arg(lock_token)
             .arg(lease_expires_at.to_rfc3339())
@@ -6013,12 +6041,13 @@ impl JobQueueBackend for RedisJobQueue {
         let scheduled_at = add_duration(now, delay);
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(DELAY_ACTIVE_JOB_SCRIPT)
-            .arg(5)
+            .arg(6)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.state_key(JobState::Delayed))
             .arg(self.lock_key(job_id))
             .arg(self.events_key())
+            .arg(self.stalled_key())
             .arg(job_id)
             .arg(lock_token)
             .arg(scheduled_at.to_rfc3339())
@@ -6042,13 +6071,14 @@ impl JobQueueBackend for RedisJobQueue {
         let mut conn = self.connection().await?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(RELEASE_ACTIVE_JOB_SCRIPT)
-            .arg(6)
+            .arg(7)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.state_key(JobState::Waiting))
             .arg(self.sequence_key())
             .arg(self.lock_key(job_id))
             .arg(self.events_key())
+            .arg(self.stalled_key())
             .arg(job_id)
             .arg(lock_token)
             .arg(now.to_rfc3339())
@@ -6557,7 +6587,7 @@ impl JobQueueBackend for RedisJobQueue {
         let mut conn = self.connection().await?;
         redis::cmd("EVAL")
             .arg(RECOVER_STALLED_SCRIPT)
-            .arg(7)
+            .arg(8)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.state_key(JobState::Waiting))
@@ -6565,6 +6595,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.sequence_key())
             .arg(self.state_key(JobState::WaitingChildren))
             .arg(self.state_key(JobState::Delayed))
+            .arg(self.stalled_key())
             .arg(millis(now))
             .arg(now.to_rfc3339())
             .arg(self.lock_key_prefix())
@@ -7447,6 +7478,7 @@ mod tests {
             queue.state_key(JobState::Waiting),
             "test:lane:email:waiting"
         );
+        assert_eq!(queue.stalled_key(), "test:lane:email:stalled");
     }
 
     #[test]
@@ -7500,6 +7532,20 @@ mod tests {
                 "parent[\"options\"] and parent[\"options\"][\"remove_on_fail\"] == true"
             ));
         }
+    }
+
+    #[test]
+    fn stalled_recovery_scripts_use_bullmq_candidate_set_mechanism() {
+        assert!(RECOVER_STALLED_SCRIPT.contains("redis.call('SPOP', KEYS[8]"));
+        assert!(RECOVER_STALLED_SCRIPT.contains("mark_active_jobs_stalled(KEYS[2], KEYS[8])"));
+        assert!(!RECOVER_STALLED_SCRIPT
+            .contains("redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1]"));
+
+        assert!(RENEW_LEASE_SCRIPT.contains("redis.call('SREM', KEYS[4], ARGV[1])"));
+        assert!(COMPLETE_SCRIPT.contains("redis.call('SREM', KEYS[11], ARGV[1])"));
+        assert!(FAIL_SCRIPT.contains("redis.call('SREM', KEYS[10], ARGV[1])"));
+        assert!(DELAY_ACTIVE_JOB_SCRIPT.contains("redis.call('SREM', KEYS[6], ARGV[1])"));
+        assert!(RELEASE_ACTIVE_JOB_SCRIPT.contains("redis.call('SREM', KEYS[7], ARGV[1])"));
     }
 
     #[test]

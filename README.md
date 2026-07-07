@@ -369,10 +369,10 @@ A3S stack and language SDKs.
 | Phase | Status | Scope |
 | --- | --- | --- |
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
-| Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, debounce TTL extension, delayed-owner replace, and keep-last-if-active requeue, repeat-key ownership, explicit job states, priority plus FIFO/LIFO same-priority ordering, finished-job retention by age/count/limit, retained queue event streams, delayed jobs, token-owned worker leases, active-to-wait/delayed movement, completion/failure snapshots, retry backoff, Redis-shared rate-limit and active-concurrency controls, stalled-job recovery, pause/resume. |
+| Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, debounce TTL extension, delayed-owner replace, and keep-last-if-active requeue, repeat-key ownership, explicit job states, priority plus FIFO/LIFO same-priority ordering, finished-job retention by age/count/limit, retained queue event streams, delayed jobs, token-owned worker leases, active-to-wait/delayed movement, completion/failure snapshots, retry backoff, Redis-shared rate-limit and active-concurrency controls, BullMQ-style two-phase stalled recovery, pause/resume. |
 | Job management API | In progress | Add/get/get-state/get-job-counts/get-job-count/count-pending/remove/remove-repeat/remove-deduplication-key/get-deduplication-job-id/list-repeats/get-flow-dependencies/get-flow-dependency-counts/remove-unprocessed-children/remove-child-dependency/promote/reschedule/delay-active/release-active/retry/update-priority/update-priority-with-lifo/update-data/pause/resume/is-paused/drain/clean/obliterate APIs, multi-state pagination, ascending/descending listing, waiting priority counts, add-log/get-logs/clear-job-logs, read-events/trim-events, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, and stalled recovery loops. |
-| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, FIFO/LIFO waiting score ordering, Redis stream queue events, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership/listing/removal, flow submission, flow dependency inspection, delayed promotion and rescheduling, active-to-wait/delayed movement, single-job promote, state-index queries, job count snapshots, manual retry, priority update, progress update, log append, list/stat snapshots, finished-job age/count retention during complete/fail/stalled scripts, drain, clean, obliterate, claim, Redis-shared rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled recovery semantics. Postgres/NATS backends remain planned. |
+| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, FIFO/LIFO waiting score ordering, Redis stream queue events, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership/listing/removal, flow submission, flow dependency inspection, delayed promotion and rescheduling, active-to-wait/delayed movement, single-job promote, state-index queries, job count snapshots, manual retry, priority update, progress update, log append, list/stat snapshots, finished-job age/count retention during complete/fail/stalled scripts, drain, clean, obliterate, claim, Redis-shared rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled candidate-set recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, dependency inspection, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, end timestamps, and repeat-key removal are available across in-memory, local durable, and Redis backends. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
@@ -854,12 +854,15 @@ Use `RedisJobQueue` when multiple workers or processes need to claim from the
 same durable priority queue. It stores jobs as JSON in a Redis hash, indexes
 states with sorted sets, stores retained job logs in per-job Redis lists, and
 uses Lua scripts to atomically add jobs, promote due delayed jobs, claim work,
-and transition leased jobs. The Redis backend
-follows the core BullMQ locking mechanism: a claim creates an independent TTL
-lock key for the job, and complete, fail, and renew operations must prove
-ownership by matching the lock token before the script mutates the
-active/completed/failed/delayed indexes. Stalled recovery checks the TTL lock
-key, not only the job JSON snapshot:
+and transition leased jobs. The Redis backend follows the core BullMQ locking
+mechanism: a claim creates an independent TTL lock key for the job, and
+complete, fail, release, delay, and renew operations must prove ownership by
+matching the lock token before the script mutates the
+active/completed/failed/delayed indexes. Stalled recovery uses BullMQ's
+two-phase candidate set shape: a recovery pass records active jobs in a
+`stalled` set for the next pass, successful renew/finalize scripts remove the
+job from that set, and only a later pass whose candidate has no TTL lock can
+requeue or fail the job:
 
 ```rust
 use a3s_lane::{JobOptions, JobQueueBackend, JobRateLimit, RedisJobQueue, RetryPolicy};
@@ -1249,12 +1252,17 @@ together several client-side reads. Redis pause state follows BullMQ's
 `is_paused()` reads that same field. A legacy `paused = 0` value is treated as
 resumed and cleaned up.
 
-Stalled recovery is Lua-backed as well. The recovery script scans expired
-active scores, verifies that the independent lock key is missing, increments
+Stalled recovery is Lua-backed as well. The recovery script follows BullMQ's
+`moveStalledJobsToWait` shape: it consumes the previous `stalled` candidate
+set, verifies that each candidate's independent lock key is missing, increments
 the stalled count, and either requeues the job or fails it in the same Redis
-turn. If an active sorted-set member points at a job that has already moved to a
-different state, the same script prunes that stale active index instead of
-treating it as recoverable work.
+turn. At the end of the script it marks the current active index members in the
+`stalled` set for the next recovery pass. Successful `renew_lease()`,
+`complete_job()`, `fail_job()`, `delay_active_job()`, and
+`release_active_job()` scripts remove the job from the candidate set, mirroring
+BullMQ's `extendLock` and `removeLock` helpers. If an active sorted-set member
+points at a job that has already moved to a different state, a later recovery
+pass prunes that stale active index instead of treating it as recoverable work.
 
 `remove_job()` uses a Redis script to reject active jobs and remove the job
 hash, lock key, all state indexes, retained log list, and any child dependency
