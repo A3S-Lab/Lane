@@ -2139,7 +2139,7 @@ if parent_id and parent_id ~= cjson.null then
           end
           if child_raw then
             local child = cjson.decode(child_raw)
-            if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true)) then
+            if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true or child["options"]["continue_parent_on_failure"] == true)) then
               failed_child_id = child_id
               failed_reason = child["failed_reason"] or "unknown error"
               break
@@ -2264,6 +2264,47 @@ local function add_base_marker_if_waiting(marker_key, waiting_key)
   if marker_key and marker_key ~= '' and redis.call('ZCARD', waiting_key) > 0 then
     redis.call('ZADD', marker_key, 0, '0')
   end
+end
+
+local function days_from_civil(year, month, day)
+  if month <= 2 then
+    year = year - 1
+  end
+  local era = math.floor(year / 400)
+  local yoe = year - era * 400
+  local shifted_month = month
+  if month > 2 then
+    shifted_month = month - 3
+  else
+    shifted_month = month + 9
+  end
+  local doy = math.floor((153 * shifted_month + 2) / 5) + day - 1
+  local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+  return era * 146097 + doe - 719468
+end
+
+local function iso_to_millis(value)
+  local year = tonumber(string.sub(value, 1, 4))
+  local month = tonumber(string.sub(value, 6, 7))
+  local day = tonumber(string.sub(value, 9, 10))
+  local hour = tonumber(string.sub(value, 12, 13))
+  local minute = tonumber(string.sub(value, 15, 16))
+  local second = tonumber(string.sub(value, 18, 19))
+  if not year or not month or not day or not hour or not minute or not second then
+    return 0
+  end
+
+  local millis = 0
+  if string.sub(value, 20, 20) == "." then
+    local digits = string.match(string.sub(value, 21), "^(%d+)")
+    if digits then
+      digits = string.sub(digits .. "000", 1, 3)
+      millis = tonumber(digits) or 0
+    end
+  end
+
+  local days = days_from_civil(year, month, day)
+  return (((days * 24 + hour) * 60 + minute) * 60 + second) * 1000 + millis
 end
 
 local function deduplication_id(job)
@@ -2735,36 +2776,45 @@ if parent_id and parent_id ~= cjson.null then
   if parent_raw then
     local parent = cjson.decode(parent_raw)
     if parent["state"] == "waiting_children" then
-      local dependency_failure_releases_parent = job["options"] and job["options"] ~= cjson.null and (job["options"]["ignore_dependency_on_failure"] == true or job["options"]["remove_dependency_on_failure"] == true)
+      local continue_parent_failure = job["options"] and job["options"] ~= cjson.null and job["options"]["continue_parent_on_failure"] == true
+      local dependency_failure_releases_parent = job["options"] and job["options"] ~= cjson.null and (job["options"]["ignore_dependency_on_failure"] == true or job["options"]["remove_dependency_on_failure"] == true or job["options"]["continue_parent_on_failure"] == true)
       local dependency_key = ARGV[10] .. parent_id
       local all_done = true
+      local continue_parent = false
       local failed_child_id = nil
       local failed_reason = nil
 
       if dependency_failure_releases_parent then
-        local had_dependency_set = redis.call('EXISTS', dependency_key) == 1
-        if had_dependency_set then
-          redis.call('SREM', dependency_key, ARGV[1])
-          if redis.call('SCARD', dependency_key) > 0 then
-            all_done = false
+        if continue_parent_failure then
+          if redis.call('EXISTS', dependency_key) == 1 then
+            redis.call('SREM', dependency_key, ARGV[1])
           end
+          continue_parent = true
         else
-          for _, child_id in ipairs(parent["child_ids"] or {}) do
-            local child_raw = nil
-            if child_id == ARGV[1] then
-              child_raw = updated
-            else
-              child_raw = redis.call('HGET', KEYS[1], child_id)
+          local had_dependency_set = redis.call('EXISTS', dependency_key) == 1
+          if had_dependency_set then
+            redis.call('SREM', dependency_key, ARGV[1])
+            if redis.call('SCARD', dependency_key) > 0 then
+              all_done = false
             end
-            if child_raw then
-              local child = cjson.decode(child_raw)
-              if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true)) then
-                failed_child_id = child_id
-                failed_reason = child["failed_reason"] or "unknown error"
-                break
-              elseif child["state"] ~= "completed" and child["state"] ~= "failed" then
-                all_done = false
-                break
+          else
+            for _, child_id in ipairs(parent["child_ids"] or {}) do
+              local child_raw = nil
+              if child_id == ARGV[1] then
+                child_raw = updated
+              else
+                child_raw = redis.call('HGET', KEYS[1], child_id)
+              end
+              if child_raw then
+                local child = cjson.decode(child_raw)
+                if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true or child["options"]["continue_parent_on_failure"] == true)) then
+                  failed_child_id = child_id
+                  failed_reason = child["failed_reason"] or "unknown error"
+                  break
+                elseif child["state"] ~= "completed" and child["state"] ~= "failed" then
+                  all_done = false
+                  break
+                end
               end
             end
           end
@@ -2793,6 +2843,26 @@ if parent_id and parent_id ~= cjson.null then
           redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
           redis.call('ZADD', KEYS[4], ARGV[8], parent_id)
           apply_finished_retention(ARGV[8], parent_failure_retention, KEYS[4], KEYS[1], ARGV[10], ARGV[11], ARGV[12], ARGV[15])
+        end
+      elseif continue_parent then
+        redis.call('ZREM', KEYS[6], parent_id)
+        parent["processed_at"] = cjson.null
+        parent["finished_at"] = cjson.null
+        parent["worker_id"] = cjson.null
+        parent["lock_token"] = cjson.null
+        parent["lease_expires_at"] = cjson.null
+        parent["failed_reason"] = cjson.null
+
+        local parent_scheduled_millis = iso_to_millis(parent["scheduled_at"])
+        if parent_scheduled_millis <= tonumber(ARGV[8]) then
+          parent["state"] = "waiting"
+          local priority = tonumber(parent["priority"] or '1000') or 1000
+          enqueue_waiting_job(KEYS[1], KEYS[7], KEYS[8], parent, parent_id, priority, ARGV[13], KEYS[#KEYS])
+        else
+          parent["state"] = "delayed"
+          redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+          redis.call('ZADD', KEYS[3], parent_scheduled_millis, parent_id)
+          refresh_delay_marker(KEYS[#KEYS], KEYS[3])
         end
       elseif all_done then
         redis.call('DEL', dependency_key)
@@ -3518,37 +3588,46 @@ for _, id in ipairs(ids) do
             if parent_raw then
               local parent = cjson.decode(parent_raw)
               if parent["state"] == "waiting_children" then
-                local dependency_failure_releases_parent = job["options"] and job["options"] ~= cjson.null and (job["options"]["ignore_dependency_on_failure"] == true or job["options"]["remove_dependency_on_failure"] == true)
+                local continue_parent_failure = job["options"] and job["options"] ~= cjson.null and job["options"]["continue_parent_on_failure"] == true
+                local dependency_failure_releases_parent = job["options"] and job["options"] ~= cjson.null and (job["options"]["ignore_dependency_on_failure"] == true or job["options"]["remove_dependency_on_failure"] == true or job["options"]["continue_parent_on_failure"] == true)
                 local dependency_key = ARGV[6] .. parent_id
                 local all_done = true
+                local continue_parent = false
                 local failed_child_id = nil
                 local failed_reason = nil
 
                 if dependency_failure_releases_parent then
-                  local had_dependency_set = redis.call('EXISTS', dependency_key) == 1
-                  if had_dependency_set then
-                    redis.call('SREM', dependency_key, id)
-                    if redis.call('SCARD', dependency_key) > 0 then
-                      all_done = false
+                  if continue_parent_failure then
+                    if redis.call('EXISTS', dependency_key) == 1 then
+                      redis.call('SREM', dependency_key, id)
                     end
+                    continue_parent = true
                   else
-                    local updated = cjson.encode(job)
-                    for _, child_id in ipairs(parent["child_ids"] or {}) do
-                      local child_raw = nil
-                      if child_id == id then
-                        child_raw = updated
-                      else
-                        child_raw = redis.call('HGET', KEYS[1], child_id)
+                    local had_dependency_set = redis.call('EXISTS', dependency_key) == 1
+                    if had_dependency_set then
+                      redis.call('SREM', dependency_key, id)
+                      if redis.call('SCARD', dependency_key) > 0 then
+                        all_done = false
                       end
-                      if child_raw then
-                        local child = cjson.decode(child_raw)
-                        if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true)) then
-                          failed_child_id = child_id
-                          failed_reason = child["failed_reason"] or "unknown error"
-                          break
-                        elseif child["state"] ~= "completed" and child["state"] ~= "failed" then
-                          all_done = false
-                          break
+                    else
+                      local updated = cjson.encode(job)
+                      for _, child_id in ipairs(parent["child_ids"] or {}) do
+                        local child_raw = nil
+                        if child_id == id then
+                          child_raw = updated
+                        else
+                          child_raw = redis.call('HGET', KEYS[1], child_id)
+                        end
+                        if child_raw then
+                          local child = cjson.decode(child_raw)
+                          if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true or child["options"]["continue_parent_on_failure"] == true)) then
+                            failed_child_id = child_id
+                            failed_reason = child["failed_reason"] or "unknown error"
+                            break
+                          elseif child["state"] ~= "completed" and child["state"] ~= "failed" then
+                            all_done = false
+                            break
+                          end
                         end
                       end
                     end
@@ -3577,6 +3656,26 @@ for _, id in ipairs(ids) do
                     redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
                     redis.call('ZADD', KEYS[4], ARGV[1], parent_id)
                     apply_finished_retention(ARGV[1], parent_failure_retention, KEYS[4], KEYS[1], ARGV[6], ARGV[7], ARGV[8], ARGV[10])
+                  end
+                elseif continue_parent then
+                  redis.call('ZREM', KEYS[6], parent_id)
+                  parent["processed_at"] = cjson.null
+                  parent["finished_at"] = cjson.null
+                  parent["worker_id"] = cjson.null
+                  parent["lock_token"] = cjson.null
+                  parent["lease_expires_at"] = cjson.null
+                  parent["failed_reason"] = cjson.null
+
+                  local parent_scheduled_millis = iso_to_millis(parent["scheduled_at"])
+                  if parent_scheduled_millis <= tonumber(ARGV[1]) then
+                    parent["state"] = "waiting"
+                    local priority = tonumber(parent["priority"] or '1000') or 1000
+                    enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[5], parent, parent_id, priority, ARGV[4], KEYS[#KEYS])
+                  else
+                    parent["state"] = "delayed"
+                    redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
+                    redis.call('ZADD', KEYS[7], parent_scheduled_millis, parent_id)
+                    refresh_delay_marker(KEYS[#KEYS], KEYS[7])
                   end
                 elseif all_done then
                   redis.call('DEL', dependency_key)
@@ -4445,7 +4544,7 @@ if parent_id and parent_id ~= cjson.null then
 
           if child_raw then
             local child = cjson.decode(child_raw)
-            if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true)) then
+            if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true or child["options"]["continue_parent_on_failure"] == true)) then
               failed_child_id = child_id
               failed_reason = child["failed_reason"] or "unknown error"
               break
@@ -4791,7 +4890,7 @@ local function release_parent_after_removed_child(job, removed_id)
 
       if child_raw then
         local child = cjson.decode(child_raw)
-        if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true)) then
+        if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true or child["options"]["continue_parent_on_failure"] == true)) then
           failed_child_id = child_id
           failed_reason = child["failed_reason"]
           if not failed_reason or failed_reason == cjson.null then
@@ -5226,7 +5325,7 @@ local function release_parent_after_removed_child(job, removed_id)
 
       if child_raw then
         local child = cjson.decode(child_raw)
-        if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true)) then
+        if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true or child["options"]["continue_parent_on_failure"] == true)) then
           failed_child_id = child_id
           failed_reason = child["failed_reason"]
           if not failed_reason or failed_reason == cjson.null then
@@ -5694,7 +5793,7 @@ for _, child_id in ipairs(parent['child_ids'] or {}) do
     if child["state"] == "completed" then
       processed = processed + 1
     elseif child["state"] == "failed" then
-      if child["options"] and child["options"] ~= cjson.null and child["options"]["ignore_dependency_on_failure"] == true then
+      if child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["continue_parent_on_failure"] == true) then
         ignored = ignored + 1
       elseif child["options"] and child["options"] ~= cjson.null and child["options"]["remove_dependency_on_failure"] == true then
         -- Removed dependencies are intentionally omitted from dependency counts.
@@ -5744,7 +5843,7 @@ for _, child_id in ipairs(parent['child_ids'] or {}) do
   local child_raw = redis.call('HGET', KEYS[1], child_id)
   if child_raw then
     local child = cjson.decode(child_raw)
-    if child["state"] == "failed" and child["options"] and child["options"] ~= cjson.null and child["options"]["ignore_dependency_on_failure"] == true then
+    if child["state"] == "failed" and child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["continue_parent_on_failure"] == true) then
       table.insert(result, child_id)
       table.insert(result, child["failed_reason"] or "")
     end
@@ -6063,7 +6162,7 @@ local function release_parent_if_ready(parent_id, parent)
       local child_raw = redis.call('HGET', KEYS[1], child_id)
       if child_raw then
         local child = cjson.decode(child_raw)
-        if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true)) then
+        if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true or child["options"]["continue_parent_on_failure"] == true)) then
           failed_child_id = child_id
           failed_reason = child["failed_reason"]
           if not failed_reason or failed_reason == cjson.null then
@@ -6402,7 +6501,7 @@ local function release_parent_if_ready(parent_id, parent, dependency_key)
       local child_raw = redis.call('HGET', KEYS[1], child_id)
       if child_raw then
         local child = cjson.decode(child_raw)
-        if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true)) then
+        if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true or child["options"]["continue_parent_on_failure"] == true)) then
           failed_child_id = child_id
           failed_reason = child["failed_reason"]
           if not failed_reason or failed_reason == cjson.null then

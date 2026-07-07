@@ -815,6 +815,9 @@ pub struct JobOptions {
     /// Remove this child from its parent dependencies when it reaches terminal failure.
     #[serde(default, skip_serializing_if = "is_false")]
     pub remove_dependency_on_failure: bool,
+    /// Continue the parent flow when this child reaches terminal failure.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub continue_parent_on_failure: bool,
 }
 
 impl Default for JobOptions {
@@ -835,6 +838,7 @@ impl Default for JobOptions {
             deduplication: None,
             ignore_dependency_on_failure: false,
             remove_dependency_on_failure: false,
+            continue_parent_on_failure: false,
         }
     }
 }
@@ -945,6 +949,12 @@ impl JobOptions {
         self
     }
 
+    /// Configure BullMQ-style `continueParentOnFailure` for flow children.
+    pub fn with_continue_parent_on_failure(mut self, continue_parent: bool) -> Self {
+        self.continue_parent_on_failure = continue_parent;
+        self
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         if matches!(self.job_id.as_deref(), Some(job_id) if job_id.trim().is_empty()) {
             return Err(LaneError::ConfigError(
@@ -966,6 +976,20 @@ impl JobOptions {
 
         if let Some(retention) = &self.failure_retention {
             retention.validate("failure retention")?;
+        }
+
+        let flow_failure_policies = [
+            self.ignore_dependency_on_failure,
+            self.remove_dependency_on_failure,
+            self.continue_parent_on_failure,
+        ]
+        .into_iter()
+        .filter(|enabled| *enabled)
+        .count();
+        if flow_failure_policies > 1 {
+            return Err(LaneError::ConfigError(
+                "flow child failure policies are mutually exclusive".to_string(),
+            ));
         }
 
         Ok(())

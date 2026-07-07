@@ -411,6 +411,140 @@ async fn run_ignored_flow_dependency_failure(redis_url: String) -> redis::RedisR
 }
 
 #[tokio::test]
+async fn redis_backend_continues_flow_dependency_failure_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_continued_flow_dependency_failure(redis_url),
+    )
+    .await
+    .expect("Redis continued flow dependency failure integration test timed out")
+    .unwrap();
+}
+
+async fn run_continued_flow_dependency_failure(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-continue")
+        .expect("valid Redis URL should build the flow-continue queue");
+    let worker = RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-continue")
+        .expect("valid Redis URL should build the flow-continue worker");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new(
+                "continued-failure-parent",
+                serde_json::json!({ "kind": "aggregate" }),
+            )
+            .with_options(JobOptions::new().with_priority(1)),
+            vec![
+                JobSpec::new(
+                    "continued-failure-optional-child",
+                    serde_json::json!({ "optional": true }),
+                )
+                .with_options(
+                    JobOptions::new()
+                        .with_priority(1)
+                        .with_continue_parent_on_failure(true),
+                ),
+                JobSpec::new(
+                    "continued-failure-required-child",
+                    serde_json::json!({ "required": true }),
+                )
+                .with_options(JobOptions::new().with_priority(2)),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("continued flow should be added");
+    let dependency_key = format!("{namespace}:flow-continue:dependencies:{}", flow.parent.id);
+
+    let optional_child = worker
+        .claim_next(
+            "worker-continued-optional".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("optional child claim should return")
+        .expect("optional child should be claimable");
+    assert_eq!(optional_child.id, flow.children[0].id);
+    worker
+        .fail_job(
+            &optional_child.id,
+            lock_token(&optional_child),
+            "optional child failed".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("optional child should fail");
+
+    let pending_count: usize = conn.scard(&dependency_key).await?;
+    assert_eq!(pending_count, 1);
+    let optional_pending: bool = conn
+        .sismember(&dependency_key, &flow.children[0].id)
+        .await?;
+    let required_pending: bool = conn
+        .sismember(&dependency_key, &flow.children[1].id)
+        .await?;
+    assert!(!optional_pending);
+    assert!(required_pending);
+    let parent_after_failure = queue
+        .get_job(&flow.parent.id)
+        .await
+        .expect("parent after continued failure should load")
+        .expect("parent should exist");
+    assert_eq!(parent_after_failure.state, JobState::Waiting);
+    assert!(parent_after_failure.failed_reason.is_none());
+    let counts_after_failure = queue
+        .get_flow_dependency_counts(&flow.parent.id)
+        .await
+        .expect("continued failure counts should load")
+        .expect("continued failure counts should exist");
+    assert_eq!(counts_after_failure.processed, 0);
+    assert_eq!(counts_after_failure.unprocessed, 1);
+    assert_eq!(counts_after_failure.failed, 0);
+    assert_eq!(counts_after_failure.ignored, 1);
+    assert_eq!(counts_after_failure.missing, 0);
+    let ignored_failures = queue
+        .get_flow_ignored_children_failures(&flow.parent.id)
+        .await
+        .expect("continued failure map should load")
+        .expect("continued failure map should exist");
+    assert_eq!(
+        ignored_failures
+            .get(&flow.children[0].id)
+            .map(String::as_str),
+        Some("optional child failed")
+    );
+
+    let continued_parent = worker
+        .claim_next(
+            "worker-continued-parent".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("continued parent claim should return")
+        .expect("continued parent should be claimable");
+    assert_eq!(continued_parent.id, flow.parent.id);
+    let required_still_pending: bool = conn
+        .sismember(&dependency_key, &flow.children[1].id)
+        .await?;
+    assert!(required_still_pending);
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
+#[tokio::test]
 async fn redis_backend_removes_flow_dependency_failure_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");

@@ -373,7 +373,7 @@ A3S stack and language SDKs.
 | Job management API | In progress | Add/get/get-state/get-job-counts/get-job-count/count-pending/remove/remove-repeat/upsert-repeat/remove-deduplication-key/get-deduplication-job-id/list-repeats/get-repeat/count-repeats/list-repeats-page/get-flow-dependencies/get-flow-dependency-counts/get-flow-children-values/get-flow-ignored-children-failures/remove-unprocessed-children/remove-child-dependency/promote/reschedule/delay-active/release-active/retry/update-priority/update-priority-with-lifo/update-data/pause/resume/is-paused/drain/clean/obliterate APIs, multi-state pagination, ascending/descending listing, waiting priority counts, add-log/get-logs/clear-job-logs, read-events/trim-events, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, uses backend-native blocking claim hooks when available, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, and stalled recovery loops. |
 | Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, FIFO/LIFO waiting score ordering, BullMQ-style Redis worker marker zset updates, Redis marker-backed blocking claim, Redis stream queue events, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership, Redis-backed repeat scheduler zset/hash metadata, listing/removal/upsert/pagination, flow submission, flow dependency inspection, flow child-value and ignored-failure reads, delayed promotion and rescheduling, active-to-wait/delayed movement, single-job promote, state-index queries, job count snapshots, manual retry, priority update, progress update, log append, list/stat snapshots, finished-job age/count retention during complete/fail/stalled scripts, drain, clean, obliterate, claim, Redis-shared rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled candidate-set recovery semantics. Postgres/NATS backends remain planned. |
-| Flow jobs | In progress | Parent-child dependencies, waiting-children state, dependency inspection, child return-value inspection, ignored and removed child-failure release, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
+| Flow jobs | In progress | Parent-child dependencies, waiting-children state, dependency inspection, child return-value inspection, ignored, removed, and continued child-failure release, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, end timestamps, repeat-key removal, upsert, single-key lookup, counts, and BullMQ-style next-time pagination are available across in-memory, local durable, and Redis backends. Redis additionally maintains scheduler zset/hash metadata in Lua so distributed readers and writers share one repeat-series state machine. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
 
@@ -565,12 +565,17 @@ parent once the remaining dependencies finish.
 `removeDependencyOnFailure`: terminal failure also removes the child from the
 still-blocking dependency set, but does not add it to the ignored dependency
 count.
+`JobOptions::new().with_continue_parent_on_failure(true)` mirrors BullMQ's
+`continueParentOnFailure`: terminal failure removes the child from the
+still-blocking dependency set, records the failure for parent inspection, and
+moves the parent to `waiting` or `delayed` immediately instead of waiting for the
+remaining dependencies.
 Parents can call `get_flow_children_values()` after fan-in release to retrieve
 completed child return values, mirroring BullMQ's `getChildrenValues()`.
 `get_flow_ignored_children_failures()` mirrors BullMQ's
-`getIgnoredChildrenFailures()` and returns only failures from children configured
-with `ignoreDependencyOnFailure`; removed dependency failures are intentionally
-omitted.
+`getIgnoredChildrenFailures()` and returns failures from children configured with
+`ignoreDependencyOnFailure` or `continueParentOnFailure`; removed dependency
+failures are intentionally omitted.
 
 ```rust
 use a3s_lane::{InMemoryJobQueue, JobOptions, JobSpec, JobState};
@@ -1132,9 +1137,9 @@ returns the child ids that are still pending or missing from retention.
 `get_flow_dependency_counts()` follows BullMQ's `getDependencyCounts` Redis/Lua
 mechanism instead of only copying the API names. BullMQ 5.79.3 counts
 parent-scoped `:processed`, `:dependencies`, `:failed`, and `:unsuccessful`
-structures with `HLEN`, `SCARD`, `HLEN`, and `ZCARD`, with ignored and removed
-failures handled by the failure-policy path. Lane keeps child snapshots in the
-queue jobs hash and keeps the still-blocking children in
+structures with `HLEN`, `SCARD`, `HLEN`, and `ZCARD`, with ignored, removed, and
+continued failures handled by the failure-policy path. Lane keeps child snapshots
+in the queue jobs hash and keeps the still-blocking children in
 `dependencies:<parent_id>`, so the Redis count script reads both structures in
 one turn and returns processed, unprocessed, failed, ignored, and missing totals
 without returning every child snapshot to the client. Removed failed
@@ -1169,13 +1174,16 @@ is due, or failed because a child reached terminal failure. This follows
 BullMQ's dependency-removal mechanism: cleanup that removes a child also updates
 the parent dependency state instead of relying on a later client-side cleanup
 pass.
-`ignore_dependency_on_failure` and `remove_dependency_on_failure` use the same
-Redis-side path for terminal `fail_job()` and stalled terminal failure: the Lua
-script removes the failed child from `dependencies:<parent_id>` and releases or
-delays the parent only when the remaining dependency set is empty. The failed
-child remains retained for inspection. Ignored failures are reported through the
-ignored dependency count; removed failures are retained but omitted from failed
-and ignored dependency counts.
+`ignore_dependency_on_failure`, `remove_dependency_on_failure`, and
+`continue_parent_on_failure` use Redis-side failure-policy paths for terminal
+`fail_job()` and stalled terminal failure. Ignored and removed failures remove
+the failed child from `dependencies:<parent_id>` and release or delay the parent
+only when the remaining dependency set is empty. Continued failures remove the
+failed child and move the parent to `waiting` or `delayed` immediately, leaving
+other pending dependencies inspectable. The failed child remains retained for
+inspection. Ignored and continued failures are reported through the ignored
+dependency count; removed failures are retained but omitted from failed and
+ignored dependency counts.
 
 Repeat successors are created during the Redis completion script too. The
 worker computes the next occurrence from `RepeatOptions`, then the Lua script
