@@ -1,8 +1,8 @@
 #![cfg(feature = "redis-backend")]
 
 use a3s_lane::{
-    job_processor_fn, DeduplicationOptions, Job, JobContext, JobListOptions, JobLogEntry,
-    JobOptions, JobPriorityCount, JobProcessor, JobQueueBackend, JobRateLimit,
+    job_processor_fn, DeduplicationOptions, Job, JobContext, JobFinishedResult, JobListOptions,
+    JobLogEntry, JobOptions, JobPriorityCount, JobProcessor, JobQueueBackend, JobRateLimit,
     JobRepeatListOptions, JobRetention, JobRunOutcome, JobSpec, JobState, JobStateCount, JobWorker,
     JobWorkerConfig, LaneError, RedisJobQueue, RepeatOptions, RetryPolicy,
 };
@@ -79,6 +79,157 @@ async fn redis_backend_counts_states_against_real_server() {
         .await
         .expect("Redis state-count integration test timed out")
         .unwrap();
+}
+
+#[tokio::test]
+async fn redis_backend_reads_job_finished_results_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_job_finished_results(redis_url),
+    )
+    .await
+    .expect("Redis job finished result integration test timed out")
+    .unwrap();
+}
+
+async fn run_job_finished_results(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "finished-result")
+        .expect("valid Redis URL should build the finished-result queue");
+    let waiting = queue
+        .add_job(
+            "waiting".to_string(),
+            serde_json::json!({ "kind": "waiting" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("waiting job should add");
+    assert_eq!(
+        queue
+            .get_job_finished_result(&waiting.id)
+            .await
+            .expect("waiting finished status should load"),
+        Some(JobFinishedResult::NotFinished)
+    );
+
+    let completed = queue
+        .claim_next(
+            "worker-finished-complete".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("completed claim should return")
+        .expect("completed job should be claimable");
+    assert_eq!(completed.id, waiting.id);
+    queue
+        .complete_job(
+            &completed.id,
+            lock_token(&completed),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("completed job should complete");
+    assert_eq!(
+        queue
+            .get_job_finished_result(&completed.id)
+            .await
+            .expect("completed finished status should load"),
+        Some(JobFinishedResult::Completed {
+            return_value: Some(serde_json::json!({ "ok": true })),
+        })
+    );
+
+    let false_value_job = queue
+        .add_job(
+            "completed-false".to_string(),
+            serde_json::json!({ "kind": "completed-false" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("false-value job should add");
+    let false_value_claim = queue
+        .claim_next(
+            "worker-finished-false".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("false-value claim should return")
+        .expect("false-value job should be claimable");
+    assert_eq!(false_value_claim.id, false_value_job.id);
+    queue
+        .complete_job(
+            &false_value_claim.id,
+            lock_token(&false_value_claim),
+            serde_json::json!(false),
+            Utc::now(),
+        )
+        .await
+        .expect("false-value job should complete");
+    assert_eq!(
+        queue
+            .get_job_finished_result(&false_value_claim.id)
+            .await
+            .expect("false-value finished status should load"),
+        Some(JobFinishedResult::Completed {
+            return_value: Some(serde_json::json!(false)),
+        })
+    );
+
+    let failed_job = queue
+        .add_job(
+            "failed".to_string(),
+            serde_json::json!({ "kind": "failed" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("failed job should add");
+    let failed = queue
+        .claim_next(
+            "worker-finished-fail".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("failed claim should return")
+        .expect("failed job should be claimable");
+    assert_eq!(failed.id, failed_job.id);
+    queue
+        .fail_job(
+            &failed.id,
+            lock_token(&failed),
+            "terminal failure".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("failed job should fail");
+    assert_eq!(
+        queue
+            .get_job_finished_result(&failed.id)
+            .await
+            .expect("failed finished status should load"),
+        Some(JobFinishedResult::Failed {
+            failed_reason: Some("terminal failure".to_string()),
+        })
+    );
+    assert_eq!(
+        queue
+            .get_job_finished_result("missing-finished-job")
+            .await
+            .expect("missing finished status should load"),
+        None
+    );
+
+    cleanup_namespace(&redis_url, &namespace).await
 }
 
 #[tokio::test]

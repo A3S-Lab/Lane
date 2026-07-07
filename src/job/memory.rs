@@ -1,10 +1,10 @@
 use super::backend::JobQueueBackend;
 use super::types::{
-    deduplication_expiration, page_repeat_entries, Job, JobEvent, JobFlow, JobFlowChildValues,
-    JobFlowDependencies, JobFlowDependencyCounts, JobFlowIgnoredFailures, JobId, JobListOptions,
-    JobListPage, JobLogEntry, JobLogPage, JobOptions, JobPriority, JobPriorityCount,
-    JobQueueSnapshot, JobQueueStats, JobRepeatEntry, JobRepeatListOptions, JobRepeatPage,
-    JobRetention, JobSpec, JobState, JobStateCount, JobWorkerId, QueueName,
+    deduplication_expiration, page_repeat_entries, Job, JobEvent, JobFinishedResult, JobFlow,
+    JobFlowChildValues, JobFlowDependencies, JobFlowDependencyCounts, JobFlowIgnoredFailures,
+    JobId, JobListOptions, JobListPage, JobLogEntry, JobLogPage, JobOptions, JobPriority,
+    JobPriorityCount, JobQueueSnapshot, JobQueueStats, JobRepeatEntry, JobRepeatListOptions,
+    JobRepeatPage, JobRetention, JobSpec, JobState, JobStateCount, JobWorkerId, QueueName,
     DEFAULT_JOB_EVENT_RETENTION,
 };
 use crate::error::{LaneError, Result};
@@ -736,6 +736,12 @@ impl InMemoryJobQueue {
     pub async fn get_state(&self, job_id: &str) -> Result<Option<JobState>> {
         let inner = self.inner.lock().await;
         Ok(inner.jobs.get(job_id).map(|job| job.state))
+    }
+
+    /// Return finished status and retained terminal payload for a job.
+    pub async fn get_finished_result(&self, job_id: &str) -> Result<Option<JobFinishedResult>> {
+        let inner = self.inner.lock().await;
+        Ok(inner.jobs.get(job_id).map(job_finished_result))
     }
 
     /// Remove a job from the queue.
@@ -2398,6 +2404,10 @@ impl JobQueueBackend for InMemoryJobQueue {
         self.get_state(job_id).await
     }
 
+    async fn get_job_finished_result(&self, job_id: &str) -> Result<Option<JobFinishedResult>> {
+        self.get_finished_result(job_id).await
+    }
+
     async fn stats(&self) -> Result<JobQueueStats> {
         let inner = self.inner.lock().await;
         let mut stats = JobQueueStats {
@@ -2610,6 +2620,18 @@ fn sorted_released_deduplication_owners(
     let mut owners = released_owners.iter().cloned().collect::<Vec<_>>();
     owners.sort();
     owners
+}
+
+fn job_finished_result(job: &Job) -> JobFinishedResult {
+    match job.state {
+        JobState::Completed => JobFinishedResult::Completed {
+            return_value: job.return_value.clone(),
+        },
+        JobState::Failed => JobFinishedResult::Failed {
+            failed_reason: job.failed_reason.clone(),
+        },
+        _ => JobFinishedResult::NotFinished,
+    }
 }
 
 fn flow_dependency_counts(parent: &Job, jobs: &HashMap<JobId, Job>) -> JobFlowDependencyCounts {

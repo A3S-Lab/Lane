@@ -89,13 +89,14 @@ pub use event::{EventEmitter, EventPayload, EventStream, LaneEvent};
 #[cfg(feature = "redis-backend")]
 pub use job::RedisJobQueue;
 pub use job::{
-    job_processor_fn, DeduplicationOptions, InMemoryJobQueue, Job, JobContext, JobEvent, JobFlow,
-    JobFlowDependencyCounts, JobId, JobListOptions, JobListPage, JobLockToken, JobLogEntry,
-    JobOptions, JobPriority, JobPriorityCount, JobProcessor, JobProcessorFn, JobProcessorRouter,
-    JobQueueBackend, JobQueueSnapshot, JobQueueStats, JobRateLimit, JobRepeatEntry,
-    JobRepeatListOptions, JobRepeatPage, JobRetention, JobRunOutcome, JobSpec, JobState,
-    JobStateCount, JobWorker, JobWorkerConfig, JobWorkerHandle, JobWorkerId, LocalJobQueue,
-    QueueName, RepeatOptions, RepeatSchedule, DEFAULT_JOB_EVENT_RETENTION, DEFAULT_JOB_PRIORITY,
+    job_processor_fn, DeduplicationOptions, InMemoryJobQueue, Job, JobContext, JobEvent,
+    JobFinishedResult, JobFlow, JobFlowDependencyCounts, JobId, JobListOptions, JobListPage,
+    JobLockToken, JobLogEntry, JobOptions, JobPriority, JobPriorityCount, JobProcessor,
+    JobProcessorFn, JobProcessorRouter, JobQueueBackend, JobQueueSnapshot, JobQueueStats,
+    JobRateLimit, JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobRetention, JobRunOutcome,
+    JobSpec, JobState, JobStateCount, JobWorker, JobWorkerConfig, JobWorkerHandle, JobWorkerId,
+    LocalJobQueue, QueueName, RepeatOptions, RepeatSchedule, DEFAULT_JOB_EVENT_RETENTION,
+    DEFAULT_JOB_PRIORITY,
 };
 pub use manager::{QueueManager, QueueManagerBuilder};
 pub use queue::{

@@ -1,10 +1,10 @@
 use super::backend::JobQueueBackend;
 use super::types::{
-    add_duration, deduplication_expiration, page_repeat_entries, Job, JobEvent, JobFlow,
-    JobFlowChildValues, JobFlowDependencies, JobFlowDependencyCounts, JobFlowIgnoredFailures,
-    JobId, JobListOptions, JobListPage, JobLogEntry, JobLogPage, JobOptions, JobPriority,
-    JobPriorityCount, JobQueueStats, JobRateLimit, JobRepeatEntry, JobRepeatListOptions,
-    JobRepeatPage, JobSpec, JobState, JobStateCount, JobWorkerId, QueueName,
+    add_duration, deduplication_expiration, page_repeat_entries, Job, JobEvent, JobFinishedResult,
+    JobFlow, JobFlowChildValues, JobFlowDependencies, JobFlowDependencyCounts,
+    JobFlowIgnoredFailures, JobId, JobListOptions, JobListPage, JobLogEntry, JobLogPage,
+    JobOptions, JobPriority, JobPriorityCount, JobQueueStats, JobRateLimit, JobRepeatEntry,
+    JobRepeatListOptions, JobRepeatPage, JobSpec, JobState, JobStateCount, JobWorkerId, QueueName,
     DEFAULT_JOB_EVENT_RETENTION,
 };
 use crate::error::{LaneError, Result};
@@ -6200,6 +6200,38 @@ end
 return 'unknown'
 "#;
 
+const GET_JOB_FINISHED_RESULT_SCRIPT: &str = r#"
+local raw = redis.call('HGET', KEYS[3], ARGV[1])
+if not raw then
+  return {'missing'}
+end
+
+local job = cjson.decode(raw)
+if redis.call('ZSCORE', KEYS[1], ARGV[1]) then
+  if job["state"] ~= "completed" then
+    return {'not_finished'}
+  end
+  local return_value = job["return_value"]
+  if return_value ~= nil and return_value ~= cjson.null then
+    return {'completed', cjson.encode(return_value)}
+  end
+  return {'completed'}
+end
+
+if redis.call('ZSCORE', KEYS[2], ARGV[1]) then
+  if job["state"] ~= "failed" then
+    return {'not_finished'}
+  end
+  local failed_reason = job["failed_reason"]
+  if failed_reason and failed_reason ~= cjson.null then
+    return {'failed', failed_reason}
+  end
+  return {'failed'}
+end
+
+return {'not_finished'}
+"#;
+
 const STATS_SCRIPT: &str = r#"
 local paused_value = 0
 local paused = redis.call('HGET', KEYS[1], 'paused')
@@ -9244,6 +9276,21 @@ impl JobQueueBackend for RedisJobQueue {
         decode_job_state(&state)
     }
 
+    async fn get_job_finished_result(&self, job_id: &str) -> Result<Option<JobFinishedResult>> {
+        let mut conn = self.connection().await?;
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(GET_JOB_FINISHED_RESULT_SCRIPT)
+            .arg(3)
+            .arg(self.state_key(JobState::Completed))
+            .arg(self.state_key(JobState::Failed))
+            .arg(self.jobs_key())
+            .arg(job_id)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_job_finished_result(&result, job_id)
+    }
+
     async fn stats(&self) -> Result<JobQueueStats> {
         let mut conn = self.connection().await?;
         let result: Vec<i64> = redis::cmd("EVAL")
@@ -9700,6 +9747,38 @@ fn decode_job_state(state: &str) -> Result<Option<JobState>> {
         "unknown" => Ok(None),
         other => Err(LaneError::Other(format!(
             "unexpected Redis job state `{other}`"
+        ))),
+    }
+}
+
+fn decode_job_finished_result(
+    result: &[String],
+    job_id: &str,
+) -> Result<Option<JobFinishedResult>> {
+    match result.first().map(String::as_str) {
+        Some("missing") => Ok(None),
+        Some("not_finished") => Ok(Some(JobFinishedResult::NotFinished)),
+        Some("completed") => {
+            let return_value = result
+                .get(1)
+                .map(|raw| {
+                    serde_json::from_str(raw).map_err(|error| {
+                        LaneError::Other(format!(
+                            "failed to decode Redis job completion value for {job_id}: {error}"
+                        ))
+                    })
+                })
+                .transpose()?;
+            Ok(Some(JobFinishedResult::Completed { return_value }))
+        }
+        Some("failed") => Ok(Some(JobFinishedResult::Failed {
+            failed_reason: result.get(1).cloned(),
+        })),
+        Some(other) => Err(LaneError::Other(format!(
+            "unexpected Redis job finished script status `{other}` for {job_id}"
+        ))),
+        None => Err(LaneError::Other(format!(
+            "Redis job finished script returned no status for {job_id}"
         ))),
     }
 }

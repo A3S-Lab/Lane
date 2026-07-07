@@ -1,10 +1,11 @@
 use super::backend::JobQueueBackend;
 use super::memory::InMemoryJobQueue;
 use super::types::{
-    Job, JobEvent, JobFlow, JobFlowChildValues, JobFlowDependencies, JobFlowDependencyCounts,
-    JobFlowIgnoredFailures, JobId, JobListOptions, JobListPage, JobLogPage, JobOptions,
-    JobPriority, JobPriorityCount, JobQueueSnapshot, JobQueueStats, JobRepeatEntry,
-    JobRepeatListOptions, JobRepeatPage, JobSpec, JobState, JobStateCount, JobWorkerId,
+    Job, JobEvent, JobFinishedResult, JobFlow, JobFlowChildValues, JobFlowDependencies,
+    JobFlowDependencyCounts, JobFlowIgnoredFailures, JobId, JobListOptions, JobListPage,
+    JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueSnapshot, JobQueueStats,
+    JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobSpec, JobState, JobStateCount,
+    JobWorkerId,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -207,6 +208,11 @@ impl LocalJobQueue {
     /// Return the current state for a job id.
     pub async fn get_state(&self, job_id: &str) -> Result<Option<JobState>> {
         self.inner.get_state(job_id).await
+    }
+
+    /// Return finished status and retained terminal payload for a job.
+    pub async fn get_finished_result(&self, job_id: &str) -> Result<Option<JobFinishedResult>> {
+        self.inner.get_finished_result(job_id).await
     }
 
     /// Capture the durable queue snapshot.
@@ -640,6 +646,10 @@ impl JobQueueBackend for LocalJobQueue {
 
     async fn get_job_state(&self, job_id: &str) -> Result<Option<JobState>> {
         self.inner.get_job_state(job_id).await
+    }
+
+    async fn get_job_finished_result(&self, job_id: &str) -> Result<Option<JobFinishedResult>> {
+        LocalJobQueue::get_finished_result(self, job_id).await
     }
 
     async fn stats(&self) -> Result<JobQueueStats> {

@@ -150,6 +150,10 @@ async fn job_state_queries_follow_lifecycle() {
         queue.get_job_state(&flow.parent.id).await.unwrap(),
         Some(JobState::WaitingChildren)
     );
+    assert_eq!(
+        queue.get_job_finished_result(&waiting.id).await.unwrap(),
+        Some(JobFinishedResult::NotFinished)
+    );
 
     let claimed = queue
         .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
@@ -173,7 +177,38 @@ async fn job_state_queries_follow_lifecycle() {
         queue.get_job_state(&claimed.id).await.unwrap(),
         Some(JobState::Completed)
     );
+    assert_eq!(
+        queue.get_job_finished_result(&claimed.id).await.unwrap(),
+        Some(JobFinishedResult::Completed {
+            return_value: Some(serde_json::json!({ "ok": true })),
+        })
+    );
+
+    let failed = queue
+        .claim_next("worker-b".to_string(), Duration::from_secs(30), ts(1_200))
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .fail_job(
+            &failed.id,
+            lock_token(&failed),
+            "terminal failure".to_string(),
+            ts(1_300),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        queue.get_job_finished_result(&failed.id).await.unwrap(),
+        Some(JobFinishedResult::Failed {
+            failed_reason: Some("terminal failure".to_string()),
+        })
+    );
     assert_eq!(queue.get_job_state("missing").await.unwrap(), None);
+    assert_eq!(
+        queue.get_job_finished_result("missing").await.unwrap(),
+        None
+    );
 }
 
 #[tokio::test]

@@ -1,8 +1,9 @@
 use super::types::{
-    page_repeat_entries, Job, JobEvent, JobFlow, JobFlowChildValues, JobFlowDependencies,
-    JobFlowDependencyCounts, JobFlowIgnoredFailures, JobId, JobListOptions, JobListPage,
-    JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueStats, JobRepeatEntry,
-    JobRepeatListOptions, JobRepeatPage, JobSpec, JobState, JobStateCount, JobWorkerId,
+    page_repeat_entries, Job, JobEvent, JobFinishedResult, JobFlow, JobFlowChildValues,
+    JobFlowDependencies, JobFlowDependencyCounts, JobFlowIgnoredFailures, JobId, JobListOptions,
+    JobListPage, JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueStats,
+    JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobSpec, JobState, JobStateCount,
+    JobWorkerId,
 };
 use crate::error::Result;
 use async_trait::async_trait;
@@ -318,6 +319,14 @@ pub trait JobQueueBackend: Send + Sync {
     async fn get_job(&self, job_id: &str) -> Result<Option<Job>>;
 
     async fn get_job_state(&self, job_id: &str) -> Result<Option<JobState>>;
+
+    /// Return whether a retained job has finished and include its terminal payload.
+    ///
+    /// This mirrors BullMQ's `isFinished(..., returnValue=true)` Redis shape at
+    /// the Lane type level: missing retained records return `None`, non-terminal
+    /// jobs return `NotFinished`, and terminal jobs return the retained success
+    /// value or failure reason.
+    async fn get_job_finished_result(&self, job_id: &str) -> Result<Option<JobFinishedResult>>;
 
     async fn stats(&self) -> Result<JobQueueStats>;
 }

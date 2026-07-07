@@ -345,6 +345,24 @@ pub struct JobFlowDependencyCounts {
     pub missing: usize,
 }
 
+/// Finished status for a retained job.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum JobFinishedResult {
+    /// The job exists but has not reached a terminal state yet.
+    NotFinished,
+    /// The job completed successfully.
+    Completed {
+        /// Retained completion value, when the job record still stores one.
+        return_value: Option<Value>,
+    },
+    /// The job failed terminally.
+    Failed {
+        /// Retained failure reason, when the job record still stores one.
+        failed_reason: Option<String>,
+    },
+}
+
 /// Completed child return values keyed by child job id.
 pub type JobFlowChildValues = BTreeMap<JobId, Value>;
 
