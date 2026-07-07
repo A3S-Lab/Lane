@@ -1112,6 +1112,22 @@ async fn redis_backend_emits_retries_exhausted_event_against_real_server() {
 }
 
 #[tokio::test]
+async fn redis_backend_emits_stalled_recovery_events_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_stalled_recovery_events(redis_url),
+    )
+    .await
+    .expect("Redis stalled recovery events integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_updates_worker_markers_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -2518,6 +2534,109 @@ async fn run_retries_exhausted_event(redis_url: String) -> redis::RedisResult<()
         exhausted.fields.get("attemptsMade"),
         Some(&serde_json::json!(2))
     );
+
+    cleanup_namespace(&redis_url, &namespace).await?;
+    Ok(())
+}
+
+async fn run_stalled_recovery_events(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "stalled-events")
+        .expect("valid Redis URL should build the stalled-events queue");
+    let job = queue
+        .add_job(
+            "stalled-event".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_max_stalled_count(1),
+        )
+        .await
+        .expect("stalled event job should add");
+    let first = queue
+        .claim_next(
+            "worker-stalled-event-a".to_string(),
+            Duration::from_millis(20),
+            Utc::now(),
+        )
+        .await
+        .expect("stalled event first claim should return")
+        .expect("stalled event job should be claimable");
+    assert_eq!(first.id, job.id);
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(
+        queue
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("stalled event first recovery pass should mark candidates"),
+        0
+    );
+    assert_eq!(
+        queue
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("stalled event first recovery pass should requeue"),
+        1
+    );
+
+    let second = queue
+        .claim_next(
+            "worker-stalled-event-b".to_string(),
+            Duration::from_millis(20),
+            Utc::now(),
+        )
+        .await
+        .expect("stalled event second claim should return")
+        .expect("stalled event job should be claimable after requeue");
+    assert_eq!(second.id, job.id);
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(
+        queue
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("stalled event second recovery pass should mark candidates"),
+        0
+    );
+    assert_eq!(
+        queue
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("stalled event second recovery pass should fail terminally"),
+        1
+    );
+
+    let events = queue
+        .read_events("-", "+", 20)
+        .await
+        .expect("stalled recovery events should read");
+    let job_events = events
+        .iter()
+        .filter(|event| event.job_id.as_deref() == Some(job.id.as_str()))
+        .collect::<Vec<_>>();
+    let names = job_events
+        .iter()
+        .map(|event| event.event.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec!["added", "waiting", "active", "stalled", "waiting", "active", "stalled", "failed"]
+    );
+    let stalled_events = job_events
+        .iter()
+        .filter(|event| event.event == "stalled")
+        .collect::<Vec<_>>();
+    assert_eq!(stalled_events.len(), 2);
+    assert!(stalled_events.iter().all(|event| {
+        event.fields.get("failedReason")
+            == Some(&serde_json::Value::String(
+                "job stalled after worker lease expired".to_string(),
+            ))
+    }));
+    let failed_event = job_events
+        .last()
+        .expect("terminal failed event should be present");
+    assert_eq!(failed_event.event, "failed");
+    assert_eq!(failed_event.prev, Some(JobState::Active));
 
     cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())

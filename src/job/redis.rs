@@ -4947,6 +4947,59 @@ local function collect_metrics(meta_key, data_key, max_points, timestamp)
   end
 end
 
+local function emit_stalled_event(events_key, max_events, job_id, failed_reason)
+  redis.call(
+    'XADD',
+    events_key,
+    'MAXLEN',
+    '~',
+    max_events,
+    '*',
+    'event',
+    'stalled',
+    'jobId',
+    job_id,
+    'failedReason',
+    failed_reason
+  )
+end
+
+local function emit_waiting_event(events_key, max_events, job_id)
+  redis.call(
+    'XADD',
+    events_key,
+    'MAXLEN',
+    '~',
+    max_events,
+    '*',
+    'event',
+    'waiting',
+    'jobId',
+    job_id,
+    'prev',
+    'active'
+  )
+end
+
+local function emit_failed_event(events_key, max_events, job_id, failed_reason)
+  redis.call(
+    'XADD',
+    events_key,
+    'MAXLEN',
+    '~',
+    max_events,
+    '*',
+    'event',
+    'failed',
+    'jobId',
+    job_id,
+    'failedReason',
+    failed_reason,
+    'prev',
+    'active'
+  )
+end
+
 local candidate_limit = tonumber(ARGV[5]) or 1000
 local ids = redis.call('SPOP', KEYS[8], candidate_limit)
 if not ids then
@@ -4995,7 +5048,7 @@ for _, id in ipairs(ids) do
           redis.call('DEL', ARGV[6] .. id)
           release_deduplication_key_on_finalization(job, id, ARGV[7])
           release_repeat_key(job, id, ARGV[8])
-          enqueue_deduplicated_next(job, KEYS[1], KEYS[3], KEYS[6], KEYS[7], KEYS[5], ARGV[7], ARGV[9], ARGV[8], ARGV[6], ARGV[2], ARGV[1], ARGV[4], KEYS[#KEYS])
+          enqueue_deduplicated_next(job, KEYS[1], KEYS[3], KEYS[6], KEYS[7], KEYS[5], ARGV[7], ARGV[9], ARGV[8], ARGV[6], ARGV[2], ARGV[1], ARGV[4], KEYS[11])
 
           local failure_retention = retention_options(job, 'remove_on_fail', 'failure_retention')
           local failure_max_count = retention_count(failure_retention)
@@ -5007,6 +5060,8 @@ for _, id in ipairs(ids) do
             apply_finished_retention(ARGV[1], failure_retention, KEYS[4], KEYS[1], ARGV[6], ARGV[7], ARGV[8], ARGV[10])
           end
           collect_metrics(KEYS[9], KEYS[10], ARGV[11], ARGV[1])
+          emit_stalled_event(KEYS[12], ARGV[12], id, job["failed_reason"])
+          emit_failed_event(KEYS[12], ARGV[12], id, job["failed_reason"])
 
           local parent_id = job["parent_id"]
           if parent_id and parent_id ~= cjson.null then
@@ -5106,12 +5161,12 @@ for _, id in ipairs(ids) do
                   if parent_scheduled_millis <= tonumber(ARGV[1]) then
                     parent["state"] = "waiting"
                     local priority = tonumber(parent["priority"] or '1000') or 1000
-                    enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[5], parent, parent_id, priority, ARGV[4], KEYS[#KEYS])
+                    enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[5], parent, parent_id, priority, ARGV[4], KEYS[11])
                   else
                     parent["state"] = "delayed"
                     redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
                     redis.call('ZADD', KEYS[7], parent_scheduled_millis, parent_id)
-                    refresh_delay_marker(KEYS[#KEYS], KEYS[7])
+                    refresh_delay_marker(KEYS[11], KEYS[7])
                   end
                 elseif continue_parent then
                   redis.call('ZREM', KEYS[6], parent_id)
@@ -5127,12 +5182,12 @@ for _, id in ipairs(ids) do
                   if parent_scheduled_millis <= tonumber(ARGV[1]) then
                     parent["state"] = "waiting"
                     local priority = tonumber(parent["priority"] or '1000') or 1000
-                    enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[5], parent, parent_id, priority, ARGV[4], KEYS[#KEYS])
+                    enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[5], parent, parent_id, priority, ARGV[4], KEYS[11])
                   else
                     parent["state"] = "delayed"
                     redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
                     redis.call('ZADD', KEYS[7], parent_scheduled_millis, parent_id)
-                    refresh_delay_marker(KEYS[#KEYS], KEYS[7])
+                    refresh_delay_marker(KEYS[11], KEYS[7])
                   end
                 elseif all_done then
                   redis.call('DEL', dependency_key)
@@ -5149,12 +5204,12 @@ for _, id in ipairs(ids) do
                   if parent_scheduled_millis <= tonumber(ARGV[1]) then
                     parent["state"] = "waiting"
                     local priority = tonumber(parent["priority"] or '1000') or 1000
-                    enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[5], parent, parent_id, priority, ARGV[4], KEYS[#KEYS])
+                    enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[5], parent, parent_id, priority, ARGV[4], KEYS[11])
                   else
                     parent["state"] = "delayed"
                     redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
                     redis.call('ZADD', KEYS[7], parent_scheduled_millis, parent_id)
-                    refresh_delay_marker(KEYS[#KEYS], KEYS[7])
+                    refresh_delay_marker(KEYS[11], KEYS[7])
                   end
                 end
               end
@@ -5164,7 +5219,9 @@ for _, id in ipairs(ids) do
           job["state"] = "waiting"
           job["processed_at"] = cjson.null
           local priority = tonumber(job["priority"] or '1000') or 1000
-          enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[5], job, id, priority, ARGV[4], KEYS[#KEYS])
+          enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[5], job, id, priority, ARGV[4], KEYS[11])
+          emit_stalled_event(KEYS[12], ARGV[12], id, job["failed_reason"])
+          emit_waiting_event(KEYS[12], ARGV[12], id)
         end
 
         recovered = recovered + 1
@@ -10919,7 +10976,7 @@ impl JobQueueBackend for RedisJobQueue {
         let mut conn = self.connection().await?;
         redis::cmd("EVAL")
             .arg(RECOVER_STALLED_SCRIPT)
-            .arg(11)
+            .arg(12)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Active))
             .arg(self.state_key(JobState::Waiting))
@@ -10931,6 +10988,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.metrics_key(JobState::Failed)?)
             .arg(self.metrics_data_key(JobState::Failed)?)
             .arg(self.marker_key())
+            .arg(self.events_key())
             .arg(now.timestamp_millis())
             .arg(now.to_rfc3339())
             .arg(self.lock_key_prefix())
@@ -10942,6 +11000,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.deduplication_next_key_prefix())
             .arg(self.logs_key_prefix())
             .arg(DEFAULT_JOB_METRICS_RETENTION)
+            .arg(DEFAULT_JOB_EVENT_RETENTION)
             .query_async(&mut conn)
             .await
             .map_err(redis_error)

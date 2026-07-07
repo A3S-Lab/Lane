@@ -1524,6 +1524,10 @@ turn. At the end of the script it marks the current active index members in the
 BullMQ's `extendLock` and `removeLock` helpers. If an active sorted-set member
 points at a job that has already moved to a different state, a later recovery
 pass prunes that stale active index instead of treating it as recoverable work.
+When a candidate is actually recovered, Redis writes a `stalled` event with the
+failure reason and then writes the resulting `waiting prev=active` or
+`failed prev=active` transition in the same Lua turn, matching the in-memory and
+local event contract while preserving BullMQ's explicit `stalled` notification.
 BullMQ 5.79.3 also special-cases repeatable scheduler jobs in
 `moveStalledJobsToWait-9.lua`: if the scheduler record still exists, the stalled
 occurrence is requeued even after the ordinary stalled limit is exceeded. Lane

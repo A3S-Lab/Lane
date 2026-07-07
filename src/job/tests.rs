@@ -2961,6 +2961,30 @@ async fn stalled_jobs_are_recovered_until_limit() {
     let failed = queue.get_job(&job.id).await.unwrap().unwrap();
     assert_eq!(failed.state, JobState::Failed);
     assert_eq!(failed.stalled_count, 2);
+
+    let events = queue.read_events("-", "+", 20).await.unwrap();
+    let names = events
+        .iter()
+        .map(|event| event.event.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec!["added", "waiting", "active", "stalled", "waiting", "active", "stalled", "failed"]
+    );
+    let stalled_events = events
+        .iter()
+        .filter(|event| event.event == "stalled")
+        .collect::<Vec<_>>();
+    assert_eq!(stalled_events.len(), 2);
+    assert!(stalled_events
+        .iter()
+        .all(|event| event.prev == Some(JobState::Active)));
+    assert!(stalled_events
+        .iter()
+        .all(|event| event.fields.get("failedReason")
+            == Some(&Value::String(
+                "job stalled after worker lease expired".to_string()
+            ))));
 }
 
 #[tokio::test]
