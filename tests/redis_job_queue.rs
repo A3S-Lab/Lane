@@ -942,6 +942,22 @@ async fn redis_backend_releases_repeat_scheduler_metadata_without_fast_owner_aga
 }
 
 #[tokio::test]
+async fn redis_backend_recovers_repeat_stalled_from_scheduler_metadata_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_repeat_stalled_scheduler_metadata(redis_url),
+    )
+    .await
+    .expect("Redis repeat scheduler metadata stalled integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_removes_repeat_from_scheduler_metadata_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -4571,6 +4587,110 @@ async fn run_repeat_release_scheduler_metadata(redis_url: String) -> redis::Redi
 
     cleanup_namespace_with_conn(&mut conn, &namespace).await?;
     trace_stage("repeat-release-scheduler:cleanup-final:done");
+    Ok(())
+}
+
+async fn run_repeat_stalled_scheduler_metadata(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    trace_stage("repeat-stalled-scheduler:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("repeat-stalled-scheduler:cleanup:done");
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "repeat-stalled-scheduler")
+        .expect("valid Redis URL should build the repeat stalled scheduler queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let stalled_owner = queue
+        .add_job(
+            "scheduler-stalled-owner".to_string(),
+            serde_json::json!({ "path": "stalled" }),
+            JobOptions::new().with_max_stalled_count(0).with_repeat(
+                RepeatOptions::every(Duration::from_secs(60)).with_key("stalled-scheduler"),
+            ),
+        )
+        .await
+        .expect("stalled repeat owner should add");
+    let owner_key = format!("{namespace}:repeat-stalled-scheduler:repeat:stalled-scheduler");
+    let scheduler_meta_key =
+        format!("{namespace}:repeat-stalled-scheduler:repeat_meta:stalled-scheduler");
+    let scheduler_owner_id: Option<String> = conn.hget(&scheduler_meta_key, "jid").await?;
+    assert_eq!(
+        scheduler_owner_id.as_deref(),
+        Some(stalled_owner.id.as_str())
+    );
+
+    let claimed = queue
+        .claim_next(
+            "worker-repeat-stalled-scheduler".to_string(),
+            Duration::from_millis(50),
+            Utc::now(),
+        )
+        .await
+        .expect("stalled repeat owner claim should return")
+        .expect("stalled repeat owner should claim");
+    assert_eq!(claimed.id, stalled_owner.id);
+    let removed_owner_key: usize = conn.del(&owner_key).await?;
+    assert_eq!(removed_owner_key, 1);
+    let owner_after_delete: Option<String> = conn.get(&owner_key).await?;
+    assert!(owner_after_delete.is_none());
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        queue
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("repeat stalled scheduler recovery should mark candidates"),
+        0
+    );
+    assert_eq!(
+        queue
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("repeat stalled scheduler recovery should requeue"),
+        1
+    );
+    trace_stage("repeat-stalled-scheduler:requeued");
+
+    let recovered = queue
+        .get_job(&stalled_owner.id)
+        .await
+        .expect("stalled repeat owner lookup should return")
+        .expect("stalled repeat owner should still exist");
+    assert_eq!(recovered.state, JobState::Waiting);
+    assert_eq!(recovered.stalled_count, 1);
+    let failed_score: Option<f64> = conn
+        .zscore(
+            format!("{namespace}:repeat-stalled-scheduler:failed"),
+            &stalled_owner.id,
+        )
+        .await?;
+    assert!(failed_score.is_none());
+    let waiting_score: Option<f64> = conn
+        .zscore(
+            format!("{namespace}:repeat-stalled-scheduler:waiting"),
+            &stalled_owner.id,
+        )
+        .await?;
+    assert!(waiting_score.is_some());
+    let restored_owner: Option<String> = conn.get(&owner_key).await?;
+    assert_eq!(restored_owner.as_deref(), Some(stalled_owner.id.as_str()));
+    let scheduler_owner_after: Option<String> = conn.hget(&scheduler_meta_key, "jid").await?;
+    assert_eq!(
+        scheduler_owner_after.as_deref(),
+        Some(stalled_owner.id.as_str())
+    );
+    assert_eq!(
+        queue
+            .count_repeats()
+            .await
+            .expect("repeat count should load after stalled recovery"),
+        1
+    );
+
+    cleanup_namespace_with_conn(&mut conn, &namespace).await?;
+    trace_stage("repeat-stalled-scheduler:cleanup-final:done");
     Ok(())
 }
 

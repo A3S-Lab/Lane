@@ -4204,10 +4204,18 @@ local function is_current_repeat_scheduler_job(job, job_id, repeat_prefix)
   if not key then
     return false
   end
-  if redis.call('GET', repeat_prefix .. key) == job_id then
+  local owner_key = repeat_prefix .. key
+  local owner_id = redis.call('GET', owner_key)
+  if owner_id == job_id then
     return true
   end
-  return redis.call('HGET', repeat_scheduler_meta_key(repeat_prefix, key), 'jid') == job_id
+  if redis.call('HGET', repeat_scheduler_meta_key(repeat_prefix, key), 'jid') == job_id then
+    if not owner_id then
+      redis.call('SET', owner_key, job_id, 'NX')
+    end
+    return true
+  end
+  return false
 end
 
 local function retention_options(job, remove_field, retention_field)

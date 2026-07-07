@@ -1474,7 +1474,9 @@ occurrence is requeued even after the ordinary stalled limit is exceeded. Lane
 mirrors that branch for active repeat owners: non-repeat jobs still fail after
 `max_stalled_count`, but a stalled repeat owner whose owner key or scheduler
 metadata still points at the job is moved back to `waiting` and keeps its
-repeat ownership.
+repeat ownership. If the fast `repeat:<key>` owner key is missing but
+`repeat_meta:<key>.jid` still names the stalled occurrence, the recovery script
+restores the fast owner key before requeueing it.
 
 `remove_job()` uses a Redis script to reject active jobs and remove the job
 hash, lock key, all state indexes, retained log list, and any child dependency
