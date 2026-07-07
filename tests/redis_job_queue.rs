@@ -926,6 +926,22 @@ async fn redis_backend_rejects_repeat_retry_from_scheduler_metadata_against_real
 }
 
 #[tokio::test]
+async fn redis_backend_releases_repeat_scheduler_metadata_without_fast_owner_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_repeat_release_scheduler_metadata(redis_url),
+    )
+    .await
+    .expect("Redis repeat scheduler metadata release integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_removes_repeat_from_scheduler_metadata_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -4422,6 +4438,139 @@ async fn run_repeat_retry_scheduler_metadata(redis_url: String) -> redis::RedisR
 
     cleanup_namespace_with_conn(&mut conn, &namespace).await?;
     trace_stage("repeat-retry-scheduler:cleanup-final:done");
+    Ok(())
+}
+
+async fn run_repeat_release_scheduler_metadata(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    trace_stage("repeat-release-scheduler:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("repeat-release-scheduler:cleanup:done");
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "repeat-release-scheduler")
+        .expect("valid Redis URL should build the repeat release scheduler queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let complete_owner = queue
+        .add_job(
+            "scheduler-release-complete".to_string(),
+            serde_json::json!({ "path": "complete" }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(60))
+                    .with_limit(1)
+                    .with_key("release-complete"),
+            ),
+        )
+        .await
+        .expect("complete repeat owner should add");
+    let complete_owner_key =
+        format!("{namespace}:repeat-release-scheduler:repeat:release-complete");
+    let complete_scheduler_meta_key =
+        format!("{namespace}:repeat-release-scheduler:repeat_meta:release-complete");
+    let complete_scheduler_key = format!("{namespace}:repeat-release-scheduler:repeat");
+    let complete_scheduler_owner_id: Option<String> =
+        conn.hget(&complete_scheduler_meta_key, "jid").await?;
+    assert_eq!(
+        complete_scheduler_owner_id.as_deref(),
+        Some(complete_owner.id.as_str())
+    );
+    let removed_complete_owner_key: usize = conn.del(&complete_owner_key).await?;
+    assert_eq!(removed_complete_owner_key, 1);
+
+    let complete_claim = queue
+        .claim_next(
+            "worker-repeat-release-complete".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("complete repeat owner claim should return")
+        .expect("complete repeat owner should claim");
+    assert_eq!(complete_claim.id, complete_owner.id);
+    queue
+        .complete_job(
+            &complete_claim.id,
+            lock_token(&complete_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("complete repeat owner should complete");
+    trace_stage("repeat-release-scheduler:completed");
+
+    let complete_owner_after: Option<String> = conn.get(&complete_owner_key).await?;
+    assert!(complete_owner_after.is_none());
+    let complete_scheduler_owner_after: Option<String> =
+        conn.hget(&complete_scheduler_meta_key, "jid").await?;
+    assert!(complete_scheduler_owner_after.is_none());
+    let complete_scheduler_score_after: Option<f64> = conn
+        .zscore(&complete_scheduler_key, "release-complete")
+        .await?;
+    assert!(complete_scheduler_score_after.is_none());
+
+    let fail_owner = queue
+        .add_job(
+            "scheduler-release-fail".to_string(),
+            serde_json::json!({ "path": "fail" }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(60)).with_key("release-fail"),
+            ),
+        )
+        .await
+        .expect("failed repeat owner should add");
+    let fail_owner_key = format!("{namespace}:repeat-release-scheduler:repeat:release-fail");
+    let fail_scheduler_meta_key =
+        format!("{namespace}:repeat-release-scheduler:repeat_meta:release-fail");
+    let fail_scheduler_owner_id: Option<String> =
+        conn.hget(&fail_scheduler_meta_key, "jid").await?;
+    assert_eq!(
+        fail_scheduler_owner_id.as_deref(),
+        Some(fail_owner.id.as_str())
+    );
+    let removed_fail_owner_key: usize = conn.del(&fail_owner_key).await?;
+    assert_eq!(removed_fail_owner_key, 1);
+
+    let fail_claim = queue
+        .claim_next(
+            "worker-repeat-release-fail".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("failed repeat owner claim should return")
+        .expect("failed repeat owner should claim");
+    assert_eq!(fail_claim.id, fail_owner.id);
+    queue
+        .fail_job(
+            &fail_claim.id,
+            lock_token(&fail_claim),
+            "terminal repeat release failure".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("failed repeat owner should fail terminally");
+    trace_stage("repeat-release-scheduler:failed");
+
+    let fail_owner_after: Option<String> = conn.get(&fail_owner_key).await?;
+    assert!(fail_owner_after.is_none());
+    let fail_scheduler_owner_after: Option<String> =
+        conn.hget(&fail_scheduler_meta_key, "jid").await?;
+    assert!(fail_scheduler_owner_after.is_none());
+    let fail_scheduler_score_after: Option<f64> =
+        conn.zscore(&complete_scheduler_key, "release-fail").await?;
+    assert!(fail_scheduler_score_after.is_none());
+    assert_eq!(
+        queue
+            .count_repeats()
+            .await
+            .expect("repeat count should load after release recovery"),
+        0
+    );
+
+    cleanup_namespace_with_conn(&mut conn, &namespace).await?;
+    trace_stage("repeat-release-scheduler:cleanup-final:done");
     Ok(())
 }
 

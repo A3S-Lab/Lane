@@ -596,10 +596,16 @@ local function release_repeat_key(job, job_id, repeat_prefix)
   local key = repeat_key(job)
   if key then
     local owner_key = repeat_prefix .. key
-    if redis.call('GET', owner_key) == job_id then
+    local owner_matches = redis.call('GET', owner_key) == job_id
+    if owner_matches then
       redis.call('DEL', owner_key)
+    end
+
+    local scheduler_meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
+    local scheduler_owner_id = redis.call('HGET', scheduler_meta_key, 'jid')
+    if scheduler_owner_id == job_id or (owner_matches and not scheduler_owner_id) then
       redis.call('ZREM', repeat_scheduler_key(repeat_prefix), key)
-      redis.call('DEL', repeat_scheduler_meta_key(repeat_prefix, key))
+      redis.call('DEL', scheduler_meta_key)
     end
   end
 end
@@ -2393,10 +2399,16 @@ local function release_repeat_key(job, job_id, repeat_prefix)
   local key = repeat_key(job)
   if key then
     local owner_key = repeat_prefix .. key
-    if redis.call('GET', owner_key) == job_id then
+    local owner_matches = redis.call('GET', owner_key) == job_id
+    if owner_matches then
       redis.call('DEL', owner_key)
+    end
+
+    local scheduler_meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
+    local scheduler_owner_id = redis.call('HGET', scheduler_meta_key, 'jid')
+    if scheduler_owner_id == job_id or (owner_matches and not scheduler_owner_id) then
       redis.call('ZREM', repeat_scheduler_key(repeat_prefix), key)
-      redis.call('DEL', repeat_scheduler_meta_key(repeat_prefix, key))
+      redis.call('DEL', scheduler_meta_key)
     end
   end
 end
@@ -3167,10 +3179,16 @@ local function release_repeat_key(job, job_id, repeat_prefix)
   local key = repeat_key(job)
   if key then
     local owner_key = repeat_prefix .. key
-    if redis.call('GET', owner_key) == job_id then
+    local owner_matches = redis.call('GET', owner_key) == job_id
+    if owner_matches then
       redis.call('DEL', owner_key)
+    end
+
+    local scheduler_meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
+    local scheduler_owner_id = redis.call('HGET', scheduler_meta_key, 'jid')
+    if scheduler_owner_id == job_id or (owner_matches and not scheduler_owner_id) then
       redis.call('ZREM', repeat_scheduler_key(repeat_prefix), key)
-      redis.call('DEL', repeat_scheduler_meta_key(repeat_prefix, key))
+      redis.call('DEL', scheduler_meta_key)
     end
   end
 end
@@ -4160,10 +4178,16 @@ local function release_repeat_key(job, job_id, repeat_prefix)
   local key = repeat_key(job)
   if key then
     local owner_key = repeat_prefix .. key
-    if redis.call('GET', owner_key) == job_id then
+    local owner_matches = redis.call('GET', owner_key) == job_id
+    if owner_matches then
       redis.call('DEL', owner_key)
+    end
+
+    local scheduler_meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
+    local scheduler_owner_id = redis.call('HGET', scheduler_meta_key, 'jid')
+    if scheduler_owner_id == job_id or (owner_matches and not scheduler_owner_id) then
       redis.call('ZREM', repeat_scheduler_key(repeat_prefix), key)
-      redis.call('DEL', repeat_scheduler_meta_key(repeat_prefix, key))
+      redis.call('DEL', scheduler_meta_key)
     end
   end
 end
@@ -5437,10 +5461,16 @@ local function release_repeat_key(job, job_id, repeat_prefix)
   local key = repeat_key(job)
   if key then
     local owner_key = repeat_prefix .. key
-    if redis.call('GET', owner_key) == job_id then
+    local owner_matches = redis.call('GET', owner_key) == job_id
+    if owner_matches then
       redis.call('DEL', owner_key)
+    end
+
+    local scheduler_meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
+    local scheduler_owner_id = redis.call('HGET', scheduler_meta_key, 'jid')
+    if scheduler_owner_id == job_id or (owner_matches and not scheduler_owner_id) then
       redis.call('ZREM', repeat_scheduler_key(repeat_prefix), key)
-      redis.call('DEL', repeat_scheduler_meta_key(repeat_prefix, key))
+      redis.call('DEL', scheduler_meta_key)
     end
   end
 end
@@ -5797,10 +5827,16 @@ local function release_repeat_key(job, job_id, repeat_prefix)
   local key = repeat_key(job)
   if key then
     local owner_key = repeat_prefix .. key
-    if redis.call('GET', owner_key) == job_id then
+    local owner_matches = redis.call('GET', owner_key) == job_id
+    if owner_matches then
       redis.call('DEL', owner_key)
+    end
+
+    local scheduler_meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
+    local scheduler_owner_id = redis.call('HGET', scheduler_meta_key, 'jid')
+    if scheduler_owner_id == job_id or (owner_matches and not scheduler_owner_id) then
       redis.call('ZREM', repeat_scheduler_key(repeat_prefix), key)
-      redis.call('DEL', repeat_scheduler_meta_key(repeat_prefix, key))
+      redis.call('DEL', scheduler_meta_key)
     end
   end
 end
@@ -6223,10 +6259,16 @@ local function release_repeat_key(job, job_id, repeat_prefix)
   local key = repeat_key(job)
   if key then
     local owner_key = repeat_prefix .. key
-    if redis.call('GET', owner_key) == job_id then
+    local owner_matches = redis.call('GET', owner_key) == job_id
+    if owner_matches then
       redis.call('DEL', owner_key)
+    end
+
+    local scheduler_meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
+    local scheduler_owner_id = redis.call('HGET', scheduler_meta_key, 'jid')
+    if scheduler_owner_id == job_id or (owner_matches and not scheduler_owner_id) then
       redis.call('ZREM', repeat_scheduler_key(repeat_prefix), key)
-      redis.call('DEL', repeat_scheduler_meta_key(repeat_prefix, key))
+      redis.call('DEL', scheduler_meta_key)
     end
   end
 end
@@ -7100,11 +7142,18 @@ end
 local function release_repeat_key(job, job_id)
   local key = repeat_key(job)
   if key then
-    local owner_key = ARGV[8] .. key
-    if redis.call('GET', owner_key) == job_id then
+    local repeat_prefix = ARGV[8]
+    local owner_key = repeat_prefix .. key
+    local owner_matches = redis.call('GET', owner_key) == job_id
+    if owner_matches then
       redis.call('DEL', owner_key)
-      redis.call('ZREM', repeat_scheduler_key(ARGV[8]), key)
-      redis.call('DEL', repeat_scheduler_meta_key(ARGV[8], key))
+    end
+
+    local scheduler_meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
+    local scheduler_owner_id = redis.call('HGET', scheduler_meta_key, 'jid')
+    if scheduler_owner_id == job_id or (owner_matches and not scheduler_owner_id) then
+      redis.call('ZREM', repeat_scheduler_key(repeat_prefix), key)
+      redis.call('DEL', scheduler_meta_key)
     end
   end
 end
@@ -7486,11 +7535,18 @@ end
 local function release_repeat_key(job, job_id)
   local key = repeat_key(job)
   if key then
-    local owner_key = ARGV[7] .. key
-    if redis.call('GET', owner_key) == job_id then
+    local repeat_prefix = ARGV[7]
+    local owner_key = repeat_prefix .. key
+    local owner_matches = redis.call('GET', owner_key) == job_id
+    if owner_matches then
       redis.call('DEL', owner_key)
-      redis.call('ZREM', repeat_scheduler_key(ARGV[7]), key)
-      redis.call('DEL', repeat_scheduler_meta_key(ARGV[7], key))
+    end
+
+    local scheduler_meta_key = repeat_scheduler_meta_key(repeat_prefix, key)
+    local scheduler_owner_id = redis.call('HGET', scheduler_meta_key, 'jid')
+    if scheduler_owner_id == job_id or (owner_matches and not scheduler_owner_id) then
+      redis.call('ZREM', repeat_scheduler_key(repeat_prefix), key)
+      redis.call('DEL', scheduler_meta_key)
     end
   end
 end

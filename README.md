@@ -1243,7 +1243,9 @@ fall back to scheduler metadata before inserting a new repeat job, the
 completion script transfers ownership and scheduler metadata to the successor
 before releasing the completed occurrence, and terminal failure, remove, clean,
 drain, and stalled terminal failure release both records only if they still
-point at the job being finalized or removed.
+point at the job being finalized or removed. Those release helpers also check
+`repeat_meta:<key>.jid`, so a terminal script clears scheduler metadata even when
+the fast `repeat:<key>` owner key has already disappeared.
 Manual retry reclaims the repeat key and scheduler metadata inside the retry
 script and rejects retry if another non-terminal occurrence already owns the
 series. `list_repeats()` reads the scheduler zset first, loads each owner job
