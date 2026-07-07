@@ -894,6 +894,22 @@ async fn redis_backend_removes_repeat_from_scheduler_metadata_against_real_serve
 }
 
 #[tokio::test]
+async fn redis_backend_reads_repeat_from_scheduler_metadata_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_repeat_read_scheduler_metadata(redis_url),
+    )
+    .await
+    .expect("Redis repeat scheduler metadata read integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_orders_lifo_waiting_jobs_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -4115,6 +4131,76 @@ async fn run_repeat_remove_scheduler_metadata(redis_url: String) -> redis::Redis
 
     cleanup_namespace_with_conn(&mut conn, &namespace).await?;
     trace_stage("repeat-remove-scheduler:cleanup-final:done");
+    Ok(())
+}
+
+async fn run_repeat_read_scheduler_metadata(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    trace_stage("repeat-read-scheduler:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("repeat-read-scheduler:cleanup:done");
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "repeat-read-scheduler")
+        .expect("valid Redis URL should build the repeat read scheduler queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let job = queue
+        .add_job(
+            "recoverable-repeat".to_string(),
+            serde_json::json!({ "kind": "scheduler-meta-reader" }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(60)).with_key("recoverable-repeat"),
+            ),
+        )
+        .await
+        .expect("repeat owner should add");
+    trace_stage("repeat-read-scheduler:added");
+
+    let owner_key = format!("{namespace}:repeat-read-scheduler:repeat:recoverable-repeat");
+    let scheduler_meta_key =
+        format!("{namespace}:repeat-read-scheduler:repeat_meta:recoverable-repeat");
+    let scheduler_owner_id: Option<String> = conn.hget(&scheduler_meta_key, "jid").await?;
+    assert_eq!(scheduler_owner_id.as_deref(), Some(job.id.as_str()));
+
+    let removed_owner_key: usize = conn.del(&owner_key).await?;
+    assert_eq!(removed_owner_key, 1);
+    let entries = queue
+        .list_repeats()
+        .await
+        .expect("repeat list should recover scheduler metadata owner");
+    assert!(entries
+        .iter()
+        .any(|entry| entry.key == "recoverable-repeat" && entry.job_id == job.id));
+    let restored_owner_after_list: Option<String> = conn.get(&owner_key).await?;
+    assert_eq!(restored_owner_after_list.as_deref(), Some(job.id.as_str()));
+
+    let removed_owner_key: usize = conn.del(&owner_key).await?;
+    assert_eq!(removed_owner_key, 1);
+    let entry = queue
+        .get_repeat("recoverable-repeat")
+        .await
+        .expect("repeat getter should recover scheduler metadata owner")
+        .expect("repeat getter should return scheduler metadata owner");
+    assert_eq!(entry.job_id, job.id);
+    let restored_owner_after_get: Option<String> = conn.get(&owner_key).await?;
+    assert_eq!(restored_owner_after_get.as_deref(), Some(job.id.as_str()));
+
+    let removed_owner_key: usize = conn.del(&owner_key).await?;
+    assert_eq!(removed_owner_key, 1);
+    assert_eq!(
+        queue
+            .count_repeats()
+            .await
+            .expect("repeat count should recover scheduler metadata owner"),
+        1
+    );
+    let restored_owner_after_count: Option<String> = conn.get(&owner_key).await?;
+    assert_eq!(restored_owner_after_count.as_deref(), Some(job.id.as_str()));
+
+    cleanup_namespace_with_conn(&mut conn, &namespace).await?;
+    trace_stage("repeat-read-scheduler:cleanup-final:done");
     Ok(())
 }
 

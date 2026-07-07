@@ -8683,25 +8683,65 @@ impl RedisJobQueue {
         }
 
         let owner_key = self.repeat_owner_key(repeat_key);
-        let Some(owner_id): Option<String> = conn.get(&owner_key).await.map_err(redis_error)?
+        let scheduler_meta_key = self.repeat_scheduler_meta_key(repeat_key);
+        let owner_id: Option<String> = conn.get(&owner_key).await.map_err(redis_error)?;
+        let scheduler_owner_id: Option<String> = conn
+            .hget(&scheduler_meta_key, "jid")
+            .await
+            .map_err(redis_error)?;
+
+        if let Some(owner_id) = owner_id {
+            if let Some(entry) = self
+                .load_valid_repeat_entry(conn, repeat_key, &owner_id)
+                .await?
+            {
+                return Ok(Some(entry));
+            }
+
+            if scheduler_owner_id.as_deref() == Some(owner_id.as_str())
+                || scheduler_owner_id.is_none()
+            {
+                self.clear_repeat_owner_if_stale(conn, repeat_key, &owner_id)
+                    .await?;
+                return Ok(None);
+            }
+
+            self.clear_repeat_owner_key_if_stale(conn, repeat_key, &owner_id)
+                .await?;
+        }
+
+        let Some(scheduler_owner_id) = scheduler_owner_id else {
+            self.clear_repeat_scheduler_metadata(conn, repeat_key)
+                .await?;
+            return Ok(None);
+        };
+
+        let Some(entry) = self
+            .load_valid_repeat_entry(conn, repeat_key, &scheduler_owner_id)
+            .await?
         else {
             self.clear_repeat_scheduler_metadata(conn, repeat_key)
                 .await?;
             return Ok(None);
         };
 
-        let Some(job) = self.load_job(conn, &owner_id).await? else {
-            self.clear_repeat_owner_if_stale(conn, repeat_key, &owner_id)
-                .await?;
+        self.restore_repeat_owner_if_missing(conn, repeat_key, &scheduler_owner_id)
+            .await?;
+        Ok(Some(entry))
+    }
+
+    async fn load_valid_repeat_entry(
+        &self,
+        conn: &mut ConnectionManager,
+        repeat_key: &str,
+        owner_id: &str,
+    ) -> Result<Option<JobRepeatEntry>> {
+        let Some(job) = self.load_job(conn, owner_id).await? else {
             return Ok(None);
         };
-
         if job.state.is_terminal() || job.repeat_key.as_deref() != Some(repeat_key) {
-            self.clear_repeat_owner_if_stale(conn, repeat_key, &owner_id)
-                .await?;
             return Ok(None);
         }
-
         Ok(repeat_entry(&job))
     }
 
@@ -8758,6 +8798,42 @@ impl RedisJobQueue {
             .arg(self.repeat_scheduler_meta_key(repeat_key))
             .arg(owner_id)
             .arg(repeat_key)
+            .query_async(conn)
+            .await
+            .map_err(redis_error)?;
+        Ok(())
+    }
+
+    async fn clear_repeat_owner_key_if_stale(
+        &self,
+        conn: &mut ConnectionManager,
+        repeat_key: &str,
+        owner_id: &str,
+    ) -> Result<()> {
+        let _: usize = redis::cmd("EVAL")
+            .arg(
+                "if redis.call('GET', KEYS[1]) == ARGV[1] then \
+                 return redis.call('DEL', KEYS[1]) end return 0",
+            )
+            .arg(1)
+            .arg(self.repeat_owner_key(repeat_key))
+            .arg(owner_id)
+            .query_async(conn)
+            .await
+            .map_err(redis_error)?;
+        Ok(())
+    }
+
+    async fn restore_repeat_owner_if_missing(
+        &self,
+        conn: &mut ConnectionManager,
+        repeat_key: &str,
+        owner_id: &str,
+    ) -> Result<()> {
+        let _: Option<String> = redis::cmd("SET")
+            .arg(self.repeat_owner_key(repeat_key))
+            .arg(owner_id)
+            .arg("NX")
             .query_async(conn)
             .await
             .map_err(redis_error)?;

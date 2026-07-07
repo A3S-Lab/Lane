@@ -1243,15 +1243,20 @@ both records only if they still point at the job being finalized or removed.
 Manual retry reclaims the repeat key and scheduler metadata inside the retry
 script and rejects retry if another non-terminal occurrence already owns the
 series. `list_repeats()` reads the scheduler zset first, loads each owner job
-snapshot from the jobs hash, returns only non-terminal matching owners, clears
-stale scheduler/owner records that point at missing, terminal, or mismatched
-jobs, and scans legacy `repeat:<key>` owner keys as a migration fallback.
+snapshot from the jobs hash, returns only non-terminal matching owners, restores
+the fast `repeat:<key>` owner key from `repeat_meta:<key>.jid` when that
+scheduler owner is still valid, clears stale scheduler/owner records that point
+at missing, terminal, or mismatched jobs, and scans legacy `repeat:<key>` owner
+keys as a migration fallback.
 `remove_repeat()` resolves the current `repeat:<key>` owner, falls back to the
 `repeat_meta:<key>` scheduler owner id when the fast owner key is missing, and
 then runs the same Redis-side removal path as `remove_job()`, so it rejects
 active leased owners, removes the job hash and state indexes, releases repeat
-and deduplication ownership, and can unblock flow parents. If the owner key or
-scheduler metadata points at a missing job, Redis clears the stale owner key,
+and deduplication ownership, and can unblock flow parents. Repeat readers use
+the same scheduler metadata fallback: if the fast owner key is missing but
+`repeat_meta:<key>.jid` still points at a valid non-terminal repeat owner, Redis
+returns that owner and restores `repeat:<key>` with `SET NX`. If the owner key
+or scheduler metadata points at a missing job, Redis clears the stale owner key,
 zset entry, and metadata hash only when they still describe that missing owner.
 `upsert_repeat()` follows BullMQ's
 `upsertJobScheduler(..., override: true)` mechanism at Lane's current
@@ -1282,10 +1287,11 @@ an overwrite from an interval schedule to a cron schedule cannot leave stale
 repeat successor enqueue, retry, remove, clean, drain, and stalled terminal
 cleanup update those records inside the same Redis script that mutates the job
 state. `get_repeat()`, `count_repeats()`, and `list_repeats_page()` read
-through the scheduler zset, validate the owner job snapshot, prune stale
-metadata, and mirror BullMQ's `getJobScheduler`, `getJobSchedulersCount`, and
-`getJobSchedulers(start, end, asc)` read side: entries are ordered by next
-scheduled time, defaulting to descending order. Lane still models repeat work as
+through the scheduler zset, validate the owner job snapshot, repair missing fast
+owner keys from scheduler metadata, prune stale metadata, and mirror BullMQ's
+`getJobScheduler`, `getJobSchedulersCount`, and `getJobSchedulers(start, end,
+asc)` read side: entries are ordered by next scheduled time, defaulting to
+descending order. Lane still models repeat work as
 a Rust-native repeat-series owner and successor enqueue flow rather than a full
 BullMQ JS template engine, so exact BullMQ scheduler field-for-field parity
 remains a later SDK/runtime compatibility item.
