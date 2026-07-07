@@ -136,6 +136,15 @@ pub trait JobQueueBackend: Send + Sync {
 
     async fn list_repeats(&self) -> Result<Vec<JobRepeatEntry>>;
 
+    /// Create or replace the current non-active occurrence for a repeat series.
+    ///
+    /// This follows BullMQ's `upsertJobScheduler(..., override: true)` shape at
+    /// the current Lane repeat-owner layer: the repeat key is taken from
+    /// `spec.options.repeat.key` or falls back to Lane's `queue:name` key,
+    /// non-active current owners are replaced, and active leased owners are
+    /// rejected.
+    async fn upsert_repeat(&self, spec: JobSpec, now: DateTime<Utc>) -> Result<Job>;
+
     /// Return one repeat series / job scheduler by key.
     async fn get_repeat(&self, repeat_key: &str) -> Result<Option<JobRepeatEntry>> {
         Ok(self

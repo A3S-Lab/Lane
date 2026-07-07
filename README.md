@@ -369,12 +369,12 @@ A3S stack and language SDKs.
 | Phase | Status | Scope |
 | --- | --- | --- |
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
-| Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, debounce TTL extension, delayed-owner replace, and keep-last-if-active requeue, repeat-key ownership, explicit job states, priority plus FIFO/LIFO same-priority ordering, finished-job retention by age/count/limit, retained queue event streams, delayed jobs, token-owned worker leases, active-to-wait/delayed movement, completion/failure snapshots, retry backoff, Redis-shared rate-limit and active-concurrency controls, BullMQ-style two-phase stalled recovery, pause/resume. |
-| Job management API | In progress | Add/get/get-state/get-job-counts/get-job-count/count-pending/remove/remove-repeat/remove-deduplication-key/get-deduplication-job-id/list-repeats/get-repeat/count-repeats/list-repeats-page/get-flow-dependencies/get-flow-dependency-counts/remove-unprocessed-children/remove-child-dependency/promote/reschedule/delay-active/release-active/retry/update-priority/update-priority-with-lifo/update-data/pause/resume/is-paused/drain/clean/obliterate APIs, multi-state pagination, ascending/descending listing, waiting priority counts, add-log/get-logs/clear-job-logs, read-events/trim-events, progress updates, lease renewal. |
+| Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, debounce TTL extension, delayed-owner replace, and keep-last-if-active requeue, repeat-key ownership and upsert, explicit job states, priority plus FIFO/LIFO same-priority ordering, finished-job retention by age/count/limit, retained queue event streams, delayed jobs, token-owned worker leases, active-to-wait/delayed movement, completion/failure snapshots, retry backoff, Redis-shared rate-limit and active-concurrency controls, BullMQ-style two-phase stalled recovery, pause/resume. |
+| Job management API | In progress | Add/get/get-state/get-job-counts/get-job-count/count-pending/remove/remove-repeat/upsert-repeat/remove-deduplication-key/get-deduplication-job-id/list-repeats/get-repeat/count-repeats/list-repeats-page/get-flow-dependencies/get-flow-dependency-counts/remove-unprocessed-children/remove-child-dependency/promote/reschedule/delay-active/release-active/retry/update-priority/update-priority-with-lifo/update-data/pause/resume/is-paused/drain/clean/obliterate APIs, multi-state pagination, ascending/descending listing, waiting priority counts, add-log/get-logs/clear-job-logs, read-events/trim-events, progress updates, lease renewal. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, and stalled recovery loops. |
-| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, FIFO/LIFO waiting score ordering, Redis stream queue events, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership/listing/removal/pagination, flow submission, flow dependency inspection, delayed promotion and rescheduling, active-to-wait/delayed movement, single-job promote, state-index queries, job count snapshots, manual retry, priority update, progress update, log append, list/stat snapshots, finished-job age/count retention during complete/fail/stalled scripts, drain, clean, obliterate, claim, Redis-shared rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled candidate-set recovery semantics. Postgres/NATS backends remain planned. |
+| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, FIFO/LIFO waiting score ordering, Redis stream queue events, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership/listing/removal/upsert/pagination, flow submission, flow dependency inspection, delayed promotion and rescheduling, active-to-wait/delayed movement, single-job promote, state-index queries, job count snapshots, manual retry, priority update, progress update, log append, list/stat snapshots, finished-job age/count retention during complete/fail/stalled scripts, drain, clean, obliterate, claim, Redis-shared rate limit, max-active, flow parent release/failure, repeat successor enqueue, complete, fail, renew, remove, and stalled candidate-set recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, dependency inspection, and fan-out/fan-in release are available across in-memory, local durable, and Redis backends. |
-| Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, end timestamps, repeat-key removal, single-key lookup, counts, and BullMQ-style next-time pagination are available across in-memory, local durable, and Redis backends. |
+| Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, end timestamps, repeat-key removal, upsert, single-key lookup, counts, and BullMQ-style next-time pagination are available across in-memory, local durable, and Redis backends. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
 
 The generic job runtime is exposed through the `JobQueueBackend` trait.
@@ -469,6 +469,8 @@ the same-priority waiting reinsert side, `renew_lease()` extends an active
 worker lease with the claim token,
 `remove_job()` removes non-active jobs,
 `remove_repeat()` removes the current non-active owner for a repeat key,
+`upsert_repeat()` creates or replaces the current non-active owner for a repeat
+key,
 `remove_deduplication_key()` clears the active owner for a deduplication id,
 `get_deduplication_job_id()` returns the current owner job id for a
 deduplication id, `list_repeats()` lists current non-terminal repeat-series
@@ -610,7 +612,7 @@ non-terminal occurrence with the same repeat key exists, duplicate adds return
 that owner instead of creating a parallel repeat chain:
 
 ```rust
-use a3s_lane::{InMemoryJobQueue, JobOptions, RepeatOptions};
+use a3s_lane::{InMemoryJobQueue, JobOptions, JobSpec, RepeatOptions};
 use std::time::Duration;
 
 # async fn repeat_example() -> a3s_lane::Result<()> {
@@ -661,12 +663,34 @@ let duplicate = queue
 
 assert_eq!(duplicate.id, job.id);
 
+let replacement = queue
+    .upsert_repeat(
+        JobSpec::new(
+            "heartbeat-v2",
+            serde_json::json!({ "target": "crm", "template": "v2" }),
+        )
+        .with_options(
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(30))
+                    .with_limit(10)
+                    .with_key("crm-heartbeat"),
+            ),
+        ),
+        chrono::Utc::now(),
+    )
+    .await?;
+
+assert_ne!(replacement.id, job.id);
+
 let repeats = queue.list_repeats().await?;
 assert_eq!(repeats[0].key, "crm-heartbeat");
-assert_eq!(repeats[0].job_id, job.id);
+assert_eq!(repeats[0].job_id, replacement.id);
 
 let removed = queue.remove_repeat("crm-heartbeat").await?;
-assert_eq!(removed.as_ref().map(|job| job.id.as_str()), Some(job.id.as_str()));
+assert_eq!(
+    removed.as_ref().map(|job| job.id.as_str()),
+    Some(replacement.id.as_str())
+);
 # Ok(())
 # }
 ```
@@ -1111,19 +1135,31 @@ then runs the same Redis-side removal path as `remove_job()`, so it rejects
 active leased owners, removes the job hash and state indexes, releases repeat
 and deduplication ownership, and can unblock flow parents. If the owner key
 points at a missing job, Redis clears that stale owner key only when it still
-points at the missing id.
+points at the missing id. `upsert_repeat()` follows BullMQ's
+`upsertJobScheduler(..., override: true)` mechanism at Lane's current
+repeat-owner layer: the Redis script resolves the current `repeat:<key>` owner,
+rejects active leased owners, rejects flow-owned occurrences to avoid corrupting
+parent dependencies, checks job-id and deduplication-owner collisions, removes
+the old non-active owner from the jobs hash and state indexes, clears its lock,
+logs, dependency key, deduplication owner, and repeat owner only when they still
+point at that job, then writes the replacement job, its waiting/delayed index,
+events, deduplication key, and `repeat:<key>` owner in the same Redis turn.
 
 This is intentionally a script-level mechanism, not just API-field parity. It is
 inspired by BullMQ's use of Lua scripts to maintain repeat scheduler records,
-deduplication keys, locks, and state indexes atomically, including BullMQ's
-`removeJobScheduler` and legacy `removeRepeatable` scripts that remove both the
-repeat scheduler metadata and the current delayed occurrence. `get_repeat()`,
+deduplication keys, locks, and state indexes atomically. In BullMQ 5.79.2,
+`addJobScheduler-11.lua` stores scheduler metadata in the repeat zset/hash and,
+when overriding, removes the previous delayed, prioritized, waiting, or paused
+next job before creating the new scheduled job; active/completed/failed
+collisions are not blindly overwritten. Lane does not yet store the full
+BullMQ scheduler zset/hash metadata, but it preserves the same atomic
+replace-or-reject invariant for the current repeat owner. `get_repeat()`,
 `count_repeats()`, and `list_repeats_page()` mirror BullMQ's
 `getJobScheduler`, `getJobSchedulersCount`, and `getJobSchedulers(start, end,
 asc)` read side: entries are ordered by next scheduled time, defaulting to
 descending order. A3S Lane's current repeat support is still a lightweight
-repeat-series owner and successor enqueue model; full BullMQ scheduler upsert
-APIs and richer scheduler metadata remain later SDK/runtime parity items.
+repeat-series owner and successor enqueue model; richer BullMQ scheduler
+metadata remains a later SDK/runtime parity item.
 
 Manual lifecycle management follows the same Redis-side state movement rule:
 `promote_job()` removes a delayed job from the delayed zset and inserts it into

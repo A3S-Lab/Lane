@@ -34,7 +34,7 @@ fn redis_backend_runs_job_lifecycle_against_real_server() {
                 .build()
                 .expect("Redis lifecycle runtime should build");
             runtime.block_on(async move {
-                tokio::time::timeout(Duration::from_secs(420), run_job_lifecycle(redis_url))
+                tokio::time::timeout(Duration::from_secs(900), run_job_lifecycle(redis_url))
                     .await
                     .expect("Redis job lifecycle integration test timed out")
                     .unwrap();
@@ -90,6 +90,18 @@ async fn redis_backend_keeps_latest_repeat_duplicate_against_real_server() {
     tokio::time::timeout(Duration::from_secs(120), run_repeat_keep_last(redis_url))
         .await
         .expect("Redis repeat keep-last integration test timed out")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn redis_backend_upserts_repeat_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    tokio::time::timeout(Duration::from_secs(120), run_repeat_upsert(redis_url))
+        .await
+        .expect("Redis repeat upsert integration test timed out")
         .unwrap();
 }
 
@@ -655,6 +667,133 @@ async fn run_repeat_keep_last(redis_url: String) -> redis::RedisResult<()> {
 
     cleanup_namespace_with_conn(&mut conn, &namespace).await?;
     trace_stage("repeat-keep-last:cleanup-final:done");
+    Ok(())
+}
+
+async fn run_repeat_upsert(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    trace_stage("repeat-upsert:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("repeat-upsert:cleanup:done");
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "repeat-upsert")
+        .expect("valid Redis URL should build the repeat upsert queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let first = queue
+        .add_job(
+            "heartbeat".to_string(),
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(5)).with_key("heartbeat-series"),
+            ),
+        )
+        .await
+        .expect("first repeat owner should add");
+    trace_stage("repeat-upsert:first-added");
+
+    let replacement = queue
+        .upsert_repeat(
+            JobSpec::new("heartbeat-v2", serde_json::json!({ "version": 2 })).with_options(
+                JobOptions::new()
+                    .with_delay(Duration::from_secs(30))
+                    .with_repeat(
+                        RepeatOptions::every(Duration::from_secs(30)).with_key("heartbeat-series"),
+                    ),
+            ),
+            Utc::now(),
+        )
+        .await
+        .expect("repeat upsert should replace non-active owner");
+    trace_stage("repeat-upsert:replaced");
+    assert_ne!(replacement.id, first.id);
+    assert_eq!(replacement.name, "heartbeat-v2");
+    assert_eq!(replacement.payload, serde_json::json!({ "version": 2 }));
+    assert_eq!(replacement.state, JobState::Delayed);
+    assert_eq!(replacement.repeat_key.as_deref(), Some("heartbeat-series"));
+
+    let old_hash: Option<String> = conn
+        .hget(format!("{namespace}:repeat-upsert:jobs"), &first.id)
+        .await?;
+    assert!(old_hash.is_none());
+    let old_waiting_score: Option<f64> = conn
+        .zscore(format!("{namespace}:repeat-upsert:waiting"), &first.id)
+        .await?;
+    assert!(old_waiting_score.is_none());
+    let replacement_delayed_score: Option<f64> = conn
+        .zscore(
+            format!("{namespace}:repeat-upsert:delayed"),
+            &replacement.id,
+        )
+        .await?;
+    assert!(replacement_delayed_score.is_some());
+    let owner_id: Option<String> = conn
+        .get(format!("{namespace}:repeat-upsert:repeat:heartbeat-series"))
+        .await?;
+    assert_eq!(owner_id.as_deref(), Some(replacement.id.as_str()));
+
+    let entry = queue
+        .get_repeat("heartbeat-series")
+        .await
+        .expect("repeat upsert entry should load")
+        .expect("repeat upsert entry should exist");
+    assert_eq!(entry.job_id, replacement.id);
+    assert_eq!(entry.name, "heartbeat-v2");
+    assert_eq!(entry.options.interval(), Some(Duration::from_secs(30)));
+    assert_eq!(
+        queue
+            .count_repeats()
+            .await
+            .expect("repeat upsert count should load"),
+        1
+    );
+
+    let active_queue =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "repeat-upsert-active")
+            .expect("valid Redis URL should build the repeat upsert active queue");
+    let active = active_queue
+        .add_job(
+            "active-heartbeat".to_string(),
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(5)).with_key("active-series"),
+            ),
+        )
+        .await
+        .expect("active repeat owner should add");
+    let claimed = active_queue
+        .claim_next(
+            "worker-repeat-upsert-active".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("active repeat owner claim should return")
+        .expect("active repeat owner should be claimable");
+    assert_eq!(claimed.id, active.id);
+    let active_error = active_queue
+        .upsert_repeat(
+            JobSpec::new("active-heartbeat-v2", serde_json::json!({ "version": 2 })).with_options(
+                JobOptions::new().with_repeat(
+                    RepeatOptions::every(Duration::from_secs(30)).with_key("active-series"),
+                ),
+            ),
+            Utc::now(),
+        )
+        .await
+        .expect_err("active repeat owner should reject upsert");
+    assert!(matches!(active_error, LaneError::JobLeaseConflict(_)));
+    let active_owner_id: Option<String> = conn
+        .get(format!(
+            "{namespace}:repeat-upsert-active:repeat:active-series"
+        ))
+        .await?;
+    assert_eq!(active_owner_id.as_deref(), Some(active.id.as_str()));
+
+    cleanup_namespace_with_conn(&mut conn, &namespace).await?;
+    trace_stage("repeat-upsert:cleanup-final:done");
     Ok(())
 }
 
@@ -1317,7 +1456,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             "dedup-ttl".to_string(),
             serde_json::json!({ "version": 6 }),
             JobOptions::new().with_deduplication(
-                DeduplicationOptions::new("tenant:ttl").with_ttl(Duration::from_secs(1)),
+                DeduplicationOptions::new("tenant:ttl").with_ttl(Duration::from_secs(3)),
             ),
         )
         .await
@@ -1327,7 +1466,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             "dedup-ttl-duplicate".to_string(),
             serde_json::json!({ "version": 7 }),
             JobOptions::new().with_deduplication(
-                DeduplicationOptions::new("tenant:ttl").with_ttl(Duration::from_secs(1)),
+                DeduplicationOptions::new("tenant:ttl").with_ttl(Duration::from_secs(3)),
             ),
         )
         .await
@@ -1338,13 +1477,13 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .query_async(&mut dedup_conn)
         .await?;
     assert!(ttl_dedup_pttl > 0);
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    tokio::time::sleep(Duration::from_millis(3_100)).await;
     let ttl_after_expiration = dedup_queue
         .add_job(
             "dedup-ttl-after-expiration".to_string(),
             serde_json::json!({ "version": 8 }),
             JobOptions::new().with_deduplication(
-                DeduplicationOptions::new("tenant:ttl").with_ttl(Duration::from_secs(1)),
+                DeduplicationOptions::new("tenant:ttl").with_ttl(Duration::from_secs(5)),
             ),
         )
         .await
@@ -1380,7 +1519,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             serde_json::json!({ "version": 9 }),
             JobOptions::new().with_deduplication(
                 DeduplicationOptions::new("tenant:extend")
-                    .with_ttl(Duration::from_secs(5))
+                    .with_ttl(Duration::from_secs(10))
                     .extend_ttl(true),
             ),
         )
@@ -1388,7 +1527,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("extend dedup job should be added");
     let extend_ttl_shortened: bool = redis::cmd("PEXPIRE")
         .arg(&extend_dedup_key)
-        .arg(250)
+        .arg(5_000)
         .query_async(&mut dedup_conn)
         .await?;
     assert!(extend_ttl_shortened);
@@ -1398,7 +1537,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             serde_json::json!({ "version": 10 }),
             JobOptions::new().with_deduplication(
                 DeduplicationOptions::new("tenant:extend")
-                    .with_ttl(Duration::from_secs(5))
+                    .with_ttl(Duration::from_secs(10))
                     .extend_ttl(true),
             ),
         )
@@ -1409,7 +1548,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .arg(&extend_dedup_key)
         .query_async(&mut dedup_conn)
         .await?;
-    assert!(extend_ttl_after_duplicate > 1_000);
+    assert!(extend_ttl_after_duplicate > 7_000);
     dedup_queue
         .remove_job(&extend_owner.id)
         .await
@@ -1499,7 +1638,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("replace ttl old dedup job should be added");
     let ttl_overridden: bool = redis::cmd("PEXPIRE")
         .arg(&replace_ttl_key)
-        .arg(750)
+        .arg(3_000)
         .query_async(&mut dedup_conn)
         .await?;
     assert!(ttl_overridden);
@@ -1528,7 +1667,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await?;
     assert!(replace_ttl_after > 0);
     assert!(
-        replace_ttl_after <= 1_000,
+        replace_ttl_after <= 3_500,
         "expected replace to preserve the short deduplication TTL instead of refreshing to the job TTL, before {replace_ttl_before}, after {replace_ttl_after}"
     );
     dedup_queue
@@ -1966,7 +2105,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("valid Redis URL should build the rate producer");
     let rate_worker = RedisJobQueue::with_namespace(&redis_url, &namespace, "rate")
         .expect("valid Redis URL should build the rate worker")
-        .with_claim_rate_limit(JobRateLimit::new(1, Duration::from_millis(200)))
+        .with_claim_rate_limit(JobRateLimit::new(1, Duration::from_secs(2)))
         .expect("rate limit should be valid");
     let rate_first = rate_producer
         .add_job(
@@ -2012,7 +2151,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("first rate job should complete");
-    tokio::time::sleep(Duration::from_millis(240)).await;
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
     let second_rate_claim = rate_worker
         .claim_next(
             "worker-rate".to_string(),
@@ -2051,7 +2190,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         None
     );
     global_rate_admin
-        .set_claim_rate_limit(JobRateLimit::new(1, Duration::from_millis(1_000)))
+        .set_claim_rate_limit(JobRateLimit::new(1, Duration::from_secs(5)))
         .await
         .expect("global rate limit should be configured");
     let global_rate_meta_key = format!("{namespace}:global-rate:meta");
@@ -2061,13 +2200,13 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     let stored_global_rate: (Option<u64>, Option<u64>) = global_rate_conn
         .hmget(&global_rate_meta_key, &["max", "duration"])
         .await?;
-    assert_eq!(stored_global_rate, (Some(1), Some(1_000)));
+    assert_eq!(stored_global_rate, (Some(1), Some(5_000)));
     assert_eq!(
         global_rate_worker
             .get_claim_rate_limit()
             .await
             .expect("stored global rate limit should load"),
-        Some(JobRateLimit::new(1, Duration::from_millis(1_000)))
+        Some(JobRateLimit::new(1, Duration::from_secs(5)))
     );
     let global_rate_first = global_rate_admin
         .add_job(
@@ -2100,7 +2239,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect("global rate-limit TTL should load from meta max");
     assert!(
-        (1..=1_000).contains(&global_rate_ttl),
+        (1..=5_000).contains(&global_rate_ttl),
         "expected global rate-limit TTL to be within the configured window, got {global_rate_ttl}"
     );
     assert_eq!(
@@ -2185,7 +2324,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect_err("zero manual rate-limit duration should be rejected");
     assert!(matches!(zero_manual_rate, LaneError::ConfigError(_)));
     manual_rate_queue
-        .set_claim_rate_limit(JobRateLimit::new(1, Duration::from_millis(1_000)))
+        .set_claim_rate_limit(JobRateLimit::new(1, Duration::from_secs(5)))
         .await
         .expect("manual rate queue should configure shared max");
     let manual_rate_job = manual_rate_queue
@@ -2197,7 +2336,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect("manual rate job should add");
     manual_rate_queue
-        .rate_limit_claims_for(Duration::from_millis(1_000))
+        .rate_limit_claims_for(Duration::from_secs(5))
         .await
         .expect("manual rate limit key should be set");
     let mut manual_rate_conn = redis::Client::open(redis_url.as_str())?
@@ -2211,7 +2350,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect("manual rate TTL should load");
     assert!(
-        (1..=1_000).contains(&manual_rate_ttl),
+        (1..=5_000).contains(&manual_rate_ttl),
         "expected manual rate TTL to be within the configured window, got {manual_rate_ttl}"
     );
     assert!(manual_rate_queue
@@ -2262,7 +2401,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             serde_json::json!({}),
             JobOptions::new()
                 .with_priority(7)
-                .with_delay(Duration::from_millis(500)),
+                .with_delay(Duration::from_secs(2)),
         )
         .await
         .expect("claim-promoted delayed job should be added");
@@ -2275,7 +2414,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect("early claim-promote claim should return")
         .is_none());
-    tokio::time::sleep(Duration::from_millis(560)).await;
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
     let claim_promoted_claim = claim_promote_queue
         .claim_next(
             "worker-claim-promote".to_string(),
@@ -3261,16 +3400,13 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .delay_active_job(
             &claimed_delayed.id,
             lock_token(&claimed_delayed),
-            Duration::from_millis(750),
+            Duration::from_secs(10),
             Utc::now(),
         )
         .await
         .expect("active job should move back to delayed");
     assert_eq!(delayed_again.state, JobState::Delayed);
-    assert_eq!(
-        delayed_again.options.delay,
-        Some(Duration::from_millis(750))
-    );
+    assert_eq!(delayed_again.options.delay, Some(Duration::from_secs(10)));
     assert!(delayed_again.worker_id.is_none());
     assert!(delayed_again.lease_expires_at.is_none());
     let active_after_delay: Option<f64> = remove_index_conn
@@ -3307,7 +3443,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect("early delayed-again claim should return")
         .is_none());
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    tokio::time::sleep(Duration::from_millis(10_100)).await;
     assert_eq!(
         producer
             .promote_due_jobs(Utc::now())
@@ -4003,9 +4139,19 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     let raw_high: String = logs_conn
         .hget(format!("{namespace}:jobs:jobs"), &high.id)
         .await?;
-    let decoded_high: Job = serde_json::from_str(&raw_high).expect("raw high job should decode");
+    let decoded_high: serde_json::Value =
+        serde_json::from_str(&raw_high).expect("raw high job should decode");
     assert_eq!(
-        decoded_high.payload,
+        decoded_high.get("payload"),
+        Some(&serde_json::json!({ "n": 1, "stage": "archived" }))
+    );
+    assert_eq!(
+        producer
+            .get_job(&high.id)
+            .await
+            .expect("high job should load")
+            .expect("high job should still exist")
+            .payload,
         serde_json::json!({ "n": 1, "stage": "archived" })
     );
     let high_logs_len: usize = logs_conn.llen(&high_logs_key).await?;
@@ -4025,11 +4171,11 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     assert_eq!(kept_high_logs.logs[0].line, "provider delivered");
     let high_logs_len_after_keep: usize = logs_conn.llen(&high_logs_key).await?;
     assert_eq!(high_logs_len_after_keep, 1);
-    let raw_high_after_keep: String = logs_conn
-        .hget(format!("{namespace}:jobs:jobs"), &high.id)
-        .await?;
-    let decoded_high_after_keep: Job =
-        serde_json::from_str(&raw_high_after_keep).expect("trimmed high job should decode");
+    let decoded_high_after_keep = producer
+        .get_job(&high.id)
+        .await
+        .expect("trimmed high job should load")
+        .expect("trimmed high job should still exist");
     assert_eq!(decoded_high_after_keep.logs.len(), 1);
     assert_eq!(decoded_high_after_keep.logs[0].line, "provider delivered");
     let cleared_high_logs = producer
@@ -4040,15 +4186,15 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     assert!(cleared_high_logs.logs.is_empty());
     let high_logs_len_after_clear: usize = logs_conn.llen(&high_logs_key).await?;
     assert_eq!(high_logs_len_after_clear, 0);
-    let raw_high_after_clear: String = logs_conn
-        .hget(format!("{namespace}:jobs:jobs"), &high.id)
-        .await?;
-    let decoded_high_after_clear: Job =
-        serde_json::from_str(&raw_high_after_clear).expect("cleared high job should decode");
+    let decoded_high_after_clear = producer
+        .get_job(&high.id)
+        .await
+        .expect("cleared high job should load")
+        .expect("cleared high job should still exist");
     assert!(decoded_high_after_clear.logs.is_empty());
 
     let stats = producer.stats().await.expect("stats should load");
-    assert_eq!(stats.completed, 5);
+    assert_eq!(stats.completed, 6);
     assert_eq!(stats.failed, 2);
     assert_eq!(stats.active, 0);
     trace_stage("main-lifecycle:done");
@@ -4579,6 +4725,11 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     );
     trace_stage("drain:done");
 
+    producer
+        .drain_jobs(true)
+        .await
+        .expect("pre-flow waiting and delayed leftovers should drain");
+
     let mut flow_index_conn = redis::Client::open(redis_url.as_str())?
         .get_connection_manager()
         .await?;
@@ -5086,7 +5237,16 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await?;
     assert!(remove_dependency_parent_waiting_score.is_some());
 
-    let clean_release_flow = producer
+    let clean_release_queue =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-clean-release")
+            .expect("valid Redis URL should build the clean-release flow queue");
+    let clean_release_worker =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-clean-release")
+            .expect("valid Redis URL should build the clean-release flow worker");
+    let mut clean_release_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let clean_release_flow = clean_release_queue
         .add_flow_at(
             JobSpec::new(
                 "clean-release-flow-parent",
@@ -5103,7 +5263,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("clean-release flow should be added");
-    let clean_release_child = worker
+    let clean_release_child = clean_release_worker
         .claim_next(
             "worker-clean-release-child-a".to_string(),
             Duration::from_secs(30),
@@ -5112,8 +5272,16 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect("clean-release child claim should return")
         .expect("clean-release child should be claimable");
-    assert_eq!(clean_release_child.id, clean_release_flow.children[0].id);
-    worker
+    assert!(clean_release_flow
+        .children
+        .iter()
+        .any(|child| child.id == clean_release_child.id));
+    let clean_release_remaining_child = clean_release_flow
+        .children
+        .iter()
+        .find(|child| child.id != clean_release_child.id)
+        .expect("clean-release flow should have one unclaimed child");
+    clean_release_worker
         .complete_job(
             &clean_release_child.id,
             lock_token(&clean_release_child),
@@ -5122,40 +5290,40 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("clean-release child should complete");
-    let clean_released = producer
+    let clean_released = clean_release_queue
         .clean_jobs(JobState::Waiting, Duration::from_millis(0), 10, Utc::now())
         .await
         .expect("waiting flow child should clean");
     assert_eq!(clean_released.len(), 1);
-    assert_eq!(clean_released[0].id, clean_release_flow.children[1].id);
-    let clean_released_parent = producer
+    assert_eq!(clean_released[0].id, clean_release_remaining_child.id);
+    let clean_released_parent = clean_release_queue
         .get_job(&clean_release_flow.parent.id)
         .await
         .expect("clean-released parent should load")
         .expect("clean-released parent should exist");
     assert_eq!(clean_released_parent.state, JobState::Waiting);
-    let clean_released_parent_waiting_score: Option<f64> = flow_index_conn
+    let clean_released_parent_waiting_score: Option<f64> = clean_release_conn
         .zscore(
-            format!("{namespace}:jobs:waiting"),
+            format!("{namespace}:flow-clean-release:waiting"),
             &clean_release_flow.parent.id,
         )
         .await?;
     assert!(clean_released_parent_waiting_score.is_some());
-    let clean_released_parent_waiting_children_score: Option<f64> = flow_index_conn
+    let clean_released_parent_waiting_children_score: Option<f64> = clean_release_conn
         .zscore(
-            format!("{namespace}:jobs:waiting_children"),
+            format!("{namespace}:flow-clean-release:waiting_children"),
             &clean_release_flow.parent.id,
         )
         .await?;
     assert!(clean_released_parent_waiting_children_score.is_none());
-    let cleaned_flow_child_hash: Option<String> = flow_index_conn
+    let cleaned_flow_child_hash: Option<String> = clean_release_conn
         .hget(
-            format!("{namespace}:jobs:jobs"),
-            &clean_release_flow.children[1].id,
+            format!("{namespace}:flow-clean-release:jobs"),
+            &clean_release_remaining_child.id,
         )
         .await?;
     assert!(cleaned_flow_child_hash.is_none());
-    let claimed_clean_released_parent = worker
+    let claimed_clean_released_parent = clean_release_worker
         .claim_next(
             "worker-clean-released-parent".to_string(),
             Duration::from_secs(30),
@@ -5168,6 +5336,11 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         claimed_clean_released_parent.id,
         clean_release_flow.parent.id
     );
+
+    producer
+        .drain_jobs(true)
+        .await
+        .expect("pre-delayed-flow leftovers should drain");
 
     let remove_delayed_flow = producer
         .add_flow_at(

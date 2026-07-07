@@ -1863,6 +1863,100 @@ async fn repeat_scheduler_management_paginates_by_next_scheduled_time() {
 }
 
 #[tokio::test]
+async fn upsert_repeat_replaces_current_non_active_owner() {
+    let queue = InMemoryJobQueue::new("repeat-upsert");
+    let now = ts(1_000);
+    let first = queue
+        .add_at(
+            "heartbeat",
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(5)).with_key("heartbeat-series"),
+            ),
+            now,
+        )
+        .await
+        .unwrap();
+
+    let replacement = queue
+        .upsert_repeat(
+            JobSpec::new("heartbeat-v2", serde_json::json!({ "version": 2 })).with_options(
+                JobOptions::new()
+                    .with_delay(Duration::from_secs(10))
+                    .with_repeat(
+                        RepeatOptions::every(Duration::from_secs(30)).with_key("heartbeat-series"),
+                    ),
+            ),
+            ts(1_100),
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(replacement.id, first.id);
+    assert_eq!(replacement.name, "heartbeat-v2");
+    assert_eq!(replacement.payload, serde_json::json!({ "version": 2 }));
+    assert_eq!(replacement.repeat_key.as_deref(), Some("heartbeat-series"));
+    assert_eq!(replacement.repeat_count, 0);
+    assert_eq!(replacement.state, JobState::Delayed);
+    assert!(queue.get_job(&first.id).await.unwrap().is_none());
+    assert_eq!(queue.count_repeats().await.unwrap(), 1);
+    let entry = queue.get_repeat("heartbeat-series").await.unwrap().unwrap();
+    assert_eq!(entry.job_id, replacement.id);
+    assert_eq!(entry.name, "heartbeat-v2");
+    assert_eq!(entry.options.interval(), Some(Duration::from_secs(30)));
+}
+
+#[tokio::test]
+async fn upsert_repeat_rejects_active_leased_owner() {
+    let queue = InMemoryJobQueue::new("repeat-upsert-active");
+    let now = ts(1_000);
+    let job = queue
+        .add_at(
+            "heartbeat",
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(5)).with_key("heartbeat-series"),
+            ),
+            now,
+        )
+        .await
+        .unwrap();
+
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, job.id);
+
+    let error = queue
+        .upsert_repeat(
+            JobSpec::new("heartbeat-v2", serde_json::json!({ "version": 2 })).with_options(
+                JobOptions::new().with_repeat(
+                    RepeatOptions::every(Duration::from_secs(30)).with_key("heartbeat-series"),
+                ),
+            ),
+            ts(1_100),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, LaneError::JobLeaseConflict(_)));
+    assert_eq!(
+        queue
+            .get_repeat("heartbeat-series")
+            .await
+            .unwrap()
+            .unwrap()
+            .job_id,
+        job.id
+    );
+    assert_eq!(
+        queue.get_job(&job.id).await.unwrap().unwrap().state,
+        JobState::Active
+    );
+}
+
+#[tokio::test]
 async fn remove_repeat_removes_current_series_owner_by_key() {
     let queue = InMemoryJobQueue::new("repeat-remove-key");
     let now = ts(1_000);

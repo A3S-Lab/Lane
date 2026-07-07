@@ -647,6 +647,79 @@ impl InMemoryJobQueue {
         Ok(page_repeat_entries(self.list_repeats().await?, options))
     }
 
+    /// Create or replace the current non-active occurrence for a repeat series.
+    pub async fn upsert_repeat(&self, spec: JobSpec, now: DateTime<Utc>) -> Result<Job> {
+        validate_job_options(&spec.options)?;
+        if spec.options.repeat.is_none() {
+            return Err(LaneError::ConfigError(
+                "repeat options are required to upsert a repeat series".to_string(),
+            ));
+        }
+
+        let mut job = Job::new(
+            self.queue.clone(),
+            spec.name,
+            spec.payload,
+            spec.options,
+            now,
+        );
+        let repeat_key = job
+            .repeat_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| LaneError::ConfigError("repeat key must not be empty".to_string()))?
+            .to_string();
+
+        let mut inner = self.inner.lock().await;
+        let current_owner = find_active_repeat_key(&inner.jobs, &repeat_key).cloned();
+        if let Some(owner) = &current_owner {
+            require_removable(owner)?;
+            if owner.parent_id.is_some() || !owner.child_ids.is_empty() {
+                return Err(LaneError::JobStateConflict(format!(
+                    "cannot upsert repeat key `{repeat_key}`; current owner {} has flow dependencies",
+                    owner.id
+                )));
+            }
+        }
+
+        if let Some(existing) = inner.jobs.get(&job.id) {
+            if current_owner.as_ref().map(|owner| owner.id.as_str()) != Some(existing.id.as_str()) {
+                return Err(LaneError::ConfigError(format!(
+                    "job id `{}` already exists",
+                    job.id
+                )));
+            }
+        }
+
+        if let Some(deduplication_id) = job_deduplication_id(&job) {
+            if let Some(existing) = find_active_deduplication_id(
+                &inner.jobs,
+                &inner.released_deduplication_owners,
+                deduplication_id,
+                now,
+            ) {
+                if current_owner.as_ref().map(|owner| owner.id.as_str())
+                    != Some(existing.id.as_str())
+                {
+                    return Err(LaneError::JobStateConflict(format!(
+                        "cannot upsert repeat key `{repeat_key}`; deduplication id `{deduplication_id}` is active on job {}",
+                        existing.id
+                    )));
+                }
+            }
+        }
+
+        if let Some(owner) = current_owner {
+            Self::remove_job_record_locked(&mut inner, &owner.id);
+        }
+
+        Self::forget_released_deduplication_owner_locked(&mut inner, &job);
+        assign_waiting_order(&mut inner.sequence, &mut job);
+        inner.jobs.insert(job.id.clone(), job.clone());
+        Self::emit_job_created_events_locked(&mut inner, &job, now);
+        Ok(job)
+    }
+
     /// Remove the current non-terminal occurrence for a repeat series.
     pub async fn remove_repeat(&self, repeat_key: &str) -> Result<Option<Job>> {
         let mut inner = self.inner.lock().await;
@@ -1708,6 +1781,10 @@ impl JobQueueBackend for InMemoryJobQueue {
 
     async fn list_repeats(&self) -> Result<Vec<JobRepeatEntry>> {
         InMemoryJobQueue::list_repeats(self).await
+    }
+
+    async fn upsert_repeat(&self, spec: JobSpec, now: DateTime<Utc>) -> Result<Job> {
+        InMemoryJobQueue::upsert_repeat(self, spec, now).await
     }
 
     async fn clean_jobs(

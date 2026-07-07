@@ -211,6 +211,13 @@ impl LocalJobQueue {
         self.inner.list_repeats_page(options).await
     }
 
+    /// Create or replace the current non-active occurrence for a repeat series.
+    pub async fn upsert_repeat(&self, spec: JobSpec, now: DateTime<Utc>) -> Result<Job> {
+        let job = self.inner.upsert_repeat(spec, now).await?;
+        self.persist().await?;
+        Ok(job)
+    }
+
     /// Clear retained log entries for a job. `keep == 0` clears all logs.
     pub async fn clear_logs(&self, job_id: &str, keep: usize) -> Result<JobLogPage> {
         let logs = self.inner.clear_logs(job_id, keep).await?;
@@ -438,6 +445,10 @@ impl JobQueueBackend for LocalJobQueue {
 
     async fn list_repeats(&self) -> Result<Vec<JobRepeatEntry>> {
         LocalJobQueue::list_repeats(self).await
+    }
+
+    async fn upsert_repeat(&self, spec: JobSpec, now: DateTime<Utc>) -> Result<Job> {
+        LocalJobQueue::upsert_repeat(self, spec, now).await
     }
 
     async fn clean_jobs(
