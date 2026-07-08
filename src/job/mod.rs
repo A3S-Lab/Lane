@@ -22,7 +22,8 @@ pub use redis::RedisJobQueue;
 pub use types::{
     DeduplicationOptions, Job, JobEvent, JobFinishedResult, JobFlow, JobFlowChildValues,
     JobFlowDependencies, JobFlowDependencyCounts, JobFlowDependencyKind, JobFlowDependencyPage,
-    JobFlowDependencyPageItem, JobFlowDependencyPageOptions, JobFlowIgnoredFailures, JobId,
+    JobFlowDependencyPageCursor, JobFlowDependencyPageItem, JobFlowDependencyPageOptions,
+    JobFlowDependencyPages, JobFlowDependencyPagesOptions, JobFlowIgnoredFailures, JobId,
     JobLeaseRenewal, JobListOptions, JobListPage, JobLockToken, JobLogEntry, JobLogPage,
     JobMetrics, JobMetricsMeta, JobOptions, JobPriority, JobPriorityCount, JobQueueSnapshot,
     JobQueueStats, JobRateLimit, JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobRetention,

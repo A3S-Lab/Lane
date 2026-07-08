@@ -3,10 +3,11 @@ use super::types::{
     deduplication_expiration, page_repeat_entries, validate_job_priority, Job, JobEvent,
     JobFinishedResult, JobFlow, JobFlowChildValues, JobFlowDependencies, JobFlowDependencyCounts,
     JobFlowDependencyKind, JobFlowDependencyPage, JobFlowDependencyPageItem,
-    JobFlowDependencyPageOptions, JobFlowIgnoredFailures, JobId, JobListOptions, JobListPage,
-    JobLogEntry, JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueSnapshot,
-    JobQueueStats, JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobRetention, JobSpec,
-    JobState, JobStateCount, JobWorkerId, QueueName, DEFAULT_JOB_EVENT_RETENTION,
+    JobFlowDependencyPageOptions, JobFlowDependencyPages, JobFlowDependencyPagesOptions,
+    JobFlowIgnoredFailures, JobId, JobListOptions, JobListPage, JobLogEntry, JobLogPage,
+    JobOptions, JobPriority, JobPriorityCount, JobQueueSnapshot, JobQueueStats, JobRepeatEntry,
+    JobRepeatListOptions, JobRepeatPage, JobRetention, JobSpec, JobState, JobStateCount,
+    JobWorkerId, QueueName, DEFAULT_JOB_EVENT_RETENTION,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -1018,6 +1019,20 @@ impl InMemoryJobQueue {
         };
 
         Ok(Some(flow_dependency_page(parent, &inner.jobs, options)))
+    }
+
+    /// Return cursor pages from several parent flow dependency buckets.
+    pub async fn get_flow_dependency_pages(
+        &self,
+        parent_id: &str,
+        options: JobFlowDependencyPagesOptions,
+    ) -> Result<Option<JobFlowDependencyPages>> {
+        let inner = self.inner.lock().await;
+        let Some(parent) = inner.jobs.get(parent_id) else {
+            return Ok(None);
+        };
+
+        Ok(Some(flow_dependency_pages(parent, &inner.jobs, options)))
     }
 
     /// Return completed child result values for a flow parent.
@@ -2389,6 +2404,14 @@ impl JobQueueBackend for InMemoryJobQueue {
         InMemoryJobQueue::get_flow_dependency_page(self, parent_id, options).await
     }
 
+    async fn get_flow_dependency_pages(
+        &self,
+        parent_id: &str,
+        options: JobFlowDependencyPagesOptions,
+    ) -> Result<Option<JobFlowDependencyPages>> {
+        InMemoryJobQueue::get_flow_dependency_pages(self, parent_id, options).await
+    }
+
     async fn get_flow_children_values(
         &self,
         parent_id: &str,
@@ -3386,6 +3409,18 @@ fn flow_dependency_page(
         next_cursor,
         count,
     }
+}
+
+fn flow_dependency_pages(
+    parent: &Job,
+    jobs: &HashMap<JobId, Job>,
+    options: JobFlowDependencyPagesOptions,
+) -> JobFlowDependencyPages {
+    let mut pages = JobFlowDependencyPages::default();
+    for page_options in options.selected() {
+        pages.insert(flow_dependency_page(parent, jobs, page_options));
+    }
+    pages
 }
 
 fn flow_children_values(parent: &Job, jobs: &HashMap<JobId, Job>) -> JobFlowChildValues {

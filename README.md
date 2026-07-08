@@ -370,10 +370,10 @@ A3S stack and language SDKs.
 | --- | --- | --- |
 | Lane scheduler | Done | Lane priorities, per-lane concurrency, command retries, timeout, DLQ, events, metrics, monitoring. |
 | Generic job runtime | In progress | JSON jobs, Lua-backed Redis bulk submission, idempotent custom job IDs, simple deduplication with optional TTL, debounce TTL extension, delayed-owner replace, and keep-last-if-active requeue, repeat-key ownership and upsert, explicit job states, priority plus FIFO/LIFO same-priority ordering, finished-job retention by age/count/limit, retained queue event streams, delayed jobs, token-owned worker leases, active-to-wait/delayed movement, completion/failure snapshots, retry backoff, Redis-shared rate-limit and active-concurrency controls, BullMQ-style two-phase stalled recovery with repeat scheduler requeue handling, pause/resume. |
-| Job management API | In progress | Add/get/get-state/get-job-finished-result/get-job-counts/get-job-count/count-pending/remove/remove-repeat/upsert-repeat/remove-deduplication-key/get-deduplication-job-id/list-repeats/get-repeat/count-repeats/list-repeats-page/add-flow-children/get-flow-dependencies/get-flow-dependency-counts/get-flow-dependency-page/get-flow-children-values/get-flow-ignored-children-failures/remove-unprocessed-children/remove-child-dependency/promote/reschedule/delay-active/release-active/retry/update-priority/update-priority-with-lifo/update-data/save-stacktrace/pause/resume/is-paused/drain/clean/obliterate/remove-orphaned Redis maintenance APIs, multi-state pagination, ascending/descending listing, waiting priority counts, add-log/get-logs/clear-job-logs, read-events/trim-events, progress updates, single and bulk lease renewal, Redis terminal metrics. |
+| Job management API | In progress | Add/get/get-state/get-job-finished-result/get-job-counts/get-job-count/count-pending/remove/remove-repeat/upsert-repeat/remove-deduplication-key/get-deduplication-job-id/list-repeats/get-repeat/count-repeats/list-repeats-page/add-flow-children/get-flow-dependencies/get-flow-dependency-counts/get-flow-dependency-page/get-flow-dependency-pages/get-flow-children-values/get-flow-ignored-children-failures/remove-unprocessed-children/remove-child-dependency/promote/reschedule/delay-active/release-active/retry/update-priority/update-priority-with-lifo/update-data/save-stacktrace/pause/resume/is-paused/drain/clean/obliterate/remove-orphaned Redis maintenance APIs, multi-state pagination, ascending/descending listing, waiting priority counts, add-log/get-logs/clear-job-logs, read-events/trim-events, progress updates, single and bulk lease renewal, Redis terminal metrics. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, uses backend-native blocking claim hooks when available, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, shared batch lease renewal for background loops, and stalled recovery loops. |
-| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, FIFO/LIFO waiting score ordering, BullMQ-style Redis worker marker zset updates, Redis marker-backed blocking claim, Redis stream queue events, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership, Redis-backed repeat scheduler zset/hash metadata, listing/removal/upsert/pagination, static flow submission, dynamic flow child fan-out, flow dependency inspection and paginated dependency reads, flow child-value and ignored-failure reads, dynamic flow child deduplication skip and keep-last materialization, flow parent and active flow-child keep-last materialization, delayed promotion and rescheduling, active-to-wait/delayed movement, single-job promote, state-index and finished-result queries, job count snapshots, terminal metrics, manual retry, priority update, progress update, stacktrace update, log append, list/stat snapshots, finished-job age/count retention during complete/fail/stalled scripts, drain, clean, orphaned-job cleanup, obliterate, claim, Redis-shared rate limit, max-active, flow parent release/failure events, repeat successor enqueue, complete, fail, renew, remove, and stalled candidate-set recovery semantics. Postgres/NATS backends remain planned. |
-| Flow jobs | In progress | Parent-child dependencies, waiting-children state, dependency inspection, paginated dependency bucket inspection, child return-value inspection, ignored, removed, continued, and fail-parent child-failure release, static and dynamic fan-out, fan-in release, flow parent deduplication events, static and dynamic ordinary flow child deduplication skip semantics, active flow-child keep-last deduplication materialization, BullMQ-style existing parent and child custom job-id attachment with `duplicated` events, in-memory/local flow-parent keep-last deduplication, and Redis flow-parent keep-last materialization on active parent completion, terminal failure, or stalled terminal failure are available. |
+| Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, FIFO/LIFO waiting score ordering, BullMQ-style Redis worker marker zset updates, Redis marker-backed blocking claim, Redis stream queue events, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership, Redis-backed repeat scheduler zset/hash metadata, listing/removal/upsert/pagination, static flow submission, dynamic flow child fan-out, flow dependency inspection and single/multi-bucket paginated dependency reads, flow child-value and ignored-failure reads, dynamic flow child deduplication skip and keep-last materialization, flow parent and active flow-child keep-last materialization, delayed promotion and rescheduling, active-to-wait/delayed movement, single-job promote, state-index and finished-result queries, job count snapshots, terminal metrics, manual retry, priority update, progress update, stacktrace update, log append, list/stat snapshots, finished-job age/count retention during complete/fail/stalled scripts, drain, clean, orphaned-job cleanup, obliterate, claim, Redis-shared rate limit, max-active, flow parent release/failure events, repeat successor enqueue, complete, fail, renew, remove, and stalled candidate-set recovery semantics. Postgres/NATS backends remain planned. |
+| Flow jobs | In progress | Parent-child dependencies, waiting-children state, dependency inspection, single/multi-bucket paginated dependency inspection, child return-value inspection, ignored, removed, continued, and fail-parent child-failure release, static and dynamic fan-out, fan-in release, flow parent deduplication events, static and dynamic ordinary flow child deduplication skip semantics, active flow-child keep-last deduplication materialization, BullMQ-style existing parent and child custom job-id attachment with `duplicated` events, in-memory/local flow-parent keep-last deduplication, and Redis flow-parent keep-last materialization on active parent completion, terminal failure, or stalled terminal failure are available. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, end timestamps, repeat-key removal, upsert, single-key lookup, counts, and BullMQ-style next-time pagination are available across in-memory, local durable, and Redis backends. Redis additionally maintains scheduler zset/hash metadata in Lua so distributed readers and writers share one repeat-series state machine. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
 
@@ -485,7 +485,9 @@ BullMQ-style default descending pagination,
 and missing child ids, `get_flow_dependency_counts()` returns processed,
 unprocessed, failed, ignored, and missing child counts,
 `get_flow_dependency_page()` returns one BullMQ-style cursor page from a
-processed, unprocessed, ignored, or failed flow dependency bucket,
+processed, unprocessed, ignored, or failed flow dependency bucket, and
+`get_flow_dependency_pages()` returns several requested dependency bucket pages
+in one backend call,
 flow parents cannot be completed while blocking child dependencies remain,
 `add_flow_children()` lets an active, token-owned parent add new or existing
 custom-id child jobs and move itself to `waiting_children`, mirroring BullMQ's
@@ -620,8 +622,8 @@ failures are intentionally omitted.
 
 ```rust
 use a3s_lane::{
-    InMemoryJobQueue, JobFlowDependencyKind, JobFlowDependencyPageOptions, JobOptions, JobSpec,
-    JobState,
+    InMemoryJobQueue, JobFlowDependencyKind, JobFlowDependencyPageCursor,
+    JobFlowDependencyPageOptions, JobFlowDependencyPagesOptions, JobOptions, JobSpec, JobState,
 };
 
 # async fn flow_example() -> a3s_lane::Result<()> {
@@ -659,6 +661,23 @@ let pending_page = queue
     .unwrap();
 assert_eq!(pending_page.items.len(), 2);
 assert_eq!(pending_page.next_cursor, 0);
+
+let dependency_pages = queue
+    .get_flow_dependency_pages(
+        &flow.parent.id,
+        JobFlowDependencyPagesOptions::new()
+            .with_unprocessed(JobFlowDependencyPageCursor::new().with_count(20)),
+    )
+    .await?
+    .unwrap();
+assert_eq!(
+    dependency_pages
+        .get(JobFlowDependencyKind::Unprocessed)
+        .unwrap()
+        .items
+        .len(),
+    2
+);
 
 let removed = queue
     .remove_unprocessed_children(&flow.parent.id, chrono::Utc::now())
@@ -1318,12 +1337,15 @@ reads those side indexes in one turn and returns processed, unprocessed, failed,
 ignored, and missing totals without returning every child snapshot to the client.
 Removed failed dependencies are intentionally omitted from the failed and ignored
 totals, matching BullMQ's `removeDependencyOnFailure` behavior.
-`get_flow_dependency_page(parent_id, options)` mirrors BullMQ's paginated
-`Job.getDependencies(opts)` path for large fan-out inspection: Redis reads
+`get_flow_dependency_page(parent_id, options)` and
+`get_flow_dependency_pages(parent_id, options)` mirror BullMQ's paginated
+`Job.getDependencies(opts)` path for large fan-out inspection. Redis reads
 `processed` with `HSCAN dependencies:<parent_id>:processed`, `unprocessed` with
 `SSCAN dependencies:<parent_id>`, `ignored` with
 `HSCAN dependencies:<parent_id>:failed`, and `failed` with
-`ZRANGE dependencies:<parent_id>:unsuccessful`. The `count` option is a Redis
+`ZRANGE dependencies:<parent_id>:unsuccessful`. The multi-bucket getter keeps
+the BullMQ result order and reads all requested buckets in one Lua turn instead
+of stitching together multiple client round trips. The `count` option is a Redis
 scan hint for hash and set buckets, just like BullMQ; callers should keep reading
 with the returned cursor until it becomes `0`.
 When a static flow or an active parent fan-out reuses an existing completed child

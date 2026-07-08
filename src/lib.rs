@@ -91,7 +91,8 @@ pub use job::RedisJobQueue;
 pub use job::{
     job_processor_fn, DeduplicationOptions, InMemoryJobQueue, Job, JobContext, JobEvent,
     JobFinishedResult, JobFlow, JobFlowDependencyCounts, JobFlowDependencyKind,
-    JobFlowDependencyPage, JobFlowDependencyPageItem, JobFlowDependencyPageOptions, JobId,
+    JobFlowDependencyPage, JobFlowDependencyPageCursor, JobFlowDependencyPageItem,
+    JobFlowDependencyPageOptions, JobFlowDependencyPages, JobFlowDependencyPagesOptions, JobId,
     JobLeaseRenewal, JobListOptions, JobListPage, JobLockToken, JobLogEntry, JobMetrics,
     JobMetricsMeta, JobOptions, JobPriority, JobPriorityCount, JobProcessor, JobProcessorFn,
     JobProcessorRouter, JobQueueBackend, JobQueueSnapshot, JobQueueStats, JobRateLimit,

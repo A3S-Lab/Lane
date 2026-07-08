@@ -2,11 +2,11 @@
 
 use a3s_lane::{
     job_processor_fn, DeduplicationOptions, Job, JobContext, JobFinishedResult,
-    JobFlowDependencyKind, JobFlowDependencyPageItem, JobFlowDependencyPageOptions,
-    JobLeaseRenewal, JobListOptions, JobLogEntry, JobOptions, JobPriorityCount, JobProcessor,
-    JobQueueBackend, JobRateLimit, JobRepeatListOptions, JobRetention, JobRunOutcome, JobSpec,
-    JobState, JobStateCount, JobWorker, JobWorkerConfig, LaneError, RedisJobQueue, RepeatOptions,
-    RetryPolicy, MAX_JOB_PRIORITY,
+    JobFlowDependencyKind, JobFlowDependencyPageCursor, JobFlowDependencyPageItem,
+    JobFlowDependencyPageOptions, JobFlowDependencyPagesOptions, JobLeaseRenewal, JobListOptions,
+    JobLogEntry, JobOptions, JobPriorityCount, JobProcessor, JobQueueBackend, JobRateLimit,
+    JobRepeatListOptions, JobRetention, JobRunOutcome, JobSpec, JobState, JobStateCount, JobWorker,
+    JobWorkerConfig, LaneError, RedisJobQueue, RepeatOptions, RetryPolicy, MAX_JOB_PRIORITY,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use redis::AsyncCommands;
@@ -2746,6 +2746,67 @@ async fn run_paginated_flow_dependencies(redis_url: String) -> redis::RedisResul
         failed_second.items,
         vec![JobFlowDependencyPageItem::Failed {
             child_id: flow.children[4].id.clone(),
+        }]
+    );
+
+    let pages = queue
+        .get_flow_dependency_pages(
+            &flow.parent.id,
+            JobFlowDependencyPagesOptions::new()
+                .with_processed(JobFlowDependencyPageCursor::new().with_count(20))
+                .with_unprocessed(JobFlowDependencyPageCursor::new().with_count(20))
+                .with_ignored(JobFlowDependencyPageCursor::new().with_count(20))
+                .with_failed(JobFlowDependencyPageCursor::new().with_count(1)),
+        )
+        .await
+        .expect("multi dependency pages should load")
+        .expect("multi dependency pages should exist");
+    let multi_processed = pages
+        .get(JobFlowDependencyKind::Processed)
+        .expect("processed page should be present")
+        .items
+        .iter()
+        .map(|item| match item {
+            JobFlowDependencyPageItem::Processed { child_id, value } => {
+                (child_id.clone(), value["done"].as_i64().unwrap())
+            }
+            other => panic!("unexpected multi processed dependency item: {other:?}"),
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        multi_processed,
+        BTreeSet::from([
+            (flow.children[0].id.clone(), 0),
+            (flow.children[1].id.clone(), 1),
+        ])
+    );
+    assert_eq!(
+        pages
+            .get(JobFlowDependencyKind::Unprocessed)
+            .expect("unprocessed page should be present")
+            .items,
+        vec![JobFlowDependencyPageItem::Unprocessed {
+            child_id: flow.children[5].id.clone(),
+        }]
+    );
+    assert_eq!(
+        pages
+            .get(JobFlowDependencyKind::Ignored)
+            .expect("ignored page should be present")
+            .items,
+        vec![JobFlowDependencyPageItem::Ignored {
+            child_id: flow.children[2].id.clone(),
+            failed_reason: "optional child failed".to_string(),
+        }]
+    );
+    let multi_failed = pages
+        .get(JobFlowDependencyKind::Failed)
+        .expect("failed page should be present");
+    assert_eq!(multi_failed.next_cursor, 1);
+    assert_eq!(
+        multi_failed.items,
+        vec![JobFlowDependencyPageItem::Failed {
+            child_id: flow.children[3].id.clone(),
         }]
     );
 

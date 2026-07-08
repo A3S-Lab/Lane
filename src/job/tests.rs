@@ -3859,6 +3859,46 @@ async fn flow_dependency_pages_classify_and_page_children() {
         }]
     );
 
+    let pages = queue
+        .get_flow_dependency_pages(
+            &flow.parent.id,
+            JobFlowDependencyPagesOptions::new()
+                .with_processed(JobFlowDependencyPageCursor::new().with_count(2))
+                .with_unprocessed(JobFlowDependencyPageCursor::new())
+                .with_ignored(JobFlowDependencyPageCursor::new())
+                .with_failed(JobFlowDependencyPageCursor::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pages
+            .get(JobFlowDependencyKind::Processed)
+            .unwrap()
+            .items
+            .len(),
+        2
+    );
+    assert_eq!(
+        pages.get(JobFlowDependencyKind::Unprocessed).unwrap().items,
+        vec![JobFlowDependencyPageItem::Unprocessed {
+            child_id: flow.children[4].id.clone(),
+        }]
+    );
+    assert_eq!(
+        pages.get(JobFlowDependencyKind::Ignored).unwrap().items,
+        vec![JobFlowDependencyPageItem::Ignored {
+            child_id: flow.children[2].id.clone(),
+            failed_reason: "optional child failed".to_string(),
+        }]
+    );
+    assert_eq!(
+        pages.get(JobFlowDependencyKind::Failed).unwrap().items,
+        vec![JobFlowDependencyPageItem::Failed {
+            child_id: flow.children[3].id.clone(),
+        }]
+    );
+
     assert!(queue
         .get_flow_dependency_page(
             "missing-parent",

@@ -458,6 +458,136 @@ impl JobFlowDependencyPageOptions {
     }
 }
 
+/// Cursor options shared by multi-bucket flow dependency page reads.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobFlowDependencyPageCursor {
+    /// Redis cursor for hash/set buckets, or zset offset for failed dependencies.
+    pub cursor: u64,
+    /// Scan count hint or zset page size. BullMQ defaults this to 20.
+    pub count: usize,
+}
+
+impl Default for JobFlowDependencyPageCursor {
+    fn default() -> Self {
+        Self {
+            cursor: 0,
+            count: 20,
+        }
+    }
+}
+
+impl JobFlowDependencyPageCursor {
+    /// Create default cursor options for one bucket.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the cursor returned by the previous page.
+    pub fn with_cursor(mut self, cursor: u64) -> Self {
+        self.cursor = cursor;
+        self
+    }
+
+    /// Set the scan count hint or zset page size.
+    pub fn with_count(mut self, count: usize) -> Self {
+        self.count = count;
+        self
+    }
+}
+
+impl From<JobFlowDependencyPageOptions> for JobFlowDependencyPageCursor {
+    fn from(options: JobFlowDependencyPageOptions) -> Self {
+        Self {
+            cursor: options.cursor,
+            count: options.count,
+        }
+    }
+}
+
+/// Options for reading several flow dependency buckets in one backend call.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobFlowDependencyPagesOptions {
+    pub processed: Option<JobFlowDependencyPageCursor>,
+    pub unprocessed: Option<JobFlowDependencyPageCursor>,
+    pub ignored: Option<JobFlowDependencyPageCursor>,
+    pub failed: Option<JobFlowDependencyPageCursor>,
+}
+
+impl JobFlowDependencyPagesOptions {
+    /// Create empty multi-bucket dependency page options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Read all dependency buckets with default cursors and counts.
+    pub fn all() -> Self {
+        let cursor = JobFlowDependencyPageCursor::default();
+        Self {
+            processed: Some(cursor),
+            unprocessed: Some(cursor),
+            ignored: Some(cursor),
+            failed: Some(cursor),
+        }
+    }
+
+    /// Include the processed bucket.
+    pub fn with_processed(mut self, cursor: JobFlowDependencyPageCursor) -> Self {
+        self.processed = Some(cursor);
+        self
+    }
+
+    /// Include the unprocessed bucket.
+    pub fn with_unprocessed(mut self, cursor: JobFlowDependencyPageCursor) -> Self {
+        self.unprocessed = Some(cursor);
+        self
+    }
+
+    /// Include the ignored-failure bucket.
+    pub fn with_ignored(mut self, cursor: JobFlowDependencyPageCursor) -> Self {
+        self.ignored = Some(cursor);
+        self
+    }
+
+    /// Include the fail-parent bucket.
+    pub fn with_failed(mut self, cursor: JobFlowDependencyPageCursor) -> Self {
+        self.failed = Some(cursor);
+        self
+    }
+
+    /// Include one bucket by kind.
+    pub fn with_kind(
+        mut self,
+        kind: JobFlowDependencyKind,
+        cursor: JobFlowDependencyPageCursor,
+    ) -> Self {
+        match kind {
+            JobFlowDependencyKind::Processed => self.processed = Some(cursor),
+            JobFlowDependencyKind::Unprocessed => self.unprocessed = Some(cursor),
+            JobFlowDependencyKind::Ignored => self.ignored = Some(cursor),
+            JobFlowDependencyKind::Failed => self.failed = Some(cursor),
+        }
+        self
+    }
+
+    pub(crate) fn selected(&self) -> Vec<JobFlowDependencyPageOptions> {
+        [
+            (JobFlowDependencyKind::Processed, self.processed),
+            (JobFlowDependencyKind::Unprocessed, self.unprocessed),
+            (JobFlowDependencyKind::Ignored, self.ignored),
+            (JobFlowDependencyKind::Failed, self.failed),
+        ]
+        .into_iter()
+        .filter_map(|(kind, cursor)| {
+            cursor.map(|cursor| JobFlowDependencyPageOptions {
+                kind,
+                cursor: cursor.cursor,
+                count: cursor.count,
+            })
+        })
+        .collect()
+    }
+}
+
 /// One entry from a paginated flow dependency bucket.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -484,6 +614,36 @@ pub struct JobFlowDependencyPage {
     pub next_cursor: u64,
     /// Requested scan count hint or zset page size.
     pub count: usize,
+}
+
+/// Cursor pages for several requested flow dependency buckets.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct JobFlowDependencyPages {
+    pub processed: Option<JobFlowDependencyPage>,
+    pub unprocessed: Option<JobFlowDependencyPage>,
+    pub ignored: Option<JobFlowDependencyPage>,
+    pub failed: Option<JobFlowDependencyPage>,
+}
+
+impl JobFlowDependencyPages {
+    /// Return the page for one dependency bucket, when it was requested.
+    pub fn get(&self, kind: JobFlowDependencyKind) -> Option<&JobFlowDependencyPage> {
+        match kind {
+            JobFlowDependencyKind::Processed => self.processed.as_ref(),
+            JobFlowDependencyKind::Unprocessed => self.unprocessed.as_ref(),
+            JobFlowDependencyKind::Ignored => self.ignored.as_ref(),
+            JobFlowDependencyKind::Failed => self.failed.as_ref(),
+        }
+    }
+
+    pub(crate) fn insert(&mut self, page: JobFlowDependencyPage) {
+        match page.kind {
+            JobFlowDependencyKind::Processed => self.processed = Some(page),
+            JobFlowDependencyKind::Unprocessed => self.unprocessed = Some(page),
+            JobFlowDependencyKind::Ignored => self.ignored = Some(page),
+            JobFlowDependencyKind::Failed => self.failed = Some(page),
+        }
+    }
 }
 
 /// Finished status for a retained job.
