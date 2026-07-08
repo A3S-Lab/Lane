@@ -13,12 +13,13 @@ use chrono::{DateTime, TimeZone, Utc};
 use redis::AsyncCommands;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, MutexGuard};
 
 static NAMESPACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static REDIS_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+static REDIS_TEST_URL: OnceLock<Option<String>> = OnceLock::new();
 
 async fn redis_test_guard() -> MutexGuard<'static, ()> {
     REDIS_TEST_LOCK.lock().await
@@ -16824,9 +16825,43 @@ async fn sleep_until_due(scheduled_at: DateTime<Utc>) {
 }
 
 fn redis_url() -> Option<String> {
-    std::env::var("A3S_LANE_REDIS_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    REDIS_TEST_URL
+        .get_or_init(|| {
+            let value = std::env::var("A3S_LANE_REDIS_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())?;
+
+            match redis_preflight(&value) {
+                Ok(()) => Some(value),
+                Err(error) => {
+                    eprintln!(
+                        "skipping Redis integration test; A3S_LANE_REDIS_URL is not usable: {error}"
+                    );
+                    None
+                }
+            }
+        })
+        .clone()
+}
+
+fn redis_preflight(redis_url: &str) -> std::result::Result<(), String> {
+    let client = redis::Client::open(redis_url)
+        .map_err(|error| format!("failed to parse Redis URL: {error}"))?;
+    let mut conn = client
+        .get_connection_with_timeout(Duration::from_secs(1))
+        .map_err(|error| format!("failed to connect within 1s: {error}"))?;
+    conn.set_read_timeout(Some(Duration::from_secs(1)))
+        .map_err(|error| format!("failed to set Redis read timeout: {error}"))?;
+    conn.set_write_timeout(Some(Duration::from_secs(1)))
+        .map_err(|error| format!("failed to set Redis write timeout: {error}"))?;
+    let pong = redis::cmd("PING")
+        .query::<String>(&mut conn)
+        .map_err(|error| format!("PING failed: {error}"))?;
+    if pong == "PONG" {
+        Ok(())
+    } else {
+        Err(format!("PING returned {pong:?} instead of \"PONG\""))
+    }
 }
 
 fn unique_namespace() -> String {

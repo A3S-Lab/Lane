@@ -1785,6 +1785,11 @@ A3S_LANE_REDIS_URL=redis://127.0.0.1:6379/ \
   cargo test --features redis-backend --test redis_job_queue
 ```
 
+The integration harness performs a one-second Redis `PING` preflight before the
+test body runs. Missing, unreachable, or non-responsive Redis endpoints are
+reported and skipped quickly instead of letting every async test wait for its
+longer per-test timeout.
+
 Use `JobWorker` to run async processors against any backend:
 
 ```rust
