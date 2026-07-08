@@ -179,6 +179,7 @@ pub trait JobQueueBackend: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<Job>;
 
+    /// Reprocess a retained failed or completed job by moving it back to waiting.
     async fn retry_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job>;
 
     /// Update an existing job's stored priority.

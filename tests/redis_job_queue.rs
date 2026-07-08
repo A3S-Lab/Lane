@@ -250,6 +250,19 @@ async fn redis_backend_release_active_pushes_back_waiting_jobs_against_real_serv
     .unwrap();
 }
 
+#[tokio::test]
+async fn redis_backend_retries_completed_jobs_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(Duration::from_secs(120), run_completed_retry(redis_url))
+        .await
+        .expect("Redis completed retry integration test timed out")
+        .unwrap();
+}
+
 async fn run_priority_update_limit(redis_url: String) -> redis::RedisResult<()> {
     let namespace = unique_namespace();
     cleanup_namespace(&redis_url, &namespace).await?;
@@ -545,6 +558,187 @@ async fn run_release_active_waiting_front(redis_url: String) -> redis::RedisResu
             .expect("release-front job should be claimable");
         assert_eq!(claimed.id, expected.id);
     }
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
+async fn run_completed_retry(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "completed-retry")
+        .expect("valid Redis URL should build the completed-retry queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let job = queue
+        .add_job(
+            "completed-retry".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("completed retry job should add");
+    let claimed = queue
+        .claim_next(
+            "worker-completed-retry-a".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("completed retry claim should return")
+        .expect("completed retry job should be claimable");
+    assert_eq!(claimed.id, job.id);
+    queue
+        .complete_job(
+            &claimed.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("completed retry job should complete");
+
+    let retried = queue
+        .retry_job(&job.id, Utc::now())
+        .await
+        .expect("completed job should retry");
+    assert_eq!(retried.state, JobState::Waiting);
+    assert!(retried.return_value.is_none());
+    assert!(retried.finished_at.is_none());
+    assert_eq!(
+        queue
+            .get_job_finished_result(&job.id)
+            .await
+            .expect("completed retry finished result should load"),
+        Some(JobFinishedResult::NotFinished)
+    );
+    let completed_score: Option<f64> = conn
+        .zscore(format!("{namespace}:completed-retry:completed"), &job.id)
+        .await?;
+    assert!(completed_score.is_none());
+    let waiting_score: Option<f64> = conn
+        .zscore(format!("{namespace}:completed-retry:waiting"), &job.id)
+        .await?;
+    assert!(waiting_score.is_some());
+    let events = queue
+        .read_events("-", "+", 100)
+        .await
+        .expect("completed retry events should load");
+    let waiting_event = events
+        .iter()
+        .rev()
+        .find(|event| event.event == "waiting" && event.job_id.as_deref() == Some(job.id.as_str()))
+        .expect("completed retry should emit waiting event");
+    assert_eq!(waiting_event.prev, Some(JobState::Completed));
+
+    let reclaimed = queue
+        .claim_next(
+            "worker-completed-retry-b".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("completed retry reclaim should return")
+        .expect("completed retry job should be claimable again");
+    assert_eq!(reclaimed.id, job.id);
+    queue
+        .complete_job(
+            &reclaimed.id,
+            lock_token(&reclaimed),
+            serde_json::json!({ "ok": "again" }),
+            Utc::now(),
+        )
+        .await
+        .expect("completed retry reclaimed job should complete");
+
+    let flow_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "completed-flow-retry")
+        .expect("valid Redis URL should build the completed-flow-retry queue");
+    let flow = flow_queue
+        .add_flow(
+            JobSpec::new("parent", serde_json::json!({ "kind": "aggregate" }))
+                .with_options(JobOptions::new().with_priority(1)),
+            vec![JobSpec::new("child", serde_json::json!({ "child": true }))
+                .with_options(JobOptions::new().with_priority(1))],
+        )
+        .await
+        .expect("completed flow retry flow should add");
+    let flow_child = flow_queue
+        .claim_next(
+            "worker-completed-flow-child".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("completed flow child claim should return")
+        .expect("completed flow child should be claimable");
+    assert_eq!(flow_child.id, flow.children[0].id);
+    flow_queue
+        .complete_job(
+            &flow_child.id,
+            lock_token(&flow_child),
+            serde_json::json!({ "child": "done" }),
+            Utc::now(),
+        )
+        .await
+        .expect("completed flow child should complete");
+    assert_eq!(
+        flow_queue
+            .get_job(&flow.parent.id)
+            .await
+            .expect("flow parent should load")
+            .expect("flow parent should exist")
+            .state,
+        JobState::Waiting
+    );
+
+    let retried_child = flow_queue
+        .retry_job(&flow_child.id, Utc::now())
+        .await
+        .expect("completed flow child should retry");
+    assert_eq!(retried_child.state, JobState::Waiting);
+    assert!(retried_child.return_value.is_none());
+    let parent_after_retry = flow_queue
+        .get_job(&flow.parent.id)
+        .await
+        .expect("flow parent after retry should load")
+        .expect("flow parent after retry should exist");
+    assert_eq!(parent_after_retry.state, JobState::WaitingChildren);
+    assert_eq!(
+        flow_queue
+            .get_flow_dependency_counts(&flow.parent.id)
+            .await
+            .expect("flow dependency counts should load")
+            .expect("flow dependency counts should exist"),
+        a3s_lane::JobFlowDependencyCounts {
+            processed: 0,
+            unprocessed: 1,
+            failed: 0,
+            ignored: 0,
+            missing: 0,
+        }
+    );
+    assert!(flow_queue
+        .get_flow_children_values(&flow.parent.id)
+        .await
+        .expect("flow child values should load")
+        .expect("flow child values should exist")
+        .is_empty());
+    let parent_waiting_score: Option<f64> = conn
+        .zscore(
+            format!("{namespace}:completed-flow-retry:waiting"),
+            &flow.parent.id,
+        )
+        .await?;
+    assert!(parent_waiting_score.is_none());
+    let parent_waiting_children_score: Option<f64> = conn
+        .zscore(
+            format!("{namespace}:completed-flow-retry:waiting_children"),
+            &flow.parent.id,
+        )
+        .await?;
+    assert!(parent_waiting_children_score.is_some());
 
     cleanup_namespace(&redis_url, &namespace).await
 }

@@ -1646,6 +1646,66 @@ async fn retry_reclaims_simple_deduplication() {
 }
 
 #[tokio::test]
+async fn completed_jobs_can_be_retried_back_to_waiting() {
+    let queue = InMemoryJobQueue::new("completed-retry");
+    let job = queue
+        .add_at(
+            "completed-retry",
+            serde_json::json!({}),
+            JobOptions::new(),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(1_100))
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .complete_job(
+            &claimed.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        queue.get_job_finished_result(&job.id).await.unwrap(),
+        Some(JobFinishedResult::Completed {
+            return_value: Some(serde_json::json!({ "ok": true }))
+        })
+    );
+
+    let retried = queue.retry_job(&job.id, ts(1_300)).await.unwrap();
+    assert_eq!(retried.state, JobState::Waiting);
+    assert_eq!(retried.attempts_made, 1);
+    assert!(retried.processed_at.is_none());
+    assert!(retried.finished_at.is_none());
+    assert!(retried.return_value.is_none());
+    assert_eq!(
+        queue.get_job_finished_result(&job.id).await.unwrap(),
+        Some(JobFinishedResult::NotFinished)
+    );
+    let events = queue.read_events("-", "+", 20).await.unwrap();
+    let waiting_event = events
+        .iter()
+        .rev()
+        .find(|event| event.event == "waiting" && event.job_id.as_deref() == Some(job.id.as_str()))
+        .expect("completed retry should emit waiting event");
+    assert_eq!(waiting_event.prev, Some(JobState::Completed));
+
+    let reclaimed = queue
+        .claim_next("worker-b".to_string(), Duration::from_secs(30), ts(1_400))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reclaimed.id, job.id);
+    assert_eq!(reclaimed.attempts_made, 2);
+}
+
+#[tokio::test]
 async fn retry_rejects_active_deduplication_owner() {
     let queue = InMemoryJobQueue::new("dedup-retry-conflict");
     let first = queue
@@ -6387,6 +6447,89 @@ async fn flow_retry_restores_parent_dependency_after_deferred_failure() {
         .unwrap()
         .unwrap();
     assert_eq!(parent.id, flow.parent.id);
+}
+
+#[tokio::test]
+async fn flow_retry_completed_child_restores_parent_dependency() {
+    let queue = InMemoryJobQueue::new("flow-retry-completed-child");
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({ "kind": "aggregate" }))
+                .with_options(JobOptions::new().with_priority(1)),
+            vec![JobSpec::new("child", serde_json::json!({ "child": true }))
+                .with_options(JobOptions::new().with_priority(1))],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    let child = queue
+        .claim_next(
+            "worker-child".to_string(),
+            Duration::from_secs(30),
+            ts(1_100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child.id, flow.children[0].id);
+    queue
+        .complete_job(
+            &child.id,
+            lock_token(&child),
+            serde_json::json!({ "child": "done" }),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+    let parent_after_child = queue.get_job(&flow.parent.id).await.unwrap().unwrap();
+    assert_eq!(parent_after_child.state, JobState::Waiting);
+    assert_eq!(
+        queue
+            .get_flow_children_values(&flow.parent.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .get(&child.id),
+        Some(&serde_json::json!({ "child": "done" }))
+    );
+
+    let retried_child = queue.retry_job(&child.id, ts(1_300)).await.unwrap();
+    assert_eq!(retried_child.state, JobState::Waiting);
+    assert!(retried_child.return_value.is_none());
+    let parent_after_retry = queue.get_job(&flow.parent.id).await.unwrap().unwrap();
+    assert_eq!(parent_after_retry.state, JobState::WaitingChildren);
+    assert_eq!(
+        queue
+            .get_flow_dependency_counts(&flow.parent.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        JobFlowDependencyCounts {
+            processed: 0,
+            unprocessed: 1,
+            failed: 0,
+            ignored: 0,
+            missing: 0,
+        }
+    );
+    assert!(queue
+        .get_flow_children_values(&flow.parent.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_empty());
+
+    let reclaimed_child = queue
+        .claim_next(
+            "worker-retried-child".to_string(),
+            Duration::from_secs(30),
+            ts(1_400),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reclaimed_child.id, child.id);
 }
 
 #[tokio::test]

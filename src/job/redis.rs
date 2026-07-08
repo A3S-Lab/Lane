@@ -6293,9 +6293,10 @@ if not raw then
 end
 
 local job = cjson.decode(raw)
-if job["state"] ~= "failed" then
+local previous_state = job["state"] or ''
+if previous_state ~= "failed" and previous_state ~= "completed" then
   redis.call('ZREM', KEYS[2], ARGV[1])
-  return {'state', job["state"] or ''}
+  return {'state', previous_state}
 end
 
 local retry_deduplication_id = deduplication_id(job)
@@ -6324,6 +6325,7 @@ job["lock_token"] = cjson.null
 job["lease_expires_at"] = cjson.null
 job["deferred_failure"] = cjson.null
 job["failed_reason"] = cjson.null
+job["return_value"] = cjson.null
 if retry_deduplication_id then
   if ARGV[6] ~= '' then
     job["deduplication_expires_at"] = ARGV[6]
@@ -6334,7 +6336,7 @@ end
 
 local priority = tonumber(job["priority"] or '1000') or 1000
 local updated = enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[4], job, ARGV[1], priority, ARGV[3], KEYS[#KEYS])
-redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[8], '*', 'event', 'waiting', 'jobId', ARGV[1], 'prev', 'failed')
+redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[8], '*', 'event', 'waiting', 'jobId', ARGV[1], 'prev', previous_state)
 
 local parent_id = job["parent_id"]
 if parent_id and parent_id ~= cjson.null then
@@ -11026,6 +11028,13 @@ impl JobQueueBackend for RedisJobQueue {
     async fn retry_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {
         let mut conn = self.connection().await?;
         let retry_job = self.load_job(&mut conn, job_id).await?;
+        let retry_state_key = retry_job
+            .as_ref()
+            .map(|job| match job.state {
+                JobState::Completed => self.state_key(JobState::Completed),
+                _ => self.state_key(JobState::Failed),
+            })
+            .unwrap_or_else(|| self.state_key(JobState::Failed));
         let deduplication_expires_at = retry_job
             .as_ref()
             .and_then(|job| deduplication_expiration(&job.options, now))
@@ -11040,7 +11049,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(RETRY_JOB_SCRIPT)
             .arg(8)
             .arg(self.jobs_key())
-            .arg(self.state_key(JobState::Failed))
+            .arg(retry_state_key)
             .arg(self.state_key(JobState::Waiting))
             .arg(self.sequence_key())
             .arg(self.events_key())

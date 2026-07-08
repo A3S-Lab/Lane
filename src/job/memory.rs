@@ -1359,12 +1359,13 @@ impl InMemoryJobQueue {
             .jobs
             .get(job_id)
             .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
-        if current.state != JobState::Failed {
+        if !matches!(current.state, JobState::Failed | JobState::Completed) {
             return Err(LaneError::JobStateConflict(format!(
                 "cannot retry job {} from state {:?}",
                 current.id, current.state
             )));
         }
+        let previous_state = current.state;
         let retry_deduplication_id = current
             .options
             .deduplication
@@ -1416,13 +1417,14 @@ impl InMemoryJobQueue {
         job.lease_expires_at = None;
         job.deferred_failure = None;
         job.failed_reason = None;
+        job.return_value = None;
         job.enqueued_seq = enqueued_seq;
         let job = job.clone();
         emit_event_locked(
             &mut inner,
             "waiting",
             Some(&job),
-            Some(JobState::Failed),
+            Some(previous_state),
             now,
             BTreeMap::new(),
         );

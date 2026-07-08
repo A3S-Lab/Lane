@@ -462,8 +462,8 @@ waiting, `reschedule_job()` changes a delayed job's due time relative to the
 current clock, `delay_active_job()` moves a token-owned active job back to
 delayed, `release_active_job()` moves a token-owned active job back to waiting,
 `get_job_state()` returns the current lifecycle state for a job id, `retry_job()`
-manually requeues failed jobs, `fail_job_discarding_retry()` fails an active
-token-owned job without applying remaining automatic retries, `update_priority()`
+manually requeues retained failed or completed jobs, `fail_job_discarding_retry()`
+fails an active token-owned job without applying remaining automatic retries, `update_priority()`
 changes stored job priority, `update_priority_with_lifo()` also chooses the
 same-priority waiting reinsert side, `renew_lease()` extends an active worker
 lease with the claim token, `renew_leases()` renews multiple claimed
@@ -1465,18 +1465,22 @@ manual promote, reschedule, active delay, and active release also rebuild the
 scheduler hash/zset in the same script and repair a missing fast owner key
 instead of leaving the repeat series split across stale Redis keys. They do not
 overwrite a scheduler record that already points at another owner.
-`retry_job()` clears terminal failure metadata, treats the failed zset as the
-Redis movement gate, prunes orphaned or stale failed members, and moves valid
-failed jobs back to waiting inside one script. For deduplicated jobs, that same
-script reclaims the owner key and reapplies the deduplication TTL before
-returning the job to waiting. For repeat-keyed jobs, retry first checks both the
-fast `repeat:<key>` owner key and the scheduler `repeat_meta:<key>.jid` owner; if
-either points at another non-terminal occurrence, Redis restores the fast owner
-key when needed and rejects the retry. Only an uncontested failed owner reclaims
-the repeat key and scheduler metadata. When the retried job is a retained flow
-child, retry restores the child into the parent's pending dependency set, clears
-stale deferred parent failure metadata, and moves a non-terminal parent back to
-`waiting_children`, matching BullMQ's `reprocessJob` dependency restoration path.
+`retry_job()` follows BullMQ's `reprocessJob` shape for retained failed and
+completed jobs: it treats the matching terminal zset as the Redis movement gate,
+clears terminal metadata (`failed_reason` for failed jobs, `return_value` for
+completed jobs, plus processed/finished timestamps), emits `waiting` with
+`prev=failed` or `prev=completed`, and moves the job back to waiting inside one
+script. For deduplicated failed jobs, that same script reclaims the owner key and
+reapplies the deduplication TTL before returning the job to waiting. For
+repeat-keyed failed jobs, retry first checks both the fast `repeat:<key>` owner
+key and the scheduler `repeat_meta:<key>.jid` owner; if either points at another
+non-terminal occurrence, Redis restores the fast owner key when needed and
+rejects the retry. Only an uncontested failed owner reclaims the repeat key and
+scheduler metadata. When the retried job is a retained flow child, retry restores
+the child into the parent's pending dependency set, clears stale deferred parent
+failure metadata, and moves a non-terminal parent back to `waiting_children`,
+matching BullMQ's dependency restoration path for both failed and completed
+children.
 When a processing failure reaches terminal failed state because its configured
 retry attempts are exhausted, Lane emits `retries-exhausted` after `failed`,
 matching BullMQ's `moveToFinished` event order. Manual retry-discard paths only
