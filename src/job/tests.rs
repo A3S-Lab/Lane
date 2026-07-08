@@ -8054,15 +8054,28 @@ async fn local_job_queue_persists_terminal_dependency_side_indexes() {
     let flow = queue
         .add_flow_at(
             JobSpec::new("parent", serde_json::json!({ "kind": "aggregate" })),
-            vec![JobSpec::new("child", serde_json::json!({ "n": 1 }))],
+            vec![
+                JobSpec::new("completed-child", serde_json::json!({ "n": 1 }))
+                    .with_options(JobOptions::new().with_priority(1)),
+                JobSpec::new("ignored-child", serde_json::json!({ "n": 2 })).with_options(
+                    JobOptions::new()
+                        .with_priority(2)
+                        .with_ignore_dependency_on_failure(true),
+                ),
+                JobSpec::new("fail-parent-child", serde_json::json!({ "n": 3 })).with_options(
+                    JobOptions::new()
+                        .with_priority(3)
+                        .with_fail_parent_on_failure(true),
+                ),
+            ],
             ts(1_000),
         )
         .await
         .unwrap();
 
-    let child = queue
+    let completed_child = queue
         .claim_next(
-            "worker-child".to_string(),
+            "worker-completed".to_string(),
             Duration::from_secs(30),
             ts(1_100),
         )
@@ -8071,19 +8084,75 @@ async fn local_job_queue_persists_terminal_dependency_side_indexes() {
         .unwrap();
     queue
         .complete_job(
-            &child.id,
-            lock_token(&child),
+            &completed_child.id,
+            lock_token(&completed_child),
             serde_json::json!({ "ok": true }),
             ts(1_200),
         )
         .await
         .unwrap();
-    queue.remove_job(&child.id).await.unwrap().unwrap();
+    let ignored_child = queue
+        .claim_next(
+            "worker-ignored".to_string(),
+            Duration::from_secs(30),
+            ts(1_300),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .fail_job(
+            &ignored_child.id,
+            lock_token(&ignored_child),
+            "ignored source failed".to_string(),
+            ts(1_400),
+        )
+        .await
+        .unwrap();
+    let fail_parent_child = queue
+        .claim_next(
+            "worker-fail-parent".to_string(),
+            Duration::from_secs(30),
+            ts(1_500),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .fail_job(
+            &fail_parent_child.id,
+            lock_token(&fail_parent_child),
+            "required source failed".to_string(),
+            ts(1_600),
+        )
+        .await
+        .unwrap();
+    queue
+        .remove_job(&completed_child.id)
+        .await
+        .unwrap()
+        .unwrap();
+    queue.remove_job(&ignored_child.id).await.unwrap().unwrap();
+    queue
+        .remove_job(&fail_parent_child.id)
+        .await
+        .unwrap()
+        .unwrap();
 
     let reopened = LocalJobQueue::open("durable-terminal-dependency-indexes", &snapshot_path)
         .await
         .unwrap();
-    assert!(reopened.get_job(&child.id).await.unwrap().is_none());
+    assert!(reopened
+        .get_job(&completed_child.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(reopened.get_job(&ignored_child.id).await.unwrap().is_none());
+    assert!(reopened
+        .get_job(&fail_parent_child.id)
+        .await
+        .unwrap()
+        .is_none());
     let counts = reopened
         .get_flow_dependency_counts(&flow.parent.id)
         .await
@@ -8094,8 +8163,8 @@ async fn local_job_queue_persists_terminal_dependency_side_indexes() {
         JobFlowDependencyCounts {
             processed: 1,
             unprocessed: 0,
-            failed: 0,
-            ignored: 0,
+            failed: 1,
+            ignored: 1,
             missing: 0,
         }
     );
@@ -8105,9 +8174,14 @@ async fn local_job_queue_persists_terminal_dependency_side_indexes() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        values.processed.get(&child.id),
+        values.processed.get(&completed_child.id),
         Some(&serde_json::json!({ "ok": true }))
     );
+    assert_eq!(
+        values.ignored.get(&ignored_child.id).map(String::as_str),
+        Some("ignored source failed")
+    );
+    assert_eq!(values.failed, vec![fail_parent_child.id.clone()]);
 }
 
 #[tokio::test]
