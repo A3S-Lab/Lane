@@ -1620,6 +1620,122 @@ async fn add_many_preserves_order_and_idempotent_custom_ids() {
 }
 
 #[tokio::test]
+async fn add_many_deduplicated_jobs_emit_events_in_input_order() {
+    let queue = InMemoryJobQueue::new("bulk-dedup-events");
+    let jobs = queue
+        .add_many_at(
+            vec![
+                JobSpec::new("bulk-owner", serde_json::json!({ "version": 1 })).with_options(
+                    JobOptions::new()
+                        .with_job_id("bulk:dedup-owner")
+                        .with_deduplication_id("account:bulk"),
+                ),
+                JobSpec::new("bulk-duplicate", serde_json::json!({ "version": 2 })).with_options(
+                    JobOptions::new()
+                        .with_job_id("bulk:dedup-duplicate")
+                        .with_deduplication_id("account:bulk"),
+                ),
+            ],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[1].id, jobs[0].id);
+
+    let events = queue.read_events("-", "+", 10).await.unwrap();
+    let names = events
+        .iter()
+        .map(|event| event.event.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["added", "waiting", "debounced", "deduplicated"]);
+    assert_eq!(events[2].job_id.as_deref(), Some(jobs[0].id.as_str()));
+    assert_eq!(
+        events[2].fields.get("debounceId"),
+        Some(&Value::String("account:bulk".to_string()))
+    );
+    assert_eq!(events[3].job_id.as_deref(), Some(jobs[0].id.as_str()));
+    assert_eq!(
+        events[3].fields.get("deduplicationId"),
+        Some(&Value::String("account:bulk".to_string()))
+    );
+    assert_eq!(
+        events[3].fields.get("deduplicatedJobId"),
+        Some(&Value::String("bulk:dedup-duplicate".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn add_many_delayed_dedup_replacement_emits_events_in_input_order() {
+    let queue = InMemoryJobQueue::new("bulk-dedup-replace-events");
+    let jobs = queue
+        .add_many_at(
+            vec![
+                JobSpec::new("bulk-replace-old", serde_json::json!({ "version": 1 })).with_options(
+                    JobOptions::new()
+                        .with_job_id("bulk:replace-old")
+                        .with_delay(Duration::from_secs(30))
+                        .with_deduplication(
+                            DeduplicationOptions::new("account:bulk-replace").replace_delayed(true),
+                        ),
+                ),
+                JobSpec::new("bulk-replace-new", serde_json::json!({ "version": 2 })).with_options(
+                    JobOptions::new()
+                        .with_job_id("bulk:replace-new")
+                        .with_delay(Duration::from_secs(60))
+                        .with_deduplication(
+                            DeduplicationOptions::new("account:bulk-replace").replace_delayed(true),
+                        ),
+                ),
+            ],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0].id, "bulk:replace-old");
+    assert_eq!(jobs[1].id, "bulk:replace-new");
+    assert!(queue.get_job(&jobs[0].id).await.unwrap().is_none());
+    assert!(queue.get_job(&jobs[1].id).await.unwrap().is_some());
+
+    let events = queue.read_events("-", "+", 10).await.unwrap();
+    let names = events
+        .iter()
+        .map(|event| event.event.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "added",
+            "delayed",
+            "removed",
+            "debounced",
+            "deduplicated",
+            "added",
+            "delayed"
+        ]
+    );
+    assert_eq!(events[2].job_id.as_deref(), Some("bulk:replace-old"));
+    assert_eq!(events[2].prev, Some(JobState::Delayed));
+    assert_eq!(events[3].job_id.as_deref(), Some("bulk:replace-new"));
+    assert_eq!(
+        events[3].fields.get("debounceId"),
+        Some(&Value::String("account:bulk-replace".to_string()))
+    );
+    assert_eq!(events[4].job_id.as_deref(), Some("bulk:replace-new"));
+    assert_eq!(
+        events[4].fields.get("deduplicationId"),
+        Some(&Value::String("account:bulk-replace".to_string()))
+    );
+    assert_eq!(
+        events[4].fields.get("deduplicatedJobId"),
+        Some(&Value::String("bulk:replace-old".to_string()))
+    );
+}
+
+#[tokio::test]
 async fn add_many_rejects_invalid_jobs_without_partial_insert() {
     let queue = InMemoryJobQueue::new("bulk-invalid");
     let error = queue

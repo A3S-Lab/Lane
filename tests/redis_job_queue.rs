@@ -1096,6 +1096,19 @@ async fn redis_backend_records_queue_events_against_real_server() {
 }
 
 #[tokio::test]
+async fn redis_backend_records_bulk_dedup_events_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(Duration::from_secs(120), run_bulk_dedup_events(redis_url))
+        .await
+        .expect("Redis bulk dedup-events integration test timed out")
+        .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_emits_flow_parent_transition_events_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -2604,6 +2617,134 @@ async fn run_queue_events(redis_url: String) -> redis::RedisResult<()> {
     assert_eq!(
         events[20].fields.get("deduplicatedJobId"),
         Some(&serde_json::json!("events:dedup-replace-old"))
+    );
+
+    cleanup_namespace(&redis_url, &namespace).await?;
+    Ok(())
+}
+
+async fn run_bulk_dedup_events(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "bulk-dedup-events")
+        .expect("valid Redis URL should build the bulk dedup events queue");
+    let dedup_jobs = queue
+        .add_jobs(
+            vec![
+                JobSpec::new("bulk-dedup-owner", serde_json::json!({ "version": 1 })).with_options(
+                    JobOptions::new()
+                        .with_job_id("bulk-events:dedup-owner")
+                        .with_deduplication_id("bulk-events:dedup"),
+                ),
+                JobSpec::new("bulk-dedup-duplicate", serde_json::json!({ "version": 2 }))
+                    .with_options(
+                        JobOptions::new()
+                            .with_job_id("bulk-events:dedup-duplicate")
+                            .with_deduplication_id("bulk-events:dedup"),
+                    ),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("bulk dedup duplicate jobs should add");
+    assert_eq!(dedup_jobs.len(), 2);
+    assert_eq!(dedup_jobs[1].id, dedup_jobs[0].id);
+
+    let replace_jobs = queue
+        .add_jobs(
+            vec![
+                JobSpec::new(
+                    "bulk-dedup-replace-old",
+                    serde_json::json!({ "version": 1 }),
+                )
+                .with_options(
+                    JobOptions::new()
+                        .with_job_id("bulk-events:replace-old")
+                        .with_delay(Duration::from_secs(30))
+                        .with_deduplication(
+                            DeduplicationOptions::new("bulk-events:replace").replace_delayed(true),
+                        ),
+                ),
+                JobSpec::new(
+                    "bulk-dedup-replace-new",
+                    serde_json::json!({ "version": 2 }),
+                )
+                .with_options(
+                    JobOptions::new()
+                        .with_job_id("bulk-events:replace-new")
+                        .with_delay(Duration::from_secs(60))
+                        .with_deduplication(
+                            DeduplicationOptions::new("bulk-events:replace").replace_delayed(true),
+                        ),
+                ),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("bulk delayed replacement jobs should add");
+    assert_eq!(replace_jobs.len(), 2);
+    assert_eq!(replace_jobs[0].id, "bulk-events:replace-old");
+    assert_eq!(replace_jobs[1].id, "bulk-events:replace-new");
+    assert!(queue
+        .get_job(&replace_jobs[0].id)
+        .await
+        .expect("replaced bulk owner lookup should return")
+        .is_none());
+
+    let events = queue
+        .read_events("-", "+", 20)
+        .await
+        .expect("bulk dedup events should read");
+    let names = events
+        .iter()
+        .map(|event| event.event.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "added",
+            "waiting",
+            "debounced",
+            "deduplicated",
+            "added",
+            "delayed",
+            "removed",
+            "debounced",
+            "deduplicated",
+            "added",
+            "delayed"
+        ]
+    );
+    assert_eq!(events[2].job_id.as_deref(), Some(dedup_jobs[0].id.as_str()));
+    assert_eq!(
+        events[2].fields.get("debounceId"),
+        Some(&serde_json::json!("bulk-events:dedup"))
+    );
+    assert_eq!(events[3].job_id.as_deref(), Some(dedup_jobs[0].id.as_str()));
+    assert_eq!(
+        events[3].fields.get("deduplicationId"),
+        Some(&serde_json::json!("bulk-events:dedup"))
+    );
+    assert_eq!(
+        events[3].fields.get("deduplicatedJobId"),
+        Some(&serde_json::json!("bulk-events:dedup-duplicate"))
+    );
+    assert_eq!(events[6].job_id.as_deref(), Some("bulk-events:replace-old"));
+    assert_eq!(events[6].prev, Some(JobState::Delayed));
+    assert_eq!(events[7].job_id.as_deref(), Some("bulk-events:replace-new"));
+    assert_eq!(
+        events[7].fields.get("debounceId"),
+        Some(&serde_json::json!("bulk-events:replace"))
+    );
+    assert_eq!(events[8].job_id.as_deref(), Some("bulk-events:replace-new"));
+    assert_eq!(
+        events[8].fields.get("deduplicationId"),
+        Some(&serde_json::json!("bulk-events:replace"))
+    );
+    assert_eq!(
+        events[8].fields.get("deduplicatedJobId"),
+        Some(&serde_json::json!("bulk-events:replace-old"))
     );
 
     cleanup_namespace(&redis_url, &namespace).await?;

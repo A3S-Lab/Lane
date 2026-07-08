@@ -334,14 +334,9 @@ impl InMemoryJobQueue {
             .collect::<Vec<_>>();
 
         let mut inner = self.inner.lock().await;
-        let mut staged: HashMap<JobId, Job> = HashMap::new();
         let mut added = Vec::with_capacity(created.len());
         for mut job in created {
             if let Some(existing) = inner.jobs.get(&job.id) {
-                added.push(existing.clone());
-                continue;
-            }
-            if let Some(existing) = staged.get(&job.id) {
                 added.push(existing.clone());
                 continue;
             }
@@ -356,7 +351,13 @@ impl InMemoryJobQueue {
                 if deduplication_replaces_delayed_owner(&job, &existing) {
                     preserve_replacement_deduplication_expiration(&mut job, &existing);
                     let existing_id = existing.id.clone();
-                    Self::remove_job_record_locked(&mut inner, &existing_id);
+                    if let Some(removed) = Self::remove_job_record_locked(&mut inner, &existing_id)
+                    {
+                        emit_removed_event_locked(&mut inner, &removed, now);
+                        emit_replaced_deduplicated_owner_events_locked(
+                            &mut inner, &job, &removed, now,
+                        );
+                    }
                 } else {
                     Self::store_deduplicated_next_locked(&mut inner, &job, &existing);
                     Self::extend_deduplication_expiration_locked(
@@ -365,43 +366,22 @@ impl InMemoryJobQueue {
                         &existing.id,
                         now,
                     );
+                    if deduplication_duplicate_emits_events(&job, &existing) {
+                        emit_deduplicated_events_locked(&mut inner, &existing, &job, now);
+                    }
                     added.push(inner.jobs.get(&existing.id).cloned().unwrap_or(existing));
                     continue;
                 }
             }
-            if let Some(existing) =
-                find_active_deduplicated_job(&staged, &HashSet::new(), &job, now).cloned()
-            {
-                if deduplication_replaces_delayed_owner(&job, &existing) {
-                    preserve_replacement_deduplication_expiration(&mut job, &existing);
-                    let existing_id = existing.id.clone();
-                    staged.remove(&existing_id);
-                } else {
-                    Self::extend_deduplication_expiration_locked(
-                        &mut staged,
-                        &job,
-                        &existing.id,
-                        now,
-                    );
-                    added.push(staged.get(&existing.id).cloned().unwrap_or(existing));
-                    continue;
-                }
-            }
-            if let Some(existing) = find_active_repeat_job(&inner.jobs, &job)
-                .or_else(|| find_active_repeat_job(&staged, &job))
-            {
+            if let Some(existing) = find_active_repeat_job(&inner.jobs, &job) {
                 added.push(existing.clone());
                 continue;
             }
             assign_waiting_order(&mut inner.sequence, &mut job);
-            staged.insert(job.id.clone(), job.clone());
-            added.push(job);
-        }
-
-        for (job_id, job) in staged {
             Self::forget_released_deduplication_owner_locked(&mut inner, &job);
-            inner.jobs.insert(job_id, job.clone());
+            inner.jobs.insert(job.id.clone(), job.clone());
             Self::emit_job_created_events_locked(&mut inner, &job, now);
+            added.push(job);
         }
         Ok(added)
     }

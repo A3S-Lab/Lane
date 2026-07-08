@@ -1001,6 +1001,32 @@ local function extend_deduplicated_owner(candidate_job, existing_job, deduplicat
   end
 end
 
+local function deduplication_replace(candidate_job)
+  if not candidate_job["options"] or candidate_job["options"] == cjson.null then
+    return false
+  end
+  local deduplication = candidate_job["options"]["deduplication"]
+  return deduplication and deduplication ~= cjson.null and deduplication["replace"] == true
+end
+
+local function emit_deduplication_events(events_key, max_events, event_job_id, deduplication_id, deduplicated_job_id)
+  redis.call('XADD', events_key, 'MAXLEN', '~', max_events, '*', 'event', 'debounced', 'jobId', event_job_id, 'debounceId', deduplication_id)
+  redis.call('XADD', events_key, 'MAXLEN', '~', max_events, '*', 'event', 'deduplicated', 'jobId', event_job_id, 'deduplicationId', deduplication_id, 'deduplicatedJobId', deduplicated_job_id)
+end
+
+local function emit_deduplicated_events(events_key, max_events, owner_job, candidate_job)
+  local deduplication = candidate_job["options"]["deduplication"]
+  local deduplication_id = deduplication["id"]
+  emit_deduplication_events(events_key, max_events, owner_job["id"], deduplication_id, candidate_job["id"])
+end
+
+local function emit_replaced_deduplicated_owner_events(events_key, max_events, candidate_job, existing_job)
+  local deduplication = candidate_job["options"]["deduplication"]
+  local deduplication_id = deduplication["id"]
+  redis.call('XADD', events_key, 'MAXLEN', '~', max_events, '*', 'event', 'removed', 'jobId', existing_job["id"], 'prev', 'delayed')
+  emit_deduplication_events(events_key, max_events, candidate_job["id"], deduplication_id, existing_job["id"])
+end
+
 local function active_repeat_raw(jobs_key, repeat_prefix, repeat_key)
   if not repeat_key or repeat_key == '' then
     return nil
@@ -1159,6 +1185,7 @@ for index = 1, count do
         if removed > 0 then
           redis.call('HDEL', KEYS[1], existing_job["id"])
           redis.call('DEL', logs_prefix .. existing_job["id"])
+          emit_replaced_deduplicated_owner_events(KEYS[7], max_events, candidate_job, existing_job)
           replaced_deduplicated_owner = true
         else
           added[index] = deduplicated
@@ -1166,10 +1193,14 @@ for index = 1, count do
         end
       elseif can_store_deduplicated_next(candidate_job, existing_job, KEYS[6]) then
         store_deduplicated_next(raw, candidate_job, deduplication_prefix, deduplication_next_prefix)
+        emit_deduplicated_events(KEYS[7], max_events, existing_job, candidate_job)
         added[index] = deduplicated
         should_insert = false
       else
         extend_deduplicated_owner(candidate_job, existing_job, deduplication_prefix)
+        if not deduplication_replace(candidate_job) then
+          emit_deduplicated_events(KEYS[7], max_events, existing_job, candidate_job)
+        end
         added[index] = deduplicated
         should_insert = false
       end

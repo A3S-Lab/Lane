@@ -1072,7 +1072,9 @@ Redis adds are Lua-backed as well. The add scripts write job JSON and the
 waiting, delayed, or waiting-children index in the same Redis turn. If a custom
 job id already exists, the script returns the existing job without advancing the
 waiting sequence or writing duplicate state indexes. Bulk add follows the same
-mechanism in one script call while preserving the caller's input order.
+mechanism in one script call while preserving the caller's input order, including
+the same deduplication stream events that BullMQ's pipelined `addBulk()` emits
+for each job.
 For simple deduplication, the same add scripts use an independent
 `deduplication:<id>` key, equivalent to BullMQ's `de:<id>` role, to return the
 current owner before writing a duplicate. If `DeduplicationOptions` has a TTL,
@@ -1168,11 +1170,12 @@ completion, terminal failure, and stalled terminal failure paths also emit paren
 same Lua turn releases or fails the parent;
 explicit removal writes `removed prev=<state>` for the removed job; `clean_jobs()`
 writes a queue-level `cleaned count=<n>` event after removing aged jobs;
-deduplicated adds write BullMQ-style `debounced` and `deduplicated` events with
-the owner job id, deduplication id, and skipped candidate job id; delayed-owner
-replacement also writes `removed prev=delayed` for the old owner followed by
-`debounced` and `deduplicated` events on the replacement job id; progress writes
-`progress data=<json>`; pause/resume write queue-level events.
+deduplicated adds, including bulk adds, write BullMQ-style `debounced` and
+`deduplicated` events with the owner job id, deduplication id, and skipped
+candidate job id; delayed-owner replacement also writes `removed prev=delayed`
+for the old owner followed by `debounced` and `deduplicated` events on the
+replacement job id; progress writes `progress data=<json>`; pause/resume write
+queue-level events.
 `read_events()` uses `XRANGE` over stream ids, and
 `trim_events()` uses BullMQ-style `XTRIM MAXLEN ~`. The in-memory and local
 durable backends keep the same retained event entries in their snapshots so
