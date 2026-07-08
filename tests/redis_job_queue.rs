@@ -3618,6 +3618,22 @@ async fn redis_backend_records_queue_events_against_real_server() {
 }
 
 #[tokio::test]
+async fn redis_backend_trims_queue_events_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_queue_event_trimming(redis_url),
+    )
+    .await
+    .expect("Redis queue-event trimming integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_records_bulk_dedup_events_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -7335,6 +7351,139 @@ async fn run_queue_events(redis_url: String) -> redis::RedisResult<()> {
 
     cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())
+}
+
+async fn run_queue_event_trimming(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    trace_stage("trim-events:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("trim-events:cleanup:done");
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "trim-events")
+        .expect("valid Redis URL should build the trim-events queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let events_key = format!("{namespace}:trim-events:events");
+    trace_stage("trim-events:conn-created");
+
+    let seed_script = r#"
+local count = tonumber(ARGV[1])
+local first_id = nil
+local last_id = nil
+for index = 0, count - 1 do
+  local job_id = 'trim-events:' .. tostring(index)
+  local added_id = redis.call('XADD', KEYS[1], '*', 'event', 'added', 'jobId', job_id, 'name', 'trim-event-' .. tostring(index))
+  if not first_id then
+    first_id = added_id
+  end
+  last_id = redis.call('XADD', KEYS[1], '*', 'event', 'waiting', 'jobId', job_id)
+end
+return {first_id, last_id, tostring(redis.call('XLEN', KEYS[1]))}
+"#;
+    trace_stage("trim-events:seed-built");
+    let seed_result: Vec<String> = redis::cmd("EVAL")
+        .arg(seed_script)
+        .arg(1)
+        .arg(&events_key)
+        .arg(120)
+        .query_async(&mut conn)
+        .await?;
+    let first_id = seed_result
+        .first()
+        .expect("seed script should return the first event id")
+        .clone();
+    let last_id = seed_result
+        .get(1)
+        .expect("seed script should return the last event id")
+        .clone();
+    let seeded_len = seed_result
+        .get(2)
+        .and_then(|value| value.parse::<usize>().ok())
+        .expect("seed script should return the stream length");
+    assert_eq!(seeded_len, 240);
+    trace_stage("trim-events:seeded");
+
+    let first_before = queue
+        .read_events(&first_id, &first_id, 1)
+        .await
+        .expect("first trim event should read before trimming");
+    assert_eq!(first_before.len(), 1);
+    assert_eq!(
+        first_before.first().map(|event| event.event.as_str()),
+        Some("added")
+    );
+    assert_eq!(
+        first_before
+            .first()
+            .and_then(|event| event.job_id.as_deref()),
+        Some("trim-events:0")
+    );
+
+    let last_before = queue
+        .read_events(&last_id, &last_id, 1)
+        .await
+        .expect("last trim event should read before trimming");
+    assert_eq!(last_before.len(), 1);
+    assert_eq!(
+        last_before.first().map(|event| event.event.as_str()),
+        Some("waiting")
+    );
+    assert_eq!(
+        last_before
+            .first()
+            .and_then(|event| event.job_id.as_deref()),
+        Some("trim-events:119")
+    );
+    trace_stage("trim-events:before-read");
+
+    let trimmed = queue
+        .trim_events(100)
+        .await
+        .expect("trim event stream should trim");
+    assert!(trimmed > 0);
+    trace_stage("trim-events:trimmed");
+
+    let after_len: usize = redis::cmd("XLEN")
+        .arg(&events_key)
+        .query_async(&mut conn)
+        .await
+        .expect("trim event stream length should read after trimming");
+    trace_stage("trim-events:after-read");
+    assert_eq!(after_len + trimmed, seeded_len);
+    assert!(after_len < seeded_len);
+
+    let removed_first = queue
+        .read_events(&first_id, &first_id, 1)
+        .await
+        .expect("first trim event lookup should return after trimming");
+    assert!(removed_first.is_empty());
+
+    let retained_last = queue
+        .read_events(&last_id, &last_id, 1)
+        .await
+        .expect("last trim event should remain after trimming");
+    assert_eq!(retained_last.len(), 1);
+    assert_eq!(
+        retained_last.first().map(|event| event.event.as_str()),
+        Some("waiting")
+    );
+    assert_eq!(
+        retained_last
+            .first()
+            .and_then(|event| event.job_id.as_deref()),
+        Some("trim-events:119")
+    );
+
+    let limited = queue
+        .read_events("-", "+", 5)
+        .await
+        .expect("trimmed event stream should respect read limits");
+    assert_eq!(limited.len(), 5);
+    assert_ne!(limited[0].id, first_id);
+    assert!(limited.windows(2).all(|pair| pair[0].id <= pair[1].id));
+
+    cleanup_namespace_with_conn(&mut conn, &namespace).await
 }
 
 async fn run_bulk_dedup_events(redis_url: String) -> redis::RedisResult<()> {

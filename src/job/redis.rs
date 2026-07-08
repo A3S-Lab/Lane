@@ -15,7 +15,7 @@ use crate::error::{LaneError, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use redis::aio::ConnectionManager;
-use redis::streams::{StreamMaxlen, StreamRangeReply};
+use redis::streams::StreamRangeReply;
 use redis::AsyncCommands;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
@@ -12393,7 +12393,8 @@ impl JobQueueBackend for RedisJobQueue {
         redis::cmd("XTRIM")
             .arg(self.events_key())
             .arg("MAXLEN")
-            .arg(StreamMaxlen::Approx(max_len))
+            .arg("~")
+            .arg(max_len)
             .query_async(&mut conn)
             .await
             .map_err(redis_error)
