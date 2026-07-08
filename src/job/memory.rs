@@ -2722,10 +2722,9 @@ impl JobQueueBackend for InMemoryJobQueue {
         };
 
         let claimed = {
-            let job = inner
-                .jobs
-                .get_mut(&job_id)
-                .expect("selected job must still exist");
+            let Some(job) = inner.jobs.get_mut(&job_id) else {
+                return Ok(None);
+            };
             job.state = JobState::Active;
             job.attempts_made = job.attempts_made.saturating_add(1);
             job.processed_at = Some(now);
