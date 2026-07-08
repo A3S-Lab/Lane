@@ -4622,6 +4622,100 @@ async fn flow_parent_keep_last_duplicate_emits_deduplicated_events() {
 }
 
 #[tokio::test]
+async fn flow_child_deduplication_duplicate_emits_events_without_parent_dependency() {
+    let queue = InMemoryJobQueue::new("flow-child-dedup-events");
+    let owner = queue
+        .add_at(
+            "existing-child-owner",
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new()
+                .with_job_id("flow-child:existing")
+                .with_deduplication_id("tenant:flow-child"),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("flow-parent", serde_json::json!({ "parent": true }))
+                .with_options(JobOptions::new().with_job_id("flow-child:parent")),
+            vec![
+                JobSpec::new(
+                    "candidate-duplicate-child",
+                    serde_json::json!({ "version": 2 }),
+                )
+                .with_options(
+                    JobOptions::new()
+                        .with_job_id("flow-child:candidate")
+                        .with_deduplication_id("tenant:flow-child"),
+                ),
+                JobSpec::new("retained-child", serde_json::json!({ "version": 3 }))
+                    .with_options(JobOptions::new().with_job_id("flow-child:retained")),
+            ],
+            ts(1_100),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(flow.children.len(), 1);
+    assert_eq!(flow.children[0].id, "flow-child:retained");
+    assert_eq!(
+        flow.parent.child_ids,
+        vec!["flow-child:retained".to_string()]
+    );
+    assert!(queue
+        .get_job("flow-child:candidate")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        queue.get_job(&owner.id).await.unwrap().unwrap().parent_id,
+        None
+    );
+
+    let counts = queue
+        .get_flow_dependency_counts(&flow.parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(counts.unprocessed, 1);
+    assert_eq!(counts.missing, 0);
+
+    let events = queue.read_events("-", "+", 20).await.unwrap();
+    let names = events
+        .iter()
+        .map(|event| event.event.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "added",
+            "waiting",
+            "added",
+            "waiting-children",
+            "debounced",
+            "deduplicated",
+            "added",
+            "waiting"
+        ]
+    );
+    assert_eq!(events[4].job_id.as_deref(), Some(owner.id.as_str()));
+    assert_eq!(
+        events[4].fields.get("debounceId"),
+        Some(&Value::String("tenant:flow-child".to_string()))
+    );
+    assert_eq!(events[5].job_id.as_deref(), Some(owner.id.as_str()));
+    assert_eq!(
+        events[5].fields.get("deduplicationId"),
+        Some(&Value::String("tenant:flow-child".to_string()))
+    );
+    assert_eq!(
+        events[5].fields.get("deduplicatedJobId"),
+        Some(&Value::String("flow-child:candidate".to_string()))
+    );
+}
+
+#[tokio::test]
 async fn flow_parent_releases_when_pending_child_is_cleaned() {
     let queue = InMemoryJobQueue::new("flow-clean");
     let flow = queue

@@ -373,7 +373,7 @@ A3S stack and language SDKs.
 | Job management API | In progress | Add/get/get-state/get-job-finished-result/get-job-counts/get-job-count/count-pending/remove/remove-repeat/upsert-repeat/remove-deduplication-key/get-deduplication-job-id/list-repeats/get-repeat/count-repeats/list-repeats-page/add-flow-children/get-flow-dependencies/get-flow-dependency-counts/get-flow-children-values/get-flow-ignored-children-failures/remove-unprocessed-children/remove-child-dependency/promote/reschedule/delay-active/release-active/retry/update-priority/update-priority-with-lifo/update-data/save-stacktrace/pause/resume/is-paused/drain/clean/obliterate APIs, multi-state pagination, ascending/descending listing, waiting priority counts, add-log/get-logs/clear-job-logs, read-events/trim-events, progress updates, single and bulk lease renewal, Redis terminal metrics. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, uses backend-native blocking claim hooks when available, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, shared batch lease renewal for background loops, and stalled recovery loops. |
 | Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, FIFO/LIFO waiting score ordering, BullMQ-style Redis worker marker zset updates, Redis marker-backed blocking claim, Redis stream queue events, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership, Redis-backed repeat scheduler zset/hash metadata, listing/removal/upsert/pagination, static flow submission, dynamic flow child fan-out, flow dependency inspection, flow child-value and ignored-failure reads, flow parent keep-last completion materialization, delayed promotion and rescheduling, active-to-wait/delayed movement, single-job promote, state-index and finished-result queries, job count snapshots, terminal metrics, manual retry, priority update, progress update, stacktrace update, log append, list/stat snapshots, finished-job age/count retention during complete/fail/stalled scripts, drain, clean, obliterate, claim, Redis-shared rate limit, max-active, flow parent release/failure events, repeat successor enqueue, complete, fail, renew, remove, and stalled candidate-set recovery semantics. Postgres/NATS backends remain planned. |
-| Flow jobs | In progress | Parent-child dependencies, waiting-children state, dependency inspection, child return-value inspection, ignored, removed, continued, and fail-parent child-failure release, static and dynamic fan-out, fan-in release, in-memory/local flow-parent keep-last deduplication, and Redis flow-parent keep-last materialization on active parent completion, terminal failure, or stalled terminal failure are available. |
+| Flow jobs | In progress | Parent-child dependencies, waiting-children state, dependency inspection, child return-value inspection, ignored, removed, continued, and fail-parent child-failure release, static and dynamic fan-out, fan-in release, flow parent deduplication events, ordinary flow child deduplication skip semantics, in-memory/local flow-parent keep-last deduplication, and Redis flow-parent keep-last materialization on active parent completion, terminal failure, or stalled terminal failure are available. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, end timestamps, repeat-key removal, upsert, single-key lookup, counts, and BullMQ-style next-time pagination are available across in-memory, local durable, and Redis backends. Redis additionally maintains scheduler zset/hash metadata in Lua so distributed readers and writers share one repeat-series state machine. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
 
@@ -884,6 +884,11 @@ active stores the latest replacement parent and children, then materializes that
 flow when the active parent finalizes. Redis Lua now covers active parent
 completion, terminal failure, and stalled terminal-failure paths for flow
 keep-last.
+Ordinary flow child deduplication follows BullMQ's child add path: if a child
+candidate matches an existing deduplication owner, Lane returns and emits events
+for the owner, skips storing the candidate child, leaves the owner detached from
+the new parent, and records only the non-skipped children as the new parent's
+pending dependencies.
 Retrying a failed deduplicated job reclaims the deduplication id while the job is
 waiting or active again; retry is rejected if another live deduplication owner,
 including a retained terminal TTL owner, already owns that id.
@@ -1178,7 +1183,9 @@ writes a queue-level `cleaned count=<n>` event after removing aged jobs;
 deduplicated adds, including bulk adds, write BullMQ-style `debounced` and
 `deduplicated` events with the owner job id, deduplication id, and skipped
 candidate job id; flow parent deduplication writes the same event pair with the
-owner parent id and skipped candidate parent id; delayed-owner replacement also
+owner parent id and skipped candidate parent id; ordinary flow child
+deduplication writes the event pair on the existing child owner while omitting the
+skipped candidate from the new parent dependency set; delayed-owner replacement also
 writes `removed prev=delayed` for the old owner followed by `debounced` and
 `deduplicated` events on the replacement job id; progress writes
 `progress data=<json>`; pause/resume write queue-level events.
@@ -1221,7 +1228,11 @@ Redis flow submission is all-or-nothing: the flow add script first checks every
 parent and child job id, then writes the parent, children, and all state indexes
 plus the parent's pending dependency set in one Redis turn. If any job id
 already exists, no partial parent, child, index, or dependency records are
-created. `get_flow_dependencies()` uses a Redis-side read script to load the
+created. If a child candidate deduplicates against an existing owner, the add
+script handles that before dependency insertion: the candidate child is skipped,
+the existing owner is not attached to the new parent, and the returned flow
+contains only the children that were actually stored. `get_flow_dependencies()`
+uses a Redis-side read script to load the
 parent and every retained child snapshot from the jobs hash in one turn, and
 returns the child ids that are still pending or missing from retention.
 `get_flow_dependency_counts()` follows BullMQ's `getDependencyCounts` Redis/Lua

@@ -2937,6 +2937,106 @@ async fn run_flow_dedup_events(redis_url: String) -> redis::RedisResult<()> {
         Some(&serde_json::json!("flow-events:keep-last-latest-parent"))
     );
 
+    let child_queue =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-child-dedup-events")
+            .expect("valid Redis URL should build the flow child dedup events queue");
+    let child_owner = child_queue
+        .add_job(
+            "existing-child-owner".to_string(),
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new()
+                .with_job_id("flow-events:existing-child")
+                .with_deduplication_id("flow-events:child-dedup"),
+        )
+        .await
+        .expect("flow child dedup owner should add");
+    let child_flow = child_queue
+        .add_flow_at(
+            JobSpec::new("flow-child-parent", serde_json::json!({ "parent": true }))
+                .with_options(JobOptions::new().with_job_id("flow-events:child-parent")),
+            vec![
+                JobSpec::new("flow-child-candidate", serde_json::json!({ "version": 2 }))
+                    .with_options(
+                        JobOptions::new()
+                            .with_job_id("flow-events:candidate-child")
+                            .with_deduplication_id("flow-events:child-dedup"),
+                    ),
+                JobSpec::new("flow-child-retained", serde_json::json!({ "version": 3 }))
+                    .with_options(JobOptions::new().with_job_id("flow-events:retained-child")),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("flow with deduplicated child should add");
+    assert_eq!(child_flow.children.len(), 1);
+    assert_eq!(child_flow.children[0].id, "flow-events:retained-child");
+    assert_eq!(
+        child_flow.parent.child_ids,
+        vec!["flow-events:retained-child".to_string()]
+    );
+    assert!(child_queue
+        .get_job("flow-events:candidate-child")
+        .await
+        .expect("deduplicated child candidate lookup should return")
+        .is_none());
+    assert_eq!(
+        child_queue
+            .get_job(&child_owner.id)
+            .await
+            .expect("child dedup owner lookup should return")
+            .expect("child dedup owner should exist")
+            .parent_id,
+        None
+    );
+    let child_counts = child_queue
+        .get_flow_dependency_counts(&child_flow.parent.id)
+        .await
+        .expect("child dedup flow dependency counts should load")
+        .expect("child dedup flow dependency counts should exist");
+    assert_eq!(child_counts.unprocessed, 1);
+    assert_eq!(child_counts.missing, 0);
+    let child_events = child_queue
+        .read_events("-", "+", 20)
+        .await
+        .expect("flow child dedup events should read");
+    let child_event_names = child_events
+        .iter()
+        .map(|event| event.event.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        child_event_names,
+        vec![
+            "added",
+            "waiting",
+            "added",
+            "waiting-children",
+            "debounced",
+            "deduplicated",
+            "added",
+            "waiting"
+        ]
+    );
+    assert_eq!(
+        child_events[4].job_id.as_deref(),
+        Some(child_owner.id.as_str())
+    );
+    assert_eq!(
+        child_events[4].fields.get("debounceId"),
+        Some(&serde_json::json!("flow-events:child-dedup"))
+    );
+    assert_eq!(
+        child_events[5].job_id.as_deref(),
+        Some(child_owner.id.as_str())
+    );
+    assert_eq!(
+        child_events[5].fields.get("deduplicationId"),
+        Some(&serde_json::json!("flow-events:child-dedup"))
+    );
+    assert_eq!(
+        child_events[5].fields.get("deduplicatedJobId"),
+        Some(&serde_json::json!("flow-events:candidate-child"))
+    );
+
     cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())
 }

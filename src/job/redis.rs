@@ -1432,6 +1432,17 @@ local function emit_deduplicated_events(events_key, max_events, owner_job, candi
   redis.call('XADD', events_key, 'MAXLEN', '~', max_events, '*', 'event', 'deduplicated', 'jobId', owner_job["id"], 'deduplicationId', deduplication_id, 'deduplicatedJobId', candidate_job["id"])
 end
 
+local function flow_child_deduplication_requires_next(candidate_job, existing_job)
+  if not candidate_job["options"] or candidate_job["options"] == cjson.null then
+    return false
+  end
+  local deduplication = candidate_job["options"]["deduplication"]
+  return deduplication
+    and deduplication ~= cjson.null
+    and deduplication["keep_last_if_active"] == true
+    and existing_job["state"] == "active"
+end
+
 local function active_repeat_id(jobs_key, repeat_prefix, repeat_key)
   if not repeat_key or repeat_key == '' then
     return nil
@@ -1566,6 +1577,8 @@ local deduplication_next_prefix = ARGV[6 + count * per_job_args]
 local max_events = ARGV[7 + count * per_job_args]
 local staged_deduplication_ids = {}
 local staged_repeat_keys = {}
+local skipped_job_ids = {}
+local deduplicated_child_owner_ids = {}
 local parent_raw = ARGV[3]
 local child_raws = {}
 local child_jobs = {}
@@ -1600,24 +1613,39 @@ for index = 1, count do
         emit_deduplicated_events(KEYS[6], max_events, existing_job, parent_job)
         return {'deduplicated_parent', deduplicated_id}
       end
+    else
+      local existing_raw = redis.call('HGET', KEYS[1], deduplicated_id)
+      if existing_raw then
+        local child_job = cjson.decode(raw)
+        local existing_job = cjson.decode(existing_raw)
+        if flow_child_deduplication_requires_next(child_job, existing_job) then
+          return {'deduplicated', deduplicated_id}
+        end
+        extend_deduplicated_owner(child_job, existing_job, deduplication_prefix)
+        skipped_job_ids[id] = true
+        deduplicated_child_owner_ids[id] = deduplicated_id
+      else
+        return {'deduplicated', deduplicated_id}
+      end
     end
-    return {'deduplicated', deduplicated_id}
   end
-  if deduplication_id ~= '' then
-    if staged_deduplication_ids[deduplication_id] then
-      return {'deduplicated', staged_deduplication_ids[deduplication_id]}
+  if not skipped_job_ids[id] then
+    if deduplication_id ~= '' then
+      if staged_deduplication_ids[deduplication_id] then
+        return {'deduplicated', staged_deduplication_ids[deduplication_id]}
+      end
+      staged_deduplication_ids[deduplication_id] = id
     end
-    staged_deduplication_ids[deduplication_id] = id
-  end
-  local repeat_owner_id = active_repeat_id(KEYS[1], repeat_prefix, repeat_key)
-  if repeat_owner_id then
-    return {'repeat', repeat_owner_id}
-  end
-  if repeat_key ~= '' then
-    if staged_repeat_keys[repeat_key] then
-      return {'repeat', staged_repeat_keys[repeat_key]}
+    local repeat_owner_id = active_repeat_id(KEYS[1], repeat_prefix, repeat_key)
+    if repeat_owner_id then
+      return {'repeat', repeat_owner_id}
     end
-    staged_repeat_keys[repeat_key] = id
+    if repeat_key ~= '' then
+      if staged_repeat_keys[repeat_key] then
+        return {'repeat', staged_repeat_keys[repeat_key]}
+      end
+      staged_repeat_keys[repeat_key] = id
+    end
   end
   offset = offset + per_job_args
 end
@@ -1632,29 +1660,49 @@ for index = 1, count do
   local deduplication_id = ARGV[offset + 5]
   local repeat_key = ARGV[offset + 6]
 
-  redis.call('HSET', KEYS[1], id, raw)
-  if state == 'waiting' then
-    enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[5], cjson.decode(raw), id, priority, waiting_score_bucket, KEYS[#KEYS])
-  elseif state == 'delayed' then
-    redis.call('ZADD', KEYS[3], scheduled_score, id)
-    refresh_delay_marker(KEYS[#KEYS], KEYS[3])
-  elseif state == 'waiting_children' then
-    redis.call('ZADD', KEYS[4], scheduled_score, id)
+  if skipped_job_ids[id] then
+    local owner_raw = redis.call('HGET', KEYS[1], deduplicated_child_owner_ids[id])
+    if owner_raw then
+      emit_deduplicated_events(KEYS[6], max_events, cjson.decode(owner_raw), cjson.decode(raw))
+    end
+  else
+    if index == 1 then
+      local parent_job = cjson.decode(raw)
+      if parent_job["child_ids"] and parent_job["child_ids"] ~= cjson.null then
+        local retained_child_ids = {}
+        for _, child_id in ipairs(parent_job["child_ids"]) do
+          if not skipped_job_ids[child_id] then
+            retained_child_ids[#retained_child_ids + 1] = child_id
+          end
+        end
+        parent_job["child_ids"] = retained_child_ids
+        raw = cjson.encode(parent_job)
+      end
+    end
+    redis.call('HSET', KEYS[1], id, raw)
+    if state == 'waiting' then
+      enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[5], cjson.decode(raw), id, priority, waiting_score_bucket, KEYS[#KEYS])
+    elseif state == 'delayed' then
+      redis.call('ZADD', KEYS[3], scheduled_score, id)
+      refresh_delay_marker(KEYS[#KEYS], KEYS[3])
+    elseif state == 'waiting_children' then
+      redis.call('ZADD', KEYS[4], scheduled_score, id)
+    end
+    if deduplication_id ~= '' then
+      set_deduplication_key(cjson.decode(raw), id, deduplication_prefix)
+    end
+    if repeat_key ~= '' then
+      redis.call('SET', repeat_prefix .. repeat_key, id)
+      store_repeat_scheduler(cjson.decode(raw), id, repeat_prefix, scheduled_score)
+    end
+    local event_job = cjson.decode(raw)
+    redis.call('XADD', KEYS[6], 'MAXLEN', '~', max_events, '*', 'event', 'added', 'jobId', id, 'name', event_job["name"] or '')
+    local event_state = state
+    if event_state == 'waiting_children' then
+      event_state = 'waiting-children'
+    end
+    redis.call('XADD', KEYS[6], 'MAXLEN', '~', max_events, '*', 'event', event_state, 'jobId', id)
   end
-  if deduplication_id ~= '' then
-    set_deduplication_key(cjson.decode(raw), id, deduplication_prefix)
-  end
-  if repeat_key ~= '' then
-    redis.call('SET', repeat_prefix .. repeat_key, id)
-    store_repeat_scheduler(cjson.decode(raw), id, repeat_prefix, scheduled_score)
-  end
-  local event_job = cjson.decode(raw)
-  redis.call('XADD', KEYS[6], 'MAXLEN', '~', max_events, '*', 'event', 'added', 'jobId', id, 'name', event_job["name"] or '')
-  local event_state = state
-  if event_state == 'waiting_children' then
-    event_state = 'waiting-children'
-  end
-  redis.call('XADD', KEYS[6], 'MAXLEN', '~', max_events, '*', 'event', event_state, 'jobId', id)
 
   offset = offset + per_job_args
 end
@@ -1666,12 +1714,24 @@ if count > 1 and ARGV[4] == 'waiting_children' then
 
   local child_offset = 2 + per_job_args
   for index = 2, count do
-    redis.call('SADD', dependency_key, ARGV[child_offset])
+    if not skipped_job_ids[ARGV[child_offset]] then
+      redis.call('SADD', dependency_key, ARGV[child_offset])
+    end
     child_offset = child_offset + per_job_args
   end
 end
 
-return {'ok'}
+local result = {'ok'}
+local skipped_offset = 2 + per_job_args
+for index = 2, count do
+  local child_id = ARGV[skipped_offset]
+  if skipped_job_ids[child_id] then
+    result[#result + 1] = child_id
+  end
+  skipped_offset = skipped_offset + per_job_args
+end
+
+return result
 "#;
 
 const ADD_FLOW_CHILDREN_SCRIPT: &str = r#"
@@ -9407,10 +9467,10 @@ impl RedisJobQueue {
         validate_flow_job_ids(&parent_job, &child_jobs)?;
 
         let mut conn = self.connection().await?;
-        if let Some(existing_parent_id) = self
+        let add_result = self
             .add_flow_jobs(&mut conn, &parent_job, &child_jobs)
-            .await?
-        {
+            .await?;
+        if let Some(existing_parent_id) = add_result.existing_parent_id {
             return self
                 .load_flow_for_parent(&mut conn, &existing_parent_id)
                 .await;
@@ -9421,6 +9481,9 @@ impl RedisJobQueue {
             .unwrap_or(parent_job);
         let mut children = Vec::with_capacity(child_jobs.len());
         for child in child_jobs {
+            if add_result.skipped_child_ids.contains(&child.id) {
+                continue;
+            }
             children.push(self.load_job(&mut conn, &child.id).await?.unwrap_or(child));
         }
 
@@ -9804,7 +9867,7 @@ impl RedisJobQueue {
         conn: &mut ConnectionManager,
         parent: &Job,
         children: &[Job],
-    ) -> Result<Option<JobId>> {
+    ) -> Result<RedisAddFlowResult> {
         let job_count = 1 + children.len();
         let mut command = redis::cmd("EVAL");
         command
@@ -11428,19 +11491,41 @@ fn decode_add_jobs_result(result: &[String], expected_len: usize) -> Result<Vec<
     result.iter().map(|raw| decode_job(raw)).collect()
 }
 
-fn decode_add_flow_result(result: &[String]) -> Result<Option<JobId>> {
+struct RedisAddFlowResult {
+    existing_parent_id: Option<JobId>,
+    skipped_child_ids: HashSet<JobId>,
+}
+
+fn decode_add_flow_result(result: &[String]) -> Result<RedisAddFlowResult> {
     match result.first().map(String::as_str) {
-        Some("ok") => Ok(None),
-        Some("deduplicated_next") => result.get(1).cloned().map(Some).ok_or_else(|| {
-            LaneError::Other(
-                "Redis add flow script returned deduplicated_next without parent id".to_string(),
-            )
+        Some("ok") => Ok(RedisAddFlowResult {
+            existing_parent_id: None,
+            skipped_child_ids: result.iter().skip(1).cloned().collect(),
         }),
-        Some("deduplicated_parent") => result.get(1).cloned().map(Some).ok_or_else(|| {
-            LaneError::Other(
-                "Redis add flow script returned deduplicated_parent without parent id".to_string(),
-            )
-        }),
+        Some("deduplicated_next") => {
+            let existing_parent_id = result.get(1).cloned().ok_or_else(|| {
+                LaneError::Other(
+                    "Redis add flow script returned deduplicated_next without parent id"
+                        .to_string(),
+                )
+            })?;
+            Ok(RedisAddFlowResult {
+                existing_parent_id: Some(existing_parent_id),
+                skipped_child_ids: HashSet::new(),
+            })
+        }
+        Some("deduplicated_parent") => {
+            let existing_parent_id = result.get(1).cloned().ok_or_else(|| {
+                LaneError::Other(
+                    "Redis add flow script returned deduplicated_parent without parent id"
+                        .to_string(),
+                )
+            })?;
+            Ok(RedisAddFlowResult {
+                existing_parent_id: Some(existing_parent_id),
+                skipped_child_ids: HashSet::new(),
+            })
+        }
         Some("exists") => {
             let id = result.get(1).map(String::as_str).unwrap_or("unknown");
             Err(LaneError::ConfigError(format!(
