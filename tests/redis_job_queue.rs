@@ -423,6 +423,22 @@ async fn redis_backend_allows_terminal_progress_updates_against_real_server() {
 }
 
 #[tokio::test]
+async fn redis_backend_allows_terminal_data_updates_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_terminal_data_update(redis_url),
+    )
+    .await
+    .expect("Redis terminal data integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_emits_reschedule_delayed_events_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -2258,6 +2274,121 @@ async fn run_terminal_progress_update(redis_url: String) -> redis::RedisResult<(
         progress.fields.get("data"),
         Some(&serde_json::json!({ "percent": 100 }))
     );
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
+async fn run_terminal_data_update(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "terminal-data")
+        .expect("valid Redis URL should build the terminal-data queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let jobs_key = format!("{namespace}:terminal-data:jobs");
+
+    let completed = queue
+        .add_job(
+            "completed".to_string(),
+            serde_json::json!({ "stage": "created" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("terminal data completed job should add");
+    let completed_claim = queue
+        .claim_next(
+            "worker-terminal-data-completed".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("terminal data completed claim should return")
+        .expect("terminal data completed job should claim");
+    assert_eq!(completed_claim.id, completed.id);
+    queue
+        .complete_job(
+            &completed.id,
+            lock_token(&completed_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("terminal data completed job should complete");
+
+    let updated_completed = queue
+        .update_data(
+            &completed.id,
+            serde_json::json!({ "stage": "archived", "terminal": "completed" }),
+        )
+        .await
+        .expect("completed terminal data update should succeed");
+    assert_eq!(updated_completed.state, JobState::Completed);
+    assert_eq!(
+        updated_completed.payload,
+        serde_json::json!({ "stage": "archived", "terminal": "completed" })
+    );
+    let completed_raw = load_raw_job_value(&mut conn, &jobs_key, &completed.id).await?;
+    assert_eq!(
+        completed_raw.get("payload"),
+        Some(&serde_json::json!({ "stage": "archived", "terminal": "completed" }))
+    );
+
+    let failed = queue
+        .add_job(
+            "failed".to_string(),
+            serde_json::json!({ "stage": "created" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("terminal data failed job should add");
+    let failed_claim = queue
+        .claim_next(
+            "worker-terminal-data-failed".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("terminal data failed claim should return")
+        .expect("terminal data failed job should claim");
+    assert_eq!(failed_claim.id, failed.id);
+    queue
+        .fail_job(
+            &failed.id,
+            lock_token(&failed_claim),
+            "terminal data failure".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("terminal data failed job should fail");
+
+    let updated_failed = queue
+        .update_data(
+            &failed.id,
+            serde_json::json!({ "stage": "archived", "terminal": "failed" }),
+        )
+        .await
+        .expect("failed terminal data update should succeed");
+    assert_eq!(updated_failed.state, JobState::Failed);
+    assert_eq!(
+        updated_failed.payload,
+        serde_json::json!({ "stage": "archived", "terminal": "failed" })
+    );
+    let failed_raw = load_raw_job_value(&mut conn, &jobs_key, &failed.id).await?;
+    assert_eq!(
+        failed_raw.get("payload"),
+        Some(&serde_json::json!({ "stage": "archived", "terminal": "failed" }))
+    );
+
+    let missing = queue
+        .update_data(
+            "missing-terminal-data-job",
+            serde_json::json!({ "stage": "missing" }),
+        )
+        .await
+        .expect_err("missing terminal data update should fail");
+    assert!(matches!(missing, LaneError::JobNotFound(_)));
 
     cleanup_namespace(&redis_url, &namespace).await
 }
