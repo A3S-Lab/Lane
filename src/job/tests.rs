@@ -2998,6 +2998,19 @@ async fn repeat_options_reject_invalid_schedules() {
         .unwrap_err();
     assert!(matches!(invalid_cron, LaneError::ConfigError(_)));
 
+    let expired_end_at = queue
+        .add_at(
+            "sync",
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_repeat(RepeatOptions::every(Duration::from_secs(5)).until(ts(999))),
+            ts(1_000),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(expired_end_at, LaneError::ConfigError(_)));
+    assert_eq!(queue.stats().await.unwrap().total, 0);
+
     let empty_job_id = queue
         .add_at(
             "sync",
@@ -3008,6 +3021,56 @@ async fn repeat_options_reject_invalid_schedules() {
         .await
         .unwrap_err();
     assert!(matches!(empty_job_id, LaneError::ConfigError(_)));
+}
+
+#[tokio::test]
+async fn repeat_end_at_rejects_bulk_flow_and_upsert_without_partial_writes() {
+    let queue = InMemoryJobQueue::new("repeat-expired-end-at");
+    let now = ts(1_000);
+    let bulk_error = queue
+        .add_many_at(
+            vec![
+                JobSpec::new("valid", serde_json::json!({ "ok": true })),
+                JobSpec::new("expired", serde_json::json!({ "ok": false })).with_options(
+                    JobOptions::new()
+                        .with_repeat(RepeatOptions::every(Duration::from_secs(5)).until(ts(999))),
+                ),
+            ],
+            now,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(bulk_error, LaneError::ConfigError(_)));
+    assert_eq!(queue.stats().await.unwrap().total, 0);
+
+    let flow_error = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({})),
+            vec![
+                JobSpec::new("expired-child", serde_json::json!({})).with_options(
+                    JobOptions::new()
+                        .with_repeat(RepeatOptions::every(Duration::from_secs(5)).until(ts(999))),
+                ),
+            ],
+            now,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(flow_error, LaneError::ConfigError(_)));
+    assert_eq!(queue.stats().await.unwrap().total, 0);
+
+    let upsert_error = queue
+        .upsert_repeat(
+            JobSpec::new("expired-upsert", serde_json::json!({})).with_options(
+                JobOptions::new()
+                    .with_repeat(RepeatOptions::every(Duration::from_secs(5)).until(ts(999))),
+            ),
+            now,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(upsert_error, LaneError::ConfigError(_)));
+    assert_eq!(queue.stats().await.unwrap().total, 0);
 }
 
 #[tokio::test]

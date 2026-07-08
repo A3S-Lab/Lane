@@ -667,7 +667,9 @@ non-terminal occurrence with the same repeat key exists, duplicate adds return
 that owner instead of creating a parallel repeat chain. In Redis, duplicate
 repeat adds can recover from a missing fast owner key by validating
 `repeat_meta:<key>.jid` and restoring `repeat:<key>` before returning the
-current owner:
+current owner. Adds, bulk adds, flow adds, dynamic flow children, and repeat
+upserts reject repeat options whose `end_at` is earlier than the add timestamp,
+matching BullMQ's `endDate` add-time guard and avoiding partial writes:
 
 ```rust
 use a3s_lane::{InMemoryJobQueue, JobOptions, JobSpec, RepeatOptions};
@@ -1383,7 +1385,10 @@ non-active owner from the jobs hash and state indexes, clears its lock, logs,
 dependency key, deduplication owner, and repeat owner only when they still point
 at that job, then writes the replacement job, its waiting/delayed index, events,
 deduplication key, `repeat:<key>` owner, and scheduler metadata in the same
-Redis turn.
+Redis turn. Lane validates repeat `end_at` before the Redis script is invoked;
+if the end timestamp is already earlier than the add/upsert timestamp, the
+operation returns a configuration error and leaves job hashes, state indexes,
+repeat owners, and scheduler metadata untouched.
 
 This is intentionally a script-level mechanism, not just API-field parity. It is
 inspired by BullMQ's use of Lua scripts to maintain repeat scheduler records,

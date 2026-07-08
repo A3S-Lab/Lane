@@ -800,6 +800,22 @@ async fn redis_backend_adds_repeat_from_scheduler_metadata_against_real_server()
 }
 
 #[tokio::test]
+async fn redis_backend_rejects_expired_repeat_end_at_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_repeat_expired_end_at_validation(redis_url),
+    )
+    .await
+    .expect("Redis expired repeat end_at integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_clears_keep_last_next_on_manual_release_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -6432,6 +6448,215 @@ async fn run_repeat_add_scheduler_metadata(redis_url: String) -> redis::RedisRes
 
     cleanup_namespace_with_conn(&mut conn, &namespace).await?;
     trace_stage("repeat-add-scheduler:cleanup-final:done");
+    Ok(())
+}
+
+async fn run_repeat_expired_end_at_validation(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    trace_stage("repeat-expired-end-at:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("repeat-expired-end-at:cleanup:done");
+
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let add_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "repeat-expired-add")
+        .expect("valid Redis URL should build the expired repeat add queue");
+    let add_error = add_queue
+        .add_job(
+            "expired-add".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_repeat(
+                RepeatOptions::every(Duration::from_secs(60))
+                    .until(Utc::now() - chrono::Duration::seconds(1))
+                    .with_key("expired-add"),
+            ),
+        )
+        .await
+        .expect_err("expired repeat add should reject before Redis writes");
+    assert!(matches!(add_error, LaneError::ConfigError(_)));
+    assert_eq!(add_queue.stats().await.unwrap().total, 0);
+    assert_eq!(add_queue.count_repeats().await.unwrap(), 0);
+    let add_jobs_len: usize = conn
+        .hlen(format!("{namespace}:repeat-expired-add:jobs"))
+        .await?;
+    assert_eq!(add_jobs_len, 0);
+    let add_scheduler_score: Option<f64> = conn
+        .zscore(
+            format!("{namespace}:repeat-expired-add:repeat"),
+            "expired-add",
+        )
+        .await?;
+    assert!(add_scheduler_score.is_none());
+
+    let bulk_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "repeat-expired-bulk")
+        .expect("valid Redis URL should build the expired repeat bulk queue");
+    let bulk_error = bulk_queue
+        .add_many_at(
+            vec![
+                JobSpec::new("valid-bulk", serde_json::json!({ "ok": true }))
+                    .with_options(JobOptions::new().with_job_id("expired-bulk-valid")),
+                JobSpec::new("expired-bulk", serde_json::json!({ "ok": false })).with_options(
+                    JobOptions::new()
+                        .with_job_id("expired-bulk-repeat")
+                        .with_repeat(
+                            RepeatOptions::every(Duration::from_secs(60))
+                                .until(ts(999))
+                                .with_key("expired-bulk"),
+                        ),
+                ),
+            ],
+            ts(1_000),
+        )
+        .await
+        .expect_err("expired repeat bulk add should reject before partial writes");
+    assert!(matches!(bulk_error, LaneError::ConfigError(_)));
+    assert_eq!(bulk_queue.stats().await.unwrap().total, 0);
+    let bulk_jobs_len: usize = conn
+        .hlen(format!("{namespace}:repeat-expired-bulk:jobs"))
+        .await?;
+    assert_eq!(bulk_jobs_len, 0);
+    let bulk_valid_hash: Option<String> = conn
+        .hget(
+            format!("{namespace}:repeat-expired-bulk:jobs"),
+            "expired-bulk-valid",
+        )
+        .await?;
+    assert!(bulk_valid_hash.is_none());
+
+    let flow_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "repeat-expired-flow")
+        .expect("valid Redis URL should build the expired repeat flow queue");
+    let flow_error = flow_queue
+        .add_flow_at(
+            JobSpec::new("flow-parent", serde_json::json!({}))
+                .with_options(JobOptions::new().with_job_id("expired-flow-parent")),
+            vec![
+                JobSpec::new("flow-child", serde_json::json!({})).with_options(
+                    JobOptions::new()
+                        .with_job_id("expired-flow-child")
+                        .with_repeat(
+                            RepeatOptions::every(Duration::from_secs(60))
+                                .until(ts(999))
+                                .with_key("expired-flow"),
+                        ),
+                ),
+            ],
+            ts(1_000),
+        )
+        .await
+        .expect_err("expired repeat flow add should reject before partial writes");
+    assert!(matches!(flow_error, LaneError::ConfigError(_)));
+    assert_eq!(flow_queue.stats().await.unwrap().total, 0);
+    let flow_jobs_len: usize = conn
+        .hlen(format!("{namespace}:repeat-expired-flow:jobs"))
+        .await?;
+    assert_eq!(flow_jobs_len, 0);
+
+    let dynamic_queue =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "repeat-expired-dynamic")
+            .expect("valid Redis URL should build the expired dynamic flow queue");
+    let parent = dynamic_queue
+        .add_job(
+            "dynamic-parent".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_job_id("expired-dynamic-parent"),
+        )
+        .await
+        .expect("dynamic parent should add");
+    let claimed_parent = dynamic_queue
+        .claim_next(
+            "worker-repeat-expired-dynamic".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("dynamic parent claim should return")
+        .expect("dynamic parent should be claimable");
+    assert_eq!(claimed_parent.id, parent.id);
+    let dynamic_error = dynamic_queue
+        .add_flow_children_at(
+            &claimed_parent.id,
+            lock_token(&claimed_parent),
+            vec![
+                JobSpec::new("dynamic-child", serde_json::json!({})).with_options(
+                    JobOptions::new()
+                        .with_job_id("expired-dynamic-child")
+                        .with_repeat(
+                            RepeatOptions::every(Duration::from_secs(60))
+                                .until(ts(999))
+                                .with_key("expired-dynamic"),
+                        ),
+                ),
+            ],
+            ts(1_000),
+        )
+        .await
+        .expect_err("expired dynamic repeat child should reject before parent movement");
+    assert!(matches!(dynamic_error, LaneError::ConfigError(_)));
+    assert_eq!(dynamic_queue.stats().await.unwrap().total, 1);
+    let dynamic_child_hash: Option<String> = conn
+        .hget(
+            format!("{namespace}:repeat-expired-dynamic:jobs"),
+            "expired-dynamic-child",
+        )
+        .await?;
+    assert!(dynamic_child_hash.is_none());
+    let dynamic_parent_active_score: Option<f64> = conn
+        .zscore(
+            format!("{namespace}:repeat-expired-dynamic:active"),
+            &claimed_parent.id,
+        )
+        .await?;
+    assert!(dynamic_parent_active_score.is_some());
+    let dynamic_parent_waiting_children_score: Option<f64> = conn
+        .zscore(
+            format!("{namespace}:repeat-expired-dynamic:waiting_children"),
+            &claimed_parent.id,
+        )
+        .await?;
+    assert!(dynamic_parent_waiting_children_score.is_none());
+
+    let upsert_queue =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "repeat-expired-upsert")
+            .expect("valid Redis URL should build the expired repeat upsert queue");
+    let upsert_error = upsert_queue
+        .upsert_repeat(
+            JobSpec::new("expired-upsert", serde_json::json!({})).with_options(
+                JobOptions::new()
+                    .with_job_id("expired-upsert-job")
+                    .with_repeat(
+                        RepeatOptions::every(Duration::from_secs(60))
+                            .until(ts(999))
+                            .with_key("expired-upsert"),
+                    ),
+            ),
+            ts(1_000),
+        )
+        .await
+        .expect_err("expired repeat upsert should reject before Redis writes");
+    assert!(matches!(upsert_error, LaneError::ConfigError(_)));
+    assert_eq!(upsert_queue.stats().await.unwrap().total, 0);
+    assert_eq!(upsert_queue.count_repeats().await.unwrap(), 0);
+    let upsert_jobs_len: usize = conn
+        .hlen(format!("{namespace}:repeat-expired-upsert:jobs"))
+        .await?;
+    assert_eq!(upsert_jobs_len, 0);
+    let upsert_owner: Option<String> = conn
+        .get(format!(
+            "{namespace}:repeat-expired-upsert:repeat:expired-upsert"
+        ))
+        .await?;
+    assert!(upsert_owner.is_none());
+    let upsert_meta_exists: bool = conn
+        .exists(format!(
+            "{namespace}:repeat-expired-upsert:repeat_meta:expired-upsert"
+        ))
+        .await?;
+    assert!(!upsert_meta_exists);
+
+    cleanup_namespace_with_conn(&mut conn, &namespace).await?;
+    trace_stage("repeat-expired-end-at:cleanup-final:done");
     Ok(())
 }
 

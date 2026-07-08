@@ -9655,7 +9655,7 @@ impl RedisJobQueue {
 
     /// Create or replace the current non-active occurrence for a repeat series.
     pub async fn upsert_repeat(&self, spec: JobSpec, now: DateTime<Utc>) -> Result<Job> {
-        validate_job_options(&spec.options)?;
+        validate_job_options_at(&spec.options, now)?;
         if spec.options.repeat.is_none() {
             return Err(LaneError::ConfigError(
                 "repeat options are required to upsert a repeat series".to_string(),
@@ -9713,7 +9713,7 @@ impl RedisJobQueue {
     /// Add multiple jobs at an explicit timestamp.
     pub async fn add_many_at(&self, jobs: Vec<JobSpec>, now: DateTime<Utc>) -> Result<Vec<Job>> {
         for spec in &jobs {
-            validate_job_options(&spec.options)?;
+            validate_job_options_at(&spec.options, now)?;
         }
         let created = jobs
             .into_iter()
@@ -9777,9 +9777,9 @@ impl RedisJobQueue {
         children: Vec<JobSpec>,
         now: DateTime<Utc>,
     ) -> Result<JobFlow> {
-        validate_job_options(&parent.options)?;
+        validate_job_options_at(&parent.options, now)?;
         for child in &children {
-            validate_job_options(&child.options)?;
+            validate_job_options_at(&child.options, now)?;
         }
         let mut parent_job = Job::new(
             self.queue.clone(),
@@ -9858,7 +9858,7 @@ impl RedisJobQueue {
             ));
         }
         for child in &children {
-            validate_job_options(&child.options)?;
+            validate_job_options_at(&child.options, now)?;
         }
 
         let mut child_jobs = Vec::with_capacity(children.len());
@@ -10659,8 +10659,8 @@ impl RedisJobQueue {
 #[async_trait]
 impl JobQueueBackend for RedisJobQueue {
     async fn add_job(&self, name: String, payload: Value, options: JobOptions) -> Result<Job> {
-        validate_job_options(&options)?;
         let now = Utc::now();
+        validate_job_options_at(&options, now)?;
         let job = Job::new(self.queue.clone(), name, payload, options, now);
         let mut conn = self.connection().await?;
         self.add_new_job(&mut conn, &job).await
@@ -12748,6 +12748,17 @@ fn state_after_dependencies(scheduled_at: DateTime<Utc>, now: DateTime<Utc>) -> 
 
 fn validate_job_options(options: &JobOptions) -> Result<()> {
     options.validate()
+}
+
+fn validate_job_options_at(options: &JobOptions, now: DateTime<Utc>) -> Result<()> {
+    validate_job_options(options)?;
+    if matches!(options.repeat.as_ref().and_then(|repeat| repeat.end_at), Some(end_at) if end_at < now)
+    {
+        return Err(LaneError::ConfigError(
+            "repeat end_at must not be earlier than the add timestamp".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_flow_job_ids(parent: &Job, children: &[Job]) -> Result<()> {
