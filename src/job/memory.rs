@@ -465,6 +465,8 @@ impl InMemoryJobQueue {
             return Ok(Self::flow_for_existing_owner_locked(&inner, &existing));
         }
         let mut deduplicated_children = HashMap::new();
+        let mut deduplicated_next_children = HashMap::new();
+        let mut deduplicated_next_child_by_id = HashMap::new();
         let mut flow_deduplication_ids = HashSet::new();
         if let Some(deduplication_id) = active_deduplication_id(&parent_job, now) {
             flow_deduplication_ids.insert(deduplication_id.to_string());
@@ -480,10 +482,22 @@ impl InMemoryJobQueue {
                 .cloned()
                 {
                     if flow_child_deduplication_requires_next(child, &existing) {
-                        return Err(LaneError::ConfigError(format!(
-                            "flow child deduplication id `{deduplication_id}` is already active on job {}",
-                            existing.id
-                        )));
+                        if !Self::store_deduplicated_next_locked(&mut inner, child, &existing) {
+                            return Err(LaneError::ConfigError(format!(
+                                "flow child deduplication id `{deduplication_id}` is already active on job {}",
+                                existing.id
+                            )));
+                        }
+                        if let Some(previous_child_id) = deduplicated_next_child_by_id
+                            .insert(deduplication_id.to_string(), child.id.clone())
+                        {
+                            parent_job
+                                .child_ids
+                                .retain(|child_id| child_id != &previous_child_id);
+                            deduplicated_next_children.remove(&previous_child_id);
+                        }
+                        deduplicated_next_children.insert(child.id.clone(), existing);
+                        continue;
                     }
                     Self::extend_deduplication_expiration_locked(
                         &mut inner.jobs,
@@ -508,11 +522,10 @@ impl InMemoryJobQueue {
             parent_job.state = state_after_dependencies(parent_job.scheduled_at, now);
         }
         let mut flow_repeat_keys = HashSet::new();
-        for job in std::iter::once(&parent_job).chain(
-            child_jobs
-                .iter()
-                .filter(|child| !deduplicated_children.contains_key(&child.id)),
-        ) {
+        for job in std::iter::once(&parent_job).chain(child_jobs.iter().filter(|child| {
+            !deduplicated_children.contains_key(&child.id)
+                && !deduplicated_next_children.contains_key(&child.id)
+        })) {
             if let Some(repeat_key) = active_repeat_key(job) {
                 if find_active_repeat_key(&inner.jobs, repeat_key).is_some()
                     || !flow_repeat_keys.insert(repeat_key.to_string())
@@ -529,7 +542,10 @@ impl InMemoryJobQueue {
         Self::emit_job_created_events_locked(&mut inner, &parent_job, now);
         let mut stored_child_jobs = Vec::with_capacity(child_jobs.len());
         for mut child in child_jobs {
-            if let Some(existing) = deduplicated_children.get(&child.id) {
+            if let Some(existing) = deduplicated_children
+                .get(&child.id)
+                .or_else(|| deduplicated_next_children.get(&child.id))
+            {
                 emit_deduplicated_events_locked(&mut inner, existing, &child, now);
             } else {
                 assign_waiting_order(&mut inner.sequence, &mut child);
@@ -1727,6 +1743,13 @@ impl InMemoryJobQueue {
         }
         if inner.jobs.contains_key(&next.id) {
             return None;
+        }
+        if let Some(parent_id) = next.parent_id.as_deref() {
+            if let Some(parent) = inner.jobs.get_mut(parent_id) {
+                if !parent.child_ids.iter().any(|child_id| child_id == &next.id) {
+                    parent.child_ids.push(next.id.clone());
+                }
+            }
         }
         Self::forget_released_deduplication_owner_locked(inner, &next);
         assign_waiting_order(&mut inner.sequence, &mut next);
@@ -3132,7 +3155,6 @@ fn deduplication_stores_next_if_active(candidate: &Job, existing: &Job) -> bool 
             .map(|deduplication| deduplication.keep_last_if_active),
         Some(true)
     ) && existing.state == JobState::Active
-        && candidate.parent_id.is_none()
         && candidate.child_ids.is_empty()
         && candidate.repeat_key.as_deref() == existing.repeat_key.as_deref()
 }

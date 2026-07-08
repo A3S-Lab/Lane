@@ -1579,6 +1579,8 @@ local staged_deduplication_ids = {}
 local staged_repeat_keys = {}
 local skipped_job_ids = {}
 local deduplicated_child_owner_ids = {}
+local deduplicated_next_child_ids = {}
+local deduplicated_next_child_id_by_deduplication = {}
 local parent_raw = ARGV[3]
 local child_raws = {}
 local child_jobs = {}
@@ -1619,11 +1621,21 @@ for index = 1, count do
         local child_job = cjson.decode(raw)
         local existing_job = cjson.decode(existing_raw)
         if flow_child_deduplication_requires_next(child_job, existing_job) then
-          return {'deduplicated', deduplicated_id}
+          redis.call('SET', deduplication_next_prefix .. deduplication_id, raw)
+          redis.call('PERSIST', deduplication_prefix .. deduplication_id)
+          skipped_job_ids[id] = true
+          deduplicated_child_owner_ids[id] = deduplicated_id
+          local previous_next_child_id = deduplicated_next_child_id_by_deduplication[deduplication_id]
+          if previous_next_child_id then
+            deduplicated_next_child_ids[previous_next_child_id] = nil
+          end
+          deduplicated_next_child_id_by_deduplication[deduplication_id] = id
+          deduplicated_next_child_ids[id] = true
+        else
+          extend_deduplicated_owner(child_job, existing_job, deduplication_prefix)
+          skipped_job_ids[id] = true
+          deduplicated_child_owner_ids[id] = deduplicated_id
         end
-        extend_deduplicated_owner(child_job, existing_job, deduplication_prefix)
-        skipped_job_ids[id] = true
-        deduplicated_child_owner_ids[id] = deduplicated_id
       else
         return {'deduplicated', deduplicated_id}
       end
@@ -1671,7 +1683,7 @@ for index = 1, count do
       if parent_job["child_ids"] and parent_job["child_ids"] ~= cjson.null then
         local retained_child_ids = {}
         for _, child_id in ipairs(parent_job["child_ids"]) do
-          if not skipped_job_ids[child_id] then
+          if not skipped_job_ids[child_id] or deduplicated_next_child_ids[child_id] then
             retained_child_ids[#retained_child_ids + 1] = child_id
           end
         end
@@ -3019,6 +3031,27 @@ local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, waiti
     set_repeat_key(next_job, next_job["id"], repeat_prefix)
   end
   enqueue_prepared_job(jobs_key, waiting_key, waiting_children_key, delayed_key, sequence_key, next_job, scheduled_millis, waiting_score_bucket, marker_key)
+  local parent_id = next_job["parent_id"]
+  if parent_id and parent_id ~= cjson.null then
+    local parent_raw = redis.call('HGET', jobs_key, parent_id)
+    if parent_raw then
+      local parent = cjson.decode(parent_raw)
+      local child_ids = parent["child_ids"] or {}
+      local found_child = false
+      for _, child_id in ipairs(child_ids) do
+        if child_id == next_job["id"] then
+          found_child = true
+          break
+        end
+      end
+      if not found_child then
+        child_ids[#child_ids + 1] = next_job["id"]
+        parent["child_ids"] = child_ids
+        redis.call('HSET', jobs_key, parent_id, cjson.encode(parent))
+      end
+      redis.call('SADD', dependency_prefix .. parent_id, next_job["id"])
+    end
+  end
   redis.call('DEL', next_key)
   return true
 end
@@ -3819,6 +3852,27 @@ local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, waiti
     store_repeat_scheduler(next_job, next_job["id"], repeat_prefix, scheduled_millis)
   end
   enqueue_prepared_job(jobs_key, waiting_key, waiting_children_key, delayed_key, sequence_key, next_job, scheduled_millis, waiting_score_bucket, marker_key)
+  local parent_id = next_job["parent_id"]
+  if parent_id and parent_id ~= cjson.null then
+    local parent_raw = redis.call('HGET', jobs_key, parent_id)
+    if parent_raw then
+      local parent = cjson.decode(parent_raw)
+      local child_ids = parent["child_ids"] or {}
+      local found_child = false
+      for _, child_id in ipairs(child_ids) do
+        if child_id == next_job["id"] then
+          found_child = true
+          break
+        end
+      end
+      if not found_child then
+        child_ids[#child_ids + 1] = next_job["id"]
+        parent["child_ids"] = child_ids
+        redis.call('HSET', jobs_key, parent_id, cjson.encode(parent))
+      end
+      redis.call('SADD', dependency_prefix .. parent_id, next_job["id"])
+    end
+  end
   redis.call('DEL', next_key)
   return true
 end
@@ -5086,6 +5140,27 @@ local function enqueue_deduplicated_next(owner_job, jobs_key, waiting_key, waiti
     store_repeat_scheduler(next_job, next_job["id"], repeat_prefix, scheduled_millis)
   end
   enqueue_prepared_job(jobs_key, waiting_key, waiting_children_key, delayed_key, sequence_key, next_job, scheduled_millis, waiting_score_bucket, marker_key)
+  local parent_id = next_job["parent_id"]
+  if parent_id and parent_id ~= cjson.null then
+    local parent_raw = redis.call('HGET', jobs_key, parent_id)
+    if parent_raw then
+      local parent = cjson.decode(parent_raw)
+      local child_ids = parent["child_ids"] or {}
+      local found_child = false
+      for _, child_id in ipairs(child_ids) do
+        if child_id == next_job["id"] then
+          found_child = true
+          break
+        end
+      end
+      if not found_child then
+        child_ids[#child_ids + 1] = next_job["id"]
+        parent["child_ids"] = child_ids
+        redis.call('HSET', jobs_key, parent_id, cjson.encode(parent))
+      end
+      redis.call('SADD', dependency_prefix .. parent_id, next_job["id"])
+    end
+  end
   redis.call('DEL', next_key)
   return true
 end

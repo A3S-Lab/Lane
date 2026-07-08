@@ -3037,6 +3037,142 @@ async fn run_flow_dedup_events(redis_url: String) -> redis::RedisResult<()> {
         Some(&serde_json::json!("flow-events:candidate-child"))
     );
 
+    let child_keep_last_queue =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-child-keep-last")
+            .expect("valid Redis URL should build the flow child keep-last queue");
+    let child_keep_last_deduplication =
+        DeduplicationOptions::new("flow-events:child-keep-last").keep_last_if_active(true);
+    let child_keep_last_owner = child_keep_last_queue
+        .add_flow_at(
+            JobSpec::new(
+                "flow-child-keep-last-owner-parent",
+                serde_json::json!({ "version": 1 }),
+            )
+            .with_options(JobOptions::new().with_priority(1000)),
+            vec![JobSpec::new(
+                "flow-child-keep-last-owner",
+                serde_json::json!({ "version": 1 }),
+            )
+            .with_options(
+                JobOptions::new()
+                    .with_job_id("flow-events:child-keep-last-owner")
+                    .with_deduplication(child_keep_last_deduplication.clone()),
+            )],
+            Utc::now(),
+        )
+        .await
+        .expect("flow child keep-last owner should add");
+    let child_keep_last_owner_claim = child_keep_last_queue
+        .claim_next(
+            "worker-flow-child-keep-last-owner".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("flow child keep-last owner claim should return")
+        .expect("flow child keep-last owner should be claimable");
+    assert_eq!(
+        child_keep_last_owner_claim.id,
+        child_keep_last_owner.children[0].id
+    );
+    let child_keep_last_next = child_keep_last_queue
+        .add_flow_at(
+            JobSpec::new(
+                "flow-child-keep-last-next-parent",
+                serde_json::json!({ "version": 2 }),
+            )
+            .with_options(JobOptions::new().with_job_id("flow-events:child-keep-last-parent")),
+            vec![JobSpec::new(
+                "flow-child-keep-last-next",
+                serde_json::json!({ "version": 2 }),
+            )
+            .with_options(
+                JobOptions::new()
+                    .with_job_id("flow-events:child-keep-last-next")
+                    .with_priority(0)
+                    .with_deduplication(child_keep_last_deduplication),
+            )],
+            Utc::now(),
+        )
+        .await
+        .expect("flow child keep-last next flow should add");
+    assert!(child_keep_last_next.children.is_empty());
+    assert_eq!(
+        child_keep_last_next.parent.child_ids,
+        vec!["flow-events:child-keep-last-next".to_string()]
+    );
+    assert!(child_keep_last_queue
+        .get_job("flow-events:child-keep-last-next")
+        .await
+        .expect("flow child keep-last next lookup should return")
+        .is_none());
+    child_keep_last_queue
+        .complete_job(
+            &child_keep_last_owner_claim.id,
+            lock_token(&child_keep_last_owner_claim),
+            serde_json::json!({ "owner": "done" }),
+            Utc::now(),
+        )
+        .await
+        .expect("flow child keep-last owner should complete");
+    let materialized_child = child_keep_last_queue
+        .get_job("flow-events:child-keep-last-next")
+        .await
+        .expect("materialized flow child keep-last lookup should return")
+        .expect("materialized flow child keep-last should exist");
+    assert_eq!(
+        materialized_child.parent_id.as_deref(),
+        Some(child_keep_last_next.parent.id.as_str())
+    );
+    assert_eq!(materialized_child.state, JobState::Waiting);
+    let child_keep_last_counts = child_keep_last_queue
+        .get_flow_dependency_counts(&child_keep_last_next.parent.id)
+        .await
+        .expect("flow child keep-last dependency counts should load")
+        .expect("flow child keep-last parent should exist");
+    assert_eq!(child_keep_last_counts.unprocessed, 1);
+    assert_eq!(child_keep_last_counts.missing, 0);
+    assert_eq!(
+        child_keep_last_queue
+            .get_job(&child_keep_last_next.parent.id)
+            .await
+            .expect("flow child keep-last parent lookup should return")
+            .expect("flow child keep-last parent should exist")
+            .state,
+        JobState::WaitingChildren
+    );
+    let child_keep_last_next_claim = child_keep_last_queue
+        .claim_next(
+            "worker-flow-child-keep-last-next".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("flow child keep-last next claim should return")
+        .expect("flow child keep-last next should be claimable");
+    assert_eq!(
+        child_keep_last_next_claim.id,
+        "flow-events:child-keep-last-next"
+    );
+    child_keep_last_queue
+        .complete_job(
+            &child_keep_last_next_claim.id,
+            lock_token(&child_keep_last_next_claim),
+            serde_json::json!({ "next": "done" }),
+            Utc::now(),
+        )
+        .await
+        .expect("flow child keep-last next should complete");
+    assert_eq!(
+        child_keep_last_queue
+            .get_job(&child_keep_last_next.parent.id)
+            .await
+            .expect("released flow child keep-last parent lookup should return")
+            .expect("released flow child keep-last parent should exist")
+            .state,
+        JobState::Waiting
+    );
+
     cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())
 }

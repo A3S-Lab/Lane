@@ -4716,6 +4716,152 @@ async fn flow_child_deduplication_duplicate_emits_events_without_parent_dependen
 }
 
 #[tokio::test]
+async fn flow_child_keep_last_deduplication_materializes_next_child_for_parent() {
+    let queue = InMemoryJobQueue::new("flow-child-keep-last");
+    let deduplication =
+        DeduplicationOptions::new("tenant:flow-child-keep-last").keep_last_if_active(true);
+    let owner_flow = queue
+        .add_flow_at(
+            JobSpec::new("owner-parent", serde_json::json!({ "owner": true }))
+                .with_options(JobOptions::new().with_priority(1000)),
+            vec![
+                JobSpec::new("owner-child", serde_json::json!({ "version": 1 })).with_options(
+                    JobOptions::new()
+                        .with_job_id("flow-child-keep-last:owner")
+                        .with_deduplication(deduplication.clone()),
+                ),
+            ],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    let owner_child = queue
+        .claim_next(
+            "worker-owner-child".to_string(),
+            Duration::from_secs(30),
+            ts(1_050),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner_child.id, owner_flow.children[0].id);
+
+    let next_flow = queue
+        .add_flow_at(
+            JobSpec::new("next-parent", serde_json::json!({ "next": true }))
+                .with_options(JobOptions::new().with_job_id("flow-child-keep-last:parent")),
+            vec![
+                JobSpec::new("next-child", serde_json::json!({ "version": 2 })).with_options(
+                    JobOptions::new()
+                        .with_job_id("flow-child-keep-last:next")
+                        .with_priority(0)
+                        .with_deduplication(deduplication),
+                ),
+            ],
+            ts(1_100),
+        )
+        .await
+        .unwrap();
+    assert!(next_flow.children.is_empty());
+    assert_eq!(
+        next_flow.parent.child_ids,
+        vec!["flow-child-keep-last:next".to_string()]
+    );
+    assert!(queue
+        .get_job("flow-child-keep-last:next")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        queue
+            .get_flow_dependency_counts(&next_flow.parent.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        JobFlowDependencyCounts {
+            processed: 0,
+            unprocessed: 0,
+            failed: 0,
+            ignored: 0,
+            missing: 1,
+        }
+    );
+
+    queue
+        .complete_job(
+            &owner_child.id,
+            lock_token(&owner_child),
+            serde_json::json!({ "owner": "done" }),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+
+    let materialized_child = queue
+        .get_job("flow-child-keep-last:next")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        materialized_child.parent_id.as_deref(),
+        Some(next_flow.parent.id.as_str())
+    );
+    assert_eq!(materialized_child.state, JobState::Waiting);
+    assert_eq!(
+        queue
+            .get_flow_dependency_counts(&next_flow.parent.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        JobFlowDependencyCounts {
+            processed: 0,
+            unprocessed: 1,
+            failed: 0,
+            ignored: 0,
+            missing: 0,
+        }
+    );
+    assert_eq!(
+        queue
+            .get_job(&next_flow.parent.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        JobState::WaitingChildren
+    );
+
+    let claimed_next = queue
+        .claim_next(
+            "worker-next-child".to_string(),
+            Duration::from_secs(30),
+            ts(1_250),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed_next.id, "flow-child-keep-last:next");
+    queue
+        .complete_job(
+            &claimed_next.id,
+            lock_token(&claimed_next),
+            serde_json::json!({ "next": "done" }),
+            ts(1_300),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        queue
+            .get_job(&next_flow.parent.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        JobState::Waiting
+    );
+}
+
+#[tokio::test]
 async fn flow_parent_releases_when_pending_child_is_cleaned() {
     let queue = InMemoryJobQueue::new("flow-clean");
     let flow = queue
