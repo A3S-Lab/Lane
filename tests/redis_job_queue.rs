@@ -816,6 +816,22 @@ async fn redis_backend_rejects_expired_repeat_end_at_against_real_server() {
 }
 
 #[tokio::test]
+async fn redis_backend_rejects_bullmq_reserved_job_ids_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_reserved_job_id_validation(redis_url),
+    )
+    .await
+    .expect("Redis reserved job-id integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_clears_keep_last_next_on_manual_release_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -6657,6 +6673,87 @@ async fn run_repeat_expired_end_at_validation(redis_url: String) -> redis::Redis
 
     cleanup_namespace_with_conn(&mut conn, &namespace).await?;
     trace_stage("repeat-expired-end-at:cleanup-final:done");
+    Ok(())
+}
+
+async fn run_reserved_job_id_validation(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    trace_stage("reserved-job-id:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await?;
+    trace_stage("reserved-job-id:cleanup:done");
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "reserved-job-id")
+        .expect("valid Redis URL should build the reserved job-id queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let now = ts(1_000);
+
+    let zero_id = queue
+        .add_job(
+            "reserved-zero".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_job_id("0"),
+        )
+        .await
+        .expect_err("job id 0 should reject before Redis writes");
+    assert!(matches!(zero_id, LaneError::ConfigError(_)));
+    assert_eq!(queue.stats().await.unwrap().total, 0);
+
+    let marker_prefix = queue
+        .add_many_at(
+            vec![
+                JobSpec::new("valid", serde_json::json!({}))
+                    .with_options(JobOptions::new().with_job_id("valid-id")),
+                JobSpec::new("reserved-marker", serde_json::json!({}))
+                    .with_options(JobOptions::new().with_job_id("0:delayed")),
+            ],
+            now,
+        )
+        .await
+        .expect_err("reserved marker-like id should reject before partial bulk writes");
+    assert!(matches!(marker_prefix, LaneError::ConfigError(_)));
+    assert_eq!(queue.stats().await.unwrap().total, 0);
+    let jobs_len: usize = conn
+        .hlen(format!("{namespace}:reserved-job-id:jobs"))
+        .await?;
+    assert_eq!(jobs_len, 0);
+
+    let flow_error = queue
+        .add_flow_at(
+            JobSpec::new("reserved-parent", serde_json::json!({}))
+                .with_options(JobOptions::new().with_job_id("0:parent")),
+            vec![JobSpec::new("child", serde_json::json!({}))],
+            now,
+        )
+        .await
+        .expect_err("reserved flow parent id should reject before Redis writes");
+    assert!(matches!(flow_error, LaneError::ConfigError(_)));
+    assert_eq!(queue.stats().await.unwrap().total, 0);
+
+    let upsert_error = queue
+        .upsert_repeat(
+            JobSpec::new("reserved-repeat", serde_json::json!({})).with_options(
+                JobOptions::new().with_job_id("0:repeat").with_repeat(
+                    RepeatOptions::every(Duration::from_secs(60)).with_key("reserved-repeat"),
+                ),
+            ),
+            now,
+        )
+        .await
+        .expect_err("reserved repeat owner id should reject before Redis writes");
+    assert!(matches!(upsert_error, LaneError::ConfigError(_)));
+    assert_eq!(queue.stats().await.unwrap().total, 0);
+    assert_eq!(queue.count_repeats().await.unwrap(), 0);
+    let repeat_owner: Option<String> = conn
+        .get(format!(
+            "{namespace}:reserved-job-id:repeat:reserved-repeat"
+        ))
+        .await?;
+    assert!(repeat_owner.is_none());
+
+    cleanup_namespace_with_conn(&mut conn, &namespace).await?;
+    trace_stage("reserved-job-id:cleanup-final:done");
     Ok(())
 }
 

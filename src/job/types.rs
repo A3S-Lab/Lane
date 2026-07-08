@@ -1030,6 +1030,16 @@ impl JobOptions {
                 "job id must not be empty".to_string(),
             ));
         }
+        if matches!(self.job_id.as_deref(), Some("0")) {
+            return Err(LaneError::ConfigError(
+                "job id cannot be `0` or start with `0:`".to_string(),
+            ));
+        }
+        if matches!(self.job_id.as_deref(), Some(job_id) if job_id.starts_with("0:")) {
+            return Err(LaneError::ConfigError(
+                "job id cannot be `0` or start with `0:`".to_string(),
+            ));
+        }
 
         if let Some(repeat) = &self.repeat {
             repeat.validate()?;

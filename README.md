@@ -514,7 +514,8 @@ queue event stream using the backend's retained-event mechanism.
 Cleanup paths can unblock flow parents when a pending child is removed.
 Set `JobOptions::with_job_id()` when producers need idempotent submission:
 adding the same job id again returns the existing job instead of enqueueing a
-duplicate.
+duplicate. Custom job ids must not be `0` or start with `0:` because BullMQ
+reserves that shape for internal waiting-list markers.
 `JobOptions::with_lifo(true)` changes the ready-job insertion semantics for
 jobs with the same priority: newer ready jobs are claimed before older ready
 jobs, while lower priority values still run first.
@@ -1097,7 +1098,10 @@ path when the queue is not currently rate-limited.
 Redis adds are Lua-backed as well. The add scripts write job JSON and the
 waiting, delayed, or waiting-children index in the same Redis turn. If a custom
 job id already exists, the script returns the existing job without advancing the
-waiting sequence or writing duplicate state indexes. Bulk add follows the same
+waiting sequence or writing duplicate state indexes. Lane rejects custom job ids
+equal to `0` or prefixed with `0:` before script execution, matching BullMQ's
+reserved marker namespace that Redis scripts special-case while claiming,
+listing, and promoting jobs. Bulk add follows the same
 mechanism in one script call while preserving the caller's input order, including
 the same deduplication stream events that BullMQ's pipelined `addBulk()` emits
 for each job.

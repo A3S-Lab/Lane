@@ -3024,6 +3024,65 @@ async fn repeat_options_reject_invalid_schedules() {
 }
 
 #[tokio::test]
+async fn job_options_reject_bullmq_reserved_marker_ids_without_partial_writes() {
+    let queue = InMemoryJobQueue::new("reserved-job-id");
+    let now = ts(1_000);
+
+    let zero_id = queue
+        .add_at(
+            "reserved",
+            serde_json::json!({}),
+            JobOptions::new().with_job_id("0"),
+            now,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(zero_id, LaneError::ConfigError(_)));
+    assert_eq!(queue.stats().await.unwrap().total, 0);
+
+    let marker_prefix = queue
+        .add_many_at(
+            vec![
+                JobSpec::new("valid", serde_json::json!({}))
+                    .with_options(JobOptions::new().with_job_id("valid-id")),
+                JobSpec::new("reserved", serde_json::json!({}))
+                    .with_options(JobOptions::new().with_job_id("0:delayed")),
+            ],
+            now,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(marker_prefix, LaneError::ConfigError(_)));
+    assert_eq!(queue.stats().await.unwrap().total, 0);
+
+    let flow_error = queue
+        .add_flow_at(
+            JobSpec::new("reserved-parent", serde_json::json!({}))
+                .with_options(JobOptions::new().with_job_id("0:parent")),
+            vec![JobSpec::new("child", serde_json::json!({}))],
+            now,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(flow_error, LaneError::ConfigError(_)));
+    assert_eq!(queue.stats().await.unwrap().total, 0);
+
+    let upsert_error = queue
+        .upsert_repeat(
+            JobSpec::new("reserved-repeat", serde_json::json!({})).with_options(
+                JobOptions::new().with_job_id("0:repeat").with_repeat(
+                    RepeatOptions::every(Duration::from_secs(5)).with_key("reserved-repeat"),
+                ),
+            ),
+            now,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(upsert_error, LaneError::ConfigError(_)));
+    assert_eq!(queue.stats().await.unwrap().total, 0);
+}
+
+#[tokio::test]
 async fn repeat_end_at_rejects_bulk_flow_and_upsert_without_partial_writes() {
     let queue = InMemoryJobQueue::new("repeat-expired-end-at");
     let now = ts(1_000);
