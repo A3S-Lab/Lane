@@ -234,6 +234,22 @@ async fn redis_backend_emits_delay_active_delayed_events_against_real_server() {
     .unwrap();
 }
 
+#[tokio::test]
+async fn redis_backend_release_active_pushes_back_waiting_jobs_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_release_active_waiting_front(redis_url),
+    )
+    .await
+    .expect("Redis release-active waiting-front integration test timed out")
+    .unwrap();
+}
+
 async fn run_priority_update_limit(redis_url: String) -> redis::RedisResult<()> {
     let namespace = unique_namespace();
     cleanup_namespace(&redis_url, &namespace).await?;
@@ -420,6 +436,115 @@ async fn run_delay_active_delayed_event(redis_url: String) -> redis::RedisResult
         Some(&serde_json::json!(3_000))
     );
     assert_eq!(delayed_event.prev, Some(JobState::Active));
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
+async fn run_release_active_waiting_front(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "release-active-front")
+        .expect("valid Redis URL should build the release-active-front queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let released_b = queue
+        .add_job(
+            "released-b".to_string(),
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_job_id("release-front:b")
+                .with_priority(5),
+        )
+        .await
+        .expect("released-b job should add");
+    let released_a = queue
+        .add_job(
+            "released-a".to_string(),
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_job_id("release-front:a")
+                .with_priority(5),
+        )
+        .await
+        .expect("released-a job should add");
+    let waiting = queue
+        .add_job(
+            "waiting".to_string(),
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_job_id("release-front:waiting")
+                .with_priority(5),
+        )
+        .await
+        .expect("waiting job should add");
+
+    let claimed_b = queue
+        .claim_next(
+            "worker-release-front-b".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("released-b claim should return")
+        .expect("released-b job should be claimable");
+    assert_eq!(claimed_b.id, released_b.id);
+    let claimed_a = queue
+        .claim_next(
+            "worker-release-front-a".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("released-a claim should return")
+        .expect("released-a job should be claimable");
+    assert_eq!(claimed_a.id, released_a.id);
+
+    let released_b = queue
+        .release_active_job(&claimed_b.id, lock_token(&claimed_b), Utc::now())
+        .await
+        .expect("released-b active job should release");
+    let released_a = queue
+        .release_active_job(&claimed_a.id, lock_token(&claimed_a), Utc::now())
+        .await
+        .expect("released-a active job should release");
+    assert_eq!(released_b.enqueued_seq, 0);
+    assert_eq!(released_a.enqueued_seq, 0);
+
+    let waiting_key = format!("{namespace}:release-active-front:waiting");
+    let released_b_score: f64 = conn.zscore(&waiting_key, &released_b.id).await?;
+    let released_a_score: f64 = conn.zscore(&waiting_key, &released_a.id).await?;
+    assert_eq!(released_b_score, 5_000_000_000_000_f64);
+    assert_eq!(released_a_score, 5_000_000_000_000_f64);
+    let waiting_ids: Vec<String> = redis::cmd("ZRANGE")
+        .arg(&waiting_key)
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut conn)
+        .await?;
+    assert_eq!(
+        waiting_ids,
+        vec![
+            released_a.id.clone(),
+            released_b.id.clone(),
+            waiting.id.clone()
+        ]
+    );
+
+    for expected in [&released_a, &released_b, &waiting] {
+        let claimed = queue
+            .claim_next(
+                "worker-release-front-next".to_string(),
+                Duration::from_secs(30),
+                Utc::now(),
+            )
+            .await
+            .expect("release-front claim should return")
+            .expect("release-front job should be claimable");
+        assert_eq!(claimed.id, expected.id);
+    }
 
     cleanup_namespace(&redis_url, &namespace).await
 }

@@ -632,6 +632,82 @@ async fn active_jobs_can_be_released_back_to_waiting_with_lock() {
 }
 
 #[tokio::test]
+async fn released_active_jobs_return_to_front_of_same_priority_bucket() {
+    let queue = InMemoryJobQueue::new("active-release-front");
+    let now = ts(1_000);
+    let released_b = queue
+        .add_at(
+            "released-b",
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_job_id("release-front:b")
+                .with_priority(5),
+            now,
+        )
+        .await
+        .unwrap();
+    let released_a = queue
+        .add_at(
+            "released-a",
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_job_id("release-front:a")
+                .with_priority(5),
+            now,
+        )
+        .await
+        .unwrap();
+    let waiting = queue
+        .add_at(
+            "waiting",
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_job_id("release-front:waiting")
+                .with_priority(5),
+            now,
+        )
+        .await
+        .unwrap();
+
+    let claimed_b = queue
+        .claim_next("worker-b".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed_b.id, released_b.id);
+    let claimed_a = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed_a.id, released_a.id);
+
+    let released_b = queue
+        .release_active_job(&claimed_b.id, lock_token(&claimed_b), ts(1_100))
+        .await
+        .unwrap();
+    let released_a = queue
+        .release_active_job(&claimed_a.id, lock_token(&claimed_a), ts(1_100))
+        .await
+        .unwrap();
+    assert_eq!(released_b.enqueued_seq, 0);
+    assert_eq!(released_a.enqueued_seq, 0);
+
+    for expected in [&released_a, &released_b, &waiting] {
+        let claimed = queue
+            .claim_next(
+                "worker-next".to_string(),
+                Duration::from_secs(30),
+                ts(1_200),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, expected.id);
+    }
+}
+
+#[tokio::test]
 async fn custom_job_ids_make_add_idempotent() {
     let queue = InMemoryJobQueue::new("idempotent");
     let now = ts(1_000);

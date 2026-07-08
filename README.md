@@ -1173,6 +1173,10 @@ reserved for FIFO entries with forward sequence order. This keeps `ZRANGE`
 claiming priority-first, newest LIFO before older LIFO, LIFO before FIFO at the
 same priority, and oldest FIFO before newer FIFO, while preserving
 `get_counts_per_priority()` as a `ZCOUNT` over the same priority bucket.
+`release_active_job()` writes the returned job at the start of its priority
+bucket, mirroring BullMQ's `pushBackJobWithPriority()` score for prioritized
+jobs and the `RPUSH` front-of-consumption behavior for standard wait-list jobs;
+if multiple released jobs share that exact score, Redis orders them by job id.
 
 Finished-job retention follows BullMQ's underlying `moveToFinished` mechanism
 rather than only matching the `removeOnComplete` and `removeOnFail` option
@@ -1452,10 +1456,10 @@ BullMQ's `moveToDelayed` script. `release_active_job()` follows BullMQ's
 `moveJobFromActiveToWait` state movement: the script verifies the lock token,
 treats the active zset as the movement gate, clears the lock and active lease
 fields, resets `processed_at`, and writes the job back into the waiting zset
-with its priority score in the same Redis turn.
-That waiting write uses the same FIFO/LIFO score helper as initial add, delayed
-promotion, manual retry, stalled recovery, repeat successor enqueue, dedup
-keep-last enqueue, and flow parent release. When the moved job is the current
+with its priority score in the same Redis turn. Unlike ordinary adds and retry
+requeues, active release writes the job at the start of its priority bucket so
+it is claimed before older FIFO or LIFO entries with the same priority, matching
+BullMQ's active-to-wait script. When the moved job is the current
 repeat-series owner, claim, claim-time delayed promotion, `promote_due_jobs()`,
 manual promote, reschedule, active delay, and active release also rebuild the
 scheduler hash/zset in the same script and repair a missing fast owner key

@@ -1508,7 +1508,6 @@ impl InMemoryJobQueue {
             require_active(job, "release active")?;
             require_lock_token(job, lock_token)?;
         }
-        let enqueued_seq = next_waiting_sequence(&mut inner.sequence);
         let job = inner
             .jobs
             .get_mut(job_id)
@@ -1521,7 +1520,7 @@ impl InMemoryJobQueue {
         job.lease_expires_at = None;
         job.deferred_failure = None;
         job.failed_reason = None;
-        job.enqueued_seq = enqueued_seq;
+        job.enqueued_seq = 0;
         let job = job.clone();
         emit_event_locked(
             &mut inner,
@@ -3145,6 +3144,13 @@ fn next_waiting_sequence(sequence: &mut u64) -> u64 {
 }
 
 fn compare_waiting_order(a: &Job, b: &Job) -> Ordering {
+    match (a.enqueued_seq == 0, b.enqueued_seq == 0) {
+        (true, true) => return a.id.cmp(&b.id),
+        (true, false) => return Ordering::Less,
+        (false, true) => return Ordering::Greater,
+        (false, false) => {}
+    }
+
     match (a.options.lifo, b.options.lifo) {
         (true, true) => b.enqueued_seq.cmp(&a.enqueued_seq),
         (true, false) => Ordering::Less,

@@ -4691,20 +4691,9 @@ return {'ok', updated}
 "#;
 
 const RELEASE_ACTIVE_JOB_SCRIPT: &str = r#"
-local function waiting_score_for(priority, sequence, job, bucket)
-  local bucket_value = tonumber(bucket)
-  local half_bucket = math.floor(bucket_value / 2)
-  local sequence_index = sequence % half_bucket
-  if job["options"] and job["options"] ~= cjson.null and job["options"]["lifo"] == true then
-    return (priority * bucket_value) + (half_bucket - 1 - sequence_index)
-  end
-  return (priority * bucket_value) + half_bucket + sequence_index
-end
-
-local function enqueue_waiting_job(jobs_key, waiting_key, sequence_key, job, job_id, priority, bucket, marker_key)
-  local sequence = redis.call('INCR', sequence_key)
-  job["enqueued_seq"] = sequence
-  local waiting_score = waiting_score_for(priority, sequence, job, bucket)
+local function push_back_waiting_job(jobs_key, waiting_key, job, job_id, priority, bucket, marker_key)
+  job["enqueued_seq"] = 0
+  local waiting_score = priority * tonumber(bucket)
   local updated = cjson.encode(job)
   redis.call('HSET', jobs_key, job_id, updated)
   redis.call('ZADD', waiting_key, waiting_score, job_id)
@@ -4863,7 +4852,7 @@ job["deferred_failure"] = cjson.null
 job["failed_reason"] = cjson.null
 
 local priority = tonumber(job["priority"] or '1000') or 1000
-local updated = enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[4], job, ARGV[1], priority, ARGV[5], KEYS[#KEYS])
+local updated = push_back_waiting_job(KEYS[1], KEYS[3], job, ARGV[1], priority, ARGV[5], KEYS[#KEYS])
 sync_repeat_scheduler(job, ARGV[1], ARGV[7], ARGV[4])
 redis.call('XADD', KEYS[6], 'MAXLEN', '~', ARGV[6], '*', 'event', 'waiting', 'jobId', ARGV[1], 'prev', 'active')
 
