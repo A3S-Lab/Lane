@@ -7626,6 +7626,59 @@ async fn local_job_queue_persists_bulk_jobs() {
 }
 
 #[tokio::test]
+async fn local_job_queue_cleans_unlocked_active_jobs_after_reopen() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("jobs").join("clean-active.json");
+    let queue = LocalJobQueue::open("durable-clean-active", &snapshot_path)
+        .await
+        .unwrap();
+    let job = queue
+        .add_at(
+            "active",
+            serde_json::json!({}),
+            JobOptions::new(),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    let claimed = queue
+        .claim_next(
+            "worker-clean-active".to_string(),
+            Duration::from_secs(30),
+            ts(1_100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, job.id);
+
+    let locked_clean = queue
+        .clean_jobs(JobState::Active, Duration::ZERO, 10, ts(2_000))
+        .await
+        .unwrap();
+    assert!(locked_clean.is_empty());
+
+    let reopened = LocalJobQueue::open("durable-clean-active", &snapshot_path)
+        .await
+        .unwrap();
+    let restored = reopened
+        .get_job(&job.id)
+        .await
+        .unwrap()
+        .expect("active job should be restored");
+    assert_eq!(restored.state, JobState::Active);
+    assert!(restored.lock_token.is_none());
+
+    let cleaned = reopened
+        .clean_jobs(JobState::Active, Duration::ZERO, 10, ts(2_000))
+        .await
+        .unwrap();
+    assert_eq!(cleaned.len(), 1);
+    assert_eq!(cleaned[0].id, job.id);
+    assert!(reopened.get_job(&job.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn local_job_queue_persists_priority_updates() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let snapshot_path = temp_dir.path().join("jobs").join("priority.json");

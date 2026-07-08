@@ -7450,6 +7450,7 @@ local function remove_finished_job(job_id)
     release_repeat_key(removed, job_id, ARGV[11])
   end
   remove_state_indexes(job_id)
+  redis.call('SREM', KEYS[11], job_id)
   redis.call('HDEL', KEYS[1], job_id)
   redis.call(
     'DEL',
@@ -7622,7 +7623,7 @@ else
   return {'bad_state'}
 end
 
-if state == 'active' or limit <= 0 then
+if limit <= 0 then
   return {}
 end
 
@@ -7633,7 +7634,8 @@ for _, id in ipairs(ids) do
   local raw = redis.call('HGET', KEYS[1], id)
   if raw then
     local job = cjson.decode(raw)
-    if job["state"] == state then
+    local active_locked = state == 'active' and redis.call('EXISTS', lock_prefix .. id) == 1
+    if job["state"] == state and not active_locked then
       local reference = job["finished_at"]
       if not reference or reference == cjson.null then
         reference = job["processed_at"]
@@ -7669,6 +7671,7 @@ local count = math.min(limit, #candidates)
 for index = 1, count do
   local candidate = candidates[index]
   redis.call('DEL', lock_prefix .. candidate.id)
+  redis.call('SREM', KEYS[11], candidate.id)
   for key_index = 2, 7 do
     redis.call('ZREM', KEYS[key_index], candidate.id)
   end
@@ -11881,7 +11884,7 @@ impl JobQueueBackend for RedisJobQueue {
         let mut conn = self.connection().await?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(CLEAN_JOBS_SCRIPT)
-            .arg(10)
+            .arg(11)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Waiting))
             .arg(self.state_key(JobState::Delayed))
@@ -11892,6 +11895,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.sequence_key())
             .arg(self.marker_key())
             .arg(self.events_key())
+            .arg(self.stalled_key())
             .arg(job_state_name(state))
             .arg(cutoff.to_rfc3339())
             .arg(limit)
@@ -14147,6 +14151,16 @@ mod tests {
         assert!(REMOVE_CHILD_DEPENDENCY_SCRIPT.contains("and not processed_removed"));
         assert!(REMOVE_CHILD_DEPENDENCY_SCRIPT.contains("and not failed_removed"));
         assert!(REMOVE_CHILD_DEPENDENCY_SCRIPT.contains("and not unsuccessful_removed"));
+    }
+
+    #[test]
+    fn clean_jobs_script_cleans_only_unlocked_active_jobs() {
+        assert!(CLEAN_JOBS_SCRIPT.contains(
+            "local active_locked = state == 'active' and redis.call('EXISTS', lock_prefix .. id) == 1"
+        ));
+        assert!(CLEAN_JOBS_SCRIPT.contains("job[\"state\"] == state and not active_locked"));
+        assert!(!CLEAN_JOBS_SCRIPT.contains("if state == 'active' or limit <= 0 then"));
+        assert!(CLEAN_JOBS_SCRIPT.contains("redis.call('SREM', KEYS[11], candidate.id)"));
     }
 
     #[test]

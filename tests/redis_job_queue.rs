@@ -14527,6 +14527,110 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     assert_eq!(first_clean_millis[0].id, clean_millis_a_id);
     trace_stage("clean-millis:done");
 
+    let clean_active_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "clean-active")
+        .expect("valid Redis URL should build the clean-active queue");
+    let mut clean_active_conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let active_locked = clean_active_queue
+        .add_job(
+            "active-locked".to_string(),
+            serde_json::json!({ "kind": "locked" }),
+            JobOptions::new().with_priority(1),
+        )
+        .await
+        .expect("locked active clean job should add");
+    let active_unlocked = clean_active_queue
+        .add_job(
+            "active-unlocked".to_string(),
+            serde_json::json!({ "kind": "unlocked" }),
+            JobOptions::new().with_priority(2),
+        )
+        .await
+        .expect("unlocked active clean job should add");
+    let active_locked_claim = clean_active_queue
+        .claim_next(
+            "worker-clean-active-locked".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("locked active clean claim should return")
+        .expect("locked active clean job should claim");
+    assert_eq!(active_locked_claim.id, active_locked.id);
+    let active_unlocked_claim = clean_active_queue
+        .claim_next(
+            "worker-clean-active-unlocked".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("unlocked active clean claim should return")
+        .expect("unlocked active clean job should claim");
+    assert_eq!(active_unlocked_claim.id, active_unlocked.id);
+    clean_active_queue
+        .add_log(
+            &active_unlocked.id,
+            "active cleanup log".to_string(),
+            10,
+            Utc::now(),
+        )
+        .await
+        .expect("unlocked active clean log should append");
+    let active_unlocked_lock_key = format!("{namespace}:clean-active:locks:{}", active_unlocked.id);
+    let active_unlocked_logs_key = format!("{namespace}:clean-active:logs:{}", active_unlocked.id);
+    let active_stalled_key = format!("{namespace}:clean-active:stalled");
+    let removed_unlocked_lock: usize = clean_active_conn.del(&active_unlocked_lock_key).await?;
+    assert_eq!(removed_unlocked_lock, 1);
+    let stalled_inserted: usize = clean_active_conn
+        .sadd(&active_stalled_key, &active_unlocked.id)
+        .await?;
+    assert_eq!(stalled_inserted, 1);
+
+    let active_cleaned = clean_active_queue
+        .clean_jobs(
+            JobState::Active,
+            Duration::ZERO,
+            10,
+            Utc::now() + chrono::Duration::seconds(1),
+        )
+        .await
+        .expect("active clean should run");
+    assert_eq!(active_cleaned.len(), 1);
+    assert_eq!(active_cleaned[0].id, active_unlocked.id);
+    assert!(clean_active_queue
+        .get_job(&active_unlocked.id)
+        .await
+        .expect("unlocked active lookup should return")
+        .is_none());
+    let active_unlocked_score: Option<f64> = clean_active_conn
+        .zscore(
+            format!("{namespace}:clean-active:active"),
+            &active_unlocked.id,
+        )
+        .await?;
+    assert!(active_unlocked_score.is_none());
+    let active_unlocked_logs_len: usize = clean_active_conn.llen(&active_unlocked_logs_key).await?;
+    assert_eq!(active_unlocked_logs_len, 0);
+    let active_unlocked_stalled: bool = clean_active_conn
+        .sismember(&active_stalled_key, &active_unlocked.id)
+        .await?;
+    assert!(!active_unlocked_stalled);
+    let active_locked_after_clean = clean_active_queue
+        .get_job(&active_locked.id)
+        .await
+        .expect("locked active lookup should return")
+        .expect("locked active job should remain");
+    assert_eq!(active_locked_after_clean.state, JobState::Active);
+    let active_locked_score: Option<f64> = clean_active_conn
+        .zscore(
+            format!("{namespace}:clean-active:active"),
+            &active_locked.id,
+        )
+        .await?;
+    assert!(active_locked_score.is_some());
+    trace_stage("clean-active:done");
+
     let drain_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "drain")
         .expect("valid Redis URL should build the drain queue");
     let mut drain_conn = redis::Client::open(redis_url.as_str())?

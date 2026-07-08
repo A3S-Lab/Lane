@@ -1632,10 +1632,14 @@ verifies that the job exists, `RPUSH`es a structured JSON entry into
 `logs:<jobId>`, applies `LTRIM` when a retention count is provided, and mirrors
 the retained entries into the job JSON snapshot for Lane compatibility without
 emitting a queue event. `clean_jobs()` filters retained records by the parsed
-millisecond reference time, removes their lock keys, hash entries, state indexes,
-dependency sets, and log lists atomically, updates flow parents for removed
-child jobs, and returns the removed snapshots. For non-terminal repeat owners,
-the clean script mirrors BullMQ's scheduler-job guard: it checks both
+millisecond reference time, and `clean_jobs(JobState::Active, ...)` now mirrors
+BullMQ's `clean(..., "active")` guard by cleaning only active jobs whose worker
+lock is already gone. Locked active jobs must still finish, fail, be released,
+or pass through stalled recovery. Redis clean removes lock keys, hash entries,
+state indexes, stalled candidate entries, dependency sets, and log lists
+atomically, updates flow parents for removed child jobs, and returns the removed
+snapshots. For non-terminal repeat owners, the clean script mirrors BullMQ's
+scheduler-job guard: it checks both
 `repeat:<key>` and `repeat_meta:<key>.jid`, restores the fast owner key from
 valid scheduler metadata, and skips the current series owner instead of deleting
 it through broad cleanup.

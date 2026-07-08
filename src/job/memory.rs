@@ -1719,7 +1719,7 @@ impl InMemoryJobQueue {
         limit: usize,
         now: DateTime<Utc>,
     ) -> Result<Vec<Job>> {
-        if state == JobState::Active || limit == 0 {
+        if limit == 0 {
             return Ok(Vec::new());
         }
 
@@ -1728,7 +1728,11 @@ impl InMemoryJobQueue {
         let mut jobs = inner
             .jobs
             .values()
-            .filter(|job| job.state == state && job_reference_time(job) <= cutoff)
+            .filter(|job| {
+                job.state == state
+                    && job_reference_time(job) <= cutoff
+                    && (state != JobState::Active || job.lock_token.is_none())
+            })
             .cloned()
             .collect::<Vec<_>>();
         jobs.sort_by(|a, b| {
