@@ -1406,10 +1406,11 @@ side indexes existed and later children wrote the new parent-scoped hashes.
 `remove_unprocessed_children()` follows BullMQ's `removeUnprocessedChildren`
 script shape at the dependency-set level: it removes children that are still in
 the parent's pending dependency set, skips completed, failed, active, or locked
-children, deletes the removed child records and per-child metadata in the same
-Redis turn, then checks whether the parent can leave `waiting_children`. Lane
-returns the removed child snapshots for auditability while preserving the parent
-`child_ids`, so later dependency inspection reports removed children as missing.
+children, deletes the removed child records and per-child metadata, emits a
+BullMQ-style `removed` event for each removed child in the same Redis turn, then
+checks whether the parent can leave `waiting_children`. Lane returns the removed
+child snapshots for auditability while preserving the parent `child_ids`, so
+later dependency inspection reports removed children as missing.
 `remove_child_dependency()` follows BullMQ's `removeChildDependency` path: it
 removes one child from the parent's pending dependency set, clears the child's
 parent reference, keeps the child job itself, and releases the parent when no

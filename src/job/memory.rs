@@ -1112,6 +1112,7 @@ impl InMemoryJobQueue {
         let mut removed = Vec::with_capacity(ids.len());
         for id in ids {
             if let Some(job) = Self::remove_job_record_locked(&mut inner, &id) {
+                emit_removed_event_locked(&mut inner, &job, now);
                 removed.push(job);
             }
         }

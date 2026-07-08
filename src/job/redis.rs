@@ -9158,6 +9158,17 @@ local function apply_failed_retention(timestamp, retention)
   remove_finished_jobs_by_max_count(retention_count(retention))
 end
 
+local function event_state_name(state)
+  if state == 'waiting_children' then
+    return 'waiting-children'
+  end
+  return state or ''
+end
+
+local function emit_removed_event(job_id, job)
+  redis.call('XADD', KEYS[10], 'MAXLEN', '~', ARGV[11], '*', 'event', 'removed', 'jobId', job_id, 'prev', event_state_name(job["state"]))
+end
+
 local function remove_job_record(job_id, job)
   release_deduplication_key(job, job_id)
   release_repeat_key(job, job_id)
@@ -9203,6 +9214,7 @@ remove_unprocessed_children = function(parent, dependency_key)
           remove_unprocessed_children(child, ARGV[6] .. child_id)
           redis.call('SREM', dependency_key, child_id)
           remove_job_record(child_id, child)
+          emit_removed_event(child_id, child)
           removed[#removed + 1] = child_raw
         end
       end
@@ -10527,7 +10539,7 @@ impl RedisJobQueue {
         let mut conn = self.connection().await?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(REMOVE_UNPROCESSED_CHILDREN_SCRIPT)
-            .arg(10)
+            .arg(11)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Waiting))
             .arg(self.state_key(JobState::Delayed))
@@ -10537,6 +10549,7 @@ impl RedisJobQueue {
             .arg(self.state_key(JobState::Failed))
             .arg(self.sequence_key())
             .arg(self.dependencies_key(parent_id))
+            .arg(self.events_key())
             .arg(self.marker_key())
             .arg(parent_id)
             .arg(now.to_rfc3339())
@@ -10548,6 +10561,7 @@ impl RedisJobQueue {
             .arg(self.repeat_key_prefix())
             .arg(self.logs_key_prefix())
             .arg(self.deduplication_next_key_prefix())
+            .arg(DEFAULT_JOB_EVENT_RETENTION)
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
@@ -14113,6 +14127,9 @@ mod tests {
                 "parent[\"options\"] and parent[\"options\"][\"remove_on_fail\"] == true"
             ));
         }
+        assert!(REMOVE_UNPROCESSED_CHILDREN_SCRIPT.contains(
+            "redis.call('XADD', KEYS[10], 'MAXLEN', '~', ARGV[11], '*', 'event', 'removed'"
+        ));
     }
 
     #[test]

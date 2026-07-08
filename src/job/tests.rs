@@ -6255,6 +6255,12 @@ async fn flow_remove_unprocessed_children_skips_active_children() {
             missing: 1,
         }
     );
+    let events_after_remove = queue.read_events("-", "+", 50).await.unwrap();
+    assert!(events_after_remove.iter().any(|event| {
+        event.event == "removed"
+            && event.job_id.as_deref() == Some(flow.children[2].id.as_str())
+            && event.prev == Some(JobState::Waiting)
+    }));
 
     queue
         .complete_job(

@@ -15065,6 +15065,15 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await?;
     assert!(removed_unprocessed_child_hash.is_none());
+    let remove_unprocessed_events = producer
+        .read_events("-", "+", 200)
+        .await
+        .expect("remove-unprocessed events should read");
+    assert!(remove_unprocessed_events.iter().any(|event| {
+        event.event == "removed"
+            && event.job_id.as_deref() == Some(remove_unprocessed_flow.children[2].id.as_str())
+            && event.prev == Some(JobState::Waiting)
+    }));
     let remove_unprocessed_parent = producer
         .get_job(&remove_unprocessed_flow.parent.id)
         .await
