@@ -4,11 +4,11 @@ use super::types::{
     JobEvent, JobFinishedResult, JobFlow, JobFlowChildValues, JobFlowDependencies,
     JobFlowDependencyCounts, JobFlowDependencyKind, JobFlowDependencyPage,
     JobFlowDependencyPageItem, JobFlowDependencyPageOptions, JobFlowDependencyPages,
-    JobFlowDependencyPagesOptions, JobFlowIgnoredFailures, JobId, JobLeaseRenewal, JobListOptions,
-    JobListPage, JobLogEntry, JobLogPage, JobMetrics, JobMetricsMeta, JobOptions, JobPriority,
-    JobPriorityCount, JobQueueStats, JobRateLimit, JobRepeatEntry, JobRepeatListOptions,
-    JobRepeatPage, JobSpec, JobState, JobStateCount, JobWorkerId, QueueName,
-    DEFAULT_JOB_EVENT_RETENTION, DEFAULT_JOB_METRICS_RETENTION,
+    JobFlowDependencyPagesOptions, JobFlowDependencyValues, JobFlowIgnoredFailures, JobId,
+    JobLeaseRenewal, JobListOptions, JobListPage, JobLogEntry, JobLogPage, JobMetrics,
+    JobMetricsMeta, JobOptions, JobPriority, JobPriorityCount, JobQueueStats, JobRateLimit,
+    JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobSpec, JobState, JobStateCount,
+    JobWorkerId, QueueName, DEFAULT_JOB_EVENT_RETENTION, DEFAULT_JOB_METRICS_RETENTION,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -8629,6 +8629,41 @@ end
 return {'ok', tostring(processed), tostring(unprocessed), tostring(failed), tostring(ignored), tostring(missing)}
 "#;
 
+const FLOW_DEPENDENCY_VALUES_SCRIPT: &str = r#"
+local parent_raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not parent_raw then
+  return {'missing'}
+end
+
+local result = {'ok'}
+
+local processed = redis.call('HGETALL', KEYS[3])
+result[#result + 1] = tostring(#processed)
+for _, entry in ipairs(processed) do
+  result[#result + 1] = entry
+end
+
+local unprocessed = redis.call('SMEMBERS', KEYS[2])
+result[#result + 1] = tostring(#unprocessed)
+for _, entry in ipairs(unprocessed) do
+  result[#result + 1] = entry
+end
+
+local ignored = redis.call('HGETALL', KEYS[4])
+result[#result + 1] = tostring(#ignored)
+for _, entry in ipairs(ignored) do
+  result[#result + 1] = entry
+end
+
+local failed = redis.call('ZRANGE', KEYS[5], 0, -1)
+result[#result + 1] = tostring(#failed)
+for _, entry in ipairs(failed) do
+  result[#result + 1] = entry
+end
+
+return result
+"#;
+
 const FLOW_DEPENDENCY_PAGE_SCRIPT: &str = r#"
 local parent_raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not parent_raw then
@@ -10304,6 +10339,28 @@ impl RedisJobQueue {
         decode_flow_dependency_counts_result(&result, parent_id)
     }
 
+    /// Return BullMQ-style full dependency buckets for a flow parent.
+    pub async fn get_flow_dependency_values(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowDependencyValues>> {
+        let mut conn = self.connection().await?;
+        let dependency_key = self.dependencies_key(parent_id);
+        let result: Vec<String> = redis::cmd("EVAL")
+            .arg(FLOW_DEPENDENCY_VALUES_SCRIPT)
+            .arg(5)
+            .arg(self.jobs_key())
+            .arg(&dependency_key)
+            .arg(format!("{dependency_key}:processed"))
+            .arg(format!("{dependency_key}:failed"))
+            .arg(format!("{dependency_key}:unsuccessful"))
+            .arg(parent_id)
+            .query_async(&mut conn)
+            .await
+            .map_err(redis_error)?;
+        decode_flow_dependency_values_result(&result, parent_id)
+    }
+
     /// Return one cursor page from a parent flow dependency bucket.
     pub async fn get_flow_dependency_page(
         &self,
@@ -11194,6 +11251,13 @@ impl JobQueueBackend for RedisJobQueue {
         parent_id: &str,
     ) -> Result<Option<JobFlowDependencyCounts>> {
         RedisJobQueue::get_flow_dependency_counts(self, parent_id).await
+    }
+
+    async fn get_flow_dependency_values(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowDependencyValues>> {
+        RedisJobQueue::get_flow_dependency_values(self, parent_id).await
     }
 
     async fn get_flow_dependency_page(
@@ -12532,6 +12596,97 @@ fn decode_flow_dependency_counts_result(
     }
 }
 
+fn decode_flow_dependency_values_result(
+    result: &[String],
+    parent_id: &str,
+) -> Result<Option<JobFlowDependencyValues>> {
+    match result.first().map(String::as_str) {
+        Some("missing") => Ok(None),
+        Some("ok") => {
+            let mut index = 1;
+            let processed_raw =
+                read_dependency_value_segment(result, &mut index, "processed", parent_id)?;
+            if !processed_raw.len().is_multiple_of(2) {
+                return Err(LaneError::Other(format!(
+                    "Redis flow dependency values script returned an odd processed pair count for {parent_id}"
+                )));
+            }
+            let mut processed = BTreeMap::new();
+            for pair in processed_raw.chunks_exact(2) {
+                let value = serde_json::from_str(&pair[1]).map_err(|error| {
+                    LaneError::Other(format!(
+                        "failed to decode Redis processed dependency value for {} on {parent_id}: {error}",
+                        pair[0]
+                    ))
+                })?;
+                processed.insert(pair[0].clone(), value);
+            }
+
+            let unprocessed =
+                read_dependency_value_segment(result, &mut index, "unprocessed", parent_id)?
+                    .to_vec();
+
+            let ignored_raw =
+                read_dependency_value_segment(result, &mut index, "ignored", parent_id)?;
+            if !ignored_raw.len().is_multiple_of(2) {
+                return Err(LaneError::Other(format!(
+                    "Redis flow dependency values script returned an odd ignored pair count for {parent_id}"
+                )));
+            }
+            let mut ignored = BTreeMap::new();
+            for pair in ignored_raw.chunks_exact(2) {
+                ignored.insert(pair[0].clone(), pair[1].clone());
+            }
+
+            let failed =
+                read_dependency_value_segment(result, &mut index, "failed", parent_id)?.to_vec();
+
+            if index != result.len() {
+                return Err(LaneError::Other(format!(
+                    "Redis flow dependency values script returned {} trailing fields for {parent_id}",
+                    result.len() - index
+                )));
+            }
+
+            Ok(Some(JobFlowDependencyValues {
+                processed,
+                unprocessed,
+                failed,
+                ignored,
+            }))
+        }
+        Some(other) => Err(LaneError::Other(format!(
+            "unexpected Redis flow dependency values script status `{other}` for {parent_id}"
+        ))),
+        None => Err(LaneError::Other(format!(
+            "Redis flow dependency values script returned no status for {parent_id}"
+        ))),
+    }
+}
+
+fn read_dependency_value_segment<'a>(
+    result: &'a [String],
+    index: &mut usize,
+    field: &str,
+    parent_id: &str,
+) -> Result<&'a [String]> {
+    let raw_len = result.get(*index).ok_or_else(|| {
+        LaneError::Other(format!(
+            "Redis flow dependency values script returned no {field} length for {parent_id}"
+        ))
+    })?;
+    let len = decode_usize_field(raw_len, field, parent_id)?;
+    *index += 1;
+    if result.len().saturating_sub(*index) < len {
+        return Err(LaneError::Other(format!(
+            "Redis flow dependency values script returned a truncated {field} payload for {parent_id}"
+        )));
+    }
+    let start = *index;
+    *index += len;
+    Ok(&result[start..start + len])
+}
+
 fn decode_flow_dependency_page_result(
     result: &[String],
     parent_id: &str,
@@ -13590,6 +13745,10 @@ mod tests {
 
     #[test]
     fn flow_dependency_page_script_scans_bullmq_side_indexes() {
+        assert!(FLOW_DEPENDENCY_VALUES_SCRIPT.contains("redis.call('HGETALL', KEYS[3]"));
+        assert!(FLOW_DEPENDENCY_VALUES_SCRIPT.contains("redis.call('SMEMBERS', KEYS[2]"));
+        assert!(FLOW_DEPENDENCY_VALUES_SCRIPT.contains("redis.call('HGETALL', KEYS[4]"));
+        assert!(FLOW_DEPENDENCY_VALUES_SCRIPT.contains("redis.call('ZRANGE', KEYS[5], 0, -1)"));
         assert!(FLOW_DEPENDENCY_PAGE_SCRIPT.contains("redis.call('HSCAN', KEYS[3]"));
         assert!(FLOW_DEPENDENCY_PAGE_SCRIPT.contains("redis.call('SSCAN', KEYS[2]"));
         assert!(FLOW_DEPENDENCY_PAGE_SCRIPT.contains("redis.call('HSCAN', KEYS[4]"));
@@ -13598,6 +13757,44 @@ mod tests {
         assert!(FLOW_DEPENDENCY_PAGES_SCRIPT.contains("redis.call('SSCAN', KEYS[2]"));
         assert!(FLOW_DEPENDENCY_PAGES_SCRIPT.contains("redis.call('HSCAN', KEYS[4]"));
         assert!(FLOW_DEPENDENCY_PAGES_SCRIPT.contains("redis.call('ZRANGE', KEYS[5]"));
+    }
+
+    #[test]
+    fn decode_flow_dependency_values_result_builds_bullmq_buckets() {
+        let values = decode_flow_dependency_values_result(
+            &[
+                "ok".to_string(),
+                "2".to_string(),
+                "child-a".to_string(),
+                serde_json::json!({ "ok": true }).to_string(),
+                "1".to_string(),
+                "child-b".to_string(),
+                "2".to_string(),
+                "child-c".to_string(),
+                "optional child failed".to_string(),
+                "1".to_string(),
+                "child-d".to_string(),
+            ],
+            "parent",
+        )
+        .expect("dependency values should decode")
+        .expect("dependency values should exist");
+
+        assert_eq!(
+            values.processed.get("child-a"),
+            Some(&serde_json::json!({ "ok": true }))
+        );
+        assert_eq!(values.unprocessed, vec!["child-b".to_string()]);
+        assert_eq!(
+            values.ignored.get("child-c").map(String::as_str),
+            Some("optional child failed")
+        );
+        assert_eq!(values.failed, vec!["child-d".to_string()]);
+
+        let missing =
+            decode_flow_dependency_values_result(&["missing".to_string()], "missing-parent")
+                .expect("missing parent should decode");
+        assert!(missing.is_none());
     }
 
     #[test]

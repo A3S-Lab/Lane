@@ -92,14 +92,15 @@ pub use job::{
     job_processor_fn, DeduplicationOptions, InMemoryJobQueue, Job, JobContext, JobEvent,
     JobFinishedResult, JobFlow, JobFlowDependencyCounts, JobFlowDependencyKind,
     JobFlowDependencyPage, JobFlowDependencyPageCursor, JobFlowDependencyPageItem,
-    JobFlowDependencyPageOptions, JobFlowDependencyPages, JobFlowDependencyPagesOptions, JobId,
-    JobLeaseRenewal, JobListOptions, JobListPage, JobLockToken, JobLogEntry, JobMetrics,
-    JobMetricsMeta, JobOptions, JobPriority, JobPriorityCount, JobProcessor, JobProcessorFn,
-    JobProcessorRouter, JobQueueBackend, JobQueueSnapshot, JobQueueStats, JobRateLimit,
-    JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobRetention, JobRunOutcome, JobSpec,
-    JobState, JobStateCount, JobWorker, JobWorkerConfig, JobWorkerHandle, JobWorkerId,
-    LocalJobQueue, QueueName, RepeatOptions, RepeatSchedule, DEFAULT_JOB_EVENT_RETENTION,
-    DEFAULT_JOB_METRICS_RETENTION, DEFAULT_JOB_PRIORITY, MAX_JOB_PRIORITY,
+    JobFlowDependencyPageOptions, JobFlowDependencyPages, JobFlowDependencyPagesOptions,
+    JobFlowDependencyValues, JobId, JobLeaseRenewal, JobListOptions, JobListPage, JobLockToken,
+    JobLogEntry, JobMetrics, JobMetricsMeta, JobOptions, JobPriority, JobPriorityCount,
+    JobProcessor, JobProcessorFn, JobProcessorRouter, JobQueueBackend, JobQueueSnapshot,
+    JobQueueStats, JobRateLimit, JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobRetention,
+    JobRunOutcome, JobSpec, JobState, JobStateCount, JobWorker, JobWorkerConfig, JobWorkerHandle,
+    JobWorkerId, LocalJobQueue, QueueName, RepeatOptions, RepeatSchedule,
+    DEFAULT_JOB_EVENT_RETENTION, DEFAULT_JOB_METRICS_RETENTION, DEFAULT_JOB_PRIORITY,
+    MAX_JOB_PRIORITY,
 };
 pub use manager::{QueueManager, QueueManagerBuilder};
 pub use queue::{

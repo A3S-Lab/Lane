@@ -4,10 +4,10 @@ use super::types::{
     JobFinishedResult, JobFlow, JobFlowChildValues, JobFlowDependencies, JobFlowDependencyCounts,
     JobFlowDependencyKind, JobFlowDependencyPage, JobFlowDependencyPageItem,
     JobFlowDependencyPageOptions, JobFlowDependencyPages, JobFlowDependencyPagesOptions,
-    JobFlowIgnoredFailures, JobId, JobListOptions, JobListPage, JobLogEntry, JobLogPage,
-    JobOptions, JobPriority, JobPriorityCount, JobQueueSnapshot, JobQueueStats, JobRepeatEntry,
-    JobRepeatListOptions, JobRepeatPage, JobRetention, JobSpec, JobState, JobStateCount,
-    JobWorkerId, QueueName, DEFAULT_JOB_EVENT_RETENTION,
+    JobFlowDependencyValues, JobFlowIgnoredFailures, JobId, JobListOptions, JobListPage,
+    JobLogEntry, JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueSnapshot,
+    JobQueueStats, JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobRetention, JobSpec,
+    JobState, JobStateCount, JobWorkerId, QueueName, DEFAULT_JOB_EVENT_RETENTION,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -1005,6 +1005,19 @@ impl InMemoryJobQueue {
         };
 
         Ok(Some(flow_dependency_counts(parent, &inner.jobs)))
+    }
+
+    /// Return BullMQ-style full dependency buckets for a flow parent.
+    pub async fn get_flow_dependency_values(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowDependencyValues>> {
+        let inner = self.inner.lock().await;
+        let Some(parent) = inner.jobs.get(parent_id) else {
+            return Ok(None);
+        };
+
+        Ok(Some(flow_dependency_values(parent, &inner.jobs)))
     }
 
     /// Return one cursor page from a parent flow dependency bucket.
@@ -2396,6 +2409,13 @@ impl JobQueueBackend for InMemoryJobQueue {
         InMemoryJobQueue::get_flow_dependency_counts(self, parent_id).await
     }
 
+    async fn get_flow_dependency_values(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowDependencyValues>> {
+        InMemoryJobQueue::get_flow_dependency_values(self, parent_id).await
+    }
+
     async fn get_flow_dependency_page(
         &self,
         parent_id: &str,
@@ -3347,6 +3367,36 @@ fn flow_dependency_counts(parent: &Job, jobs: &HashMap<JobId, Job>) -> JobFlowDe
     }
 
     counts
+}
+
+fn flow_dependency_values(parent: &Job, jobs: &HashMap<JobId, Job>) -> JobFlowDependencyValues {
+    let mut values = JobFlowDependencyValues::default();
+    for child_id in &parent.child_ids {
+        let Some(child) = jobs.get(child_id) else {
+            continue;
+        };
+        if child.state == JobState::Completed {
+            if let Some(return_value) = &child.return_value {
+                values
+                    .processed
+                    .insert(child.id.clone(), return_value.clone());
+            }
+        } else if !child.state.is_terminal() {
+            values.unprocessed.push(child.id.clone());
+        } else if child.state == JobState::Failed {
+            if child.options.ignore_dependency_on_failure
+                || child.options.continue_parent_on_failure
+            {
+                values.ignored.insert(
+                    child.id.clone(),
+                    child.failed_reason.clone().unwrap_or_default(),
+                );
+            } else if !child.options.remove_dependency_on_failure {
+                values.failed.push(child.id.clone());
+            }
+        }
+    }
+    values
 }
 
 fn flow_dependency_page(

@@ -3,10 +3,10 @@ use super::memory::InMemoryJobQueue;
 use super::types::{
     Job, JobEvent, JobFinishedResult, JobFlow, JobFlowChildValues, JobFlowDependencies,
     JobFlowDependencyCounts, JobFlowDependencyPage, JobFlowDependencyPageOptions,
-    JobFlowDependencyPages, JobFlowDependencyPagesOptions, JobFlowIgnoredFailures, JobId,
-    JobListOptions, JobListPage, JobLogPage, JobOptions, JobPriority, JobPriorityCount,
-    JobQueueSnapshot, JobQueueStats, JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobSpec,
-    JobState, JobStateCount, JobWorkerId,
+    JobFlowDependencyPages, JobFlowDependencyPagesOptions, JobFlowDependencyValues,
+    JobFlowIgnoredFailures, JobId, JobListOptions, JobListPage, JobLogPage, JobOptions,
+    JobPriority, JobPriorityCount, JobQueueSnapshot, JobQueueStats, JobRepeatEntry,
+    JobRepeatListOptions, JobRepeatPage, JobSpec, JobState, JobStateCount, JobWorkerId,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -161,6 +161,14 @@ impl LocalJobQueue {
         parent_id: &str,
     ) -> Result<Option<JobFlowDependencyCounts>> {
         self.inner.get_flow_dependency_counts(parent_id).await
+    }
+
+    /// Return BullMQ-style full dependency buckets for a flow parent.
+    pub async fn get_flow_dependency_values(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowDependencyValues>> {
+        self.inner.get_flow_dependency_values(parent_id).await
     }
 
     /// Return one cursor page from a parent flow dependency bucket.
@@ -371,6 +379,13 @@ impl JobQueueBackend for LocalJobQueue {
         parent_id: &str,
     ) -> Result<Option<JobFlowDependencyCounts>> {
         LocalJobQueue::get_flow_dependency_counts(self, parent_id).await
+    }
+
+    async fn get_flow_dependency_values(
+        &self,
+        parent_id: &str,
+    ) -> Result<Option<JobFlowDependencyValues>> {
+        LocalJobQueue::get_flow_dependency_values(self, parent_id).await
     }
 
     async fn get_flow_dependency_page(

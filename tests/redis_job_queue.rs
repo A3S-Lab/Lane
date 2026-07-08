@@ -2714,6 +2714,33 @@ async fn run_paginated_flow_dependencies(redis_url: String) -> redis::RedisResul
         }]
     );
 
+    let values = queue
+        .get_flow_dependency_values(&flow.parent.id)
+        .await
+        .expect("dependency values should load")
+        .expect("dependency values should exist");
+    assert_eq!(
+        values.processed.get(&flow.children[0].id),
+        Some(&serde_json::json!({ "done": 0 }))
+    );
+    assert_eq!(
+        values.processed.get(&flow.children[1].id),
+        Some(&serde_json::json!({ "done": 1 }))
+    );
+    let values_unprocessed = values.unprocessed.into_iter().collect::<BTreeSet<_>>();
+    assert_eq!(
+        values_unprocessed,
+        BTreeSet::from([flow.children[5].id.clone()])
+    );
+    assert_eq!(
+        values.ignored.get(&flow.children[2].id).map(String::as_str),
+        Some("optional child failed")
+    );
+    assert_eq!(
+        values.failed,
+        vec![flow.children[3].id.clone(), flow.children[4].id.clone()]
+    );
+
     let failed_first = queue
         .get_flow_dependency_page(
             &flow.parent.id,

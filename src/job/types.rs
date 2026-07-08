@@ -399,6 +399,19 @@ pub struct JobFlowDependencyCounts {
     pub missing: usize,
 }
 
+/// BullMQ-style full dependency buckets for a flow parent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct JobFlowDependencyValues {
+    /// Completed child return values from the parent-scoped `:processed` hash.
+    pub processed: BTreeMap<JobId, Value>,
+    /// Child ids that still block the parent in the pending dependency set.
+    pub unprocessed: Vec<JobId>,
+    /// Fail-parent child ids from the parent-scoped `:unsuccessful` zset.
+    pub failed: Vec<JobId>,
+    /// Ignored or continued failure reasons from the parent-scoped `:failed` hash.
+    pub ignored: BTreeMap<JobId, String>,
+}
+
 /// Flow dependency bucket used by paginated dependency inspection.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

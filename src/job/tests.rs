@@ -3859,6 +3859,26 @@ async fn flow_dependency_pages_classify_and_page_children() {
         }]
     );
 
+    let values = queue
+        .get_flow_dependency_values(&flow.parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        values.processed.get(&flow.children[0].id),
+        Some(&serde_json::json!({ "done": 0 }))
+    );
+    assert_eq!(
+        values.processed.get(&flow.children[1].id),
+        Some(&serde_json::json!({ "done": 1 }))
+    );
+    assert_eq!(values.unprocessed, vec![flow.children[4].id.clone()]);
+    assert_eq!(
+        values.ignored.get(&flow.children[2].id).map(String::as_str),
+        Some("optional child failed")
+    );
+    assert_eq!(values.failed, vec![flow.children[3].id.clone()]);
+
     let pages = queue
         .get_flow_dependency_pages(
             &flow.parent.id,
