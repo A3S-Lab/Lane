@@ -2145,6 +2145,22 @@ async fn redis_backend_updates_worker_markers_against_real_server() {
 }
 
 #[tokio::test]
+async fn redis_backend_suppresses_paused_claim_promotion_marker_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_paused_claim_promotion_marker(redis_url),
+    )
+    .await
+    .expect("Redis paused claim-promotion marker integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_blocks_on_worker_markers_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -5352,6 +5368,71 @@ async fn run_worker_markers(redis_url: String) -> redis::RedisResult<()> {
         delayed_marker_after_promote,
         Some(delayed_head_after_promote[0].1)
     );
+
+    cleanup_namespace_with_conn(&mut conn, &namespace).await?;
+    Ok(())
+}
+
+async fn run_paused_claim_promotion_marker(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "paused-marker")
+        .expect("valid Redis URL should build the paused-marker queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let marker_key = format!("{namespace}:paused-marker:marker");
+
+    queue
+        .pause()
+        .await
+        .expect("paused-marker queue should pause");
+    let delayed = queue
+        .add_job(
+            "paused-delayed".to_string(),
+            serde_json::json!({ "kind": "paused" }),
+            JobOptions::new().with_delay(Duration::from_millis(80)),
+        )
+        .await
+        .expect("paused delayed job should add");
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    assert!(queue
+        .claim_next(
+            "worker-paused-marker".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("paused-marker claim should return")
+        .is_none());
+    let waiting = queue
+        .list_jobs(JobListOptions::new().with_state(JobState::Waiting))
+        .await
+        .expect("paused-marker waiting jobs should list");
+    assert!(waiting.jobs.iter().any(|job| job.id == delayed.id));
+    let base_marker: Option<f64> = conn.zscore(&marker_key, "0").await?;
+    assert!(base_marker.is_none());
+    let delay_marker: Option<f64> = conn.zscore(&marker_key, "1").await?;
+    assert!(delay_marker.is_none());
+
+    queue
+        .resume()
+        .await
+        .expect("paused-marker queue should resume");
+    let resumed_marker: Option<f64> = conn.zscore(&marker_key, "0").await?;
+    assert_eq!(resumed_marker, Some(0.0));
+    let claimed = queue
+        .claim_next(
+            "worker-paused-marker-resumed".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("resumed paused-marker claim should return")
+        .expect("paused-marker job should claim after resume");
+    assert_eq!(claimed.id, delayed.id);
 
     cleanup_namespace_with_conn(&mut conn, &namespace).await?;
     Ok(())
@@ -10953,6 +11034,19 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .jobs
         .iter()
         .any(|job| job.id == paused_promoted.id));
+    let paused_marker_key = format!("{namespace}:paused-promote:marker");
+    let paused_base_marker: Option<f64> =
+        paused_promote_conn.zscore(&paused_marker_key, "0").await?;
+    assert!(
+        paused_base_marker.is_none(),
+        "claim-time delayed promotion should not wake workers with a base marker while paused"
+    );
+    let paused_delay_marker: Option<f64> =
+        paused_promote_conn.zscore(&paused_marker_key, "1").await?;
+    assert!(
+        paused_delay_marker.is_none(),
+        "claim-time delayed promotion should clear the consumed delay marker"
+    );
     paused_promote_queue
         .resume()
         .await

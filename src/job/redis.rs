@@ -2554,6 +2554,31 @@ local function refresh_delay_marker(marker_key, delayed_key)
   end
 end
 
+local function queue_is_paused_or_maxed(meta_key, active_key)
+  local paused = redis.call('HGET', meta_key, 'paused')
+  if paused == '0' then
+    redis.call('HDEL', meta_key, 'paused')
+  elseif paused then
+    return true
+  end
+
+  local max_concurrency = tonumber(redis.call('HGET', meta_key, 'concurrency') or '0')
+  if max_concurrency and max_concurrency > 0 then
+    local active_count = redis.call('ZCARD', active_key)
+    if active_count >= max_concurrency then
+      return true
+    end
+  end
+
+  return false
+end
+
+local is_paused_or_maxed = queue_is_paused_or_maxed(KEYS[5], KEYS[2])
+local promotion_marker_key = KEYS[#KEYS]
+if is_paused_or_maxed then
+  promotion_marker_key = ''
+end
+
 local due_ids = redis.call('ZRANGEBYSCORE', KEYS[6], '-inf', ARGV[10], 'LIMIT', 0, ARGV[12])
 for _, due_id in ipairs(due_ids) do
   local delayed_raw = redis.call('HGET', KEYS[3], due_id)
@@ -2563,20 +2588,13 @@ for _, due_id in ipairs(due_ids) do
     if delayed_job["state"] == "delayed" then
       delayed_job["state"] = "waiting"
       local priority = tonumber(delayed_job["priority"] or '1000') or 1000
-      enqueue_waiting_job(KEYS[3], KEYS[1], KEYS[7], delayed_job, due_id, priority, ARGV[11], KEYS[#KEYS])
+      enqueue_waiting_job(KEYS[3], KEYS[1], KEYS[7], delayed_job, due_id, priority, ARGV[11], promotion_marker_key)
       sync_repeat_scheduler(delayed_job, due_id, ARGV[15], iso_to_millis(delayed_job["scheduled_at"]))
       redis.call('XADD', KEYS[8], 'MAXLEN', '~', ARGV[14], '*', 'event', 'waiting', 'jobId', due_id, 'prev', 'delayed')
     end
   end
 end
 refresh_delay_marker(KEYS[#KEYS], KEYS[6])
-
-local paused = redis.call('HGET', KEYS[5], 'paused')
-if paused == '0' then
-  redis.call('HDEL', KEYS[5], 'paused')
-elseif paused then
-  return nil
-end
 
 local rate_limit_max = tonumber(ARGV[8])
 local rate_limit_duration = tonumber(ARGV[9])
@@ -2594,12 +2612,8 @@ if rate_limit_max and rate_limit_max > 0 then
   end
 end
 
-local max_concurrency = tonumber(redis.call('HGET', KEYS[5], 'concurrency') or '0')
-if max_concurrency and max_concurrency > 0 then
-  local active_count = redis.call('ZCARD', KEYS[2])
-  if active_count >= max_concurrency then
-    return nil
-  end
+if is_paused_or_maxed then
+  return nil
 end
 
 local candidate_limit = tonumber(ARGV[13]) or 1
@@ -13025,6 +13039,16 @@ mod tests {
         assert!(
             REMOVE_ORPHANED_JOBS_SCRIPT.contains("redis.call('DEL', dependencies_prefix .. job_id")
         );
+    }
+
+    #[test]
+    fn claim_script_suppresses_base_marker_when_paused_or_maxed() {
+        assert!(CLAIM_SCRIPT.contains("local function queue_is_paused_or_maxed"));
+        assert!(CLAIM_SCRIPT.contains("local promotion_marker_key = KEYS[#KEYS]"));
+        assert!(CLAIM_SCRIPT.contains("if is_paused_or_maxed then\n  promotion_marker_key = ''"));
+        assert!(CLAIM_SCRIPT.contains(
+            "enqueue_waiting_job(KEYS[3], KEYS[1], KEYS[7], delayed_job, due_id, priority, ARGV[11], promotion_marker_key)"
+        ));
     }
 
     #[test]

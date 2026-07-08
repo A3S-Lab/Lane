@@ -1075,10 +1075,13 @@ maxed. `clear_max_active_jobs()` removes the shared ceiling.
 Like BullMQ's `moveToActive` script, Redis claims also promote due delayed jobs
 inside the same Lua script before checking pause, rate-limit, max-active, and
 the next claim. A paused or maxed queue can still move due delayed jobs back to
-`waiting`; it simply returns `None` instead of leasing work. Claiming also
-validates the stored job state before moving a waiting-index entry to `active`,
-pruning stale waiting sorted-set entries instead of reactivating jobs that have
-already moved elsewhere.
+`waiting`; it simply returns `None` instead of leasing work. In that paused or
+maxed branch, Lane suppresses the base worker marker just like BullMQ's
+`addBaseMarkerIfNeeded(markerKey, isPausedOrMaxed)` helper, so delayed promotion
+does not wake another worker until the queue resumes or an active slot opens.
+Claiming also validates the stored job state before moving a waiting-index entry
+to `active`, pruning stale waiting sorted-set entries instead of reactivating
+jobs that have already moved elsewhere.
 
 Redis also maintains a BullMQ-style queue `marker` zset inside the same Lua
 state transitions that move jobs into `waiting` or `delayed`. Waiting writes add
