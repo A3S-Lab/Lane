@@ -3049,6 +3049,22 @@ async fn redis_backend_emits_stalled_recovery_events_against_real_server() {
 }
 
 #[tokio::test]
+async fn redis_backend_guards_stalled_recovery_indexes_and_tokens_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_stalled_recovery_guards(redis_url),
+    )
+    .await
+    .expect("Redis stalled recovery guard integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_updates_worker_markers_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -7760,6 +7776,182 @@ async fn run_stalled_recovery_events(redis_url: String) -> redis::RedisResult<()
 
     cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())
+}
+
+async fn run_stalled_recovery_guards(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue_name = "stalled-recovery-guards";
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, queue_name)
+        .expect("valid Redis URL should build the stalled-recovery-guards queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let active_key = format!("{namespace}:{queue_name}:active");
+    let waiting_key = format!("{namespace}:{queue_name}:waiting");
+    let stalled_key = format!("{namespace}:{queue_name}:stalled");
+
+    let locked = queue
+        .add_job(
+            "locked-stalled".to_string(),
+            serde_json::json!({ "kind": "locked" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("locked stalled job should add");
+    let locked_claim = queue
+        .claim_next(
+            "worker-stalled-locked".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("locked stalled claim should return")
+        .expect("locked stalled job should be claimable");
+    assert_eq!(locked_claim.id, locked.id);
+
+    assert_eq!(
+        queue
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("locked stalled recovery should mark candidates"),
+        0
+    );
+    let locked_candidate: bool = conn.sismember(&stalled_key, &locked.id).await?;
+    assert!(locked_candidate);
+    assert_eq!(
+        queue
+            .get_job(&locked.id)
+            .await
+            .expect("locked stalled job should load")
+            .expect("locked stalled job should remain")
+            .state,
+        JobState::Active
+    );
+
+    queue
+        .complete_job(
+            &locked_claim.id,
+            lock_token(&locked_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("locked stalled job should complete with its valid token");
+    let locked_candidate_after_complete: bool = conn.sismember(&stalled_key, &locked.id).await?;
+    assert!(!locked_candidate_after_complete);
+
+    let _: usize = conn.zadd(&active_key, &locked.id, 0.0).await?;
+    assert_eq!(
+        queue
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("stale completed active index recovery should run"),
+        0
+    );
+    assert_eq!(
+        queue
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("stale completed active index recovery should confirm"),
+        0
+    );
+    let stale_completed_active_score: Option<f64> = conn.zscore(&active_key, &locked.id).await?;
+    assert!(stale_completed_active_score.is_none());
+    assert_eq!(
+        queue
+            .get_job(&locked.id)
+            .await
+            .expect("completed stale-index job should load")
+            .expect("completed stale-index job should still exist")
+            .state,
+        JobState::Completed
+    );
+
+    let stalled = queue
+        .add_job(
+            "stalled-requeue".to_string(),
+            serde_json::json!({ "kind": "requeue" }),
+            JobOptions::new().with_max_stalled_count(2),
+        )
+        .await
+        .expect("stalled requeue job should add");
+    let first_claim = queue
+        .claim_next(
+            "worker-stalled-requeue-a".to_string(),
+            Duration::from_millis(100),
+            Utc::now(),
+        )
+        .await
+        .expect("stalled requeue first claim should return")
+        .expect("stalled requeue job should be claimable");
+    assert_eq!(first_claim.id, stalled.id);
+    let stale_token = lock_token(&first_claim).to_string();
+
+    tokio::time::sleep(Duration::from_millis(180)).await;
+    assert_eq!(
+        queue
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("stalled requeue first recovery pass should mark candidates"),
+        0
+    );
+    assert_eq!(
+        queue
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("stalled requeue second recovery pass should requeue"),
+        1
+    );
+    let requeued = queue
+        .get_job(&stalled.id)
+        .await
+        .expect("requeued stalled job should load")
+        .expect("requeued stalled job should still exist");
+    assert_eq!(requeued.state, JobState::Waiting);
+    assert_eq!(requeued.stalled_count, 1);
+    assert!(requeued.worker_id.is_none());
+    assert!(requeued.lock_token.is_none());
+    let requeued_active_score: Option<f64> = conn.zscore(&active_key, &stalled.id).await?;
+    assert!(requeued_active_score.is_none());
+    let requeued_waiting_score: Option<f64> = conn.zscore(&waiting_key, &stalled.id).await?;
+    assert!(requeued_waiting_score.is_some());
+    let requeued_candidate: bool = conn.sismember(&stalled_key, &stalled.id).await?;
+    assert!(!requeued_candidate);
+
+    let reclaimed = queue
+        .claim_next(
+            "worker-stalled-requeue-b".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("reclaimed stalled job claim should return")
+        .expect("requeued stalled job should be claimable again");
+    assert_eq!(reclaimed.id, stalled.id);
+    assert_ne!(lock_token(&reclaimed), stale_token);
+    let stale_complete = queue
+        .complete_job(
+            &reclaimed.id,
+            &stale_token,
+            serde_json::json!({ "ok": false }),
+            Utc::now(),
+        )
+        .await
+        .expect_err("stale token must not complete a reclaimed stalled job");
+    assert!(matches!(stale_complete, LaneError::JobLeaseConflict(_)));
+    queue
+        .complete_job(
+            &reclaimed.id,
+            lock_token(&reclaimed),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("reclaimed stalled job should complete with the current token");
+
+    cleanup_namespace(&redis_url, &namespace).await
 }
 
 async fn run_worker_markers(redis_url: String) -> redis::RedisResult<()> {
