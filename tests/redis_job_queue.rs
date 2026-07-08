@@ -535,6 +535,22 @@ async fn redis_backend_skips_stale_waiting_indexes_while_claiming_against_real_s
 }
 
 #[tokio::test]
+async fn redis_backend_cleans_completed_jobs_by_age_limit_and_millis_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_completed_clean_retention_and_millis(redis_url),
+    )
+    .await
+    .expect("Redis completed clean retention integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_retries_completed_jobs_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -1649,6 +1665,259 @@ async fn run_stale_waiting_claim_cleanup(redis_url: String) -> redis::RedisResul
         .expect("real waiting job should complete");
 
     cleanup_namespace(&redis_url, &namespace).await
+}
+
+async fn run_completed_clean_retention_and_millis(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue_name = "clean-completed-focused";
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, queue_name)
+        .expect("valid Redis URL should build the clean-completed-focused queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let old_a = queue
+        .add_job(
+            "old-a".to_string(),
+            serde_json::json!({ "age": "oldest" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("old-a clean job should add");
+    let old_b = queue
+        .add_job(
+            "old-b".to_string(),
+            serde_json::json!({ "age": "old" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("old-b clean job should add");
+    let fresh = queue
+        .add_job(
+            "fresh".to_string(),
+            serde_json::json!({ "age": "fresh" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("fresh clean job should add");
+    queue
+        .add_log(&old_a.id, "clean me".to_string(), 10, Utc::now())
+        .await
+        .expect("old-a clean log should append");
+
+    let old_a_claim = queue
+        .claim_next(
+            "worker-clean-old-a".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("old-a claim should return")
+        .expect("old-a should claim");
+    let old_b_claim = queue
+        .claim_next(
+            "worker-clean-old-b".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("old-b claim should return")
+        .expect("old-b should claim");
+    let fresh_claim = queue
+        .claim_next(
+            "worker-clean-fresh".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("fresh claim should return")
+        .expect("fresh should claim");
+    assert_eq!(old_a_claim.id, old_a.id);
+    assert_eq!(old_b_claim.id, old_b.id);
+    assert_eq!(fresh_claim.id, fresh.id);
+
+    let clean_now = ts(30_000);
+    queue
+        .complete_job(
+            &old_a_claim.id,
+            lock_token(&old_a_claim),
+            serde_json::json!({ "ok": true }),
+            ts(10_000),
+        )
+        .await
+        .expect("old-a should complete");
+    queue
+        .complete_job(
+            &old_b_claim.id,
+            lock_token(&old_b_claim),
+            serde_json::json!({ "ok": true }),
+            ts(11_000),
+        )
+        .await
+        .expect("old-b should complete");
+    queue
+        .complete_job(
+            &fresh_claim.id,
+            lock_token(&fresh_claim),
+            serde_json::json!({ "ok": true }),
+            clean_now,
+        )
+        .await
+        .expect("fresh should complete");
+
+    let first_cleaned = queue
+        .clean_jobs(JobState::Completed, Duration::from_secs(5), 1, clean_now)
+        .await
+        .expect("first completed clean should run");
+    assert_eq!(first_cleaned.len(), 1);
+    assert_eq!(first_cleaned[0].id, old_a.id);
+    assert_cleaned_job_removed(&mut conn, &namespace, queue_name, &old_a.id).await?;
+    assert_completed_index_present(&mut conn, &namespace, queue_name, &old_b.id).await?;
+    assert_completed_index_present(&mut conn, &namespace, queue_name, &fresh.id).await?;
+
+    let second_cleaned = queue
+        .clean_jobs(JobState::Completed, Duration::from_secs(5), 10, clean_now)
+        .await
+        .expect("second completed clean should run");
+    assert_eq!(
+        second_cleaned
+            .iter()
+            .map(|job| job.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![old_b.id.as_str()]
+    );
+    assert_cleaned_job_removed(&mut conn, &namespace, queue_name, &old_b.id).await?;
+    assert_completed_index_present(&mut conn, &namespace, queue_name, &fresh.id).await?;
+
+    let millis_queue_name = "clean-millis-focused";
+    let millis_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, millis_queue_name)
+        .expect("valid Redis URL should build the clean-millis-focused queue");
+    let millis_a_id = format!("{namespace}:clean-millis-focused:a");
+    let millis_b_id = format!("{namespace}:clean-millis-focused:b");
+    millis_queue
+        .add_job(
+            "millis-a".to_string(),
+            serde_json::json!({ "format": "three-digits" }),
+            JobOptions::new().with_job_id(millis_a_id.clone()),
+        )
+        .await
+        .expect("millis-a should add");
+    millis_queue
+        .add_job(
+            "millis-b".to_string(),
+            serde_json::json!({ "format": "one-digit" }),
+            JobOptions::new().with_job_id(millis_b_id.clone()),
+        )
+        .await
+        .expect("millis-b should add");
+    let millis_a = millis_queue
+        .claim_next(
+            "worker-millis-a".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("millis-a claim should return")
+        .expect("millis-a should claim");
+    let millis_b = millis_queue
+        .claim_next(
+            "worker-millis-b".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("millis-b claim should return")
+        .expect("millis-b should claim");
+    let same_finished_at = ts(1_100);
+    millis_queue
+        .complete_job(
+            &millis_a.id,
+            lock_token(&millis_a),
+            serde_json::json!({}),
+            same_finished_at,
+        )
+        .await
+        .expect("millis-a should complete");
+    millis_queue
+        .complete_job(
+            &millis_b.id,
+            lock_token(&millis_b),
+            serde_json::json!({}),
+            same_finished_at,
+        )
+        .await
+        .expect("millis-b should complete");
+
+    let millis_jobs_key = format!("{namespace}:{millis_queue_name}:jobs");
+    let raw_a: String = conn.hget(&millis_jobs_key, &millis_a_id).await?;
+    let raw_b: String = conn.hget(&millis_jobs_key, &millis_b_id).await?;
+    let mut value_a: serde_json::Value =
+        serde_json::from_str(&raw_a).expect("millis-a raw job should be JSON");
+    let mut value_b: serde_json::Value =
+        serde_json::from_str(&raw_b).expect("millis-b raw job should be JSON");
+    value_a["finished_at"] = serde_json::Value::String("1970-01-01T00:00:01.100+00:00".into());
+    value_b["finished_at"] = serde_json::Value::String("1970-01-01T00:00:01.1+00:00".into());
+    let _: usize = conn
+        .hset(
+            &millis_jobs_key,
+            &millis_a_id,
+            serde_json::to_string(&value_a).expect("millis-a raw job should encode"),
+        )
+        .await?;
+    let _: usize = conn
+        .hset(
+            &millis_jobs_key,
+            &millis_b_id,
+            serde_json::to_string(&value_b).expect("millis-b raw job should encode"),
+        )
+        .await?;
+
+    let first_millis_cleaned = millis_queue
+        .clean_jobs(JobState::Completed, Duration::ZERO, 1, same_finished_at)
+        .await
+        .expect("millisecond clean should run");
+    assert_eq!(first_millis_cleaned.len(), 1);
+    assert_eq!(first_millis_cleaned[0].id, millis_a_id);
+    assert_cleaned_job_removed(&mut conn, &namespace, millis_queue_name, &millis_a_id).await?;
+    assert_completed_index_present(&mut conn, &namespace, millis_queue_name, &millis_b_id).await?;
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
+async fn assert_cleaned_job_removed(
+    conn: &mut redis::aio::ConnectionManager,
+    namespace: &str,
+    queue_name: &str,
+    job_id: &str,
+) -> redis::RedisResult<()> {
+    let stored: Option<String> = conn
+        .hget(format!("{namespace}:{queue_name}:jobs"), job_id)
+        .await?;
+    assert!(stored.is_none());
+    let completed_score: Option<f64> = conn
+        .zscore(format!("{namespace}:{queue_name}:completed"), job_id)
+        .await?;
+    assert!(completed_score.is_none());
+    let logs_len: usize = conn
+        .llen(format!("{namespace}:{queue_name}:logs:{job_id}"))
+        .await?;
+    assert_eq!(logs_len, 0);
+    Ok(())
+}
+
+async fn assert_completed_index_present(
+    conn: &mut redis::aio::ConnectionManager,
+    namespace: &str,
+    queue_name: &str,
+    job_id: &str,
+) -> redis::RedisResult<()> {
+    let completed_score: Option<f64> = conn
+        .zscore(format!("{namespace}:{queue_name}:completed"), job_id)
+        .await?;
+    assert!(completed_score.is_some());
+    Ok(())
 }
 
 async fn run_completed_retry(redis_url: String) -> redis::RedisResult<()> {
