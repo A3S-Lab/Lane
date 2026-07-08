@@ -1493,6 +1493,57 @@ async fn run_job_finished_results(redis_url: String) -> redis::RedisResult<()> {
             failed_reason: Some("terminal failure".to_string()),
         })
     );
+
+    let stale_completed = queue
+        .add_job(
+            "stale-completed-index".to_string(),
+            serde_json::json!({ "kind": "stale-completed" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("stale completed-index job should add");
+    let stale_failed = queue
+        .add_job(
+            "stale-failed-index".to_string(),
+            serde_json::json!({ "kind": "stale-failed" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("stale failed-index job should add");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let _: usize = conn
+        .zadd(
+            format!("{namespace}:finished-result:completed"),
+            &stale_completed.id,
+            0.0,
+        )
+        .await?;
+    let _: usize = conn
+        .zadd(
+            format!("{namespace}:finished-result:failed"),
+            &stale_failed.id,
+            0.0,
+        )
+        .await?;
+    assert_eq!(
+        queue
+            .get_job_finished_result(&stale_completed.id)
+            .await
+            .expect("stale completed-index finished status should load"),
+        Some(JobFinishedResult::Completed { return_value: None })
+    );
+    assert_eq!(
+        queue
+            .get_job_finished_result(&stale_failed.id)
+            .await
+            .expect("stale failed-index finished status should load"),
+        Some(JobFinishedResult::Failed {
+            failed_reason: None,
+        })
+    );
+
     assert_eq!(
         queue
             .get_job_finished_result("missing-finished-job")

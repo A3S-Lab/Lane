@@ -8288,9 +8288,6 @@ end
 
 local job = cjson.decode(raw)
 if redis.call('ZSCORE', KEYS[1], ARGV[1]) then
-  if job["state"] ~= "completed" then
-    return {'not_finished'}
-  end
   local return_value = job["return_value"]
   if return_value ~= nil and return_value ~= cjson.null then
     return {'completed', cjson.encode(return_value)}
@@ -8299,9 +8296,6 @@ if redis.call('ZSCORE', KEYS[1], ARGV[1]) then
 end
 
 if redis.call('ZSCORE', KEYS[2], ARGV[1]) then
-  if job["state"] ~= "failed" then
-    return {'not_finished'}
-  end
   local failed_reason = job["failed_reason"]
   if failed_reason and failed_reason ~= cjson.null then
     return {'failed', failed_reason}

@@ -1573,8 +1573,9 @@ failed, delayed, active, waiting, and waiting-children sorted sets and returns
 `None` when the job id is not present in any state index.
 `get_job_finished_result()` follows BullMQ's `isFinished(..., returnValue=true)`
 shape: Redis checks the completed and failed indexes plus the retained job hash
-in one Lua script, returning `NotFinished`, a completed `return_value`, a failed
-`failed_reason`, or `None` for missing retained records.
+in one Lua script, treats those indexes as authoritative even if a retained
+snapshot still carries an older state, and returns `NotFinished`, a completed
+`return_value`, a failed `failed_reason`, or `None` for missing retained records.
 `RedisJobQueue::get_metrics(JobState::Completed | JobState::Failed, start, end)`
 follows BullMQ's `getMetrics` storage shape. Complete, fail, and stalled
 terminal scripts increment `metrics:<state>` and close one-minute windows into
