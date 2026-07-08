@@ -8633,25 +8633,27 @@ if not parent_raw then
   return {'missing'}
 end
 
-local processed_values = redis.call('HGETALL', KEYS[2])
-if #processed_values > 0 then
-  local result = {'ok'}
-  for index = 1, #processed_values, 2 do
-    table.insert(result, processed_values[index])
-    table.insert(result, processed_values[index + 1])
-  end
-  return result
-end
-
 local parent = cjson.decode(parent_raw)
 local result = {'ok'}
+local indexed_child_ids = {}
+
+local processed_values = redis.call('HGETALL', KEYS[2])
+for index = 1, #processed_values, 2 do
+  local child_id = processed_values[index]
+  indexed_child_ids[child_id] = true
+  table.insert(result, child_id)
+  table.insert(result, processed_values[index + 1])
+end
+
 for _, child_id in ipairs(parent['child_ids'] or {}) do
-  local child_raw = redis.call('HGET', KEYS[1], child_id)
-  if child_raw then
-    local child = cjson.decode(child_raw)
-    if child["state"] == "completed" and child["return_value"] ~= nil and child["return_value"] ~= cjson.null then
-      table.insert(result, child_id)
-      table.insert(result, cjson.encode(child["return_value"]))
+  if indexed_child_ids[child_id] ~= true then
+    local child_raw = redis.call('HGET', KEYS[1], child_id)
+    if child_raw then
+      local child = cjson.decode(child_raw)
+      if child["state"] == "completed" and child["return_value"] ~= nil and child["return_value"] ~= cjson.null then
+        table.insert(result, child_id)
+        table.insert(result, cjson.encode(child["return_value"]))
+      end
     end
   end
 end
@@ -8665,25 +8667,27 @@ if not parent_raw then
   return {'missing'}
 end
 
-local failed_values = redis.call('HGETALL', KEYS[2])
-if #failed_values > 0 then
-  local result = {'ok'}
-  for index = 1, #failed_values, 2 do
-    table.insert(result, failed_values[index])
-    table.insert(result, failed_values[index + 1])
-  end
-  return result
-end
-
 local parent = cjson.decode(parent_raw)
 local result = {'ok'}
+local indexed_child_ids = {}
+
+local failed_values = redis.call('HGETALL', KEYS[2])
+for index = 1, #failed_values, 2 do
+  local child_id = failed_values[index]
+  indexed_child_ids[child_id] = true
+  table.insert(result, child_id)
+  table.insert(result, failed_values[index + 1])
+end
+
 for _, child_id in ipairs(parent['child_ids'] or {}) do
-  local child_raw = redis.call('HGET', KEYS[1], child_id)
-  if child_raw then
-    local child = cjson.decode(child_raw)
-    if child["state"] == "failed" and child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["continue_parent_on_failure"] == true) then
-      table.insert(result, child_id)
-      table.insert(result, child["failed_reason"] or "")
+  if indexed_child_ids[child_id] ~= true then
+    local child_raw = redis.call('HGET', KEYS[1], child_id)
+    if child_raw then
+      local child = cjson.decode(child_raw)
+      if child["state"] == "failed" and child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["continue_parent_on_failure"] == true) then
+        table.insert(result, child_id)
+        table.insert(result, child["failed_reason"] or "")
+      end
     end
   end
 end

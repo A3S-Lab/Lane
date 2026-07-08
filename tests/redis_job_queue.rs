@@ -3082,6 +3082,200 @@ async fn run_flow_parent_dependency_side_indexes(redis_url: String) -> redis::Re
 }
 
 #[tokio::test]
+async fn redis_backend_merges_flow_side_indexes_with_retained_snapshots_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_flow_side_index_snapshot_merge(redis_url),
+    )
+    .await
+    .expect("Redis flow side-index merge integration test timed out")
+    .unwrap();
+}
+
+async fn run_flow_side_index_snapshot_merge(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-side-index-merge")
+        .expect("valid Redis URL should build the flow-side-index-merge queue");
+    let worker = RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-side-index-merge")
+        .expect("valid Redis URL should build the flow-side-index-merge worker");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("merge-parent", serde_json::json!({ "kind": "aggregate" }))
+                .with_options(JobOptions::new().with_priority(1)),
+            vec![
+                JobSpec::new("merge-completed-legacy", serde_json::json!({ "n": 1 }))
+                    .with_options(JobOptions::new().with_priority(1)),
+                JobSpec::new("merge-ignored-legacy", serde_json::json!({ "n": 2 })).with_options(
+                    JobOptions::new()
+                        .with_priority(2)
+                        .with_ignore_dependency_on_failure(true),
+                ),
+                JobSpec::new("merge-completed-indexed", serde_json::json!({ "n": 3 }))
+                    .with_options(JobOptions::new().with_priority(3)),
+                JobSpec::new("merge-ignored-indexed", serde_json::json!({ "n": 4 })).with_options(
+                    JobOptions::new()
+                        .with_priority(4)
+                        .with_ignore_dependency_on_failure(true),
+                ),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("merge flow should be added");
+    let dependency_key = format!(
+        "{namespace}:flow-side-index-merge:dependencies:{}",
+        flow.parent.id
+    );
+    let processed_key = format!("{dependency_key}:processed");
+    let failed_key = format!("{dependency_key}:failed");
+
+    let completed_legacy = worker
+        .claim_next(
+            "worker-merge-completed-legacy".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("legacy completed child claim should return")
+        .expect("legacy completed child should be claimable");
+    assert_eq!(completed_legacy.id, flow.children[0].id);
+    worker
+        .complete_job(
+            &completed_legacy.id,
+            lock_token(&completed_legacy),
+            serde_json::json!({ "value": "legacy-completed" }),
+            Utc::now(),
+        )
+        .await
+        .expect("legacy completed child should complete");
+
+    let ignored_legacy = worker
+        .claim_next(
+            "worker-merge-ignored-legacy".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("legacy ignored child claim should return")
+        .expect("legacy ignored child should be claimable");
+    assert_eq!(ignored_legacy.id, flow.children[1].id);
+    worker
+        .fail_job(
+            &ignored_legacy.id,
+            lock_token(&ignored_legacy),
+            "legacy ignored failure".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("legacy ignored child should fail");
+
+    let completed_indexed = worker
+        .claim_next(
+            "worker-merge-completed-indexed".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("indexed completed child claim should return")
+        .expect("indexed completed child should be claimable");
+    assert_eq!(completed_indexed.id, flow.children[2].id);
+    worker
+        .complete_job(
+            &completed_indexed.id,
+            lock_token(&completed_indexed),
+            serde_json::json!({ "value": "indexed-completed" }),
+            Utc::now(),
+        )
+        .await
+        .expect("indexed completed child should complete");
+
+    let ignored_indexed = worker
+        .claim_next(
+            "worker-merge-ignored-indexed".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("indexed ignored child claim should return")
+        .expect("indexed ignored child should be claimable");
+    assert_eq!(ignored_indexed.id, flow.children[3].id);
+    worker
+        .fail_job(
+            &ignored_indexed.id,
+            lock_token(&ignored_indexed),
+            "indexed ignored failure".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("indexed ignored child should fail");
+
+    let removed_processed: usize = conn.hdel(&processed_key, &flow.children[0].id).await?;
+    let removed_failed: usize = conn.hdel(&failed_key, &flow.children[1].id).await?;
+    assert_eq!(removed_processed, 1);
+    assert_eq!(removed_failed, 1);
+    let processed_side_index_len: usize = conn.hlen(&processed_key).await?;
+    let failed_side_index_len: usize = conn.hlen(&failed_key).await?;
+    assert_eq!(processed_side_index_len, 1);
+    assert_eq!(failed_side_index_len, 1);
+
+    let child_values = queue
+        .get_flow_children_values(&flow.parent.id)
+        .await
+        .expect("merged child values should load")
+        .expect("merged child values should exist");
+    assert_eq!(
+        child_values.get(&flow.children[0].id),
+        Some(&serde_json::json!({ "value": "legacy-completed" }))
+    );
+    assert_eq!(
+        child_values.get(&flow.children[2].id),
+        Some(&serde_json::json!({ "value": "indexed-completed" }))
+    );
+
+    let ignored_failures = queue
+        .get_flow_ignored_children_failures(&flow.parent.id)
+        .await
+        .expect("merged ignored failures should load")
+        .expect("merged ignored failures should exist");
+    assert_eq!(
+        ignored_failures
+            .get(&flow.children[1].id)
+            .map(String::as_str),
+        Some("legacy ignored failure")
+    );
+    assert_eq!(
+        ignored_failures
+            .get(&flow.children[3].id)
+            .map(String::as_str),
+        Some("indexed ignored failure")
+    );
+
+    let counts = queue
+        .get_flow_dependency_counts(&flow.parent.id)
+        .await
+        .expect("merged dependency counts should load")
+        .expect("merged dependency counts should exist");
+    assert_eq!(counts.processed, 2);
+    assert_eq!(counts.unprocessed, 0);
+    assert_eq!(counts.failed, 0);
+    assert_eq!(counts.ignored, 2);
+    assert_eq!(counts.missing, 0);
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
+#[tokio::test]
 async fn redis_backend_indexes_reused_completed_flow_children_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");

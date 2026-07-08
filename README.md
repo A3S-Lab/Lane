@@ -1319,8 +1319,10 @@ resolved.
 `get_flow_children_values()` and `get_flow_ignored_children_failures()` follow
 BullMQ's `getChildrenValues()` and `getIgnoredChildrenFailures()` fan-in
 semantics. BullMQ reads parent-scoped `:processed` and `:failed` hashes; Lane's
-Redis read scripts now prefer those hashes as well, and fall back to retained
-child snapshots only for older data written before the side indexes existed.
+Redis read scripts now prefer those hashes as well, then merge retained child
+snapshots for any child id not covered by the side index. This preserves
+compatibility for mixed upgrade data where some children completed before the
+side indexes existed and later children wrote the new parent-scoped hashes.
 `remove_unprocessed_children()` follows BullMQ's `removeUnprocessedChildren`
 script shape at the dependency-set level: it removes children that are still in
 the parent's pending dependency set, skips completed, failed, active, or locked
