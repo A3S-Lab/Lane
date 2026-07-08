@@ -4965,6 +4965,7 @@ async fn run_stale_terminal_child_dependency_removal(redis_url: String) -> redis
         "{namespace}:flow-stale-dependency:dependencies:{}",
         flow.parent.id
     );
+    let processed_key = format!("{dependency_key}:processed");
 
     let child_a = worker
         .claim_next(
@@ -4988,6 +4989,9 @@ async fn run_stale_terminal_child_dependency_removal(redis_url: String) -> redis
 
     let child_a_pending: bool = conn.sismember(&dependency_key, &child_a.id).await?;
     assert!(!child_a_pending);
+    let child_a_processed_before_remove: Option<String> =
+        conn.hget(&processed_key, &child_a.id).await?;
+    assert!(child_a_processed_before_remove.is_some());
     let child_b_pending: bool = conn
         .sismember(&dependency_key, &flow.children[1].id)
         .await?;
@@ -5013,6 +5017,17 @@ async fn run_stale_terminal_child_dependency_removal(redis_url: String) -> redis
     assert!(child_a_after.parent_id.is_none());
     let child_a_pending_after: bool = conn.sismember(&dependency_key, &child_a.id).await?;
     assert!(!child_a_pending_after);
+    let child_a_processed_after_remove: Option<String> =
+        conn.hget(&processed_key, &child_a.id).await?;
+    assert!(child_a_processed_after_remove.is_none());
+    let dependency_values_after_remove = queue
+        .get_flow_dependency_values(&flow.parent.id)
+        .await
+        .expect("stale dependency values after remove should load")
+        .expect("stale dependency values after remove should exist");
+    assert!(!dependency_values_after_remove
+        .processed
+        .contains_key(&child_a.id));
 
     let parent_after_remove = queue
         .get_job(&flow.parent.id)

@@ -9696,6 +9696,9 @@ if not dependency_removed and not child_id_removed then
   return {'no_relationship'}
 end
 
+redis.call('HDEL', dependency_key .. ':processed', ARGV[1])
+redis.call('HDEL', dependency_key .. ':failed', ARGV[1])
+redis.call('ZREM', dependency_key .. ':unsuccessful', ARGV[1])
 parent["child_ids"] = child_ids
 child["parent_id"] = cjson.null
 redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(child))
@@ -14130,6 +14133,16 @@ mod tests {
         assert!(REMOVE_UNPROCESSED_CHILDREN_SCRIPT.contains(
             "redis.call('XADD', KEYS[10], 'MAXLEN', '~', ARGV[11], '*', 'event', 'removed'"
         ));
+    }
+
+    #[test]
+    fn remove_child_dependency_script_clears_dependency_side_buckets() {
+        assert!(REMOVE_CHILD_DEPENDENCY_SCRIPT
+            .contains("redis.call('HDEL', dependency_key .. ':processed', ARGV[1])"));
+        assert!(REMOVE_CHILD_DEPENDENCY_SCRIPT
+            .contains("redis.call('HDEL', dependency_key .. ':failed', ARGV[1])"));
+        assert!(REMOVE_CHILD_DEPENDENCY_SCRIPT
+            .contains("redis.call('ZREM', dependency_key .. ':unsuccessful', ARGV[1])"));
     }
 
     #[test]

@@ -1417,9 +1417,10 @@ parent reference, keeps the child job itself, and releases the parent when no
 pending dependencies remain. Redis treats the pending dependency set as
 authoritative here, so a stale dependency entry for an already terminal child is
 still removed just like BullMQ's `SREM` path. Because Lane stores parent child
-references in the parent snapshot, it also removes that child id from
-`child_ids` so later dependency reads reflect the broken relationship instead of
-treating the child as missing.
+references in the parent snapshot and parent-scoped dependency side buckets, it
+also removes that child id from `child_ids`, `:processed`, `:failed`, and
+`:unsuccessful` so later dependency reads reflect the broken relationship
+instead of treating the child as missing or returning a ghost bucket entry.
 
 Flow fan-in is also protected in Redis transitions. Redis flow submission writes
 a pending dependency set for the parent, and child completion, removal, and
