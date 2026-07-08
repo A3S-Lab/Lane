@@ -218,6 +218,22 @@ async fn redis_backend_emits_reschedule_delayed_events_against_real_server() {
     .unwrap();
 }
 
+#[tokio::test]
+async fn redis_backend_emits_delay_active_delayed_events_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_delay_active_delayed_event(redis_url),
+    )
+    .await
+    .expect("Redis delay-active delayed-event integration test timed out")
+    .unwrap();
+}
+
 async fn run_priority_update_limit(redis_url: String) -> redis::RedisResult<()> {
     let namespace = unique_namespace();
     cleanup_namespace(&redis_url, &namespace).await?;
@@ -355,6 +371,55 @@ async fn run_reschedule_delayed_event(redis_url: String) -> redis::RedisResult<(
         .find(|event| event.event == "delayed" && event.job_id.as_deref() == Some(job.id.as_str()))
         .expect("reschedule should emit a delayed event");
     assert_eq!(delayed.fields.get("delay"), Some(&serde_json::json!(3_000)));
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
+async fn run_delay_active_delayed_event(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "delay-active-event")
+        .expect("valid Redis URL should build the delay-active-event queue");
+    let job = queue
+        .add_job("task".to_string(), serde_json::json!({}), JobOptions::new())
+        .await
+        .expect("delay-active event job should add");
+    let claimed = queue
+        .claim_next(
+            "worker-delay-active-event".to_string(),
+            Duration::from_secs(30),
+            ts(1_000),
+        )
+        .await
+        .expect("delay-active event claim should return")
+        .expect("delay-active event job should be claimable");
+    let delayed = queue
+        .delay_active_job(
+            &job.id,
+            lock_token(&claimed),
+            Duration::from_secs(2),
+            ts(1_000),
+        )
+        .await
+        .expect("active job should delay");
+    assert_eq!(delayed.state, JobState::Delayed);
+    assert_eq!(delayed.scheduled_at, ts(3_000));
+
+    let events = queue
+        .read_events("-", "+", 100)
+        .await
+        .expect("delay-active event stream should load");
+    let delayed_event = events
+        .iter()
+        .rev()
+        .find(|event| event.event == "delayed" && event.job_id.as_deref() == Some(job.id.as_str()))
+        .expect("delay_active_job should emit a delayed event");
+    assert_eq!(
+        delayed_event.fields.get("delay"),
+        Some(&serde_json::json!(3_000))
+    );
+    assert_eq!(delayed_event.prev, Some(JobState::Active));
 
     cleanup_namespace(&redis_url, &namespace).await
 }

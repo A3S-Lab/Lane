@@ -4685,7 +4685,7 @@ redis.call('ZADD', KEYS[3], ARGV[4], ARGV[1])
 refresh_delay_marker(KEYS[#KEYS], KEYS[3])
 add_base_marker_if_waiting(KEYS[#KEYS], KEYS[7])
 sync_repeat_scheduler(job, ARGV[1], ARGV[7], ARGV[4])
-redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[6], '*', 'event', 'delayed', 'jobId', ARGV[1], 'prev', 'active')
+redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[6], '*', 'event', 'delayed', 'jobId', ARGV[1], 'delay', ARGV[4], 'prev', 'active')
 
 return {'ok', updated}
 "#;
@@ -10933,7 +10933,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(job_id)
             .arg(lock_token)
             .arg(scheduled_at.to_rfc3339())
-            .arg(millis(scheduled_at))
+            .arg(scheduled_at.timestamp_millis())
             .arg(serde_json::to_string(&delay).map_err(|error| {
                 LaneError::Other(format!("failed to encode Redis job delay: {error}"))
             })?)

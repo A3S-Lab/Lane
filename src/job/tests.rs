@@ -515,6 +515,17 @@ async fn active_jobs_can_be_moved_back_to_delayed_with_lock() {
     assert!(delayed.worker_id.is_none());
     assert!(delayed.lock_token.is_none());
     assert!(delayed.lease_expires_at.is_none());
+    let events = queue.read_events("-", "+", 10).await.unwrap();
+    let delayed_event = events
+        .iter()
+        .rev()
+        .find(|event| event.event == "delayed" && event.job_id.as_deref() == Some(job.id.as_str()))
+        .expect("delay_active_job should emit a delayed event");
+    assert_eq!(
+        delayed_event.fields.get("delay"),
+        Some(&serde_json::json!(3_000))
+    );
+    assert_eq!(delayed_event.prev, Some(JobState::Active));
 
     let complete_error = queue
         .complete_job(

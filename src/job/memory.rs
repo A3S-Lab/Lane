@@ -1477,14 +1477,17 @@ impl InMemoryJobQueue {
         job.lease_expires_at = None;
         job.deferred_failure = None;
         job.failed_reason = None;
+        let scheduled_millis = job.scheduled_at.timestamp_millis();
         let job = job.clone();
+        let mut fields = BTreeMap::new();
+        fields.insert("delay".to_string(), Value::from(scheduled_millis));
         emit_event_locked(
             &mut inner,
             "delayed",
             Some(&job),
             Some(JobState::Active),
             now,
-            BTreeMap::new(),
+            fields,
         );
         Ok(job)
     }

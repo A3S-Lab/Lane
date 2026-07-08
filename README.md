@@ -1447,7 +1447,8 @@ It also emits BullMQ's `delayed` event with the new delayed timestamp.
 jobs: the script verifies the lock token, treats the active zset as the movement
 gate, rejects the move if that active index membership is missing, clears the
 lock, updates the stored delay and scheduled timestamp, and writes the delayed
-zset member in the same Redis turn. `release_active_job()` follows BullMQ's
+zset member in the same Redis turn. It emits the same delayed timestamp field as
+BullMQ's `moveToDelayed` script. `release_active_job()` follows BullMQ's
 `moveJobFromActiveToWait` state movement: the script verifies the lock token,
 treats the active zset as the movement gate, clears the lock and active lease
 fields, resets `processed_at`, and writes the job back into the waiting zset
