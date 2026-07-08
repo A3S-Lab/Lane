@@ -241,6 +241,9 @@ impl InMemoryJobQueue {
         if retries_exhausted(&failed) {
             emit_retries_exhausted_event_locked(&mut inner, &failed, now);
         }
+        if failed.state == JobState::Failed {
+            emit_drained_event_if_needed_locked(&mut inner, now);
+        }
         Ok(failed)
     }
 
@@ -2169,6 +2172,7 @@ impl JobQueueBackend for InMemoryJobQueue {
             now,
             fields,
         );
+        emit_drained_event_if_needed_locked(&mut inner, now);
         Ok(completed)
     }
 
@@ -2650,6 +2654,19 @@ fn emit_cleaned_event_locked(
     let mut fields = BTreeMap::new();
     fields.insert("count".to_string(), Value::from(count as u64));
     emit_event_locked(inner, "cleaned", None, None, timestamp, fields);
+}
+
+fn emit_drained_event_if_needed_locked(
+    inner: &mut InMemoryJobQueueState,
+    timestamp: DateTime<Utc>,
+) {
+    let drained = inner
+        .jobs
+        .values()
+        .all(|job| !matches!(job.state, JobState::Waiting | JobState::Active));
+    if drained {
+        emit_event_locked(inner, "drained", None, None, timestamp, BTreeMap::new());
+    }
 }
 
 fn trim_events_locked(inner: &mut InMemoryJobQueueState, max_len: usize) -> usize {

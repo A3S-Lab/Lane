@@ -2916,6 +2916,12 @@ local function emit_parent_waiting_children_transition_event(events_key, max_eve
   end
 end
 
+local function emit_drained_event_if_needed(waiting_key, active_key, events_key, max_events)
+  if redis.call('ZCARD', waiting_key) == 0 and redis.call('ZCARD', active_key) == 0 then
+    redis.call('XADD', events_key, 'MAXLEN', '~', max_events, '*', 'event', 'drained')
+  end
+end
+
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
   return {'missing'}
@@ -3089,6 +3095,7 @@ release_repeat_key(job, ARGV[1], ARGV[15])
 
 add_base_marker_if_waiting(KEYS[#KEYS], KEYS[5])
 redis.call('XADD', KEYS[10], 'MAXLEN', '~', ARGV[18], '*', 'event', 'completed', 'jobId', ARGV[1], 'returnvalue', ARGV[4], 'prev', 'active')
+emit_drained_event_if_needed(KEYS[5], KEYS[2], KEYS[10], ARGV[18])
 
 return {'ok', updated}
 "#;
@@ -3709,6 +3716,12 @@ local function emit_parent_waiting_children_transition_event(events_key, max_eve
   end
 end
 
+local function emit_drained_event_if_needed(waiting_key, active_key, events_key, max_events)
+  if redis.call('ZCARD', waiting_key) == 0 and redis.call('ZCARD', active_key) == 0 then
+    redis.call('XADD', events_key, 'MAXLEN', '~', max_events, '*', 'event', 'drained')
+  end
+end
+
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
   return {'missing'}
@@ -3959,6 +3972,7 @@ if attempts_made > max_retries then
     attempts_made
   )
 end
+emit_drained_event_if_needed(KEYS[7], KEYS[2], KEYS[9], ARGV[16])
 
 return {'ok', updated}
 "#;

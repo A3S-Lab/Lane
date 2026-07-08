@@ -2877,12 +2877,17 @@ async fn failed_jobs_retry_with_backoff_then_terminal_failure() {
             "waiting",
             "active",
             "failed",
-            "retries-exhausted"
+            "retries-exhausted",
+            "drained"
         ]
     );
-    let exhausted = events.last().unwrap();
+    let exhausted = events
+        .iter()
+        .find(|event| event.event == "retries-exhausted")
+        .unwrap();
     assert_eq!(exhausted.job_id.as_deref(), Some(job.id.as_str()));
     assert_eq!(exhausted.fields.get("attemptsMade"), Some(&Value::from(2)));
+    assert_eq!(events.last().unwrap().event, "drained");
 }
 
 #[tokio::test]
@@ -6568,7 +6573,14 @@ async fn job_event_stream_records_core_lifecycle() {
         .collect::<Vec<_>>();
     assert_eq!(
         names,
-        vec!["added", "waiting", "active", "progress", "completed"]
+        vec![
+            "added",
+            "waiting",
+            "active",
+            "progress",
+            "completed",
+            "drained"
+        ]
     );
     assert_eq!(events[0].job_id.as_deref(), Some(job.id.as_str()));
     assert_eq!(
@@ -6585,14 +6597,16 @@ async fn job_event_stream_records_core_lifecycle() {
         events[4].fields.get("returnvalue"),
         Some(&serde_json::json!({ "ok": true }))
     );
+    assert_eq!(events[5].job_id, None);
+    assert_eq!(events[5].prev, None);
 
-    assert_eq!(queue.trim_events(2).await.unwrap(), 3);
+    assert_eq!(queue.trim_events(2).await.unwrap(), 4);
     let trimmed = queue.read_events("-", "+", 20).await.unwrap();
     let names = trimmed
         .iter()
         .map(|event| event.event.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(names, vec!["progress", "completed"]);
+    assert_eq!(names, vec!["completed", "drained"]);
 }
 
 #[tokio::test]
@@ -6667,11 +6681,21 @@ async fn cleaned_jobs_emit_cleaned_event() {
         .collect::<Vec<_>>();
     assert_eq!(
         names,
-        vec!["added", "waiting", "active", "completed", "cleaned"]
+        vec![
+            "added",
+            "waiting",
+            "active",
+            "completed",
+            "drained",
+            "cleaned"
+        ]
     );
+    assert_eq!(events[4].event, "drained");
     assert_eq!(events[4].job_id, None);
     assert_eq!(events[4].prev, None);
-    assert_eq!(events[4].fields.get("count"), Some(&serde_json::json!(1)));
+    assert_eq!(events[5].job_id, None);
+    assert_eq!(events[5].prev, None);
+    assert_eq!(events[5].fields.get("count"), Some(&serde_json::json!(1)));
 }
 
 #[tokio::test]

@@ -2469,6 +2469,7 @@ async fn run_queue_events(redis_url: String) -> redis::RedisResult<()> {
             "active",
             "progress",
             "completed",
+            "drained",
             "added",
             "waiting",
             "removed",
@@ -2494,11 +2495,13 @@ async fn run_queue_events(redis_url: String) -> redis::RedisResult<()> {
         events[4].fields.get("returnvalue"),
         Some(&serde_json::json!({ "ok": true }))
     );
-    assert_eq!(events[7].job_id.as_deref(), Some(removed_job.id.as_str()));
-    assert_eq!(events[7].prev, Some(JobState::Waiting));
-    assert_eq!(events[10].job_id, None);
-    assert_eq!(events[10].prev, None);
-    assert_eq!(events[10].fields.get("count"), Some(&serde_json::json!(1)));
+    assert_eq!(events[5].job_id, None);
+    assert_eq!(events[5].prev, None);
+    assert_eq!(events[8].job_id.as_deref(), Some(removed_job.id.as_str()));
+    assert_eq!(events[8].prev, Some(JobState::Waiting));
+    assert_eq!(events[11].job_id, None);
+    assert_eq!(events[11].prev, None);
+    assert_eq!(events[11].fields.get("count"), Some(&serde_json::json!(1)));
 
     cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())
@@ -2717,17 +2720,20 @@ async fn run_retries_exhausted_event(redis_url: String) -> redis::RedisResult<()
             "waiting",
             "active",
             "failed",
-            "retries-exhausted"
+            "retries-exhausted",
+            "drained"
         ]
     );
     let exhausted = events
-        .last()
+        .iter()
+        .find(|event| event.event == "retries-exhausted")
         .expect("retries-exhausted event should be present");
     assert_eq!(exhausted.job_id.as_deref(), Some(job.id.as_str()));
     assert_eq!(
         exhausted.fields.get("attemptsMade"),
         Some(&serde_json::json!(2))
     );
+    assert_eq!(events.last().unwrap().event, "drained");
 
     cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())

@@ -1159,9 +1159,11 @@ event in the same Redis turn as the job mutation: add writes `added` followed by
 completion writes `completed prev=active` with `returnvalue`; failure writes
 `failed` or retry `delayed` with `failedReason`, and terminal failures whose
 attempt count is exhausted also write BullMQ-style `retries-exhausted` with
-`attemptsMade`; flow child completion, terminal failure, and stalled terminal
-failure paths also emit parent `waiting`, `delayed`, or `failed` events with
-`prev=waiting-children` when that same Lua turn releases or fails the parent;
+`attemptsMade`; completed and terminal failed move-to-finished paths write a
+queue-level `drained` event when no waiting or active jobs remain; flow child
+completion, terminal failure, and stalled terminal failure paths also emit parent
+`waiting`, `delayed`, or `failed` events with `prev=waiting-children` when that
+same Lua turn releases or fails the parent;
 explicit removal writes `removed prev=<state>` for the removed job; `clean_jobs()`
 writes a queue-level `cleaned count=<n>` event after removing aged jobs; progress
 writes `progress data=<json>`; pause/resume write queue-level events.
