@@ -1693,4 +1693,18 @@ pub struct JobQueueSnapshot {
     pub deduplication_next_flows: Vec<JobFlow>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub released_deduplication_owners: Vec<(String, JobId)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flow_dependency_indexes: Vec<JobFlowDependencyIndex>,
+}
+
+/// Serializable parent-scoped flow dependency side index.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct JobFlowDependencyIndex {
+    pub parent_id: JobId,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub processed: BTreeMap<JobId, Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ignored: BTreeMap<JobId, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<JobId>,
 }

@@ -2,20 +2,21 @@ use super::backend::JobQueueBackend;
 use super::types::{
     deduplication_expiration, page_repeat_entries, validate_job_priority, Job, JobEvent,
     JobFinishedResult, JobFlow, JobFlowChildValues, JobFlowDependencies,
-    JobFlowDependencyCountOptions, JobFlowDependencyCounts, JobFlowDependencyKind,
-    JobFlowDependencyPage, JobFlowDependencyPageItem, JobFlowDependencyPageOptions,
-    JobFlowDependencyPages, JobFlowDependencyPagesOptions, JobFlowDependencySelectedCounts,
-    JobFlowDependencyValues, JobFlowIgnoredFailures, JobId, JobListOptions, JobListPage,
-    JobLogEntry, JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueSnapshot,
-    JobQueueStats, JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobRetention, JobSpec,
-    JobState, JobStateCount, JobWorkerId, QueueName, DEFAULT_JOB_EVENT_RETENTION,
+    JobFlowDependencyCountOptions, JobFlowDependencyCounts, JobFlowDependencyIndex,
+    JobFlowDependencyKind, JobFlowDependencyPage, JobFlowDependencyPageItem,
+    JobFlowDependencyPageOptions, JobFlowDependencyPages, JobFlowDependencyPagesOptions,
+    JobFlowDependencySelectedCounts, JobFlowDependencyValues, JobFlowIgnoredFailures, JobId,
+    JobListOptions, JobListPage, JobLogEntry, JobLogPage, JobOptions, JobPriority,
+    JobPriorityCount, JobQueueSnapshot, JobQueueStats, JobRepeatEntry, JobRepeatListOptions,
+    JobRepeatPage, JobRetention, JobSpec, JobState, JobStateCount, JobWorkerId, QueueName,
+    DEFAULT_JOB_EVENT_RETENTION,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -28,9 +29,23 @@ struct InMemoryJobQueueState {
     event_sequence: u64,
     events: Vec<JobEvent>,
     jobs: HashMap<JobId, Job>,
+    flow_dependencies: HashMap<JobId, InMemoryFlowDependencyIndex>,
     deduplication_next: HashMap<String, Job>,
     deduplication_next_flows: HashMap<String, JobFlow>,
     released_deduplication_owners: HashSet<(String, JobId)>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct InMemoryFlowDependencyIndex {
+    processed: BTreeMap<JobId, Value>,
+    ignored: BTreeMap<JobId, String>,
+    failed: BTreeSet<JobId>,
+}
+
+impl InMemoryFlowDependencyIndex {
+    fn is_empty(&self) -> bool {
+        self.processed.is_empty() && self.ignored.is_empty() && self.failed.is_empty()
+    }
 }
 
 /// In-memory implementation of the generic job queue backend.
@@ -79,6 +94,25 @@ impl InMemoryJobQueue {
                     .jobs
                     .into_iter()
                     .map(|job| (job.id.clone(), job))
+                    .collect(),
+                flow_dependencies: snapshot
+                    .flow_dependency_indexes
+                    .into_iter()
+                    .filter_map(|index| {
+                        if index.parent_id.is_empty() {
+                            return None;
+                        }
+                        let flow_index = InMemoryFlowDependencyIndex {
+                            processed: index.processed,
+                            ignored: index.ignored,
+                            failed: index.failed.into_iter().collect(),
+                        };
+                        if flow_index.is_empty() {
+                            None
+                        } else {
+                            Some((index.parent_id, flow_index))
+                        }
+                    })
                     .collect(),
                 deduplication_next: snapshot
                     .deduplication_next_jobs
@@ -139,6 +173,7 @@ impl InMemoryJobQueue {
             released_deduplication_owners: sorted_released_deduplication_owners(
                 &inner.released_deduplication_owners,
             ),
+            flow_dependency_indexes: sorted_flow_dependency_indexes(&inner.flow_dependencies),
         }
     }
 
@@ -198,6 +233,9 @@ impl InMemoryJobQueue {
             job.clone()
         };
         if failed.state == JobState::Failed {
+            if let Some(parent_id) = &failed.parent_id {
+                Self::record_terminal_child_dependency_locked(&mut inner, parent_id, &failed);
+            }
             if failed.options.removes_failed_immediately() {
                 Self::remove_job_record_locked(&mut inner, job_id);
             } else if let Some(retention) = failed.options.failed_retention() {
@@ -570,6 +608,11 @@ impl InMemoryJobQueue {
                 if let Some(existing) = inner.jobs.get_mut(&child.id) {
                     existing.parent_id = Some(parent_job.id.clone());
                     let existing = existing.clone();
+                    Self::record_terminal_child_dependency_locked(
+                        &mut inner,
+                        &parent_job.id,
+                        &existing,
+                    );
                     emit_duplicated_event_locked(&mut inner, &existing, now);
                     stored_child_jobs.push(existing);
                 }
@@ -725,6 +768,7 @@ impl InMemoryJobQueue {
                 if let Some(existing) = inner.jobs.get_mut(&child.id) {
                     existing.parent_id = Some(parent_id.clone());
                     let existing = existing.clone();
+                    Self::record_terminal_child_dependency_locked(inner, &parent_id, &existing);
                     emit_duplicated_event_locked(inner, &existing, now);
                     stored_child_jobs.push(existing);
                 }
@@ -801,7 +845,12 @@ impl InMemoryJobQueue {
                 .ok_or_else(|| LaneError::JobNotFound(parent_id.to_string()))?;
             require_active(parent, "add flow children")?;
             require_lock_token(parent, lock_token)?;
-            ensure_flow_dependencies_have_not_failed(parent, &inner.jobs, "add flow children")?;
+            ensure_flow_dependencies_have_not_failed(
+                parent,
+                &inner.jobs,
+                inner.flow_dependencies.get(parent_id),
+                "add flow children",
+            )?;
         }
 
         let existing_child_ids = inner
@@ -937,6 +986,7 @@ impl InMemoryJobQueue {
                 if let Some(existing) = inner.jobs.get_mut(&child.id) {
                     existing.parent_id = Some(parent_id.to_string());
                     let existing = existing.clone();
+                    Self::record_terminal_child_dependency_locked(&mut inner, parent_id, &existing);
                     emit_duplicated_event_locked(&mut inner, &existing, now);
                     stored_child_jobs.push(existing);
                 }
@@ -1006,7 +1056,11 @@ impl InMemoryJobQueue {
             return Ok(None);
         };
 
-        Ok(Some(flow_dependency_counts(parent, &inner.jobs)))
+        Ok(Some(flow_dependency_counts(
+            parent,
+            &inner.jobs,
+            inner.flow_dependencies.get(parent_id),
+        )))
     }
 
     /// Return selected BullMQ-style dependency counts for a flow parent.
@@ -1023,6 +1077,7 @@ impl InMemoryJobQueue {
         Ok(Some(flow_dependency_selected_counts(
             parent,
             &inner.jobs,
+            inner.flow_dependencies.get(parent_id),
             options,
         )))
     }
@@ -1037,7 +1092,11 @@ impl InMemoryJobQueue {
             return Ok(None);
         };
 
-        Ok(Some(flow_dependency_values(parent, &inner.jobs)))
+        Ok(Some(flow_dependency_values(
+            parent,
+            &inner.jobs,
+            inner.flow_dependencies.get(parent_id),
+        )))
     }
 
     /// Return one cursor page from a parent flow dependency bucket.
@@ -1051,7 +1110,12 @@ impl InMemoryJobQueue {
             return Ok(None);
         };
 
-        Ok(Some(flow_dependency_page(parent, &inner.jobs, options)))
+        Ok(Some(flow_dependency_page(
+            parent,
+            &inner.jobs,
+            inner.flow_dependencies.get(parent_id),
+            options,
+        )))
     }
 
     /// Return cursor pages from several parent flow dependency buckets.
@@ -1065,7 +1129,12 @@ impl InMemoryJobQueue {
             return Ok(None);
         };
 
-        Ok(Some(flow_dependency_pages(parent, &inner.jobs, options)))
+        Ok(Some(flow_dependency_pages(
+            parent,
+            &inner.jobs,
+            inner.flow_dependencies.get(parent_id),
+            options,
+        )))
     }
 
     /// Return completed child result values for a flow parent.
@@ -1078,7 +1147,11 @@ impl InMemoryJobQueue {
             return Ok(None);
         };
 
-        Ok(Some(flow_children_values(parent, &inner.jobs)))
+        Ok(Some(flow_children_values(
+            parent,
+            &inner.jobs,
+            inner.flow_dependencies.get(parent_id),
+        )))
     }
 
     /// Return ignored child failure reasons for a flow parent.
@@ -1091,7 +1164,11 @@ impl InMemoryJobQueue {
             return Ok(None);
         };
 
-        Ok(Some(flow_ignored_children_failures(parent, &inner.jobs)))
+        Ok(Some(flow_ignored_children_failures(
+            parent,
+            &inner.jobs,
+            inner.flow_dependencies.get(parent_id),
+        )))
     }
 
     /// Remove children that are still unprocessed and not active.
@@ -1137,13 +1214,17 @@ impl InMemoryJobQueue {
         let Some(parent) = inner.jobs.get(&parent_id) else {
             return Err(LaneError::JobNotFound(parent_id));
         };
-        if !parent.child_ids.iter().any(|id| id == child_id) {
+        let parent_lists_child = parent.child_ids.iter().any(|id| id == child_id);
+        let parent_indexes_child =
+            Self::has_child_dependency_side_index_locked(&inner, &parent_id, child_id);
+        if !parent_lists_child && !parent_indexes_child {
             return Ok(false);
         }
 
         if let Some(parent) = inner.jobs.get_mut(&parent_id) {
             parent.child_ids.retain(|id| id != child_id);
         }
+        Self::clear_child_dependency_side_index_locked(&mut inner, &parent_id, child_id);
         if let Some(child) = inner.jobs.get_mut(child_id) {
             child.parent_id = None;
         }
@@ -1802,6 +1883,7 @@ impl InMemoryJobQueue {
 
         let removed = inner.jobs.len();
         inner.jobs.clear();
+        inner.flow_dependencies.clear();
         inner.deduplication_next.clear();
         inner.deduplication_next_flows.clear();
         inner.released_deduplication_owners.clear();
@@ -1953,8 +2035,132 @@ impl InMemoryJobQueue {
         promoted
     }
 
+    fn record_terminal_child_dependency_locked(
+        inner: &mut InMemoryJobQueueState,
+        parent_id: &str,
+        child: &Job,
+    ) {
+        let Some(parent) = inner.jobs.get(parent_id) else {
+            return;
+        };
+        if !parent
+            .child_ids
+            .iter()
+            .any(|child_id| child_id == &child.id)
+        {
+            return;
+        }
+        match child.state {
+            JobState::Completed => {
+                Self::record_completed_child_dependency_locked(
+                    inner,
+                    parent_id,
+                    &child.id,
+                    child.return_value.clone().unwrap_or(Value::Null),
+                );
+            }
+            JobState::Failed
+                if child.options.ignore_dependency_on_failure
+                    || child.options.continue_parent_on_failure =>
+            {
+                Self::record_ignored_child_dependency_locked(
+                    inner,
+                    parent_id,
+                    &child.id,
+                    child.failed_reason.clone().unwrap_or_default(),
+                );
+            }
+            JobState::Failed if child.options.fail_parent_on_failure => {
+                Self::record_failed_child_dependency_locked(inner, parent_id, &child.id);
+            }
+            JobState::Failed if child.options.remove_dependency_on_failure => {
+                Self::clear_child_dependency_side_index_locked(inner, parent_id, &child.id);
+            }
+            _ => {}
+        }
+    }
+
+    fn record_completed_child_dependency_locked(
+        inner: &mut InMemoryJobQueueState,
+        parent_id: &str,
+        child_id: &str,
+        value: Value,
+    ) {
+        let index = inner
+            .flow_dependencies
+            .entry(parent_id.to_string())
+            .or_default();
+        index.ignored.remove(child_id);
+        index.failed.remove(child_id);
+        index.processed.insert(child_id.to_string(), value);
+    }
+
+    fn record_ignored_child_dependency_locked(
+        inner: &mut InMemoryJobQueueState,
+        parent_id: &str,
+        child_id: &str,
+        failed_reason: String,
+    ) {
+        let index = inner
+            .flow_dependencies
+            .entry(parent_id.to_string())
+            .or_default();
+        index.processed.remove(child_id);
+        index.failed.remove(child_id);
+        index.ignored.insert(child_id.to_string(), failed_reason);
+    }
+
+    fn record_failed_child_dependency_locked(
+        inner: &mut InMemoryJobQueueState,
+        parent_id: &str,
+        child_id: &str,
+    ) {
+        let index = inner
+            .flow_dependencies
+            .entry(parent_id.to_string())
+            .or_default();
+        index.processed.remove(child_id);
+        index.ignored.remove(child_id);
+        index.failed.insert(child_id.to_string());
+    }
+
+    fn clear_child_dependency_side_index_locked(
+        inner: &mut InMemoryJobQueueState,
+        parent_id: &str,
+        child_id: &str,
+    ) -> bool {
+        let Some(index) = inner.flow_dependencies.get_mut(parent_id) else {
+            return false;
+        };
+        let removed = index.processed.remove(child_id).is_some()
+            || index.ignored.remove(child_id).is_some()
+            || index.failed.remove(child_id);
+        let empty = index.is_empty();
+        if empty {
+            inner.flow_dependencies.remove(parent_id);
+        }
+        removed
+    }
+
+    fn has_child_dependency_side_index_locked(
+        inner: &InMemoryJobQueueState,
+        parent_id: &str,
+        child_id: &str,
+    ) -> bool {
+        inner
+            .flow_dependencies
+            .get(parent_id)
+            .map(|index| {
+                index.processed.contains_key(child_id)
+                    || index.ignored.contains_key(child_id)
+                    || index.failed.contains(child_id)
+            })
+            .unwrap_or(false)
+    }
+
     fn remove_job_record_locked(inner: &mut InMemoryJobQueueState, job_id: &str) -> Option<Job> {
         let removed = inner.jobs.remove(job_id)?;
+        inner.flow_dependencies.remove(job_id);
         Self::forget_released_deduplication_owner_locked(inner, &removed);
         Some(removed)
     }
@@ -2370,6 +2576,7 @@ impl InMemoryJobQueue {
         }
 
         let previous_state = parent.state;
+        Self::clear_child_dependency_side_index_locked(inner, parent_id, child_id);
         let parent = inner.jobs.get_mut(parent_id)?;
         parent.state = JobState::WaitingChildren;
         parent.processed_at = None;
@@ -2554,7 +2761,12 @@ impl JobQueueBackend for InMemoryJobQueue {
                 .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
             require_active(job, "complete")?;
             require_lock_token(job, lock_token)?;
-            ensure_flow_dependencies_are_resolved(job, &inner.jobs, "complete")?;
+            ensure_flow_dependencies_are_resolved(
+                job,
+                &inner.jobs,
+                inner.flow_dependencies.get(job_id),
+                "complete",
+            )?;
         }
         let completed = {
             let job = inner
@@ -2570,6 +2782,9 @@ impl JobQueueBackend for InMemoryJobQueue {
             job.return_value = Some(value);
             job.clone()
         };
+        if let Some(parent_id) = &completed.parent_id {
+            Self::record_terminal_child_dependency_locked(&mut inner, parent_id, &completed);
+        }
         if completed.options.removes_completed_immediately() {
             Self::remove_job_record_locked(&mut inner, job_id);
         } else if let Some(retention) = completed.options.completed_retention() {
@@ -2893,6 +3108,9 @@ impl JobQueueBackend for InMemoryJobQueue {
             Self::remove_job_record_locked(&mut inner, &id);
         }
         for failed in terminal_failures {
+            if let Some(parent_id) = &failed.parent_id {
+                Self::record_terminal_child_dependency_locked(&mut inner, parent_id, &failed);
+            }
             if Self::enqueue_deduplicated_next_locked(&mut inner, &failed, now).is_none() {
                 Self::enqueue_deduplicated_next_flow_locked(&mut inner, &failed, now);
             }
@@ -3359,6 +3577,23 @@ fn sorted_released_deduplication_owners(
     owners
 }
 
+fn sorted_flow_dependency_indexes(
+    indexes: &HashMap<JobId, InMemoryFlowDependencyIndex>,
+) -> Vec<JobFlowDependencyIndex> {
+    let mut indexes = indexes
+        .iter()
+        .filter(|(_, index)| !index.is_empty())
+        .map(|(parent_id, index)| JobFlowDependencyIndex {
+            parent_id: parent_id.clone(),
+            processed: index.processed.clone(),
+            ignored: index.ignored.clone(),
+            failed: index.failed.iter().cloned().collect(),
+        })
+        .collect::<Vec<_>>();
+    indexes.sort_by(|left, right| left.parent_id.cmp(&right.parent_id));
+    indexes
+}
+
 fn job_finished_result(job: &Job) -> JobFinishedResult {
     match job.state {
         JobState::Completed => JobFinishedResult::Completed {
@@ -3371,16 +3606,23 @@ fn job_finished_result(job: &Job) -> JobFinishedResult {
     }
 }
 
-fn flow_dependency_counts(parent: &Job, jobs: &HashMap<JobId, Job>) -> JobFlowDependencyCounts {
+fn flow_dependency_counts(
+    parent: &Job,
+    jobs: &HashMap<JobId, Job>,
+    index: Option<&InMemoryFlowDependencyIndex>,
+) -> JobFlowDependencyCounts {
     let mut counts = JobFlowDependencyCounts {
-        processed: 0,
+        processed: index.map(|index| index.processed.len()).unwrap_or(0),
         unprocessed: 0,
-        failed: 0,
-        ignored: 0,
+        failed: index.map(|index| index.failed.len()).unwrap_or(0),
+        ignored: index.map(|index| index.ignored.len()).unwrap_or(0),
         missing: 0,
     };
 
     for child_id in &parent.child_ids {
+        if flow_dependency_index_contains(index, child_id) {
+            continue;
+        }
         match jobs.get(child_id) {
             Some(child) if child.state == JobState::Completed => counts.processed += 1,
             Some(child)
@@ -3405,9 +3647,10 @@ fn flow_dependency_counts(parent: &Job, jobs: &HashMap<JobId, Job>) -> JobFlowDe
 fn flow_dependency_selected_counts(
     parent: &Job,
     jobs: &HashMap<JobId, Job>,
+    index: Option<&InMemoryFlowDependencyIndex>,
     options: JobFlowDependencyCountOptions,
 ) -> JobFlowDependencySelectedCounts {
-    let counts = flow_dependency_counts(parent, jobs);
+    let counts = flow_dependency_counts(parent, jobs, index);
     let mut selected = JobFlowDependencySelectedCounts::default();
     for kind in options.selected() {
         let count = match kind {
@@ -3421,9 +3664,36 @@ fn flow_dependency_selected_counts(
     selected
 }
 
-fn flow_dependency_values(parent: &Job, jobs: &HashMap<JobId, Job>) -> JobFlowDependencyValues {
+fn flow_dependency_values(
+    parent: &Job,
+    jobs: &HashMap<JobId, Job>,
+    index: Option<&InMemoryFlowDependencyIndex>,
+) -> JobFlowDependencyValues {
     let mut values = JobFlowDependencyValues::default();
+    let mut indexed_children = HashSet::new();
     for child_id in &parent.child_ids {
+        if let Some(index) = index {
+            if let Some(value) = index.processed.get(child_id) {
+                values.processed.insert(child_id.clone(), value.clone());
+                indexed_children.insert(child_id.clone());
+                continue;
+            }
+            if let Some(failed_reason) = index.ignored.get(child_id) {
+                values
+                    .ignored
+                    .insert(child_id.clone(), failed_reason.clone());
+                indexed_children.insert(child_id.clone());
+                continue;
+            }
+            if index.failed.contains(child_id) {
+                values.failed.push(child_id.clone());
+                indexed_children.insert(child_id.clone());
+                continue;
+            }
+        }
+        if flow_dependency_index_contains(index, child_id) {
+            continue;
+        }
         let Some(child) = jobs.get(child_id) else {
             continue;
         };
@@ -3448,56 +3718,35 @@ fn flow_dependency_values(parent: &Job, jobs: &HashMap<JobId, Job>) -> JobFlowDe
             }
         }
     }
+    if let Some(index) = index {
+        for (child_id, value) in &index.processed {
+            if indexed_children.insert(child_id.clone()) {
+                values.processed.insert(child_id.clone(), value.clone());
+            }
+        }
+        for (child_id, failed_reason) in &index.ignored {
+            if indexed_children.insert(child_id.clone()) {
+                values
+                    .ignored
+                    .insert(child_id.clone(), failed_reason.clone());
+            }
+        }
+        for child_id in &index.failed {
+            if indexed_children.insert(child_id.clone()) {
+                values.failed.push(child_id.clone());
+            }
+        }
+    }
     values
 }
 
 fn flow_dependency_page(
     parent: &Job,
     jobs: &HashMap<JobId, Job>,
+    index: Option<&InMemoryFlowDependencyIndex>,
     options: JobFlowDependencyPageOptions,
 ) -> JobFlowDependencyPage {
-    let mut bucket = Vec::new();
-    for child_id in &parent.child_ids {
-        let Some(child) = jobs.get(child_id) else {
-            continue;
-        };
-        match options.kind {
-            JobFlowDependencyKind::Processed if child.state == JobState::Completed => {
-                if let Some(value) = &child.return_value {
-                    bucket.push(JobFlowDependencyPageItem::Processed {
-                        child_id: child.id.clone(),
-                        value: value.clone(),
-                    });
-                }
-            }
-            JobFlowDependencyKind::Unprocessed if !child.state.is_terminal() => {
-                bucket.push(JobFlowDependencyPageItem::Unprocessed {
-                    child_id: child.id.clone(),
-                });
-            }
-            JobFlowDependencyKind::Ignored
-                if child.state == JobState::Failed
-                    && (child.options.ignore_dependency_on_failure
-                        || child.options.continue_parent_on_failure) =>
-            {
-                bucket.push(JobFlowDependencyPageItem::Ignored {
-                    child_id: child.id.clone(),
-                    failed_reason: child.failed_reason.clone().unwrap_or_default(),
-                });
-            }
-            JobFlowDependencyKind::Failed
-                if child.state == JobState::Failed
-                    && !child.options.ignore_dependency_on_failure
-                    && !child.options.continue_parent_on_failure
-                    && !child.options.remove_dependency_on_failure =>
-            {
-                bucket.push(JobFlowDependencyPageItem::Failed {
-                    child_id: child.id.clone(),
-                });
-            }
-            _ => {}
-        }
-    }
+    let bucket = flow_dependency_page_items(parent, jobs, index, options.kind);
 
     let count = options.count.max(1);
     let start = (options.cursor as usize).min(bucket.len());
@@ -3513,21 +3762,169 @@ fn flow_dependency_page(
     }
 }
 
+fn flow_dependency_page_items(
+    parent: &Job,
+    jobs: &HashMap<JobId, Job>,
+    index: Option<&InMemoryFlowDependencyIndex>,
+    kind: JobFlowDependencyKind,
+) -> Vec<JobFlowDependencyPageItem> {
+    let mut bucket = Vec::new();
+    let mut indexed_children = HashSet::new();
+    for child_id in &parent.child_ids {
+        if let Some(item) = indexed_flow_dependency_page_item(index, child_id, kind) {
+            bucket.push(item);
+            indexed_children.insert(child_id.clone());
+            continue;
+        }
+        if flow_dependency_index_contains(index, child_id) {
+            continue;
+        }
+        let Some(child) = jobs.get(child_id) else {
+            continue;
+        };
+        if let Some(item) = retained_flow_dependency_page_item(child, kind) {
+            bucket.push(item);
+        }
+    }
+
+    if let Some(index) = index {
+        match kind {
+            JobFlowDependencyKind::Processed => {
+                for (child_id, value) in &index.processed {
+                    if indexed_children.insert(child_id.clone()) {
+                        bucket.push(JobFlowDependencyPageItem::Processed {
+                            child_id: child_id.clone(),
+                            value: value.clone(),
+                        });
+                    }
+                }
+            }
+            JobFlowDependencyKind::Ignored => {
+                for (child_id, failed_reason) in &index.ignored {
+                    if indexed_children.insert(child_id.clone()) {
+                        bucket.push(JobFlowDependencyPageItem::Ignored {
+                            child_id: child_id.clone(),
+                            failed_reason: failed_reason.clone(),
+                        });
+                    }
+                }
+            }
+            JobFlowDependencyKind::Failed => {
+                for child_id in &index.failed {
+                    if indexed_children.insert(child_id.clone()) {
+                        bucket.push(JobFlowDependencyPageItem::Failed {
+                            child_id: child_id.clone(),
+                        });
+                    }
+                }
+            }
+            JobFlowDependencyKind::Unprocessed => {}
+        }
+    }
+
+    bucket
+}
+
+fn indexed_flow_dependency_page_item(
+    index: Option<&InMemoryFlowDependencyIndex>,
+    child_id: &str,
+    kind: JobFlowDependencyKind,
+) -> Option<JobFlowDependencyPageItem> {
+    let index = index?;
+    match kind {
+        JobFlowDependencyKind::Processed => {
+            index
+                .processed
+                .get(child_id)
+                .map(|value| JobFlowDependencyPageItem::Processed {
+                    child_id: child_id.to_string(),
+                    value: value.clone(),
+                })
+        }
+        JobFlowDependencyKind::Ignored => {
+            index
+                .ignored
+                .get(child_id)
+                .map(|failed_reason| JobFlowDependencyPageItem::Ignored {
+                    child_id: child_id.to_string(),
+                    failed_reason: failed_reason.clone(),
+                })
+        }
+        JobFlowDependencyKind::Failed if index.failed.contains(child_id) => {
+            Some(JobFlowDependencyPageItem::Failed {
+                child_id: child_id.to_string(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn retained_flow_dependency_page_item(
+    child: &Job,
+    kind: JobFlowDependencyKind,
+) -> Option<JobFlowDependencyPageItem> {
+    match kind {
+        JobFlowDependencyKind::Processed if child.state == JobState::Completed => child
+            .return_value
+            .as_ref()
+            .map(|value| JobFlowDependencyPageItem::Processed {
+                child_id: child.id.clone(),
+                value: value.clone(),
+            }),
+        JobFlowDependencyKind::Unprocessed if !child.state.is_terminal() => {
+            Some(JobFlowDependencyPageItem::Unprocessed {
+                child_id: child.id.clone(),
+            })
+        }
+        JobFlowDependencyKind::Ignored
+            if child.state == JobState::Failed
+                && (child.options.ignore_dependency_on_failure
+                    || child.options.continue_parent_on_failure) =>
+        {
+            Some(JobFlowDependencyPageItem::Ignored {
+                child_id: child.id.clone(),
+                failed_reason: child.failed_reason.clone().unwrap_or_default(),
+            })
+        }
+        JobFlowDependencyKind::Failed
+            if child.state == JobState::Failed
+                && !child.options.ignore_dependency_on_failure
+                && !child.options.continue_parent_on_failure
+                && !child.options.remove_dependency_on_failure =>
+        {
+            Some(JobFlowDependencyPageItem::Failed {
+                child_id: child.id.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
 fn flow_dependency_pages(
     parent: &Job,
     jobs: &HashMap<JobId, Job>,
+    index: Option<&InMemoryFlowDependencyIndex>,
     options: JobFlowDependencyPagesOptions,
 ) -> JobFlowDependencyPages {
     let mut pages = JobFlowDependencyPages::default();
     for page_options in options.selected() {
-        pages.insert(flow_dependency_page(parent, jobs, page_options));
+        pages.insert(flow_dependency_page(parent, jobs, index, page_options));
     }
     pages
 }
 
-fn flow_children_values(parent: &Job, jobs: &HashMap<JobId, Job>) -> JobFlowChildValues {
-    let mut values = BTreeMap::new();
+fn flow_children_values(
+    parent: &Job,
+    jobs: &HashMap<JobId, Job>,
+    index: Option<&InMemoryFlowDependencyIndex>,
+) -> JobFlowChildValues {
+    let mut values = index
+        .map(|index| index.processed.clone())
+        .unwrap_or_default();
     for child_id in &parent.child_ids {
+        if flow_dependency_index_contains(index, child_id) {
+            continue;
+        }
         let Some(child) = jobs.get(child_id) else {
             continue;
         };
@@ -3543,9 +3940,13 @@ fn flow_children_values(parent: &Job, jobs: &HashMap<JobId, Job>) -> JobFlowChil
 fn flow_ignored_children_failures(
     parent: &Job,
     jobs: &HashMap<JobId, Job>,
+    index: Option<&InMemoryFlowDependencyIndex>,
 ) -> JobFlowIgnoredFailures {
-    let mut failures = BTreeMap::new();
+    let mut failures = index.map(|index| index.ignored.clone()).unwrap_or_default();
     for child_id in &parent.child_ids {
+        if flow_dependency_index_contains(index, child_id) {
+            continue;
+        }
         let Some(child) = jobs.get(child_id) else {
             continue;
         };
@@ -3560,6 +3961,19 @@ fn flow_ignored_children_failures(
         }
     }
     failures
+}
+
+fn flow_dependency_index_contains(
+    index: Option<&InMemoryFlowDependencyIndex>,
+    child_id: &str,
+) -> bool {
+    index
+        .map(|index| {
+            index.processed.contains_key(child_id)
+                || index.ignored.contains_key(child_id)
+                || index.failed.contains(child_id)
+        })
+        .unwrap_or(false)
 }
 
 fn child_failure_releases_dependency(child: &Job) -> bool {
@@ -3948,9 +4362,10 @@ fn require_lock_token(job: &Job, lock_token: &str) -> Result<()> {
 fn ensure_flow_dependencies_are_resolved(
     job: &Job,
     jobs: &HashMap<JobId, Job>,
+    index: Option<&InMemoryFlowDependencyIndex>,
     action: &str,
 ) -> Result<()> {
-    let counts = flow_dependency_counts(job, jobs);
+    let counts = flow_dependency_counts(job, jobs, index);
     if counts.unprocessed > 0 {
         return Err(LaneError::JobStateConflict(format!(
             "cannot {action} job {}; it has {} pending flow dependencies",
@@ -3969,9 +4384,10 @@ fn ensure_flow_dependencies_are_resolved(
 fn ensure_flow_dependencies_have_not_failed(
     job: &Job,
     jobs: &HashMap<JobId, Job>,
+    index: Option<&InMemoryFlowDependencyIndex>,
     action: &str,
 ) -> Result<()> {
-    let counts = flow_dependency_counts(job, jobs);
+    let counts = flow_dependency_counts(job, jobs, index);
     if counts.failed > 0 {
         return Err(LaneError::JobStateConflict(format!(
             "cannot {action} job {}; it has {} failed flow dependencies",

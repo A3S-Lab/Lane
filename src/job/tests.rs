@@ -6533,6 +6533,189 @@ async fn flow_remove_child_dependency_detaches_ignored_failed_child_values() {
 }
 
 #[tokio::test]
+async fn flow_processed_dependency_side_index_survives_child_removal() {
+    let queue = InMemoryJobQueue::new("flow-processed-side-index-removal");
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({ "kind": "aggregate" })),
+            vec![JobSpec::new("child", serde_json::json!({ "n": 1 }))],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    let child = queue
+        .claim_next(
+            "worker-child".to_string(),
+            Duration::from_secs(30),
+            ts(1_100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .complete_job(
+            &child.id,
+            lock_token(&child),
+            serde_json::json!({ "ok": true }),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+    let removed = queue.remove_job(&child.id).await.unwrap().unwrap();
+    assert_eq!(removed.id, child.id);
+    assert!(queue.get_job(&child.id).await.unwrap().is_none());
+
+    let counts = queue
+        .get_flow_dependency_counts(&flow.parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        counts,
+        JobFlowDependencyCounts {
+            processed: 1,
+            unprocessed: 0,
+            failed: 0,
+            ignored: 0,
+            missing: 0,
+        }
+    );
+
+    let values = queue
+        .get_flow_dependency_values(&flow.parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        values.processed.get(&child.id),
+        Some(&serde_json::json!({ "ok": true }))
+    );
+    let child_values = queue
+        .get_flow_children_values(&flow.parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        child_values.get(&child.id),
+        Some(&serde_json::json!({ "ok": true }))
+    );
+}
+
+#[tokio::test]
+async fn flow_ignored_dependency_side_index_survives_child_removal() {
+    let queue = InMemoryJobQueue::new("flow-ignored-side-index-removal");
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({ "kind": "aggregate" })),
+            vec![
+                JobSpec::new("optional-child", serde_json::json!({ "optional": true }))
+                    .with_options(JobOptions::new().with_ignore_dependency_on_failure(true)),
+            ],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    let child = queue
+        .claim_next(
+            "worker-child".to_string(),
+            Duration::from_secs(30),
+            ts(1_100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .fail_job(
+            &child.id,
+            lock_token(&child),
+            "optional source failed".to_string(),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+    queue.remove_job(&child.id).await.unwrap().unwrap();
+
+    let counts = queue
+        .get_flow_dependency_counts(&flow.parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(counts.ignored, 1);
+    assert_eq!(counts.missing, 0);
+
+    let ignored = queue
+        .get_flow_ignored_children_failures(&flow.parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ignored.get(&child.id).map(String::as_str),
+        Some("optional source failed")
+    );
+}
+
+#[tokio::test]
+async fn flow_fail_parent_dependency_side_index_survives_child_removal() {
+    let queue = InMemoryJobQueue::new("flow-fail-parent-side-index-removal");
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({ "kind": "aggregate" })),
+            vec![
+                JobSpec::new("required-child", serde_json::json!({ "required": true }))
+                    .with_options(JobOptions::new().with_fail_parent_on_failure(true)),
+            ],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    let child = queue
+        .claim_next(
+            "worker-child".to_string(),
+            Duration::from_secs(30),
+            ts(1_100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .fail_job(
+            &child.id,
+            lock_token(&child),
+            "required source failed".to_string(),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+    queue.remove_job(&child.id).await.unwrap().unwrap();
+
+    let counts = queue
+        .get_flow_dependency_counts(&flow.parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(counts.failed, 1);
+    assert_eq!(counts.missing, 0);
+
+    let page = queue
+        .get_flow_dependency_page(
+            &flow.parent.id,
+            JobFlowDependencyPageOptions::new(JobFlowDependencyKind::Failed),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        page.items,
+        vec![JobFlowDependencyPageItem::Failed {
+            child_id: child.id.clone(),
+        }]
+    );
+}
+
+#[tokio::test]
 async fn flow_rejects_duplicate_custom_job_ids() {
     let queue = InMemoryJobQueue::new("flow-ids");
     let error = queue
@@ -7856,6 +8039,75 @@ async fn local_job_queue_persists_removed_completed_child_dependency() {
         .unwrap()
         .expect("dependency values should be restored");
     assert!(values.processed.is_empty());
+}
+
+#[tokio::test]
+async fn local_job_queue_persists_terminal_dependency_side_indexes() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let snapshot_path = temp_dir
+        .path()
+        .join("jobs")
+        .join("terminal-dependency-side-indexes.json");
+    let queue = LocalJobQueue::open("durable-terminal-dependency-indexes", &snapshot_path)
+        .await
+        .unwrap();
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({ "kind": "aggregate" })),
+            vec![JobSpec::new("child", serde_json::json!({ "n": 1 }))],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    let child = queue
+        .claim_next(
+            "worker-child".to_string(),
+            Duration::from_secs(30),
+            ts(1_100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .complete_job(
+            &child.id,
+            lock_token(&child),
+            serde_json::json!({ "ok": true }),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+    queue.remove_job(&child.id).await.unwrap().unwrap();
+
+    let reopened = LocalJobQueue::open("durable-terminal-dependency-indexes", &snapshot_path)
+        .await
+        .unwrap();
+    assert!(reopened.get_job(&child.id).await.unwrap().is_none());
+    let counts = reopened
+        .get_flow_dependency_counts(&flow.parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        counts,
+        JobFlowDependencyCounts {
+            processed: 1,
+            unprocessed: 0,
+            failed: 0,
+            ignored: 0,
+            missing: 0,
+        }
+    );
+    let values = reopened
+        .get_flow_dependency_values(&flow.parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        values.processed.get(&child.id),
+        Some(&serde_json::json!({ "ok": true }))
+    );
 }
 
 #[tokio::test]
