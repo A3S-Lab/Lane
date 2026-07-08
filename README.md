@@ -1294,13 +1294,15 @@ child ids that are still pending or missing from retention.
 mechanism instead of only copying the API names. BullMQ 5.79.3 counts
 parent-scoped `:processed`, `:dependencies`, `:failed`, and `:unsuccessful`
 structures with `HLEN`, `SCARD`, `HLEN`, and `ZCARD`, with ignored, removed, and
-continued failures handled by the failure-policy path. Lane keeps child snapshots
-in the queue jobs hash and keeps the still-blocking children in
-`dependencies:<parent_id>`, so the Redis count script reads both structures in
-one turn and returns processed, unprocessed, failed, ignored, and missing totals
-without returning every child snapshot to the client. Removed failed
-dependencies are intentionally omitted from the failed and ignored totals,
-matching BullMQ's `removeDependencyOnFailure` behavior.
+continued failures handled by the failure-policy path. Lane now writes the same
+parent-scoped Redis side indexes under `dependencies:<parent_id>:processed`,
+`dependencies:<parent_id>:failed`, and
+`dependencies:<parent_id>:unsuccessful`, while keeping child snapshots in the
+queue jobs hash for audit and compatibility fallback. The Redis count script
+reads those side indexes in one turn and returns processed, unprocessed, failed,
+ignored, and missing totals without returning every child snapshot to the client.
+Removed failed dependencies are intentionally omitted from the failed and ignored
+totals, matching BullMQ's `removeDependencyOnFailure` behavior.
 Completing a flow parent checks both the Redis dependency set and
 `dependencies:<parent_id>:unsuccessful` before leaving the active state, matching
 BullMQ's `moveToFinished` guard that rejects jobs with pending dependencies or
@@ -1310,10 +1312,9 @@ set so the parent can only finish after the remaining required fan-in has
 resolved.
 `get_flow_children_values()` and `get_flow_ignored_children_failures()` follow
 BullMQ's `getChildrenValues()` and `getIgnoredChildrenFailures()` fan-in
-semantics. BullMQ reads parent-scoped `:processed` and `:failed` hashes; Lane
-keeps the single child snapshot as the source of truth, so Redis uses Lua to read
-the parent child list and extract completed return values or ignored failure
-reasons from retained child snapshots in one turn.
+semantics. BullMQ reads parent-scoped `:processed` and `:failed` hashes; Lane's
+Redis read scripts now prefer those hashes as well, and fall back to retained
+child snapshots only for older data written before the side indexes existed.
 `remove_unprocessed_children()` follows BullMQ's `removeUnprocessedChildren`
 script shape at the dependency-set level: it removes children that are still in
 the parent's pending dependency set, skips completed, failed, active, or locked

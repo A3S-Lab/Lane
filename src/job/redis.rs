@@ -3463,12 +3463,16 @@ local parent_id = job["parent_id"]
 if parent_id and parent_id ~= cjson.null then
   local parent_raw = redis.call('HGET', KEYS[1], parent_id)
   if parent_raw then
-    local parent = cjson.decode(parent_raw)
-    local dependency_key = ARGV[13] .. parent_id
-    local had_dependency_set = redis.call('EXISTS', dependency_key) == 1
-    if had_dependency_set then
-      redis.call('SREM', dependency_key, ARGV[1])
-    end
+	    local parent = cjson.decode(parent_raw)
+	    local dependency_key = ARGV[13] .. parent_id
+	    local had_dependency_set = redis.call('EXISTS', dependency_key) == 1
+	    local removed_dependency = 0
+	    if had_dependency_set then
+	      removed_dependency = redis.call('SREM', dependency_key, ARGV[1])
+	      if removed_dependency == 1 then
+	        redis.call('HSET', dependency_key .. ':processed', ARGV[1], ARGV[4])
+	      end
+	    end
     if parent["state"] == "waiting_children" then
       local all_done = true
       local failed_child_id = nil
@@ -4307,11 +4311,12 @@ local parent_id = job["parent_id"]
 if parent_id and parent_id ~= cjson.null then
   local parent_raw = redis.call('HGET', KEYS[1], parent_id)
   if parent_raw then
-    local parent = cjson.decode(parent_raw)
-    if parent["state"] == "waiting_children" then
-      local continue_parent_failure = job["options"] and job["options"] ~= cjson.null and job["options"]["continue_parent_on_failure"] == true
-      local fail_parent_failure = job["options"] and job["options"] ~= cjson.null and job["options"]["fail_parent_on_failure"] == true
-      local dependency_failure_releases_parent = job["options"] and job["options"] ~= cjson.null and (job["options"]["ignore_dependency_on_failure"] == true or job["options"]["remove_dependency_on_failure"] == true or job["options"]["continue_parent_on_failure"] == true or job["options"]["fail_parent_on_failure"] == true)
+	    local parent = cjson.decode(parent_raw)
+	    if parent["state"] == "waiting_children" then
+	      local ignore_parent_failure = job["options"] and job["options"] ~= cjson.null and job["options"]["ignore_dependency_on_failure"] == true
+	      local continue_parent_failure = job["options"] and job["options"] ~= cjson.null and job["options"]["continue_parent_on_failure"] == true
+	      local fail_parent_failure = job["options"] and job["options"] ~= cjson.null and job["options"]["fail_parent_on_failure"] == true
+	      local dependency_failure_releases_parent = job["options"] and job["options"] ~= cjson.null and (job["options"]["ignore_dependency_on_failure"] == true or job["options"]["remove_dependency_on_failure"] == true or job["options"]["continue_parent_on_failure"] == true or job["options"]["fail_parent_on_failure"] == true)
       local dependency_key = ARGV[10] .. parent_id
       local all_done = true
       local continue_parent = false
@@ -4326,18 +4331,22 @@ if parent_id and parent_id ~= cjson.null then
           end
           redis.call('ZADD', dependency_key .. ':unsuccessful', ARGV[8], ARGV[1])
           fail_parent = true
-        elseif continue_parent_failure then
-          if redis.call('EXISTS', dependency_key) == 1 then
-            redis.call('SREM', dependency_key, ARGV[1])
-          end
-          continue_parent = true
-        else
-          local had_dependency_set = redis.call('EXISTS', dependency_key) == 1
-          if had_dependency_set then
-            redis.call('SREM', dependency_key, ARGV[1])
-            if redis.call('SCARD', dependency_key) > 0 then
-              all_done = false
-            end
+	        elseif continue_parent_failure then
+	          if redis.call('EXISTS', dependency_key) == 1 then
+	            redis.call('SREM', dependency_key, ARGV[1])
+	          end
+	          redis.call('HSET', dependency_key .. ':failed', ARGV[1], ARGV[4])
+	          continue_parent = true
+	        else
+	          local had_dependency_set = redis.call('EXISTS', dependency_key) == 1
+	          if had_dependency_set then
+	            redis.call('SREM', dependency_key, ARGV[1])
+	            if ignore_parent_failure then
+	              redis.call('HSET', dependency_key .. ':failed', ARGV[1], ARGV[4])
+	            end
+	            if redis.call('SCARD', dependency_key) > 0 then
+	              all_done = false
+	            end
           else
             for _, child_id in ipairs(parent["child_ids"] or {}) do
               local child_raw = nil
@@ -5642,11 +5651,12 @@ for _, id in ipairs(ids) do
           if parent_id and parent_id ~= cjson.null then
             local parent_raw = redis.call('HGET', KEYS[1], parent_id)
             if parent_raw then
-              local parent = cjson.decode(parent_raw)
-              if parent["state"] == "waiting_children" then
-                local continue_parent_failure = job["options"] and job["options"] ~= cjson.null and job["options"]["continue_parent_on_failure"] == true
-                local fail_parent_failure = job["options"] and job["options"] ~= cjson.null and job["options"]["fail_parent_on_failure"] == true
-                local dependency_failure_releases_parent = job["options"] and job["options"] ~= cjson.null and (job["options"]["ignore_dependency_on_failure"] == true or job["options"]["remove_dependency_on_failure"] == true or job["options"]["continue_parent_on_failure"] == true or job["options"]["fail_parent_on_failure"] == true)
+	              local parent = cjson.decode(parent_raw)
+	              if parent["state"] == "waiting_children" then
+	                local ignore_parent_failure = job["options"] and job["options"] ~= cjson.null and job["options"]["ignore_dependency_on_failure"] == true
+	                local continue_parent_failure = job["options"] and job["options"] ~= cjson.null and job["options"]["continue_parent_on_failure"] == true
+	                local fail_parent_failure = job["options"] and job["options"] ~= cjson.null and job["options"]["fail_parent_on_failure"] == true
+	                local dependency_failure_releases_parent = job["options"] and job["options"] ~= cjson.null and (job["options"]["ignore_dependency_on_failure"] == true or job["options"]["remove_dependency_on_failure"] == true or job["options"]["continue_parent_on_failure"] == true or job["options"]["fail_parent_on_failure"] == true)
                 local dependency_key = ARGV[6] .. parent_id
                 local all_done = true
                 local continue_parent = false
@@ -5661,18 +5671,22 @@ for _, id in ipairs(ids) do
                     end
                     redis.call('ZADD', dependency_key .. ':unsuccessful', ARGV[1], id)
                     fail_parent = true
-                  elseif continue_parent_failure then
-                    if redis.call('EXISTS', dependency_key) == 1 then
-                      redis.call('SREM', dependency_key, id)
-                    end
-                    continue_parent = true
-                  else
-                    local had_dependency_set = redis.call('EXISTS', dependency_key) == 1
-                    if had_dependency_set then
-                      redis.call('SREM', dependency_key, id)
-                      if redis.call('SCARD', dependency_key) > 0 then
-                        all_done = false
-                      end
+	                  elseif continue_parent_failure then
+	                    if redis.call('EXISTS', dependency_key) == 1 then
+	                      redis.call('SREM', dependency_key, id)
+	                    end
+	                    redis.call('HSET', dependency_key .. ':failed', id, job["failed_reason"])
+	                    continue_parent = true
+	                  else
+	                    local had_dependency_set = redis.call('EXISTS', dependency_key) == 1
+	                    if had_dependency_set then
+	                      redis.call('SREM', dependency_key, id)
+	                      if ignore_parent_failure then
+	                        redis.call('HSET', dependency_key .. ':failed', id, job["failed_reason"])
+	                      end
+	                      if redis.call('SCARD', dependency_key) > 0 then
+	                        all_done = false
+	                      end
                     else
                       local updated = cjson.encode(job)
                       for _, child_id in ipairs(parent["child_ids"] or {}) do
@@ -6406,6 +6420,7 @@ if parent_id and parent_id ~= cjson.null then
     if owns_child and parent["state"] ~= "completed" and parent["state"] ~= "failed" and parent["state"] ~= "active" then
       local parent_previous_state = parent["state"] or ""
       redis.call('SADD', ARGV[10] .. parent_id, ARGV[1])
+      redis.call('HDEL', ARGV[10] .. parent_id .. ':processed', ARGV[1])
       redis.call('ZREM', ARGV[10] .. parent_id .. ':unsuccessful', ARGV[1])
       redis.call('HDEL', ARGV[10] .. parent_id .. ':failed', ARGV[1])
       redis.call('ZREM', KEYS[3], parent_id)
@@ -8529,20 +8544,47 @@ end
 local parent = cjson.decode(parent_raw)
 local has_dependency_set = redis.call('EXISTS', KEYS[2]) == 1
 local pending_child_ids = {}
-if has_dependency_set then
-  for _, pending_child_id in ipairs(redis.call('SMEMBERS', KEYS[2])) do
-    pending_child_ids[pending_child_id] = true
-  end
+for _, pending_child_id in ipairs(redis.call('SMEMBERS', KEYS[2])) do
+  pending_child_ids[pending_child_id] = true
 end
-local processed = 0
+
+local processed_child_ids = {}
+for _, processed_child_id in ipairs(redis.call('HKEYS', KEYS[3])) do
+  processed_child_ids[processed_child_id] = true
+end
+
+local ignored_child_ids = {}
+for _, ignored_child_id in ipairs(redis.call('HKEYS', KEYS[4])) do
+  ignored_child_ids[ignored_child_id] = true
+end
+
+local unsuccessful_child_ids = {}
+for _, unsuccessful_child_id in ipairs(redis.call('ZRANGE', KEYS[5], 0, -1)) do
+  unsuccessful_child_ids[unsuccessful_child_id] = true
+end
+
+local processed = redis.call('HLEN', KEYS[3])
 local unprocessed = 0
-local failed = 0
-local ignored = 0
+local failed = redis.call('ZCARD', KEYS[5])
+local ignored = redis.call('HLEN', KEYS[4])
 local missing = 0
 
 for _, child_id in ipairs(parent['child_ids'] or {}) do
+  local is_pending = pending_child_ids[child_id] == true
+  local is_indexed =
+    processed_child_ids[child_id] == true
+    or ignored_child_ids[child_id] == true
+    or unsuccessful_child_ids[child_id] == true
   local child_raw = redis.call('HGET', KEYS[1], child_id)
-  if not child_raw then
+  if is_pending then
+    if child_raw then
+      unprocessed = unprocessed + 1
+    else
+      missing = missing + 1
+    end
+  elseif is_indexed then
+    -- Parent-scoped dependency indexes are authoritative when present.
+  elseif not child_raw then
     missing = missing + 1
   else
     local child = cjson.decode(child_raw)
@@ -8556,7 +8598,7 @@ for _, child_id in ipairs(parent['child_ids'] or {}) do
       else
         failed = failed + 1
       end
-    elseif not has_dependency_set or pending_child_ids[child_id] then
+    elseif not has_dependency_set then
       unprocessed = unprocessed + 1
     end
   end
@@ -8569,6 +8611,16 @@ const FLOW_CHILDREN_VALUES_SCRIPT: &str = r#"
 local parent_raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not parent_raw then
   return {'missing'}
+end
+
+local processed_values = redis.call('HGETALL', KEYS[2])
+if #processed_values > 0 then
+  local result = {'ok'}
+  for index = 1, #processed_values, 2 do
+    table.insert(result, processed_values[index])
+    table.insert(result, processed_values[index + 1])
+  end
+  return result
 end
 
 local parent = cjson.decode(parent_raw)
@@ -8591,6 +8643,16 @@ const FLOW_IGNORED_CHILDREN_FAILURES_SCRIPT: &str = r#"
 local parent_raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not parent_raw then
   return {'missing'}
+end
+
+local failed_values = redis.call('HGETALL', KEYS[2])
+if #failed_values > 0 then
+  local result = {'ok'}
+  for index = 1, #failed_values, 2 do
+    table.insert(result, failed_values[index])
+    table.insert(result, failed_values[index + 1])
+  end
+  return result
 end
 
 local parent = cjson.decode(parent_raw)
@@ -10076,11 +10138,15 @@ impl RedisJobQueue {
         parent_id: &str,
     ) -> Result<Option<JobFlowDependencyCounts>> {
         let mut conn = self.connection().await?;
+        let dependency_key = self.dependencies_key(parent_id);
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(FLOW_DEPENDENCY_COUNTS_SCRIPT)
-            .arg(2)
+            .arg(5)
             .arg(self.jobs_key())
-            .arg(self.dependencies_key(parent_id))
+            .arg(&dependency_key)
+            .arg(format!("{dependency_key}:processed"))
+            .arg(format!("{dependency_key}:failed"))
+            .arg(format!("{dependency_key}:unsuccessful"))
             .arg(parent_id)
             .query_async(&mut conn)
             .await
@@ -10096,8 +10162,9 @@ impl RedisJobQueue {
         let mut conn = self.connection().await?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(FLOW_CHILDREN_VALUES_SCRIPT)
-            .arg(1)
+            .arg(2)
             .arg(self.jobs_key())
+            .arg(format!("{}:processed", self.dependencies_key(parent_id)))
             .arg(parent_id)
             .query_async(&mut conn)
             .await
@@ -10113,8 +10180,9 @@ impl RedisJobQueue {
         let mut conn = self.connection().await?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(FLOW_IGNORED_CHILDREN_FAILURES_SCRIPT)
-            .arg(1)
+            .arg(2)
             .arg(self.jobs_key())
+            .arg(format!("{}:failed", self.dependencies_key(parent_id)))
             .arg(parent_id)
             .query_async(&mut conn)
             .await
@@ -13150,12 +13218,25 @@ mod tests {
     #[test]
     fn move_to_finished_scripts_track_unsuccessful_flow_dependencies() {
         assert!(COMPLETE_SCRIPT.contains("ARGV[13] .. ARGV[1] .. ':unsuccessful'"));
+        assert!(COMPLETE_SCRIPT
+            .contains("redis.call('HSET', dependency_key .. ':processed', ARGV[1], ARGV[4])"));
+        assert!(FAIL_SCRIPT
+            .contains("redis.call('HSET', dependency_key .. ':failed', ARGV[1], ARGV[4])"));
         assert!(FAIL_SCRIPT
             .contains("redis.call('ZADD', dependency_key .. ':unsuccessful', ARGV[8], ARGV[1])"));
+        assert!(RECOVER_STALLED_SCRIPT.contains(
+            "redis.call('HSET', dependency_key .. ':failed', id, job[\"failed_reason\"])"
+        ));
         assert!(RECOVER_STALLED_SCRIPT
             .contains("redis.call('ZADD', dependency_key .. ':unsuccessful', ARGV[1], id)"));
         assert!(RETRY_JOB_SCRIPT
+            .contains("redis.call('HDEL', ARGV[10] .. parent_id .. ':processed', ARGV[1])"));
+        assert!(RETRY_JOB_SCRIPT
             .contains("redis.call('ZREM', ARGV[10] .. parent_id .. ':unsuccessful', ARGV[1])"));
+        assert!(RETRY_JOB_SCRIPT
+            .contains("redis.call('HDEL', ARGV[10] .. parent_id .. ':failed', ARGV[1])"));
+        assert!(FLOW_CHILDREN_VALUES_SCRIPT.contains("redis.call('HGETALL', KEYS[2])"));
+        assert!(FLOW_IGNORED_CHILDREN_FAILURES_SCRIPT.contains("redis.call('HGETALL', KEYS[2])"));
     }
 
     #[test]

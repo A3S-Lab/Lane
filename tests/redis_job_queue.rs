@@ -2914,6 +2914,174 @@ async fn run_flow_parent_unsuccessful_dependency_index(
 }
 
 #[tokio::test]
+async fn redis_backend_writes_flow_parent_dependency_side_indexes_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_flow_parent_dependency_side_indexes(redis_url),
+    )
+    .await
+    .expect("Redis flow dependency side-index integration test timed out")
+    .unwrap();
+}
+
+async fn run_flow_parent_dependency_side_indexes(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-side-indexes")
+        .expect("valid Redis URL should build the flow-side-indexes queue");
+    let worker = RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-side-indexes")
+        .expect("valid Redis URL should build the flow-side-indexes worker");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new(
+                "side-index-parent",
+                serde_json::json!({ "kind": "aggregate" }),
+            )
+            .with_options(JobOptions::new().with_priority(1)),
+            vec![
+                JobSpec::new("side-index-completed-child", serde_json::json!({ "n": 1 }))
+                    .with_options(JobOptions::new().with_priority(1)),
+                JobSpec::new("side-index-ignored-child", serde_json::json!({ "n": 2 }))
+                    .with_options(
+                        JobOptions::new()
+                            .with_priority(2)
+                            .with_ignore_dependency_on_failure(true),
+                    ),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("side-index flow should be added");
+    let dependency_key = format!(
+        "{namespace}:flow-side-indexes:dependencies:{}",
+        flow.parent.id
+    );
+    let processed_key = format!("{dependency_key}:processed");
+    let failed_key = format!("{dependency_key}:failed");
+
+    let completed_child = worker
+        .claim_next(
+            "worker-side-index-completed".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("completed child claim should return")
+        .expect("completed child should be claimable");
+    assert_eq!(completed_child.id, flow.children[0].id);
+    worker
+        .complete_job(
+            &completed_child.id,
+            lock_token(&completed_child),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("completed child should complete");
+
+    let raw_processed: Option<String> = conn.hget(&processed_key, &flow.children[0].id).await?;
+    let processed_value = raw_processed
+        .as_deref()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .transpose()
+        .expect("processed child value should be JSON");
+    assert_eq!(processed_value, Some(serde_json::json!({ "ok": true })));
+
+    let ignored_child = worker
+        .claim_next(
+            "worker-side-index-ignored".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("ignored child claim should return")
+        .expect("ignored child should be claimable");
+    assert_eq!(ignored_child.id, flow.children[1].id);
+    worker
+        .fail_job(
+            &ignored_child.id,
+            lock_token(&ignored_child),
+            "ignored side-index failure".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("ignored child should fail");
+
+    let raw_ignored: Option<String> = conn.hget(&failed_key, &flow.children[1].id).await?;
+    assert_eq!(raw_ignored.as_deref(), Some("ignored side-index failure"));
+
+    let child_values = queue
+        .get_flow_children_values(&flow.parent.id)
+        .await
+        .expect("children values should load")
+        .expect("children values should exist");
+    assert_eq!(
+        child_values.get(&flow.children[0].id),
+        Some(&serde_json::json!({ "ok": true }))
+    );
+    let ignored_failures = queue
+        .get_flow_ignored_children_failures(&flow.parent.id)
+        .await
+        .expect("ignored failures should load")
+        .expect("ignored failures should exist");
+    assert_eq!(
+        ignored_failures
+            .get(&flow.children[1].id)
+            .map(String::as_str),
+        Some("ignored side-index failure")
+    );
+    let counts = queue
+        .get_flow_dependency_counts(&flow.parent.id)
+        .await
+        .expect("dependency counts should load")
+        .expect("dependency counts should exist");
+    assert_eq!(counts.processed, 1);
+    assert_eq!(counts.unprocessed, 0);
+    assert_eq!(counts.failed, 0);
+    assert_eq!(counts.ignored, 1);
+    assert_eq!(counts.missing, 0);
+
+    let retried_child = queue
+        .retry_job(&flow.children[0].id, Utc::now())
+        .await
+        .expect("completed child retry should restore parent dependency");
+    assert_eq!(retried_child.id, flow.children[0].id);
+
+    let raw_processed_after_retry: Option<String> =
+        conn.hget(&processed_key, &flow.children[0].id).await?;
+    assert_eq!(raw_processed_after_retry, None);
+    let child_values_after_retry = queue
+        .get_flow_children_values(&flow.parent.id)
+        .await
+        .expect("children values should load after retry")
+        .expect("children values should exist after retry");
+    assert!(child_values_after_retry.is_empty());
+
+    let counts_after_retry = queue
+        .get_flow_dependency_counts(&flow.parent.id)
+        .await
+        .expect("dependency counts should load after retry")
+        .expect("dependency counts should exist after retry");
+    assert_eq!(counts_after_retry.processed, 0);
+    assert_eq!(counts_after_retry.unprocessed, 1);
+    assert_eq!(counts_after_retry.failed, 0);
+    assert_eq!(counts_after_retry.ignored, 1);
+    assert_eq!(counts_after_retry.missing, 0);
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
+#[tokio::test]
 async fn redis_backend_adds_dynamic_flow_children_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
