@@ -3178,6 +3178,62 @@ async fn run_flow_parent_unsuccessful_dependency_index(
         LaneError::JobStateConflict(message) if message.contains("failed flow dependencies")
     ));
 
+    let fanout_error = guard_queue
+        .add_flow_children_at(
+            &guard_parent.id,
+            lock_token(&guard_parent),
+            vec![
+                JobSpec::new("late-child", serde_json::json!({ "unexpected": true }))
+                    .with_options(JobOptions::new().with_job_id("unsuccessful-guard-late-child")),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect_err("unsuccessful parent should not fan out new children");
+    assert!(matches!(
+        fanout_error,
+        LaneError::JobStateConflict(message) if message.contains("failed flow dependencies")
+    ));
+    let late_child = guard_queue
+        .get_job("unsuccessful-guard-late-child")
+        .await
+        .expect("late child lookup should load");
+    assert!(late_child.is_none());
+    let guard_parent_after_fanout = guard_queue
+        .get_job(&guard_parent.id)
+        .await
+        .expect("guard parent after fan-out rejection should load")
+        .expect("guard parent after fan-out rejection should exist");
+    assert_eq!(guard_parent_after_fanout.state, JobState::Active);
+    assert_eq!(
+        guard_parent_after_fanout.lock_token.as_deref(),
+        Some(lock_token(&guard_parent))
+    );
+    let guard_parent_active_score: Option<f64> = conn
+        .zscore(
+            format!("{namespace}:flow-unsuccessful-guard:active"),
+            &guard_parent.id,
+        )
+        .await?;
+    assert!(guard_parent_active_score.is_some());
+    let guard_parent_waiting_children_score: Option<f64> = conn
+        .zscore(
+            format!("{namespace}:flow-unsuccessful-guard:waiting_children"),
+            &guard_parent.id,
+        )
+        .await?;
+    assert!(guard_parent_waiting_children_score.is_none());
+    let guard_parent_lock: Option<String> = conn
+        .get(format!(
+            "{namespace}:flow-unsuccessful-guard:locks:{}",
+            guard_parent.id
+        ))
+        .await?;
+    assert_eq!(
+        guard_parent_lock.as_deref(),
+        Some(lock_token(&guard_parent))
+    );
+
     let retry_flow = retry_queue
         .add_flow_at(
             JobSpec::new(

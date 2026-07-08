@@ -2209,6 +2209,9 @@ local deduplication_next_prefix = ARGV[8 + count * per_job_args]
 local max_events = ARGV[9 + count * per_job_args]
 local now_millis = ARGV[10 + count * per_job_args]
 local dependency_key = dependency_prefix .. parent_id
+if redis.call('ZCARD', dependency_key .. ':unsuccessful') ~= 0 then
+  return {'failed_dependencies'}
+end
 local staged_ids = {}
 local staged_deduplication_ids = {}
 local staged_repeat_keys = {}
@@ -12572,6 +12575,9 @@ fn decode_add_flow_children_result(result: &[String], parent_id: &str) -> Result
         Some("lock_mismatch") => Err(LaneError::JobLeaseConflict(format!(
             "lock token mismatch for job {parent_id}"
         ))),
+        Some("failed_dependencies") => Err(LaneError::JobStateConflict(format!(
+            "cannot add flow children to job {parent_id}; it has failed flow dependencies"
+        ))),
         Some("exists") => {
             let id = result.get(1).map(String::as_str).unwrap_or("unknown");
             Err(LaneError::ConfigError(format!(
@@ -14139,6 +14145,8 @@ mod tests {
         ));
         assert!(ADD_FLOW_CHILDREN_SCRIPT
             .contains("record_processed_child_dependency(dependency_key, id, existing_child)"));
+        assert!(ADD_FLOW_CHILDREN_SCRIPT
+            .contains("redis.call('ZCARD', dependency_key .. ':unsuccessful')"));
         assert!(FAIL_SCRIPT
             .contains("redis.call('HSET', dependency_key .. ':failed', ARGV[1], ARGV[4])"));
         assert!(FAIL_SCRIPT

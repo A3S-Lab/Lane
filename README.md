@@ -1429,10 +1429,13 @@ BullMQ's dependency-removal mechanism: cleanup that removes a child also updates
 the parent dependency state instead of relying on a later client-side cleanup
 pass.
 Dynamic flow fan-out is Redis-atomic as well: `add_flow_children()` checks the
-parent lock, inserts new children or attaches existing custom-id children,
-skips ordinary deduplicated child candidates, stores active keep-last child
-candidates in `deduplication_next:<id>`, updates `dependencies:<parent_id>`,
-removes the parent from `active`, deletes its lock, writes the parent into
+parent lock and rejects parents whose `dependencies:<parent_id>:unsuccessful`
+zset is non-empty before inserting new dependencies, matching BullMQ's
+`moveToWaitingChildren` failed-child guard. When the guard passes it inserts new
+children or attaches existing custom-id children, skips ordinary deduplicated
+child candidates, stores active keep-last child candidates in
+`deduplication_next:<id>`, updates `dependencies:<parent_id>`, removes the
+parent from `active`, deletes its lock, writes the parent into
 `waiting_children`, and releases it immediately when all attached children were
 already completed in one Lua script. Keep-last placeholders keep the parent
 blocked until the owner finalization script materializes the latest child.

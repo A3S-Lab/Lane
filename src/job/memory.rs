@@ -801,6 +801,7 @@ impl InMemoryJobQueue {
                 .ok_or_else(|| LaneError::JobNotFound(parent_id.to_string()))?;
             require_active(parent, "add flow children")?;
             require_lock_token(parent, lock_token)?;
+            ensure_flow_dependencies_have_not_failed(parent, &inner.jobs, "add flow children")?;
         }
 
         let existing_child_ids = inner
@@ -3951,6 +3952,21 @@ fn ensure_flow_dependencies_are_resolved(
             job.id, counts.unprocessed
         )));
     }
+    if counts.failed > 0 {
+        return Err(LaneError::JobStateConflict(format!(
+            "cannot {action} job {}; it has {} failed flow dependencies",
+            job.id, counts.failed
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_flow_dependencies_have_not_failed(
+    job: &Job,
+    jobs: &HashMap<JobId, Job>,
+    action: &str,
+) -> Result<()> {
+    let counts = flow_dependency_counts(job, jobs);
     if counts.failed > 0 {
         return Err(LaneError::JobStateConflict(format!(
             "cannot {action} job {}; it has {} failed flow dependencies",

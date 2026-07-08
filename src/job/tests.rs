@@ -5005,6 +5005,98 @@ async fn active_parent_can_add_flow_children_and_wait() {
 }
 
 #[tokio::test]
+async fn active_parent_cannot_add_flow_children_after_failed_dependency() {
+    let queue = InMemoryJobQueue::new("dynamic-flow-failed-dependency");
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({ "kind": "aggregate" }))
+                .with_options(JobOptions::new().with_priority(1)),
+            vec![JobSpec::new(
+                "required-failing-child",
+                serde_json::json!({ "required": true }),
+            )
+            .with_options(
+                JobOptions::new()
+                    .with_priority(1)
+                    .with_fail_parent_on_failure(true),
+            )],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    let failing_child = queue
+        .claim_next(
+            "worker-child".to_string(),
+            Duration::from_secs(30),
+            ts(1_100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(failing_child.id, flow.children[0].id);
+    queue
+        .fail_job(
+            &failing_child.id,
+            lock_token(&failing_child),
+            "required child failed".to_string(),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+
+    let active_parent = queue
+        .claim_next(
+            "worker-parent".to_string(),
+            Duration::from_secs(30),
+            ts(1_300),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active_parent.id, flow.parent.id);
+    let parent_lock_token = lock_token(&active_parent).to_string();
+
+    let error = queue
+        .add_flow_children_at(
+            &active_parent.id,
+            &parent_lock_token,
+            vec![
+                JobSpec::new("late-child", serde_json::json!({ "unexpected": true }))
+                    .with_options(JobOptions::new().with_job_id("dynamic-flow:late-child")),
+            ],
+            ts(1_400),
+        )
+        .await
+        .expect_err("failed dependencies should block dynamic fan-out");
+    assert!(matches!(
+        error,
+        LaneError::JobStateConflict(message) if message.contains("failed flow dependencies")
+    ));
+
+    let retained_parent = queue.get_job(&flow.parent.id).await.unwrap().unwrap();
+    assert_eq!(retained_parent.state, JobState::Active);
+    assert_eq!(
+        retained_parent.lock_token.as_deref(),
+        Some(parent_lock_token.as_str())
+    );
+    assert!(queue
+        .get_job("dynamic-flow:late-child")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        queue
+            .get_flow_dependency_counts(&flow.parent.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .failed,
+        1
+    );
+}
+
+#[tokio::test]
 async fn active_parent_reuses_existing_waiting_child_job_id() {
     let queue = InMemoryJobQueue::new("dynamic-flow-existing-waiting-child");
     let existing = queue
