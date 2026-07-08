@@ -422,6 +422,22 @@ async fn delayed_jobs_wait_until_due() {
 }
 
 #[tokio::test]
+async fn promote_rejects_non_delayed_jobs() {
+    let queue = InMemoryJobQueue::new("promote-state");
+    let now = ts(1_000);
+    let waiting = queue
+        .add_at("waiting", serde_json::json!({}), JobOptions::new(), now)
+        .await
+        .unwrap();
+
+    let error = queue.promote_job(&waiting.id, ts(1_100)).await.unwrap_err();
+    assert!(matches!(error, LaneError::JobStateConflict(_)));
+
+    let stored = queue.get_job(&waiting.id).await.unwrap().unwrap();
+    assert_eq!(stored.state, JobState::Waiting);
+}
+
+#[tokio::test]
 async fn reschedule_delayed_job_changes_due_time() {
     let queue = InMemoryJobQueue::new("reschedule");
     let now = ts(1_000);

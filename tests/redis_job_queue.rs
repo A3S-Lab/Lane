@@ -263,6 +263,19 @@ async fn redis_backend_retries_completed_jobs_against_real_server() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn redis_backend_rejects_non_delayed_promote_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(Duration::from_secs(120), run_promote_state_gate(redis_url))
+        .await
+        .expect("Redis promote state-gate integration test timed out")
+        .unwrap();
+}
+
 async fn run_priority_update_limit(redis_url: String) -> redis::RedisResult<()> {
     let namespace = unique_namespace();
     cleanup_namespace(&redis_url, &namespace).await?;
@@ -739,6 +752,104 @@ async fn run_completed_retry(redis_url: String) -> redis::RedisResult<()> {
         )
         .await?;
     assert!(parent_waiting_children_score.is_some());
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
+async fn run_promote_state_gate(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "promote-state")
+        .expect("valid Redis URL should build the promote-state queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let waiting = queue
+        .add_job(
+            "waiting".to_string(),
+            serde_json::json!({}),
+            JobOptions::new(),
+        )
+        .await
+        .expect("waiting promote-state job should add");
+    let waiting_promote = queue
+        .promote_job(&waiting.id, Utc::now())
+        .await
+        .expect_err("waiting job should reject promote");
+    assert!(matches!(waiting_promote, LaneError::JobStateConflict(_)));
+    assert_eq!(
+        queue
+            .get_job(&waiting.id)
+            .await
+            .expect("waiting job should load")
+            .expect("waiting job should exist")
+            .state,
+        JobState::Waiting
+    );
+
+    let delayed = queue
+        .add_job(
+            "delayed".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_delay(Duration::from_secs(60)),
+        )
+        .await
+        .expect("delayed promote-state job should add");
+    queue
+        .promote_job(&delayed.id, Utc::now())
+        .await
+        .expect("delayed promote-state job should promote");
+    let claimed = queue
+        .claim_next(
+            "worker-promote-state".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("promote-state claim should return")
+        .expect("promote-state job should be claimable");
+    assert_eq!(claimed.id, waiting.id);
+    queue
+        .complete_job(
+            &claimed.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("promote-state waiting job should complete");
+
+    let delayed_claim = queue
+        .claim_next(
+            "worker-promote-state-delayed".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("promoted delayed claim should return")
+        .expect("promoted delayed job should be claimable");
+    assert_eq!(delayed_claim.id, delayed.id);
+    queue
+        .complete_job(
+            &delayed_claim.id,
+            lock_token(&delayed_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("promoted delayed job should complete");
+
+    let delayed_key = format!("{namespace}:promote-state:delayed");
+    let _: usize = conn.zadd(&delayed_key, &delayed.id, 0.0).await?;
+    let stale_promote = queue
+        .promote_job(&delayed.id, Utc::now())
+        .await
+        .expect_err("completed job with stale delayed index should reject promote");
+    assert!(matches!(stale_promote, LaneError::JobStateConflict(_)));
+    let stale_delayed_score: Option<f64> = conn.zscore(&delayed_key, &delayed.id).await?;
+    assert!(stale_delayed_score.is_none());
 
     cleanup_namespace(&redis_url, &namespace).await
 }
@@ -10621,11 +10732,11 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             0.0,
         )
         .await?;
-    let stale_promoted = single_promote_queue
+    let stale_promote = single_promote_queue
         .promote_job(&single_promoted.id, Utc::now())
         .await
-        .expect("completed job with stale delayed index should load");
-    assert_eq!(stale_promoted.state, JobState::Completed);
+        .expect_err("completed job with stale delayed index should reject promote");
+    assert!(matches!(stale_promote, LaneError::JobStateConflict(_)));
     let stale_completed_delayed_score: Option<f64> = single_promote_conn
         .zscore(
             format!("{namespace}:single-promote:delayed"),

@@ -1441,8 +1441,9 @@ remains a later SDK/runtime compatibility item.
 Manual lifecycle management follows the same Redis-side state movement rule:
 `promote_job()` removes a delayed job from the delayed zset and inserts it into
 waiting inside one script, treats the delayed zset as the Redis movement gate,
-and prunes orphaned or stale delayed members when a job is missing or already in
-another state. `reschedule_job()` follows BullMQ's `changeDelay` mechanism: the
+rejects retained jobs whose stored state is no longer delayed, and prunes
+orphaned or stale delayed members while preserving that state-conflict result.
+`reschedule_job()` follows BullMQ's `changeDelay` mechanism: the
 script removes the job from the delayed zset, rejects the change if that zset
 membership is missing, updates the stored delay and scheduled timestamp, and
 adds the job back to the delayed zset with the new score in the same Redis turn.

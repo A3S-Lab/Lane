@@ -1287,33 +1287,33 @@ impl InMemoryJobQueue {
     /// Promote a single delayed job to waiting.
     pub async fn promote(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {
         let mut inner = self.inner.lock().await;
-        let should_promote = inner
+        let current = inner
             .jobs
             .get(job_id)
-            .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?
-            .state
-            == JobState::Delayed;
-        let enqueued_seq = should_promote.then(|| next_waiting_sequence(&mut inner.sequence));
+            .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
+        if current.state != JobState::Delayed {
+            return Err(LaneError::JobStateConflict(format!(
+                "cannot promote job {} from state {:?}",
+                current.id, current.state
+            )));
+        }
+        let enqueued_seq = next_waiting_sequence(&mut inner.sequence);
         let job = inner
             .jobs
             .get_mut(job_id)
             .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
-        if should_promote {
-            job.state = JobState::Waiting;
-            job.scheduled_at = now;
-            job.enqueued_seq = enqueued_seq.expect("promoted jobs get a waiting sequence");
-        }
+        job.state = JobState::Waiting;
+        job.scheduled_at = now;
+        job.enqueued_seq = enqueued_seq;
         let job = job.clone();
-        if should_promote {
-            emit_event_locked(
-                &mut inner,
-                "waiting",
-                Some(&job),
-                Some(JobState::Delayed),
-                now,
-                BTreeMap::new(),
-            );
-        }
+        emit_event_locked(
+            &mut inner,
+            "waiting",
+            Some(&job),
+            Some(JobState::Delayed),
+            now,
+            BTreeMap::new(),
+        );
         Ok(job)
     }
 

@@ -5906,13 +5906,15 @@ if not raw then
   return {'missing'}
 end
 
-local removed_from_delayed = redis.call('ZREM', KEYS[3], ARGV[1])
-refresh_delay_marker(KEYS[#KEYS], KEYS[3])
-
 local job = cjson.decode(raw)
 if job["state"] ~= "delayed" then
-  return {'ok', raw}
+  redis.call('ZREM', KEYS[3], ARGV[1])
+  refresh_delay_marker(KEYS[#KEYS], KEYS[3])
+  return {'state', job["state"] or ''}
 end
+
+local removed_from_delayed = redis.call('ZREM', KEYS[3], ARGV[1])
+refresh_delay_marker(KEYS[#KEYS], KEYS[3])
 
 if removed_from_delayed == 0 then
   return {'state', 'delayed_index_missing'}
