@@ -1408,6 +1408,30 @@ local function set_deduplication_key(job, job_id, deduplication_prefix)
   end
 end
 
+local function extend_deduplicated_owner(candidate_job, existing_job, deduplication_prefix)
+  if not candidate_job["options"] or candidate_job["options"] == cjson.null then
+    return
+  end
+  local deduplication = candidate_job["options"]["deduplication"]
+  if not deduplication or deduplication == cjson.null then
+    return
+  end
+  if deduplication["extend"] ~= true or deduplication["keep_last_if_active"] == true then
+    return
+  end
+  local ttl = duration_millis(deduplication["ttl"])
+  if ttl then
+    redis.call('SET', deduplication_prefix .. deduplication["id"], existing_job["id"], 'PX', ttl)
+  end
+end
+
+local function emit_deduplicated_events(events_key, max_events, owner_job, candidate_job)
+  local deduplication = candidate_job["options"]["deduplication"]
+  local deduplication_id = deduplication["id"]
+  redis.call('XADD', events_key, 'MAXLEN', '~', max_events, '*', 'event', 'debounced', 'jobId', owner_job["id"], 'debounceId', deduplication_id)
+  redis.call('XADD', events_key, 'MAXLEN', '~', max_events, '*', 'event', 'deduplicated', 'jobId', owner_job["id"], 'deduplicationId', deduplication_id, 'deduplicatedJobId', candidate_job["id"])
+end
+
 local function active_repeat_id(jobs_key, repeat_prefix, repeat_key)
   if not repeat_key or repeat_key == '' then
     return nil
@@ -1569,8 +1593,12 @@ for index = 1, count do
         local existing_job = cjson.decode(existing_raw)
         if can_store_deduplicated_next_flow(parent_job, child_jobs, existing_job, KEYS[7]) then
           store_deduplicated_next_flow(parent_raw, child_raws, deduplication_prefix, deduplication_next_prefix)
-          return {'deduplicated_next', deduplicated_id}
+          emit_deduplicated_events(KEYS[6], max_events, existing_job, parent_job)
+          return {'deduplicated_parent', deduplicated_id}
         end
+        extend_deduplicated_owner(parent_job, existing_job, deduplication_prefix)
+        emit_deduplicated_events(KEYS[6], max_events, existing_job, parent_job)
+        return {'deduplicated_parent', deduplicated_id}
       end
     end
     return {'deduplicated', deduplicated_id}
@@ -11406,6 +11434,11 @@ fn decode_add_flow_result(result: &[String]) -> Result<Option<JobId>> {
         Some("deduplicated_next") => result.get(1).cloned().map(Some).ok_or_else(|| {
             LaneError::Other(
                 "Redis add flow script returned deduplicated_next without parent id".to_string(),
+            )
+        }),
+        Some("deduplicated_parent") => result.get(1).cloned().map(Some).ok_or_else(|| {
+            LaneError::Other(
+                "Redis add flow script returned deduplicated_parent without parent id".to_string(),
             )
         }),
         Some("exists") => {

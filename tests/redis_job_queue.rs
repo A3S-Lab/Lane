@@ -1125,6 +1125,19 @@ async fn redis_backend_emits_flow_parent_transition_events_against_real_server()
 }
 
 #[tokio::test]
+async fn redis_backend_records_flow_dedup_events_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(Duration::from_secs(120), run_flow_dedup_events(redis_url))
+        .await
+        .expect("Redis flow dedup-events integration test timed out")
+        .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_emits_retries_exhausted_event_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -2745,6 +2758,183 @@ async fn run_bulk_dedup_events(redis_url: String) -> redis::RedisResult<()> {
     assert_eq!(
         events[8].fields.get("deduplicatedJobId"),
         Some(&serde_json::json!("bulk-events:replace-old"))
+    );
+
+    cleanup_namespace(&redis_url, &namespace).await?;
+    Ok(())
+}
+
+async fn run_flow_dedup_events(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-dedup-events")
+        .expect("valid Redis URL should build the flow dedup events queue");
+    let owner = queue
+        .add_flow_at(
+            JobSpec::new("flow-owner-parent", serde_json::json!({ "version": 1 })).with_options(
+                JobOptions::new()
+                    .with_job_id("flow-events:owner-parent")
+                    .with_deduplication_id("flow-events:dedup"),
+            ),
+            vec![
+                JobSpec::new("flow-owner-child", serde_json::json!({ "version": 1 }))
+                    .with_options(JobOptions::new().with_job_id("flow-events:owner-child")),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("flow dedup owner should add");
+    let duplicate = queue
+        .add_flow_at(
+            JobSpec::new("flow-duplicate-parent", serde_json::json!({ "version": 2 }))
+                .with_options(
+                    JobOptions::new()
+                        .with_job_id("flow-events:duplicate-parent")
+                        .with_deduplication_id("flow-events:dedup"),
+                ),
+            vec![
+                JobSpec::new("flow-duplicate-child", serde_json::json!({ "version": 2 }))
+                    .with_options(JobOptions::new().with_job_id("flow-events:duplicate-child")),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("flow dedup duplicate should return owner");
+    assert_eq!(duplicate.parent.id, owner.parent.id);
+    assert_eq!(duplicate.children[0].id, owner.children[0].id);
+    assert!(queue
+        .get_job("flow-events:duplicate-parent")
+        .await
+        .expect("duplicate flow parent lookup should return")
+        .is_none());
+
+    let events = queue
+        .read_events("-", "+", 10)
+        .await
+        .expect("flow dedup events should read");
+    let names = events
+        .iter()
+        .map(|event| event.event.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "added",
+            "waiting-children",
+            "added",
+            "waiting",
+            "debounced",
+            "deduplicated"
+        ]
+    );
+    assert_eq!(events[4].job_id.as_deref(), Some(owner.parent.id.as_str()));
+    assert_eq!(
+        events[4].fields.get("debounceId"),
+        Some(&serde_json::json!("flow-events:dedup"))
+    );
+    assert_eq!(events[5].job_id.as_deref(), Some(owner.parent.id.as_str()));
+    assert_eq!(
+        events[5].fields.get("deduplicationId"),
+        Some(&serde_json::json!("flow-events:dedup"))
+    );
+    assert_eq!(
+        events[5].fields.get("deduplicatedJobId"),
+        Some(&serde_json::json!("flow-events:duplicate-parent"))
+    );
+
+    let keep_last_queue =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-keep-last-events")
+            .expect("valid Redis URL should build the flow keep-last events queue");
+    let keep_last_deduplication =
+        DeduplicationOptions::new("flow-events:keep-last").keep_last_if_active(true);
+    let keep_last_owner = keep_last_queue
+        .add_flow_at(
+            JobSpec::new(
+                "flow-keep-last-owner-parent",
+                serde_json::json!({ "version": 1 }),
+            )
+            .with_options(JobOptions::new().with_deduplication(keep_last_deduplication.clone())),
+            vec![JobSpec::new(
+                "flow-keep-last-owner-child",
+                serde_json::json!({ "version": 1 }),
+            )],
+            Utc::now(),
+        )
+        .await
+        .expect("flow keep-last owner should add");
+    let keep_last_child = keep_last_queue
+        .claim_next(
+            "worker-flow-keep-last-child".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("flow keep-last child claim should return")
+        .expect("flow keep-last child should be claimable");
+    keep_last_queue
+        .complete_job(
+            &keep_last_child.id,
+            lock_token(&keep_last_child),
+            serde_json::json!({ "child": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("flow keep-last child should complete");
+    let keep_last_parent = keep_last_queue
+        .claim_next(
+            "worker-flow-keep-last-parent".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("flow keep-last parent claim should return")
+        .expect("flow keep-last parent should be claimable");
+    assert_eq!(keep_last_parent.id, keep_last_owner.parent.id);
+    let keep_last_duplicate = keep_last_queue
+        .add_flow_at(
+            JobSpec::new(
+                "flow-keep-last-latest-parent",
+                serde_json::json!({ "version": 2 }),
+            )
+            .with_options(
+                JobOptions::new()
+                    .with_job_id("flow-events:keep-last-latest-parent")
+                    .with_deduplication(keep_last_deduplication),
+            ),
+            vec![JobSpec::new(
+                "flow-keep-last-latest-child",
+                serde_json::json!({ "version": 2 }),
+            )
+            .with_options(JobOptions::new().with_job_id("flow-events:keep-last-latest-child"))],
+            Utc::now(),
+        )
+        .await
+        .expect("flow keep-last duplicate should return owner");
+    assert_eq!(keep_last_duplicate.parent.id, keep_last_owner.parent.id);
+
+    let keep_last_events = keep_last_queue
+        .read_events("-", "+", 20)
+        .await
+        .expect("flow keep-last events should read");
+    let tail = &keep_last_events[keep_last_events.len() - 2..];
+    assert_eq!(tail[0].event, "debounced");
+    assert_eq!(
+        tail[0].job_id.as_deref(),
+        Some(keep_last_owner.parent.id.as_str())
+    );
+    assert_eq!(
+        tail[0].fields.get("debounceId"),
+        Some(&serde_json::json!("flow-events:keep-last"))
+    );
+    assert_eq!(tail[1].event, "deduplicated");
+    assert_eq!(
+        tail[1].job_id.as_deref(),
+        Some(keep_last_owner.parent.id.as_str())
+    );
+    assert_eq!(
+        tail[1].fields.get("deduplicatedJobId"),
+        Some(&serde_json::json!("flow-events:keep-last-latest-parent"))
     );
 
     cleanup_namespace(&redis_url, &namespace).await?;

@@ -452,8 +452,17 @@ impl InMemoryJobQueue {
         .cloned()
         {
             if Self::store_deduplicated_next_flow_locked(&mut inner, &candidate_flow, &existing) {
+                emit_deduplicated_events_locked(&mut inner, &existing, &parent_job, now);
                 return Ok(Self::flow_for_existing_owner_locked(&inner, &existing));
             }
+            Self::extend_deduplication_expiration_locked(
+                &mut inner.jobs,
+                &parent_job,
+                &existing.id,
+                now,
+            );
+            emit_deduplicated_events_locked(&mut inner, &existing, &parent_job, now);
+            return Ok(Self::flow_for_existing_owner_locked(&inner, &existing));
         }
         let mut flow_deduplication_ids = HashSet::new();
         for job in std::iter::once(&parent_job).chain(child_jobs.iter()) {

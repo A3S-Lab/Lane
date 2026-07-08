@@ -1111,7 +1111,12 @@ mechanism, where the dedup-next record is consumed during job finalization rathe
 than by a later client-side pass. Flow keep-last uses the same
 `deduplication_next:<id>` key with a flow envelope; Redis currently materializes
 that envelope on active parent completion, terminal failure, or stalled terminal
-failure. Redis removal paths mirror BullMQ's removal helper too: when remove,
+failure. Flow parent deduplication follows BullMQ's `addParentJob` path too:
+duplicate parent submissions return the current owner flow and write
+`debounced` and `deduplicated` events on the owner parent id; active keep-last
+flow duplicates write the same events while replacing the pending
+`deduplication_next:<id>` flow envelope. Redis removal paths mirror BullMQ's
+removal helper too: when remove,
 clean, drain, repeat upsert, or flow unprocessed-child removal deletes the job
 that still owns `deduplication:<id>`, it also clears `deduplication_next:<id>` so
 a previously active owner cannot leave a stale shadow job behind.
@@ -1172,10 +1177,11 @@ explicit removal writes `removed prev=<state>` for the removed job; `clean_jobs(
 writes a queue-level `cleaned count=<n>` event after removing aged jobs;
 deduplicated adds, including bulk adds, write BullMQ-style `debounced` and
 `deduplicated` events with the owner job id, deduplication id, and skipped
-candidate job id; delayed-owner replacement also writes `removed prev=delayed`
-for the old owner followed by `debounced` and `deduplicated` events on the
-replacement job id; progress writes `progress data=<json>`; pause/resume write
-queue-level events.
+candidate job id; flow parent deduplication writes the same event pair with the
+owner parent id and skipped candidate parent id; delayed-owner replacement also
+writes `removed prev=delayed` for the old owner followed by `debounced` and
+`deduplicated` events on the replacement job id; progress writes
+`progress data=<json>`; pause/resume write queue-level events.
 `read_events()` uses `XRANGE` over stream ids, and
 `trim_events()` uses BullMQ-style `XTRIM MAXLEN ~`. The in-memory and local
 durable backends keep the same retained event entries in their snapshots so

@@ -4463,6 +4463,165 @@ async fn flow_parent_deduplication_keep_last_enqueues_latest_flow_after_active_o
 }
 
 #[tokio::test]
+async fn flow_parent_deduplication_duplicate_emits_events() {
+    let queue = InMemoryJobQueue::new("flow-dedup-events");
+    let owner = queue
+        .add_flow_at(
+            JobSpec::new("flow-owner-parent", serde_json::json!({ "version": 1 })).with_options(
+                JobOptions::new()
+                    .with_job_id("flow:owner-parent")
+                    .with_deduplication_id("tenant:flow-events"),
+            ),
+            vec![
+                JobSpec::new("flow-owner-child", serde_json::json!({ "version": 1 }))
+                    .with_options(JobOptions::new().with_job_id("flow:owner-child")),
+            ],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    let duplicate = queue
+        .add_flow_at(
+            JobSpec::new("flow-duplicate-parent", serde_json::json!({ "version": 2 }))
+                .with_options(
+                    JobOptions::new()
+                        .with_job_id("flow:duplicate-parent")
+                        .with_deduplication_id("tenant:flow-events"),
+                ),
+            vec![
+                JobSpec::new("flow-duplicate-child", serde_json::json!({ "version": 2 }))
+                    .with_options(JobOptions::new().with_job_id("flow:duplicate-child")),
+            ],
+            ts(1_100),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(duplicate.parent.id, owner.parent.id);
+    assert_eq!(duplicate.children[0].id, owner.children[0].id);
+    assert!(queue
+        .get_job("flow:duplicate-parent")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(queue
+        .get_job("flow:duplicate-child")
+        .await
+        .unwrap()
+        .is_none());
+
+    let events = queue.read_events("-", "+", 10).await.unwrap();
+    let names = events
+        .iter()
+        .map(|event| event.event.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "added",
+            "waiting-children",
+            "added",
+            "waiting",
+            "debounced",
+            "deduplicated"
+        ]
+    );
+    assert_eq!(events[4].job_id.as_deref(), Some(owner.parent.id.as_str()));
+    assert_eq!(
+        events[4].fields.get("debounceId"),
+        Some(&Value::String("tenant:flow-events".to_string()))
+    );
+    assert_eq!(events[5].job_id.as_deref(), Some(owner.parent.id.as_str()));
+    assert_eq!(
+        events[5].fields.get("deduplicationId"),
+        Some(&Value::String("tenant:flow-events".to_string()))
+    );
+    assert_eq!(
+        events[5].fields.get("deduplicatedJobId"),
+        Some(&Value::String("flow:duplicate-parent".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn flow_parent_keep_last_duplicate_emits_deduplicated_events() {
+    let queue = InMemoryJobQueue::new("flow-keep-last-events");
+    let deduplication =
+        DeduplicationOptions::new("tenant:flow-keep-last-events").keep_last_if_active(true);
+    let owner = queue
+        .add_flow_at(
+            JobSpec::new("flow-owner-parent", serde_json::json!({ "version": 1 }))
+                .with_options(JobOptions::new().with_deduplication(deduplication.clone())),
+            vec![JobSpec::new(
+                "flow-owner-child",
+                serde_json::json!({ "version": 1 }),
+            )],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    let owner_child = queue
+        .claim_next(
+            "worker-child".to_string(),
+            Duration::from_secs(30),
+            ts(1_100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .complete_job(
+            &owner_child.id,
+            lock_token(&owner_child),
+            serde_json::json!({ "child": true }),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+    let owner_parent = queue
+        .claim_next(
+            "worker-parent".to_string(),
+            Duration::from_secs(30),
+            ts(1_300),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner_parent.id, owner.parent.id);
+
+    let duplicate = queue
+        .add_flow_at(
+            JobSpec::new("flow-latest-parent", serde_json::json!({ "version": 2 })).with_options(
+                JobOptions::new()
+                    .with_job_id("flow:latest-parent")
+                    .with_deduplication(deduplication),
+            ),
+            vec![
+                JobSpec::new("flow-latest-child", serde_json::json!({ "version": 2 }))
+                    .with_options(JobOptions::new().with_job_id("flow:latest-child")),
+            ],
+            ts(1_400),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate.parent.id, owner.parent.id);
+
+    let events = queue.read_events("-", "+", 20).await.unwrap();
+    let tail = &events[events.len() - 2..];
+    assert_eq!(tail[0].event, "debounced");
+    assert_eq!(tail[0].job_id.as_deref(), Some(owner.parent.id.as_str()));
+    assert_eq!(
+        tail[0].fields.get("debounceId"),
+        Some(&Value::String("tenant:flow-keep-last-events".to_string()))
+    );
+    assert_eq!(tail[1].event, "deduplicated");
+    assert_eq!(tail[1].job_id.as_deref(), Some(owner.parent.id.as_str()));
+    assert_eq!(
+        tail[1].fields.get("deduplicatedJobId"),
+        Some(&Value::String("flow:latest-parent".to_string()))
+    );
+}
+
+#[tokio::test]
 async fn flow_parent_releases_when_pending_child_is_cleaned() {
     let queue = InMemoryJobQueue::new("flow-clean");
     let flow = queue
