@@ -171,7 +171,7 @@ async fn redis_job_worker_uses_bulk_lease_renewal_against_real_server() {
 }
 
 #[tokio::test]
-async fn redis_backend_rejects_priority_update_above_bullmq_limit_against_real_server() {
+async fn redis_backend_matches_bullmq_priority_update_guards_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
         return;
@@ -182,7 +182,7 @@ async fn redis_backend_rejects_priority_update_above_bullmq_limit_against_real_s
         run_priority_update_limit(redis_url),
     )
     .await
-    .expect("Redis priority-update limit integration test timed out")
+    .expect("Redis priority-update guard integration test timed out")
     .unwrap();
 }
 
@@ -245,6 +245,49 @@ async fn run_priority_update_limit(redis_url: String) -> redis::RedisResult<()> 
         .expect("priority-limit queue should still have waiting work");
     assert_eq!(claimed.id, first.id);
     assert_ne!(claimed.id, second.id);
+    queue
+        .complete_job(
+            &claimed.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("priority-limit claimed job should complete");
+
+    let _: usize = conn
+        .zadd(
+            format!("{namespace}:priority-update-limit:waiting"),
+            &first.id,
+            0.0,
+        )
+        .await?;
+    let terminal_update = queue
+        .update_priority(&first.id, 5)
+        .await
+        .expect("terminal priority update should update the stored snapshot");
+    assert_eq!(terminal_update.state, JobState::Completed);
+    assert_eq!(terminal_update.priority, 5);
+    assert_eq!(terminal_update.options.priority, 5);
+    let stale_terminal_score: Option<f64> = conn
+        .zscore(
+            format!("{namespace}:priority-update-limit:waiting"),
+            &first.id,
+        )
+        .await?;
+    assert!(stale_terminal_score.is_none());
+
+    let next_claimed = queue
+        .claim_next(
+            "worker-priority-update-limit-next".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("priority-limit next claim should return")
+        .expect("second priority-limit job should remain waiting");
+    assert_eq!(next_claimed.id, second.id);
+    assert_ne!(next_claimed.id, first.id);
 
     cleanup_namespace(&redis_url, &namespace).await
 }
@@ -9449,11 +9492,10 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     let terminal_priority_update = priority_queue
         .update_priority(&second_priority.id, 5)
         .await
-        .expect_err("terminal job with stale waiting index should reject priority update");
-    assert!(matches!(
-        terminal_priority_update,
-        LaneError::JobStateConflict(_)
-    ));
+        .expect("terminal job with stale waiting index should update priority");
+    assert_eq!(terminal_priority_update.state, JobState::Completed);
+    assert_eq!(terminal_priority_update.priority, 5);
+    assert_eq!(terminal_priority_update.options.priority, 5);
     let stale_terminal_waiting_score: Option<f64> = priority_conn
         .zscore(format!("{namespace}:priority:waiting"), &second_priority.id)
         .await?;

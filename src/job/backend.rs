@@ -181,6 +181,11 @@ pub trait JobQueueBackend: Send + Sync {
 
     async fn retry_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job>;
 
+    /// Update an existing job's stored priority.
+    ///
+    /// Waiting jobs are reinserted into the ready index. Retained terminal jobs
+    /// keep their terminal state and only update the stored snapshot, matching
+    /// BullMQ's `changePriority` script behavior.
     async fn update_priority(&self, job_id: &str, priority: JobPriority) -> Result<Job>;
 
     /// Update priority and choose how the job is reinserted within the same-priority group.

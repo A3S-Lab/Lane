@@ -1978,7 +1978,7 @@ async fn priority_counts_only_include_waiting_jobs() {
 }
 
 #[tokio::test]
-async fn priority_updates_reject_terminal_jobs() {
+async fn priority_updates_terminal_jobs_without_requeueing() {
     let queue = InMemoryJobQueue::new("priority-terminal");
     let now = ts(1_000);
     let job = queue
@@ -1995,8 +1995,22 @@ async fn priority_updates_reject_terminal_jobs() {
         .await
         .unwrap();
 
-    let error = queue.update_priority(&job.id, 1).await.unwrap_err();
-    assert!(matches!(error, LaneError::JobStateConflict(_)));
+    let updated = queue.update_priority(&job.id, 1).await.unwrap();
+    assert_eq!(updated.state, JobState::Completed);
+    assert_eq!(updated.priority, 1);
+    assert_eq!(updated.options.priority, 1);
+    assert_eq!(
+        queue.get_counts_per_priority(&[1]).await.unwrap(),
+        vec![JobPriorityCount {
+            priority: 1,
+            count: 0,
+        }]
+    );
+    assert!(queue
+        .claim_next("worker-b".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]

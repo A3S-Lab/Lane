@@ -464,9 +464,9 @@ delayed, `release_active_job()` moves a token-owned active job back to waiting,
 `get_job_state()` returns the current lifecycle state for a job id, `retry_job()`
 manually requeues failed jobs, `fail_job_discarding_retry()` fails an active
 token-owned job without applying remaining automatic retries, `update_priority()`
-changes non-terminal job priority, `update_priority_with_lifo()` also chooses
-the same-priority waiting reinsert side, `renew_lease()` extends an active
-worker lease with the claim token, `renew_leases()` renews multiple claimed
+changes stored job priority, `update_priority_with_lifo()` also chooses the
+same-priority waiting reinsert side, `renew_lease()` extends an active worker
+lease with the claim token, `renew_leases()` renews multiple claimed
 leases and returns the job ids that failed renewal,
 `remove_job()` removes non-active jobs,
 `remove_repeat()` removes the current non-active owner for a repeat key and, in
@@ -1490,8 +1490,10 @@ deduplication/repeat ownership, and updates flow parents atomically.
 `update_priority()`
 rewrites the job hash and, for waiting jobs, replaces the waiting zset score in
 the same script; for jobs that are no longer waiting, it prunes stale waiting
-members while preserving the stored non-terminal state. For waiting jobs, the
-script also refreshes `enqueued_seq` and recomputes the FIFO/LIFO score.
+members while preserving the stored state. Retained terminal jobs can update
+their stored priority without being requeued, matching BullMQ's
+`changePriority-7.lua` existence-only guard. For waiting jobs, the script also
+refreshes `enqueued_seq` and recomputes the FIFO/LIFO score.
 `update_priority_with_lifo()` exposes BullMQ's
 `changePriority({ priority, lifo })` shape directly: the optional LIFO flag is
 stored on `job.options.lifo` before the waiting score is recomputed, so the

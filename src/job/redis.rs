@@ -6451,10 +6451,6 @@ if job["state"] ~= "waiting" then
   redis.call('ZREM', KEYS[2], ARGV[1])
 end
 
-if job["state"] == "completed" or job["state"] == "failed" then
-  return {'terminal'}
-end
-
 local priority = tonumber(ARGV[2])
 job["priority"] = priority
 if not job["options"] or job["options"] == cjson.null then
@@ -11975,9 +11971,6 @@ fn decode_priority_update_result(result: &[String], job_id: &str) -> Result<Job>
             decode_job(raw)
         }
         Some("missing") => Err(LaneError::JobNotFound(job_id.to_string())),
-        Some("terminal") => Err(LaneError::JobStateConflict(format!(
-            "cannot update priority for terminal job {job_id}"
-        ))),
         Some(other) => Err(LaneError::Other(format!(
             "unexpected Redis priority update script status `{other}` for {job_id}"
         ))),

@@ -1526,12 +1526,12 @@ impl InMemoryJobQueue {
         Ok(job)
     }
 
-    /// Update a non-terminal job priority.
+    /// Update an existing job priority.
     pub async fn set_priority(&self, job_id: &str, priority: JobPriority) -> Result<Job> {
         self.set_priority_order(job_id, priority, None).await
     }
 
-    /// Update a non-terminal job priority and waiting reinsert order.
+    /// Update an existing job priority and waiting reinsert order.
     pub async fn set_priority_with_lifo(
         &self,
         job_id: &str,
@@ -1555,12 +1555,6 @@ impl InMemoryJobQueue {
                 .jobs
                 .get(job_id)
                 .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
-            if job.state.is_terminal() {
-                return Err(LaneError::JobStateConflict(format!(
-                    "cannot update priority for terminal job {}",
-                    job.id
-                )));
-            }
             job.state == JobState::Waiting
         };
         let enqueued_seq = should_requeue.then(|| next_waiting_sequence(&mut inner.sequence));
