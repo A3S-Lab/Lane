@@ -503,6 +503,22 @@ async fn redis_backend_auto_removes_terminal_jobs_and_logs_against_real_server()
 }
 
 #[tokio::test]
+async fn redis_backend_keeps_log_list_and_snapshot_consistent_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_log_list_snapshot_consistency(redis_url),
+    )
+    .await
+    .expect("Redis log-list snapshot consistency integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_retries_completed_jobs_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -1390,6 +1406,140 @@ async fn assert_terminal_auto_removed(
     assert!(!stalled_member);
 
     Ok(())
+}
+
+async fn run_log_list_snapshot_consistency(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue_name = "log-consistency";
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, queue_name)
+        .expect("valid Redis URL should build the log-consistency queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let job = queue
+        .add_job(
+            "log-owner".to_string(),
+            serde_json::json!({ "kind": "logs" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("log owner job should add");
+    let logs_key = format!("{namespace}:{queue_name}:logs:{}", job.id);
+    let jobs_key = format!("{namespace}:{queue_name}:jobs");
+
+    let after_first = queue
+        .add_log(&job.id, "first".to_string(), 10, ts(1_000))
+        .await
+        .expect("first log should append");
+    assert_log_lines(&after_first.logs, &["first"]);
+    let after_second = queue
+        .add_log(&job.id, "second".to_string(), 2, ts(2_000))
+        .await
+        .expect("second log should append");
+    assert_log_lines(&after_second.logs, &["first", "second"]);
+    let after_third = queue
+        .add_log(&job.id, "third".to_string(), 2, ts(3_000))
+        .await
+        .expect("third log should append and trim");
+    assert_log_lines(&after_third.logs, &["second", "third"]);
+
+    let raw_logs: Vec<String> = conn.lrange(&logs_key, 0, -1).await?;
+    assert_log_lines(&decode_raw_log_entries(raw_logs), &["second", "third"]);
+    let stored_after_adds = load_raw_job_value(&mut conn, &jobs_key, &job.id).await?;
+    assert_log_value_lines(&stored_after_adds, &["second", "third"]);
+
+    let ascending = queue
+        .get_job_logs(&job.id, 0, -1, true)
+        .await
+        .expect("ascending logs should read");
+    assert_eq!(ascending.count, 2);
+    assert_log_lines(&ascending.logs, &["second", "third"]);
+    let newest = queue
+        .get_job_logs(&job.id, 0, 0, false)
+        .await
+        .expect("newest log should read");
+    assert_eq!(newest.count, 2);
+    assert_log_lines(&newest.logs, &["third"]);
+
+    let kept = queue
+        .clear_job_logs(&job.id, 1)
+        .await
+        .expect("logs should trim to the newest entry");
+    assert_eq!(kept.count, 1);
+    assert_log_lines(&kept.logs, &["third"]);
+    let raw_after_keep: Vec<String> = conn.lrange(&logs_key, 0, -1).await?;
+    assert_log_lines(&decode_raw_log_entries(raw_after_keep), &["third"]);
+    let stored_after_keep = load_raw_job_value(&mut conn, &jobs_key, &job.id).await?;
+    assert_log_value_lines(&stored_after_keep, &["third"]);
+
+    let cleared = queue
+        .clear_job_logs(&job.id, 0)
+        .await
+        .expect("logs should clear");
+    assert_eq!(cleared.count, 0);
+    assert!(cleared.logs.is_empty());
+    let logs_len_after_clear: usize = conn.llen(&logs_key).await?;
+    assert_eq!(logs_len_after_clear, 0);
+    let stored_after_clear = load_raw_job_value(&mut conn, &jobs_key, &job.id).await?;
+    assert_log_value_lines(&stored_after_clear, &[]);
+
+    let missing = queue
+        .clear_job_logs("missing-log-owner", 1)
+        .await
+        .expect("missing log owner clear should return an empty page");
+    assert_eq!(missing.count, 0);
+    assert!(missing.logs.is_empty());
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
+fn decode_raw_log_entries(raw_logs: Vec<String>) -> Vec<JobLogEntry> {
+    raw_logs
+        .iter()
+        .map(|raw| serde_json::from_str::<JobLogEntry>(raw).expect("Redis log JSON should decode"))
+        .collect()
+}
+
+async fn load_raw_job_value(
+    conn: &mut redis::aio::ConnectionManager,
+    jobs_key: &str,
+    job_id: &str,
+) -> redis::RedisResult<serde_json::Value> {
+    let raw: String = conn.hget(jobs_key, job_id).await?;
+    Ok(serde_json::from_str(&raw).expect("raw Redis job JSON should decode"))
+}
+
+fn assert_log_lines(logs: &[JobLogEntry], expected: &[&str]) {
+    assert_eq!(
+        logs.iter()
+            .map(|entry| entry.line.as_str())
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+fn assert_log_value_lines(job: &serde_json::Value, expected: &[&str]) {
+    let raw_logs = job.get("logs").expect("raw Redis job should store logs");
+    if expected.is_empty() && raw_logs.as_object().is_some_and(|object| object.is_empty()) {
+        return;
+    }
+    let logs = raw_logs
+        .as_array()
+        .expect("raw Redis job should store non-empty logs as an array");
+    assert_eq!(
+        logs.iter()
+            .map(|entry| {
+                entry
+                    .get("line")
+                    .and_then(|line| line.as_str())
+                    .expect("raw Redis log should store a line")
+            })
+            .collect::<Vec<_>>(),
+        expected
+    );
 }
 
 async fn run_completed_retry(redis_url: String) -> redis::RedisResult<()> {
