@@ -519,6 +519,22 @@ async fn redis_backend_keeps_log_list_and_snapshot_consistent_against_real_serve
 }
 
 #[tokio::test]
+async fn redis_backend_skips_stale_waiting_indexes_while_claiming_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_stale_waiting_claim_cleanup(redis_url),
+    )
+    .await
+    .expect("Redis stale waiting-index claim cleanup integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_retries_completed_jobs_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -1540,6 +1556,99 @@ fn assert_log_value_lines(job: &serde_json::Value, expected: &[&str]) {
             .collect::<Vec<_>>(),
         expected
     );
+}
+
+async fn run_stale_waiting_claim_cleanup(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue_name = "claim-stale-focused";
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, queue_name)
+        .expect("valid Redis URL should build the claim-stale-focused queue");
+    let completed = queue
+        .add_job(
+            "stale-completed".to_string(),
+            serde_json::json!({ "kind": "completed" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("stale completed job should add");
+    let waiting = queue
+        .add_job(
+            "real-waiting".to_string(),
+            serde_json::json!({ "kind": "waiting" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("real waiting job should add");
+
+    let completed_claim = queue
+        .claim_next(
+            "worker-stale-completed".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("stale completed claim should return")
+        .expect("stale completed job should be claimable");
+    assert_eq!(completed_claim.id, completed.id);
+    queue
+        .complete_job(
+            &completed_claim.id,
+            lock_token(&completed_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("stale completed job should complete");
+
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let waiting_key = format!("{namespace}:{queue_name}:waiting");
+    let missing_id = "missing-waiting-index";
+    let _: usize = conn.zadd(&waiting_key, &completed.id, 0.0).await?;
+    let _: usize = conn.zadd(&waiting_key, missing_id, 0.5).await?;
+
+    let claimed = queue
+        .claim_next(
+            "worker-real-waiting".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("claim should skip stale waiting indexes")
+        .expect("real waiting job should claim");
+    assert_eq!(claimed.id, waiting.id);
+
+    let stale_completed_waiting_score: Option<f64> =
+        conn.zscore(&waiting_key, &completed.id).await?;
+    assert!(stale_completed_waiting_score.is_none());
+    let missing_waiting_score: Option<f64> = conn.zscore(&waiting_key, missing_id).await?;
+    assert!(missing_waiting_score.is_none());
+    let completed_after_claim = queue
+        .get_job(&completed.id)
+        .await
+        .expect("stale completed job should load")
+        .expect("stale completed job should still exist");
+    assert_eq!(completed_after_claim.state, JobState::Completed);
+    assert!(queue
+        .get_job(missing_id)
+        .await
+        .expect("missing stale waiting job lookup should return")
+        .is_none());
+
+    queue
+        .complete_job(
+            &claimed.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("real waiting job should complete");
+
+    cleanup_namespace(&redis_url, &namespace).await
 }
 
 async fn run_completed_retry(redis_url: String) -> redis::RedisResult<()> {
