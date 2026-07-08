@@ -1137,7 +1137,7 @@ impl InMemoryJobQueue {
         let Some(parent) = inner.jobs.get(&parent_id) else {
             return Err(LaneError::JobNotFound(parent_id));
         };
-        if child.state.is_terminal() || !parent.child_ids.iter().any(|id| id == child_id) {
+        if !parent.child_ids.iter().any(|id| id == child_id) {
             return Ok(false);
         }
 

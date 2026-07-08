@@ -1418,8 +1418,16 @@ parent when no pending dependencies remain. Redis treats the pending dependency
 set, parent `child_ids`, and parent-scoped `:processed`, `:failed`, and
 `:unsuccessful` buckets as relationship evidence, so terminal children that have
 already left the pending set can still be detached without leaving ghost
-dependency values behind. A stale dependency entry for an already terminal child
-is still removed just like BullMQ's `SREM` path.
+dependency values behind. In-memory and local-durable queues expose the same
+visible detach semantics by allowing retained completed or failed child
+snapshots to be removed from the parent's `child_ids` without deleting the child
+job. A stale dependency entry for an already terminal child is still removed
+just like BullMQ's `SREM` path. Ordinary job removal, clean, and drain paths
+remain separate from explicit dependency detach: they follow BullMQ's
+`removeJob`, `cleanJobsInSet`, and `drain` scripts by releasing pending parent
+dependencies and deleting the removed job's own metadata, while retained
+Redis parent-scoped terminal dependency result keys are not treated as cleanup
+targets outside explicit dependency detach.
 
 Flow fan-in is also protected in Redis transitions. Redis flow submission writes
 a pending dependency set for the parent, and child completion, removal, and

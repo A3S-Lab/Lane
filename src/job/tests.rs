@@ -6343,6 +6343,107 @@ async fn flow_remove_child_dependency_releases_parent_without_deleting_child() {
 }
 
 #[tokio::test]
+async fn flow_remove_child_dependency_detaches_completed_child_values() {
+    let queue = InMemoryJobQueue::new("flow-remove-completed-child-dependency");
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({ "kind": "aggregate" }))
+                .with_options(JobOptions::new().with_priority(1)),
+            vec![JobSpec::new("child", serde_json::json!({ "n": 1 }))
+                .with_options(JobOptions::new().with_priority(10))],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    let child = queue
+        .claim_next(
+            "worker-child".to_string(),
+            Duration::from_secs(30),
+            ts(1_100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child.id, flow.children[0].id);
+    queue
+        .complete_job(
+            &child.id,
+            lock_token(&child),
+            serde_json::json!({ "ok": true }),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+
+    let values = queue
+        .get_flow_dependency_values(&flow.parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        values.processed.get(&flow.children[0].id),
+        Some(&serde_json::json!({ "ok": true }))
+    );
+
+    assert!(queue
+        .remove_child_dependency(&flow.children[0].id, ts(1_300))
+        .await
+        .unwrap());
+    assert!(!queue
+        .remove_child_dependency(&flow.children[0].id, ts(1_400))
+        .await
+        .unwrap());
+
+    let parent = queue
+        .get_job(&flow.parent.id)
+        .await
+        .unwrap()
+        .expect("parent should remain stored");
+    assert_eq!(parent.state, JobState::Waiting);
+    assert!(parent.child_ids.is_empty());
+
+    let completed_child = queue
+        .get_job(&flow.children[0].id)
+        .await
+        .unwrap()
+        .expect("child should remain stored");
+    assert_eq!(completed_child.state, JobState::Completed);
+    assert!(completed_child.parent_id.is_none());
+
+    let counts = queue
+        .get_flow_dependency_counts(&flow.parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        counts,
+        JobFlowDependencyCounts {
+            processed: 0,
+            unprocessed: 0,
+            failed: 0,
+            ignored: 0,
+            missing: 0,
+        }
+    );
+    let values = queue
+        .get_flow_dependency_values(&flow.parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(values.processed.is_empty());
+    assert!(values.unprocessed.is_empty());
+    assert!(values.ignored.is_empty());
+    assert!(values.failed.is_empty());
+    let child_values = queue
+        .get_flow_children_values(&flow.parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(child_values.is_empty());
+}
+
+#[tokio::test]
 async fn flow_rejects_duplicate_custom_job_ids() {
     let queue = InMemoryJobQueue::new("flow-ids");
     let error = queue
@@ -7594,6 +7695,78 @@ async fn local_job_queue_persists_removed_child_dependency() {
         .unwrap()
         .expect("child should be restored");
     assert!(child.parent_id.is_none());
+}
+
+#[tokio::test]
+async fn local_job_queue_persists_removed_completed_child_dependency() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let snapshot_path = temp_dir
+        .path()
+        .join("jobs")
+        .join("remove-completed-child-dependency-flow.json");
+    let queue = LocalJobQueue::open(
+        "durable-remove-completed-child-dependency-flow",
+        &snapshot_path,
+    )
+    .await
+    .unwrap();
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({})),
+            vec![JobSpec::new("child", serde_json::json!({ "n": 1 }))],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    let child = queue
+        .claim_next(
+            "worker-child".to_string(),
+            Duration::from_secs(30),
+            ts(1_100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .complete_job(
+            &child.id,
+            lock_token(&child),
+            serde_json::json!({ "ok": true }),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+    assert!(queue
+        .remove_child_dependency(&flow.children[0].id, ts(1_300))
+        .await
+        .unwrap());
+
+    let reopened = LocalJobQueue::open(
+        "durable-remove-completed-child-dependency-flow",
+        &snapshot_path,
+    )
+    .await
+    .unwrap();
+    let parent = reopened
+        .get_job(&flow.parent.id)
+        .await
+        .unwrap()
+        .expect("parent should be restored");
+    assert!(parent.child_ids.is_empty());
+    let child = reopened
+        .get_job(&flow.children[0].id)
+        .await
+        .unwrap()
+        .expect("child should be restored");
+    assert_eq!(child.state, JobState::Completed);
+    assert!(child.parent_id.is_none());
+    let values = reopened
+        .get_flow_dependency_values(&flow.parent.id)
+        .await
+        .unwrap()
+        .expect("dependency values should be restored");
+    assert!(values.processed.is_empty());
 }
 
 #[tokio::test]
