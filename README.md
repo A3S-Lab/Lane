@@ -515,10 +515,12 @@ Cleanup paths can unblock flow parents when a pending child is removed.
 Set `JobOptions::with_job_id()` when producers need idempotent submission:
 adding the same job id again returns the existing job instead of enqueueing a
 duplicate. Custom job ids must not be `0` or start with `0:` because BullMQ
-reserves that shape for internal waiting-list markers.
+reserves that shape for internal waiting-list markers, and pure integer custom
+ids are rejected to match BullMQ's `Job.validateOptions()` guard.
 `JobOptions::with_lifo(true)` changes the ready-job insertion semantics for
 jobs with the same priority: newer ready jobs are claimed before older ready
-jobs, while lower priority values still run first.
+jobs, while lower priority values still run first. Priorities follow BullMQ's
+integer range and must not exceed `2^21`.
 Finished jobs are retained by default. `remove_on_complete(true)` and
 `remove_on_fail(true)` remain compatibility shorthands for deleting the current
 terminal job immediately, matching BullMQ's `removeOnComplete: true` and
@@ -1099,9 +1101,10 @@ Redis adds are Lua-backed as well. The add scripts write job JSON and the
 waiting, delayed, or waiting-children index in the same Redis turn. If a custom
 job id already exists, the script returns the existing job without advancing the
 waiting sequence or writing duplicate state indexes. Lane rejects custom job ids
-equal to `0` or prefixed with `0:` before script execution, matching BullMQ's
-reserved marker namespace that Redis scripts special-case while claiming,
-listing, and promoting jobs. Bulk add follows the same
+equal to `0`, prefixed with `0:`, or pure integers before script execution,
+matching BullMQ's reserved marker namespace and integer-id guard. Redis scripts
+special-case marker-like values while claiming, listing, and promoting jobs, so
+Lane keeps those ids out of the user job-id namespace. Bulk add follows the same
 mechanism in one script call while preserving the caller's input order, including
 the same deduplication stream events that BullMQ's pipelined `addBulk()` emits
 for each job.

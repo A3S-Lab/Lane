@@ -44,6 +44,9 @@ pub type JobPriority = u32;
 /// Default priority for jobs that do not specify one.
 pub const DEFAULT_JOB_PRIORITY: JobPriority = 1000;
 
+/// Maximum BullMQ-compatible priority. Lower values run first.
+pub const MAX_JOB_PRIORITY: JobPriority = 2_u32.pow(21);
+
 /// Default retained queue event count, matching BullMQ's default stream length.
 pub const DEFAULT_JOB_EVENT_RETENTION: usize = 10_000;
 
@@ -1025,20 +1028,14 @@ impl JobOptions {
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
-        if matches!(self.job_id.as_deref(), Some(job_id) if job_id.trim().is_empty()) {
-            return Err(LaneError::ConfigError(
-                "job id must not be empty".to_string(),
-            ));
+        if let Some(job_id) = self.job_id.as_deref() {
+            validate_job_id(job_id)?;
         }
-        if matches!(self.job_id.as_deref(), Some("0")) {
-            return Err(LaneError::ConfigError(
-                "job id cannot be `0` or start with `0:`".to_string(),
-            ));
-        }
-        if matches!(self.job_id.as_deref(), Some(job_id) if job_id.starts_with("0:")) {
-            return Err(LaneError::ConfigError(
-                "job id cannot be `0` or start with `0:`".to_string(),
-            ));
+
+        if self.priority > MAX_JOB_PRIORITY {
+            return Err(LaneError::ConfigError(format!(
+                "priority must be between 0 and {MAX_JOB_PRIORITY}"
+            )));
         }
 
         if let Some(repeat) = &self.repeat {
@@ -1107,6 +1104,35 @@ impl JobOptions {
         self.failure_retention
             .as_ref()
             .filter(|retention| !retention.removes_current())
+    }
+}
+
+fn validate_job_id(job_id: &str) -> Result<()> {
+    if job_id.trim().is_empty() {
+        return Err(LaneError::ConfigError(
+            "job id must not be empty".to_string(),
+        ));
+    }
+    if job_id == "0" || job_id.starts_with("0:") {
+        return Err(LaneError::ConfigError(
+            "job id cannot be `0` or start with `0:`".to_string(),
+        ));
+    }
+    if is_bullmq_integer_job_id(job_id) {
+        return Err(LaneError::ConfigError(
+            "custom job id cannot be an integer".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_bullmq_integer_job_id(job_id: &str) -> bool {
+    let mut chars = job_id.chars();
+    match chars.next() {
+        Some('-') => matches!(chars.next(), Some('1'..='9')) && chars.all(|ch| ch.is_ascii_digit()),
+        Some('1'..='9') => chars.all(|ch| ch.is_ascii_digit()),
+        Some('0') => false,
+        _ => false,
     }
 }
 

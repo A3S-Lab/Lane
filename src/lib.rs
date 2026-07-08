@@ -97,7 +97,7 @@ pub use job::{
     JobRepeatPage, JobRetention, JobRunOutcome, JobSpec, JobState, JobStateCount, JobWorker,
     JobWorkerConfig, JobWorkerHandle, JobWorkerId, LocalJobQueue, QueueName, RepeatOptions,
     RepeatSchedule, DEFAULT_JOB_EVENT_RETENTION, DEFAULT_JOB_METRICS_RETENTION,
-    DEFAULT_JOB_PRIORITY,
+    DEFAULT_JOB_PRIORITY, MAX_JOB_PRIORITY,
 };
 pub use manager::{QueueManager, QueueManagerBuilder};
 pub use queue::{

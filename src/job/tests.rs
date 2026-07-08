@@ -3040,6 +3040,30 @@ async fn job_options_reject_bullmq_reserved_marker_ids_without_partial_writes() 
     assert!(matches!(zero_id, LaneError::ConfigError(_)));
     assert_eq!(queue.stats().await.unwrap().total, 0);
 
+    let integer_id = queue
+        .add_at(
+            "reserved-integer",
+            serde_json::json!({}),
+            JobOptions::new().with_job_id("42"),
+            now,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(integer_id, LaneError::ConfigError(_)));
+    assert_eq!(queue.stats().await.unwrap().total, 0);
+
+    let negative_integer_id = queue
+        .add_at(
+            "reserved-negative-integer",
+            serde_json::json!({}),
+            JobOptions::new().with_job_id("-42"),
+            now,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(negative_integer_id, LaneError::ConfigError(_)));
+    assert_eq!(queue.stats().await.unwrap().total, 0);
+
     let marker_prefix = queue
         .add_many_at(
             vec![
@@ -3053,6 +3077,21 @@ async fn job_options_reject_bullmq_reserved_marker_ids_without_partial_writes() 
         .await
         .unwrap_err();
     assert!(matches!(marker_prefix, LaneError::ConfigError(_)));
+    assert_eq!(queue.stats().await.unwrap().total, 0);
+
+    let priority_limit = queue
+        .add_many_at(
+            vec![
+                JobSpec::new("valid", serde_json::json!({}))
+                    .with_options(JobOptions::new().with_job_id("priority-valid")),
+                JobSpec::new("too-urgent", serde_json::json!({}))
+                    .with_options(JobOptions::new().with_priority(MAX_JOB_PRIORITY + 1)),
+            ],
+            now,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(priority_limit, LaneError::ConfigError(_)));
     assert_eq!(queue.stats().await.unwrap().total, 0);
 
     let flow_error = queue

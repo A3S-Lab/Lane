@@ -5,7 +5,7 @@ use a3s_lane::{
     JobListOptions, JobLogEntry, JobOptions, JobPriorityCount, JobProcessor, JobQueueBackend,
     JobRateLimit, JobRepeatListOptions, JobRetention, JobRunOutcome, JobSpec, JobState,
     JobStateCount, JobWorker, JobWorkerConfig, LaneError, RedisJobQueue, RepeatOptions,
-    RetryPolicy,
+    RetryPolicy, MAX_JOB_PRIORITY,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use redis::AsyncCommands;
@@ -6700,6 +6700,17 @@ async fn run_reserved_job_id_validation(redis_url: String) -> redis::RedisResult
     assert!(matches!(zero_id, LaneError::ConfigError(_)));
     assert_eq!(queue.stats().await.unwrap().total, 0);
 
+    let integer_id = queue
+        .add_job(
+            "reserved-integer".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_job_id("42"),
+        )
+        .await
+        .expect_err("integer job id should reject before Redis writes");
+    assert!(matches!(integer_id, LaneError::ConfigError(_)));
+    assert_eq!(queue.stats().await.unwrap().total, 0);
+
     let marker_prefix = queue
         .add_many_at(
             vec![
@@ -6713,6 +6724,25 @@ async fn run_reserved_job_id_validation(redis_url: String) -> redis::RedisResult
         .await
         .expect_err("reserved marker-like id should reject before partial bulk writes");
     assert!(matches!(marker_prefix, LaneError::ConfigError(_)));
+    assert_eq!(queue.stats().await.unwrap().total, 0);
+    let jobs_len: usize = conn
+        .hlen(format!("{namespace}:reserved-job-id:jobs"))
+        .await?;
+    assert_eq!(jobs_len, 0);
+
+    let priority_limit = queue
+        .add_many_at(
+            vec![
+                JobSpec::new("valid-priority", serde_json::json!({}))
+                    .with_options(JobOptions::new().with_job_id("priority-valid")),
+                JobSpec::new("priority-too-high", serde_json::json!({}))
+                    .with_options(JobOptions::new().with_priority(MAX_JOB_PRIORITY + 1)),
+            ],
+            now,
+        )
+        .await
+        .expect_err("priority above BullMQ limit should reject before partial bulk writes");
+    assert!(matches!(priority_limit, LaneError::ConfigError(_)));
     assert_eq!(queue.stats().await.unwrap().total, 0);
     let jobs_len: usize = conn
         .hlen(format!("{namespace}:reserved-job-id:jobs"))

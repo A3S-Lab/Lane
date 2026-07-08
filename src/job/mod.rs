@@ -27,6 +27,7 @@ pub use types::{
     JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobRetention, JobSpec, JobState,
     JobStateCount, JobWorkerId, QueueName, RepeatOptions, RepeatSchedule,
     DEFAULT_JOB_EVENT_RETENTION, DEFAULT_JOB_METRICS_RETENTION, DEFAULT_JOB_PRIORITY,
+    MAX_JOB_PRIORITY,
 };
 pub use worker::{
     job_processor_fn, JobContext, JobProcessor, JobProcessorFn, JobProcessorRouter, JobRunOutcome,
