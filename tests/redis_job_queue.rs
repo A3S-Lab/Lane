@@ -2450,6 +2450,27 @@ async fn run_queue_events(redis_url: String) -> redis::RedisResult<()> {
         .expect("cleaned event test job should clean");
     assert_eq!(cleaned.len(), 1);
     assert_eq!(cleaned[0].id, cleaned_job.id);
+    let dedup_owner = queue
+        .add_job(
+            "dedup-owner".to_string(),
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_job_id("events:dedup-owner")
+                .with_deduplication_id("events:dedup"),
+        )
+        .await
+        .expect("deduplicated event owner should add");
+    let dedup_duplicate = queue
+        .add_job(
+            "dedup-duplicate".to_string(),
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_job_id("events:dedup-duplicate")
+                .with_deduplication_id("events:dedup"),
+        )
+        .await
+        .expect("deduplicated event duplicate should return owner");
+    assert_eq!(dedup_duplicate.id, dedup_owner.id);
     queue.pause().await.expect("queue should pause");
     queue.resume().await.expect("queue should resume");
 
@@ -2476,6 +2497,10 @@ async fn run_queue_events(redis_url: String) -> redis::RedisResult<()> {
             "added",
             "waiting",
             "cleaned",
+            "added",
+            "waiting",
+            "debounced",
+            "deduplicated",
             "paused",
             "resumed"
         ]
@@ -2502,6 +2527,20 @@ async fn run_queue_events(redis_url: String) -> redis::RedisResult<()> {
     assert_eq!(events[11].job_id, None);
     assert_eq!(events[11].prev, None);
     assert_eq!(events[11].fields.get("count"), Some(&serde_json::json!(1)));
+    assert_eq!(events[14].job_id.as_deref(), Some(dedup_owner.id.as_str()));
+    assert_eq!(
+        events[14].fields.get("debounceId"),
+        Some(&serde_json::json!("events:dedup"))
+    );
+    assert_eq!(events[15].job_id.as_deref(), Some(dedup_owner.id.as_str()));
+    assert_eq!(
+        events[15].fields.get("deduplicationId"),
+        Some(&serde_json::json!("events:dedup"))
+    );
+    assert_eq!(
+        events[15].fields.get("deduplicatedJobId"),
+        Some(&serde_json::json!("events:dedup-duplicate"))
+    );
 
     cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())

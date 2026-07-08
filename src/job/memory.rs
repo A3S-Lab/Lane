@@ -291,6 +291,9 @@ impl InMemoryJobQueue {
                     &existing.id,
                     now,
                 );
+                if deduplication_duplicate_emits_events(&job, &existing) {
+                    emit_deduplicated_events_locked(&mut inner, &existing, &job, now);
+                }
                 return Ok(inner.jobs.get(&existing.id).cloned().unwrap_or(existing));
             }
         }
@@ -2656,6 +2659,49 @@ fn emit_cleaned_event_locked(
     emit_event_locked(inner, "cleaned", None, None, timestamp, fields);
 }
 
+fn emit_deduplicated_events_locked(
+    inner: &mut InMemoryJobQueueState,
+    owner: &Job,
+    candidate: &Job,
+    timestamp: DateTime<Utc>,
+) {
+    let Some(deduplication_id) = job_deduplication_id(candidate) else {
+        return;
+    };
+
+    let mut debounced_fields = BTreeMap::new();
+    debounced_fields.insert(
+        "debounceId".to_string(),
+        Value::String(deduplication_id.to_string()),
+    );
+    emit_event_locked(
+        inner,
+        "debounced",
+        Some(owner),
+        None,
+        timestamp,
+        debounced_fields,
+    );
+
+    let mut deduplicated_fields = BTreeMap::new();
+    deduplicated_fields.insert(
+        "deduplicationId".to_string(),
+        Value::String(deduplication_id.to_string()),
+    );
+    deduplicated_fields.insert(
+        "deduplicatedJobId".to_string(),
+        Value::String(candidate.id.clone()),
+    );
+    emit_event_locked(
+        inner,
+        "deduplicated",
+        Some(owner),
+        None,
+        timestamp,
+        deduplicated_fields,
+    );
+}
+
 fn emit_drained_event_if_needed_locked(
     inner: &mut InMemoryJobQueueState,
     timestamp: DateTime<Utc>,
@@ -3033,6 +3079,13 @@ fn deduplication_stores_next_if_active(candidate: &Job, existing: &Job) -> bool 
         && candidate.parent_id.is_none()
         && candidate.child_ids.is_empty()
         && candidate.repeat_key.as_deref() == existing.repeat_key.as_deref()
+}
+
+fn deduplication_duplicate_emits_events(candidate: &Job, existing: &Job) -> bool {
+    let Some(deduplication) = candidate.options.deduplication.as_ref() else {
+        return false;
+    };
+    !deduplication.replace || deduplication_stores_next_if_active(candidate, existing)
 }
 
 fn deduplication_stores_next_flow_if_active(candidate: &JobFlow, existing: &Job) -> bool {

@@ -214,6 +214,21 @@ local function extend_deduplicated_owner(candidate_job, existing_job, deduplicat
   end
 end
 
+local function deduplication_replace(candidate_job)
+  if not candidate_job["options"] or candidate_job["options"] == cjson.null then
+    return false
+  end
+  local deduplication = candidate_job["options"]["deduplication"]
+  return deduplication and deduplication ~= cjson.null and deduplication["replace"] == true
+end
+
+local function emit_deduplicated_events(events_key, max_events, owner_job, candidate_job)
+  local deduplication = candidate_job["options"]["deduplication"]
+  local deduplication_id = deduplication["id"]
+  redis.call('XADD', events_key, 'MAXLEN', '~', max_events, '*', 'event', 'debounced', 'jobId', owner_job["id"], 'debounceId', deduplication_id)
+  redis.call('XADD', events_key, 'MAXLEN', '~', max_events, '*', 'event', 'deduplicated', 'jobId', owner_job["id"], 'deduplicationId', deduplication_id, 'deduplicatedJobId', candidate_job["id"])
+end
+
 local function active_repeat_raw(jobs_key, repeat_prefix, repeat_key)
   if not repeat_key or repeat_key == '' then
     return nil
@@ -358,9 +373,13 @@ if deduplicated then
     end
   elseif can_store_deduplicated_next(candidate_job, existing_job, KEYS[6]) then
     store_deduplicated_next(ARGV[2], candidate_job, existing_job, ARGV[8], ARGV[11])
+    emit_deduplicated_events(KEYS[7], ARGV[13], existing_job, candidate_job)
     return {'deduplicated', deduplicated}
   else
     extend_deduplicated_owner(candidate_job, existing_job, ARGV[8])
+    if not deduplication_replace(candidate_job) then
+      emit_deduplicated_events(KEYS[7], ARGV[13], existing_job, candidate_job)
+    end
     return {'deduplicated', deduplicated}
   end
 end

@@ -706,6 +706,56 @@ async fn simple_deduplication_coalesces_non_terminal_jobs() {
 }
 
 #[tokio::test]
+async fn deduplicated_adds_emit_debounced_and_deduplicated_events() {
+    let queue = InMemoryJobQueue::new("dedup-events");
+    let owner = queue
+        .add_at(
+            "sync",
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new()
+                .with_job_id("dedup:owner")
+                .with_deduplication_id("account:events"),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    let duplicate = queue
+        .add_at(
+            "sync-duplicate",
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new()
+                .with_job_id("dedup:duplicate")
+                .with_deduplication_id("account:events"),
+            ts(1_100),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(duplicate.id, owner.id);
+
+    let events = queue.read_events("-", "+", 10).await.unwrap();
+    let names = events
+        .iter()
+        .map(|event| event.event.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["added", "waiting", "debounced", "deduplicated"]);
+    assert_eq!(events[2].job_id.as_deref(), Some(owner.id.as_str()));
+    assert_eq!(
+        events[2].fields.get("debounceId"),
+        Some(&Value::String("account:events".to_string()))
+    );
+    assert_eq!(events[3].job_id.as_deref(), Some(owner.id.as_str()));
+    assert_eq!(
+        events[3].fields.get("deduplicationId"),
+        Some(&Value::String("account:events".to_string()))
+    );
+    assert_eq!(
+        events[3].fields.get("deduplicatedJobId"),
+        Some(&Value::String("dedup:duplicate".to_string()))
+    );
+}
+
+#[tokio::test]
 async fn remove_deduplication_key_allows_a_new_owner() {
     let queue = InMemoryJobQueue::new("dedup-release");
     let first = queue

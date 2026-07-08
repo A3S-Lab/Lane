@@ -1165,8 +1165,10 @@ completion, terminal failure, and stalled terminal failure paths also emit paren
 `waiting`, `delayed`, or `failed` events with `prev=waiting-children` when that
 same Lua turn releases or fails the parent;
 explicit removal writes `removed prev=<state>` for the removed job; `clean_jobs()`
-writes a queue-level `cleaned count=<n>` event after removing aged jobs; progress
-writes `progress data=<json>`; pause/resume write queue-level events.
+writes a queue-level `cleaned count=<n>` event after removing aged jobs;
+deduplicated adds write BullMQ-style `debounced` and `deduplicated` events with
+the owner job id, deduplication id, and skipped candidate job id; progress writes
+`progress data=<json>`; pause/resume write queue-level events.
 `read_events()` uses `XRANGE` over stream ids, and
 `trim_events()` uses BullMQ-style `XTRIM MAXLEN ~`. The in-memory and local
 durable backends keep the same retained event entries in their snapshots so
