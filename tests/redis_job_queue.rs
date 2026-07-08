@@ -3704,6 +3704,30 @@ async fn run_flow_side_index_snapshot_merge(redis_url: String) -> redis::RedisRe
     assert_eq!(counts.ignored, 2);
     assert_eq!(counts.missing, 0);
 
+    let values = queue
+        .get_flow_dependency_values(&flow.parent.id)
+        .await
+        .expect("merged dependency values should load")
+        .expect("merged dependency values should exist");
+    assert_eq!(
+        values.processed.get(&flow.children[0].id),
+        Some(&serde_json::json!({ "value": "legacy-completed" }))
+    );
+    assert_eq!(
+        values.processed.get(&flow.children[2].id),
+        Some(&serde_json::json!({ "value": "indexed-completed" }))
+    );
+    assert_eq!(
+        values.ignored.get(&flow.children[1].id).map(String::as_str),
+        Some("legacy ignored failure")
+    );
+    assert_eq!(
+        values.ignored.get(&flow.children[3].id).map(String::as_str),
+        Some("indexed ignored failure")
+    );
+    assert!(values.unprocessed.is_empty());
+    assert!(values.failed.is_empty());
+
     cleanup_namespace(&redis_url, &namespace).await
 }
 

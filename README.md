@@ -1378,7 +1378,10 @@ fallback support.
 `Job.getDependencies()` path: Redis reads the same parent-scoped `:processed`,
 `:dependencies`, `:failed`, and `:unsuccessful` structures with `HGETALL`,
 `SMEMBERS`, `HGETALL`, and `ZRANGE 0 -1`, parsing processed values as JSON and
-ignored values as failure-reason strings.
+ignored values as failure-reason strings. It then merges retained child
+snapshots for any parent child id not covered by those side indexes, preserving
+full-bucket compatibility for flows created before the side-index fields were
+available.
 `get_flow_dependency_page(parent_id, options)` and
 `get_flow_dependency_pages(parent_id, options)` mirror BullMQ's paginated
 `Job.getDependencies(opts)` path for large fan-out inspection. Redis reads

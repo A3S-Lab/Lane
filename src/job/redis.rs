@@ -8680,27 +8680,83 @@ if not parent_raw then
   return {'missing'}
 end
 
+local parent = cjson.decode(parent_raw)
 local result = {'ok'}
+local has_dependency_set = redis.call('EXISTS', KEYS[2]) == 1
+local pending_child_ids = {}
+local processed_child_ids = {}
+local ignored_child_ids = {}
+local unsuccessful_child_ids = {}
 
 local processed = redis.call('HGETALL', KEYS[3])
+for index = 1, #processed, 2 do
+  processed_child_ids[processed[index]] = true
+end
+
+local unprocessed = redis.call('SMEMBERS', KEYS[2])
+for _, entry in ipairs(unprocessed) do
+  pending_child_ids[entry] = true
+end
+
+local ignored = redis.call('HGETALL', KEYS[4])
+for index = 1, #ignored, 2 do
+  ignored_child_ids[ignored[index]] = true
+end
+
+local failed = redis.call('ZRANGE', KEYS[5], 0, -1)
+for _, entry in ipairs(failed) do
+  unsuccessful_child_ids[entry] = true
+end
+
+for _, child_id in ipairs(parent['child_ids'] or {}) do
+  local is_pending = pending_child_ids[child_id] == true
+  local is_indexed =
+    processed_child_ids[child_id] == true
+    or ignored_child_ids[child_id] == true
+    or unsuccessful_child_ids[child_id] == true
+
+  if not is_pending and not is_indexed then
+    local child_raw = redis.call('HGET', KEYS[1], child_id)
+    if child_raw then
+      local child = cjson.decode(child_raw)
+      if child["state"] == "completed" then
+        local return_value = child["return_value"]
+        if return_value == nil then
+          return_value = cjson.null
+        end
+        processed[#processed + 1] = child_id
+        processed[#processed + 1] = cjson.encode(return_value)
+      elseif child["state"] == "failed" then
+        if child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["continue_parent_on_failure"] == true) then
+          ignored[#ignored + 1] = child_id
+          ignored[#ignored + 1] = child["failed_reason"] or ""
+        elseif child["options"] and child["options"] ~= cjson.null and child["options"]["remove_dependency_on_failure"] == true then
+          -- Removed dependencies are intentionally omitted from dependency values.
+        else
+          failed[#failed + 1] = child_id
+        end
+      elseif not has_dependency_set then
+        unprocessed[#unprocessed + 1] = child_id
+      end
+    end
+  end
+end
+
 result[#result + 1] = tostring(#processed)
 for _, entry in ipairs(processed) do
   result[#result + 1] = entry
 end
 
-local unprocessed = redis.call('SMEMBERS', KEYS[2])
 result[#result + 1] = tostring(#unprocessed)
 for _, entry in ipairs(unprocessed) do
   result[#result + 1] = entry
 end
 
-local ignored = redis.call('HGETALL', KEYS[4])
 result[#result + 1] = tostring(#ignored)
 for _, entry in ipairs(ignored) do
   result[#result + 1] = entry
 end
 
-local failed = redis.call('ZRANGE', KEYS[5], 0, -1)
 result[#result + 1] = tostring(#failed)
 for _, entry in ipairs(failed) do
   result[#result + 1] = entry
@@ -13890,6 +13946,9 @@ mod tests {
         assert!(FLOW_DEPENDENCY_VALUES_SCRIPT.contains("redis.call('SMEMBERS', KEYS[2]"));
         assert!(FLOW_DEPENDENCY_VALUES_SCRIPT.contains("redis.call('HGETALL', KEYS[4]"));
         assert!(FLOW_DEPENDENCY_VALUES_SCRIPT.contains("redis.call('ZRANGE', KEYS[5], 0, -1)"));
+        assert!(FLOW_DEPENDENCY_VALUES_SCRIPT
+            .contains("for _, child_id in ipairs(parent['child_ids'] or {}) do"));
+        assert!(FLOW_DEPENDENCY_VALUES_SCRIPT.contains("redis.call('HGET', KEYS[1], child_id)"));
         assert!(FLOW_DEPENDENCY_PAGE_SCRIPT.contains("redis.call('HSCAN', KEYS[3]"));
         assert!(FLOW_DEPENDENCY_PAGE_SCRIPT.contains("redis.call('SSCAN', KEYS[2]"));
         assert!(FLOW_DEPENDENCY_PAGE_SCRIPT.contains("redis.call('HSCAN', KEYS[4]"));
