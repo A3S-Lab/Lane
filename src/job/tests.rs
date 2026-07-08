@@ -6622,6 +6622,59 @@ async fn removed_jobs_emit_removed_event() {
 }
 
 #[tokio::test]
+async fn cleaned_jobs_emit_cleaned_event() {
+    let queue = InMemoryJobQueue::new("cleaned-events");
+    let job = queue
+        .add_at(
+            "cleanup",
+            serde_json::json!({}),
+            JobOptions::new(),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), ts(1_100))
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .complete_job(
+            &job.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+
+    let cleaned = queue
+        .clean_jobs(
+            JobState::Completed,
+            Duration::from_millis(100),
+            10,
+            ts(1_400),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleaned.len(), 1);
+    assert_eq!(cleaned[0].id, job.id);
+
+    let events = queue.read_events("-", "+", 20).await.unwrap();
+    let names = events
+        .iter()
+        .map(|event| event.event.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec!["added", "waiting", "active", "completed", "cleaned"]
+    );
+    assert_eq!(events[4].job_id, None);
+    assert_eq!(events[4].prev, None);
+    assert_eq!(events[4].fields.get("count"), Some(&serde_json::json!(1)));
+}
+
+#[tokio::test]
 async fn local_job_queue_persists_event_stream() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let snapshot_path = temp_dir.path().join("jobs").join("events.json");

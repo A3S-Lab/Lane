@@ -1369,6 +1369,7 @@ impl InMemoryJobQueue {
         for parent_id in parent_ids {
             Self::release_parent_if_ready_locked(&mut inner, &parent_id, now);
         }
+        emit_cleaned_event_locked(&mut inner, jobs.len(), now);
 
         Ok(jobs)
     }
@@ -2639,6 +2640,16 @@ fn emit_removed_event_locked(
         timestamp,
         BTreeMap::new(),
     );
+}
+
+fn emit_cleaned_event_locked(
+    inner: &mut InMemoryJobQueueState,
+    count: usize,
+    timestamp: DateTime<Utc>,
+) {
+    let mut fields = BTreeMap::new();
+    fields.insert("count".to_string(), Value::from(count as u64));
+    emit_event_locked(inner, "cleaned", None, None, timestamp, fields);
 }
 
 fn trim_events_locked(inner: &mut InMemoryJobQueueState, max_len: usize) -> usize {

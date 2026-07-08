@@ -6966,12 +6966,12 @@ local function release_parent_after_removed_child(job, removed_id)
     if parent_scheduled_millis <= tonumber(ARGV[6]) then
       parent["state"] = "waiting"
       local priority = tonumber(parent["priority"] or '1000') or 1000
-      enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[8], parent, parent_id, priority, ARGV[7], KEYS[#KEYS])
+      enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[8], parent, parent_id, priority, ARGV[7], KEYS[9])
     else
       parent["state"] = "delayed"
       redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
       redis.call('ZADD', KEYS[3], parent_scheduled_millis, parent_id)
-      refresh_delay_marker(KEYS[#KEYS], KEYS[3])
+      refresh_delay_marker(KEYS[9], KEYS[3])
     end
   end
 end
@@ -7057,6 +7057,8 @@ for index = 1, count do
   release_parent_after_removed_child(candidate.job, candidate.id)
   removed[index] = candidate.raw
 end
+
+redis.call('XADD', KEYS[10], 'MAXLEN', '~', ARGV[14], '*', 'event', 'cleaned', 'count', count)
 
 return removed
 "#;
@@ -10690,7 +10692,7 @@ impl JobQueueBackend for RedisJobQueue {
         let mut conn = self.connection().await?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(CLEAN_JOBS_SCRIPT)
-            .arg(9)
+            .arg(10)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Waiting))
             .arg(self.state_key(JobState::Delayed))
@@ -10700,6 +10702,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.state_key(JobState::Failed))
             .arg(self.sequence_key())
             .arg(self.marker_key())
+            .arg(self.events_key())
             .arg(job_state_name(state))
             .arg(cutoff.to_rfc3339())
             .arg(limit)
@@ -10713,6 +10716,7 @@ impl JobQueueBackend for RedisJobQueue {
             .arg(self.repeat_key_prefix())
             .arg(self.logs_key_prefix())
             .arg(self.deduplication_next_key_prefix())
+            .arg(DEFAULT_JOB_EVENT_RETENTION)
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;
