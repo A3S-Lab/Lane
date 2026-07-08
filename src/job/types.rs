@@ -47,6 +47,16 @@ pub const DEFAULT_JOB_PRIORITY: JobPriority = 1000;
 /// Maximum BullMQ-compatible priority. Lower values run first.
 pub const MAX_JOB_PRIORITY: JobPriority = 2_u32.pow(21);
 
+pub(crate) fn validate_job_priority(priority: JobPriority) -> Result<()> {
+    if priority > MAX_JOB_PRIORITY {
+        return Err(LaneError::ConfigError(format!(
+            "priority must be between 0 and {MAX_JOB_PRIORITY}"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Default retained queue event count, matching BullMQ's default stream length.
 pub const DEFAULT_JOB_EVENT_RETENTION: usize = 10_000;
 
@@ -1032,11 +1042,7 @@ impl JobOptions {
             validate_job_id(job_id)?;
         }
 
-        if self.priority > MAX_JOB_PRIORITY {
-            return Err(LaneError::ConfigError(format!(
-                "priority must be between 0 and {MAX_JOB_PRIORITY}"
-            )));
-        }
+        validate_job_priority(self.priority)?;
 
         if let Some(repeat) = &self.repeat {
             repeat.validate()?;

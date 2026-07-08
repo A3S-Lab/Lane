@@ -170,6 +170,85 @@ async fn redis_job_worker_uses_bulk_lease_renewal_against_real_server() {
     .unwrap();
 }
 
+#[tokio::test]
+async fn redis_backend_rejects_priority_update_above_bullmq_limit_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_priority_update_limit(redis_url),
+    )
+    .await
+    .expect("Redis priority-update limit integration test timed out")
+    .unwrap();
+}
+
+async fn run_priority_update_limit(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "priority-update-limit")
+        .expect("valid Redis URL should build the priority-update-limit queue");
+    let first = queue
+        .add_job(
+            "first".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_priority(50),
+        )
+        .await
+        .expect("first priority-limit job should add");
+    let second = queue
+        .add_job(
+            "second".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_priority(60),
+        )
+        .await
+        .expect("second priority-limit job should add");
+
+    let error = queue
+        .update_priority(&second.id, MAX_JOB_PRIORITY + 1)
+        .await
+        .expect_err("priority above BullMQ limit should reject");
+    assert!(matches!(error, LaneError::ConfigError(_)));
+
+    let stored = queue
+        .get_job(&second.id)
+        .await
+        .expect("stored priority-limit job should load")
+        .expect("stored priority-limit job should remain");
+    assert_eq!(stored.priority, 60);
+    assert_eq!(stored.options.priority, 60);
+
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let priority_sixty_zcount: usize = redis::cmd("ZCOUNT")
+        .arg(format!("{namespace}:priority-update-limit:waiting"))
+        .arg(60_000_000_000_000_f64)
+        .arg(60_999_999_999_999_f64)
+        .query_async(&mut conn)
+        .await?;
+    assert_eq!(priority_sixty_zcount, 1);
+
+    let claimed = queue
+        .claim_next(
+            "worker-priority-update-limit".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("priority-limit claim should return")
+        .expect("priority-limit queue should still have waiting work");
+    assert_eq!(claimed.id, first.id);
+    assert_ne!(claimed.id, second.id);
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
 async fn run_maxed_active_limit(redis_url: String) -> redis::RedisResult<()> {
     let namespace = unique_namespace();
     trace_stage("maxed-active-limit:cleanup:start");

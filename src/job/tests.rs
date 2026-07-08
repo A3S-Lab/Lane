@@ -1853,6 +1853,62 @@ async fn priority_updates_can_reinsert_waiting_jobs_as_lifo() {
 }
 
 #[tokio::test]
+async fn priority_updates_reject_priority_above_bullmq_limit() {
+    let queue = InMemoryJobQueue::new("priority-update-limit");
+    let now = ts(1_000);
+    let first = queue
+        .add_at(
+            "first",
+            serde_json::json!({}),
+            JobOptions::new().with_priority(50),
+            now,
+        )
+        .await
+        .unwrap();
+    let second = queue
+        .add_at(
+            "second",
+            serde_json::json!({}),
+            JobOptions::new().with_priority(60),
+            now,
+        )
+        .await
+        .unwrap();
+
+    let error = queue
+        .update_priority(&second.id, MAX_JOB_PRIORITY + 1)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, LaneError::ConfigError(_)));
+
+    let stored = queue.get_job(&second.id).await.unwrap().unwrap();
+    assert_eq!(stored.priority, 60);
+    assert_eq!(stored.options.priority, 60);
+    let counts = queue.get_counts_per_priority(&[50, 60]).await.unwrap();
+    assert_eq!(
+        counts,
+        vec![
+            JobPriorityCount {
+                priority: 50,
+                count: 1,
+            },
+            JobPriorityCount {
+                priority: 60,
+                count: 1,
+            },
+        ]
+    );
+
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, first.id);
+    assert_ne!(claimed.id, second.id);
+}
+
+#[tokio::test]
 async fn priority_counts_only_include_waiting_jobs() {
     let queue = InMemoryJobQueue::new("priority-counts");
     let now = ts(1_000);

@@ -1,11 +1,11 @@
 use super::backend::JobQueueBackend;
 use super::types::{
-    deduplication_expiration, page_repeat_entries, Job, JobEvent, JobFinishedResult, JobFlow,
-    JobFlowChildValues, JobFlowDependencies, JobFlowDependencyCounts, JobFlowIgnoredFailures,
-    JobId, JobListOptions, JobListPage, JobLogEntry, JobLogPage, JobOptions, JobPriority,
-    JobPriorityCount, JobQueueSnapshot, JobQueueStats, JobRepeatEntry, JobRepeatListOptions,
-    JobRepeatPage, JobRetention, JobSpec, JobState, JobStateCount, JobWorkerId, QueueName,
-    DEFAULT_JOB_EVENT_RETENTION,
+    deduplication_expiration, page_repeat_entries, validate_job_priority, Job, JobEvent,
+    JobFinishedResult, JobFlow, JobFlowChildValues, JobFlowDependencies, JobFlowDependencyCounts,
+    JobFlowIgnoredFailures, JobId, JobListOptions, JobListPage, JobLogEntry, JobLogPage,
+    JobOptions, JobPriority, JobPriorityCount, JobQueueSnapshot, JobQueueStats, JobRepeatEntry,
+    JobRepeatListOptions, JobRepeatPage, JobRetention, JobSpec, JobState, JobStateCount,
+    JobWorkerId, QueueName, DEFAULT_JOB_EVENT_RETENTION,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -1547,6 +1547,8 @@ impl InMemoryJobQueue {
         priority: JobPriority,
         lifo: Option<bool>,
     ) -> Result<Job> {
+        validate_job_priority(priority)?;
+
         let mut inner = self.inner.lock().await;
         let should_requeue = {
             let job = inner

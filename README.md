@@ -520,7 +520,9 @@ ids are rejected to match BullMQ's `Job.validateOptions()` guard.
 `JobOptions::with_lifo(true)` changes the ready-job insertion semantics for
 jobs with the same priority: newer ready jobs are claimed before older ready
 jobs, while lower priority values still run first. Priorities follow BullMQ's
-integer range and must not exceed `2^21`.
+integer range and must not exceed `2^21`; both add-time options and
+`update_priority()`/`update_priority_with_lifo()` enforce that limit before
+mutating backend state.
 Finished jobs are retained by default. `remove_on_complete(true)` and
 `remove_on_fail(true)` remain compatibility shorthands for deleting the current
 terminal job immediately, matching BullMQ's `removeOnComplete: true` and
@@ -1495,7 +1497,9 @@ script also refreshes `enqueued_seq` and recomputes the FIFO/LIFO score.
 stored on `job.options.lifo` before the waiting score is recomputed, so the
 Redis index changes together with the serialized job snapshot. This is
 intentionally aligned with BullMQ's mechanism of moving job state through Redis
-scripts instead of coordinating several client-side Redis commands.
+scripts instead of coordinating several client-side Redis commands. Lane also
+applies BullMQ's `2^21` priority ceiling before entering that script, so an
+invalid update cannot partially rewrite the job hash or waiting index.
 
 Redis job management mutations are script-backed too. `update_data()` follows
 BullMQ's `updateData` existence check and write shape, adapted to Lane's Redis

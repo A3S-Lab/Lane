@@ -1,12 +1,12 @@
 use super::backend::JobQueueBackend;
 use super::types::{
-    add_duration, deduplication_expiration, page_repeat_entries, Job, JobEvent, JobFinishedResult,
-    JobFlow, JobFlowChildValues, JobFlowDependencies, JobFlowDependencyCounts,
-    JobFlowIgnoredFailures, JobId, JobLeaseRenewal, JobListOptions, JobListPage, JobLogEntry,
-    JobLogPage, JobMetrics, JobMetricsMeta, JobOptions, JobPriority, JobPriorityCount,
-    JobQueueStats, JobRateLimit, JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobSpec,
-    JobState, JobStateCount, JobWorkerId, QueueName, DEFAULT_JOB_EVENT_RETENTION,
-    DEFAULT_JOB_METRICS_RETENTION,
+    add_duration, deduplication_expiration, page_repeat_entries, validate_job_priority, Job,
+    JobEvent, JobFinishedResult, JobFlow, JobFlowChildValues, JobFlowDependencies,
+    JobFlowDependencyCounts, JobFlowIgnoredFailures, JobId, JobLeaseRenewal, JobListOptions,
+    JobListPage, JobLogEntry, JobLogPage, JobMetrics, JobMetricsMeta, JobOptions, JobPriority,
+    JobPriorityCount, JobQueueStats, JobRateLimit, JobRepeatEntry, JobRepeatListOptions,
+    JobRepeatPage, JobSpec, JobState, JobStateCount, JobWorkerId, QueueName,
+    DEFAULT_JOB_EVENT_RETENTION, DEFAULT_JOB_METRICS_RETENTION,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -10574,6 +10574,8 @@ impl RedisJobQueue {
         priority: JobPriority,
         lifo: Option<bool>,
     ) -> Result<Job> {
+        validate_job_priority(priority)?;
+
         let mut conn = self.connection().await?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(UPDATE_PRIORITY_SCRIPT)
