@@ -202,6 +202,22 @@ async fn redis_backend_allows_terminal_progress_updates_against_real_server() {
     .unwrap();
 }
 
+#[tokio::test]
+async fn redis_backend_emits_reschedule_delayed_events_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_reschedule_delayed_event(redis_url),
+    )
+    .await
+    .expect("Redis reschedule delayed-event integration test timed out")
+    .unwrap();
+}
+
 async fn run_priority_update_limit(redis_url: String) -> redis::RedisResult<()> {
     let namespace = unique_namespace();
     cleanup_namespace(&redis_url, &namespace).await?;
@@ -304,6 +320,41 @@ async fn run_priority_update_limit(redis_url: String) -> redis::RedisResult<()> 
         .expect("second priority-limit job should remain waiting");
     assert_eq!(next_claimed.id, second.id);
     assert_ne!(next_claimed.id, first.id);
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
+async fn run_reschedule_delayed_event(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "reschedule-event")
+        .expect("valid Redis URL should build the reschedule-event queue");
+    let job = queue
+        .add_job(
+            "task".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_delay(Duration::from_secs(60)),
+        )
+        .await
+        .expect("reschedule event job should add");
+    let rescheduled = queue
+        .reschedule_job(&job.id, Duration::from_secs(2), ts(1_000))
+        .await
+        .expect("delayed job should reschedule");
+    assert_eq!(rescheduled.state, JobState::Delayed);
+    assert_eq!(rescheduled.scheduled_at, ts(3_000));
+
+    let events = queue
+        .read_events("-", "+", 100)
+        .await
+        .expect("reschedule event stream should load");
+    let delayed = events
+        .iter()
+        .rev()
+        .find(|event| event.event == "delayed" && event.job_id.as_deref() == Some(job.id.as_str()))
+        .expect("reschedule should emit a delayed event");
+    assert_eq!(delayed.fields.get("delay"), Some(&serde_json::json!(3_000)));
 
     cleanup_namespace(&redis_url, &namespace).await
 }

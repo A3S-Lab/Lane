@@ -1442,6 +1442,7 @@ another state. `reschedule_job()` follows BullMQ's `changeDelay` mechanism: the
 script removes the job from the delayed zset, rejects the change if that zset
 membership is missing, updates the stored delay and scheduled timestamp, and
 adds the job back to the delayed zset with the new score in the same Redis turn.
+It also emits BullMQ's `delayed` event with the new delayed timestamp.
 `delay_active_job()` follows BullMQ's `moveToDelayed` mechanism for leased
 jobs: the script verifies the lock token, treats the active zset as the movement
 gate, rejects the move if that active index membership is missing, clears the

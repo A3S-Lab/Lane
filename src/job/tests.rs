@@ -442,6 +442,13 @@ async fn reschedule_delayed_job_changes_due_time() {
     assert_eq!(rescheduled.state, JobState::Delayed);
     assert_eq!(rescheduled.scheduled_at, ts(3_000));
     assert_eq!(rescheduled.options.delay, Some(Duration::from_secs(2)));
+    let events = queue.read_events("-", "+", 10).await.unwrap();
+    let delayed = events
+        .iter()
+        .rev()
+        .find(|event| event.event == "delayed" && event.job_id.as_deref() == Some(job.id.as_str()))
+        .expect("reschedule should emit a delayed event");
+    assert_eq!(delayed.fields.get("delay"), Some(&serde_json::json!(3_000)));
 
     assert_eq!(queue.promote_due_jobs(ts(2_999)).await.unwrap(), 0);
     assert!(queue

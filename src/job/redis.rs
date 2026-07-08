@@ -6074,8 +6074,9 @@ job["options"]["delay"] = cjson.decode(ARGV[4])
 
 local updated = cjson.encode(job)
 redis.call('ZADD', KEYS[2], ARGV[3], ARGV[1])
-refresh_delay_marker(KEYS[#KEYS], KEYS[2])
+refresh_delay_marker(KEYS[3], KEYS[2])
 redis.call('HSET', KEYS[1], ARGV[1], updated)
+redis.call('XADD', KEYS[4], 'MAXLEN', '~', ARGV[6], '*', 'event', 'delayed', 'jobId', ARGV[1], 'delay', ARGV[3])
 sync_repeat_scheduler(job, ARGV[1], ARGV[5], ARGV[3])
 
 return {'ok', updated}
@@ -11016,15 +11017,17 @@ impl JobQueueBackend for RedisJobQueue {
         let mut conn = self.connection().await?;
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(RESCHEDULE_JOB_SCRIPT)
-            .arg(3)
+            .arg(4)
             .arg(self.jobs_key())
             .arg(self.state_key(JobState::Delayed))
             .arg(self.marker_key())
+            .arg(self.events_key())
             .arg(job_id)
             .arg(scheduled_at.to_rfc3339())
-            .arg(millis(scheduled_at))
+            .arg(scheduled_at.timestamp_millis())
             .arg(delay)
             .arg(self.repeat_key_prefix())
+            .arg(DEFAULT_JOB_EVENT_RETENTION)
             .query_async(&mut conn)
             .await
             .map_err(redis_error)?;

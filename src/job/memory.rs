@@ -1344,7 +1344,12 @@ impl InMemoryJobQueue {
 
         job.options.delay = Some(delay);
         job.scheduled_at = add_duration(now, delay);
-        Ok(job.clone())
+        let scheduled_millis = job.scheduled_at.timestamp_millis();
+        let job = job.clone();
+        let mut fields = BTreeMap::new();
+        fields.insert("delay".to_string(), Value::from(scheduled_millis));
+        emit_event_locked(&mut inner, "delayed", Some(&job), None, now, fields);
+        Ok(job)
     }
 
     /// Manually retry a failed job by moving it back to the waiting state.
