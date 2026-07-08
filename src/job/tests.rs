@@ -4494,6 +4494,256 @@ async fn active_parent_reuses_existing_completed_child_job_id() {
 }
 
 #[tokio::test]
+async fn active_parent_skips_deduplicated_child_without_parent_dependency() {
+    let queue = InMemoryJobQueue::new("dynamic-flow-child-dedup");
+    let owner = queue
+        .add_at(
+            "existing-child-owner",
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new()
+                .with_job_id("dynamic-flow-dedup:owner")
+                .with_deduplication_id("tenant:dynamic-flow-child"),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    let parent = queue
+        .add_at(
+            "planner",
+            serde_json::json!({ "kind": "plan" }),
+            JobOptions::new()
+                .with_job_id("dynamic-flow-dedup:parent")
+                .with_priority(1),
+            ts(1_010),
+        )
+        .await
+        .unwrap();
+    let active_parent = queue
+        .claim_next(
+            "worker-planner".to_string(),
+            Duration::from_secs(30),
+            ts(1_100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active_parent.id, parent.id);
+
+    let children = queue
+        .add_flow_children_at(
+            &active_parent.id,
+            lock_token(&active_parent),
+            vec![
+                JobSpec::new("candidate-child", serde_json::json!({ "version": 2 })).with_options(
+                    JobOptions::new()
+                        .with_job_id("dynamic-flow-dedup:candidate")
+                        .with_deduplication_id("tenant:dynamic-flow-child"),
+                ),
+                JobSpec::new("retained-child", serde_json::json!({ "version": 3 }))
+                    .with_options(JobOptions::new().with_job_id("dynamic-flow-dedup:retained")),
+            ],
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].id, "dynamic-flow-dedup:retained");
+    assert!(queue
+        .get_job("dynamic-flow-dedup:candidate")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        queue.get_job(&owner.id).await.unwrap().unwrap().parent_id,
+        None
+    );
+    let waiting_parent = queue.get_job(&parent.id).await.unwrap().unwrap();
+    assert_eq!(waiting_parent.state, JobState::WaitingChildren);
+    assert_eq!(
+        waiting_parent.child_ids,
+        vec!["dynamic-flow-dedup:retained".to_string()]
+    );
+    assert_eq!(
+        queue
+            .get_flow_dependency_counts(&parent.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        JobFlowDependencyCounts {
+            processed: 0,
+            unprocessed: 1,
+            failed: 0,
+            ignored: 0,
+            missing: 0,
+        }
+    );
+
+    let events = queue.read_events("-", "+", 20).await.unwrap();
+    assert!(events.iter().any(|event| {
+        event.event == "debounced"
+            && event.job_id.as_deref() == Some(owner.id.as_str())
+            && event.fields.get("debounceId")
+                == Some(&Value::String("tenant:dynamic-flow-child".to_string()))
+    }));
+    assert!(events.iter().any(|event| {
+        event.event == "deduplicated"
+            && event.job_id.as_deref() == Some(owner.id.as_str())
+            && event.fields.get("deduplicatedJobId")
+                == Some(&Value::String("dynamic-flow-dedup:candidate".to_string()))
+    }));
+}
+
+#[tokio::test]
+async fn active_parent_materializes_keep_last_child_after_owner_finishes() {
+    let queue = InMemoryJobQueue::new("dynamic-flow-child-keep-last");
+    let deduplication =
+        DeduplicationOptions::new("tenant:dynamic-flow-child-keep-last").keep_last_if_active(true);
+    let owner = queue
+        .add_at(
+            "existing-owner",
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new()
+                .with_job_id("dynamic-flow-keep-last:owner")
+                .with_priority(0)
+                .with_deduplication(deduplication.clone()),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    let owner_claim = queue
+        .claim_next(
+            "worker-owner".to_string(),
+            Duration::from_secs(30),
+            ts(1_050),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner_claim.id, owner.id);
+    let parent = queue
+        .add_at(
+            "planner",
+            serde_json::json!({ "kind": "plan" }),
+            JobOptions::new()
+                .with_job_id("dynamic-flow-keep-last:parent")
+                .with_priority(1),
+            ts(1_100),
+        )
+        .await
+        .unwrap();
+    let active_parent = queue
+        .claim_next(
+            "worker-planner".to_string(),
+            Duration::from_secs(30),
+            ts(1_150),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(active_parent.id, parent.id);
+
+    let children = queue
+        .add_flow_children_at(
+            &active_parent.id,
+            lock_token(&active_parent),
+            vec![
+                JobSpec::new("next-child", serde_json::json!({ "version": 2 })).with_options(
+                    JobOptions::new()
+                        .with_job_id("dynamic-flow-keep-last:next")
+                        .with_priority(0)
+                        .with_deduplication(deduplication),
+                ),
+            ],
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+
+    assert!(children.is_empty());
+    let waiting_parent = queue.get_job(&parent.id).await.unwrap().unwrap();
+    assert_eq!(waiting_parent.state, JobState::WaitingChildren);
+    assert_eq!(
+        waiting_parent.child_ids,
+        vec!["dynamic-flow-keep-last:next".to_string()]
+    );
+    assert!(queue
+        .get_job("dynamic-flow-keep-last:next")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        queue
+            .get_flow_dependency_counts(&parent.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        JobFlowDependencyCounts {
+            processed: 0,
+            unprocessed: 0,
+            failed: 0,
+            ignored: 0,
+            missing: 1,
+        }
+    );
+
+    queue
+        .complete_job(
+            &owner_claim.id,
+            lock_token(&owner_claim),
+            serde_json::json!({ "owner": "done" }),
+            ts(1_300),
+        )
+        .await
+        .unwrap();
+    let materialized = queue
+        .get_job("dynamic-flow-keep-last:next")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(materialized.parent_id.as_deref(), Some(parent.id.as_str()));
+    assert_eq!(materialized.state, JobState::Waiting);
+    assert_eq!(
+        queue
+            .get_flow_dependency_counts(&parent.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        JobFlowDependencyCounts {
+            processed: 0,
+            unprocessed: 1,
+            failed: 0,
+            ignored: 0,
+            missing: 0,
+        }
+    );
+
+    let next_claim = queue
+        .claim_next(
+            "worker-next".to_string(),
+            Duration::from_secs(30),
+            ts(1_350),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(next_claim.id, "dynamic-flow-keep-last:next");
+    queue
+        .complete_job(
+            &next_claim.id,
+            lock_token(&next_claim),
+            serde_json::json!({ "next": "done" }),
+            ts(1_400),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        queue.get_job(&parent.id).await.unwrap().unwrap().state,
+        JobState::Waiting
+    );
+}
+
+#[tokio::test]
 async fn flow_parent_deduplication_keep_last_enqueues_latest_flow_after_active_owner_finishes() {
     let queue = InMemoryJobQueue::new("flow-keep-last");
     let parent_deduplication =

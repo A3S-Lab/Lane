@@ -2089,6 +2089,263 @@ async fn run_dynamic_flow_children(redis_url: String) -> redis::RedisResult<()> 
     assert_eq!(completed_reuse_counts.processed, 1);
     assert_eq!(completed_reuse_counts.unprocessed, 0);
 
+    let dedup_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-dynamic-dedup")
+        .expect("valid Redis URL should build the dynamic dedup queue");
+    let dedup_owner = dedup_queue
+        .add_job(
+            "existing-child-owner".to_string(),
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new()
+                .with_job_id("flow-dynamic-dedup:owner")
+                .with_deduplication_id("tenant:dynamic-flow-child"),
+        )
+        .await
+        .expect("dynamic dedup owner should add");
+    let dedup_parent = dedup_queue
+        .add_job(
+            "planner".to_string(),
+            serde_json::json!({ "kind": "plan" }),
+            JobOptions::new()
+                .with_job_id("flow-dynamic-dedup:parent")
+                .with_priority(1),
+        )
+        .await
+        .expect("dynamic dedup parent should add");
+    let active_dedup_parent = dedup_queue
+        .claim_next(
+            "worker-dynamic-dedup-parent".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("dynamic dedup parent claim should return")
+        .expect("dynamic dedup parent should be claimable");
+    assert_eq!(active_dedup_parent.id, dedup_parent.id);
+    let dedup_children = dedup_queue
+        .add_flow_children_at(
+            &active_dedup_parent.id,
+            lock_token(&active_dedup_parent),
+            vec![
+                JobSpec::new("candidate-child", serde_json::json!({ "version": 2 })).with_options(
+                    JobOptions::new()
+                        .with_job_id("flow-dynamic-dedup:candidate")
+                        .with_deduplication_id("tenant:dynamic-flow-child"),
+                ),
+                JobSpec::new("retained-child", serde_json::json!({ "version": 3 }))
+                    .with_options(JobOptions::new().with_job_id("flow-dynamic-dedup:retained")),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("dynamic dedup children should add");
+    assert_eq!(dedup_children.len(), 1);
+    assert_eq!(dedup_children[0].id, "flow-dynamic-dedup:retained");
+    assert!(dedup_queue
+        .get_job("flow-dynamic-dedup:candidate")
+        .await
+        .expect("dynamic dedup candidate lookup should return")
+        .is_none());
+    assert_eq!(
+        dedup_queue
+            .get_job(&dedup_owner.id)
+            .await
+            .expect("dynamic dedup owner should load")
+            .expect("dynamic dedup owner should exist")
+            .parent_id,
+        None
+    );
+    let dedup_dependency_key = format!(
+        "{namespace}:flow-dynamic-dedup:dependencies:{}",
+        dedup_parent.id
+    );
+    let dedup_pending_count: usize = conn.scard(&dedup_dependency_key).await?;
+    assert_eq!(dedup_pending_count, 1);
+    let candidate_is_dependency: bool = conn
+        .sismember(&dedup_dependency_key, "flow-dynamic-dedup:candidate")
+        .await?;
+    assert!(!candidate_is_dependency);
+    let dedup_parent_after = dedup_queue
+        .get_job(&dedup_parent.id)
+        .await
+        .expect("dynamic dedup parent should load")
+        .expect("dynamic dedup parent should exist");
+    assert_eq!(
+        dedup_parent_after.child_ids,
+        vec!["flow-dynamic-dedup:retained".to_string()]
+    );
+    let dedup_events = dedup_queue
+        .read_events("-", "+", 20)
+        .await
+        .expect("dynamic dedup events should read");
+    assert!(dedup_events.iter().any(|event| {
+        event.event == "debounced"
+            && event.job_id.as_deref() == Some(dedup_owner.id.as_str())
+            && event.fields.get("debounceId")
+                == Some(&serde_json::json!("tenant:dynamic-flow-child"))
+    }));
+    assert!(dedup_events.iter().any(|event| {
+        event.event == "deduplicated"
+            && event.job_id.as_deref() == Some(dedup_owner.id.as_str())
+            && event.fields.get("deduplicatedJobId")
+                == Some(&serde_json::json!("flow-dynamic-dedup:candidate"))
+    }));
+
+    let keep_last_queue =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-dynamic-keep-last")
+            .expect("valid Redis URL should build the dynamic keep-last queue");
+    let keep_last_deduplication =
+        DeduplicationOptions::new("tenant:dynamic-flow-child-keep-last").keep_last_if_active(true);
+    let keep_last_owner = keep_last_queue
+        .add_job(
+            "existing-owner".to_string(),
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new()
+                .with_job_id("flow-dynamic-keep-last:owner")
+                .with_priority(0)
+                .with_deduplication(keep_last_deduplication.clone()),
+        )
+        .await
+        .expect("dynamic keep-last owner should add");
+    let keep_last_owner_claim = keep_last_queue
+        .claim_next(
+            "worker-dynamic-keep-last-owner".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("dynamic keep-last owner claim should return")
+        .expect("dynamic keep-last owner should be claimable");
+    assert_eq!(keep_last_owner_claim.id, keep_last_owner.id);
+    let keep_last_parent = keep_last_queue
+        .add_job(
+            "planner".to_string(),
+            serde_json::json!({ "kind": "plan" }),
+            JobOptions::new()
+                .with_job_id("flow-dynamic-keep-last:parent")
+                .with_priority(1),
+        )
+        .await
+        .expect("dynamic keep-last parent should add");
+    let active_keep_last_parent = keep_last_queue
+        .claim_next(
+            "worker-dynamic-keep-last-parent".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("dynamic keep-last parent claim should return")
+        .expect("dynamic keep-last parent should be claimable");
+    assert_eq!(active_keep_last_parent.id, keep_last_parent.id);
+    let keep_last_children = keep_last_queue
+        .add_flow_children_at(
+            &active_keep_last_parent.id,
+            lock_token(&active_keep_last_parent),
+            vec![
+                JobSpec::new("next-child", serde_json::json!({ "version": 2 })).with_options(
+                    JobOptions::new()
+                        .with_job_id("flow-dynamic-keep-last:next")
+                        .with_priority(0)
+                        .with_deduplication(keep_last_deduplication),
+                ),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("dynamic keep-last child should be stored as next");
+    assert!(keep_last_children.is_empty());
+    assert!(keep_last_queue
+        .get_job("flow-dynamic-keep-last:next")
+        .await
+        .expect("dynamic keep-last next lookup should return")
+        .is_none());
+    let keep_last_parent_after = keep_last_queue
+        .get_job(&keep_last_parent.id)
+        .await
+        .expect("dynamic keep-last parent should load")
+        .expect("dynamic keep-last parent should exist");
+    assert_eq!(keep_last_parent_after.state, JobState::WaitingChildren);
+    assert_eq!(
+        keep_last_parent_after.child_ids,
+        vec!["flow-dynamic-keep-last:next".to_string()]
+    );
+    let keep_last_dependency_key = format!(
+        "{namespace}:flow-dynamic-keep-last:dependencies:{}",
+        keep_last_parent.id
+    );
+    let keep_last_placeholder_pending: bool = conn
+        .sismember(&keep_last_dependency_key, "flow-dynamic-keep-last:next")
+        .await?;
+    assert!(keep_last_placeholder_pending);
+    let keep_last_next_key = format!(
+        "{namespace}:flow-dynamic-keep-last:deduplication_next:tenant:dynamic-flow-child-keep-last"
+    );
+    let keep_last_next_raw: Option<String> = conn.get(&keep_last_next_key).await?;
+    assert!(keep_last_next_raw.is_some());
+    let keep_last_counts = keep_last_queue
+        .get_flow_dependency_counts(&keep_last_parent.id)
+        .await
+        .expect("dynamic keep-last counts should load")
+        .expect("dynamic keep-last parent should exist");
+    assert_eq!(keep_last_counts.missing, 1);
+    assert_eq!(keep_last_counts.unprocessed, 0);
+
+    keep_last_queue
+        .complete_job(
+            &keep_last_owner_claim.id,
+            lock_token(&keep_last_owner_claim),
+            serde_json::json!({ "owner": "done" }),
+            Utc::now(),
+        )
+        .await
+        .expect("dynamic keep-last owner should complete");
+    let keep_last_next_after: Option<String> = conn.get(&keep_last_next_key).await?;
+    assert!(keep_last_next_after.is_none());
+    let materialized_keep_last = keep_last_queue
+        .get_job("flow-dynamic-keep-last:next")
+        .await
+        .expect("dynamic keep-last next should load")
+        .expect("dynamic keep-last next should exist");
+    assert_eq!(
+        materialized_keep_last.parent_id.as_deref(),
+        Some(keep_last_parent.id.as_str())
+    );
+    assert_eq!(materialized_keep_last.state, JobState::Waiting);
+    let keep_last_counts_after = keep_last_queue
+        .get_flow_dependency_counts(&keep_last_parent.id)
+        .await
+        .expect("dynamic keep-last counts after materialize should load")
+        .expect("dynamic keep-last parent should exist");
+    assert_eq!(keep_last_counts_after.missing, 0);
+    assert_eq!(keep_last_counts_after.unprocessed, 1);
+    let keep_last_next_claim = keep_last_queue
+        .claim_next(
+            "worker-dynamic-keep-last-next".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("dynamic keep-last next claim should return")
+        .expect("dynamic keep-last next should be claimable");
+    assert_eq!(keep_last_next_claim.id, "flow-dynamic-keep-last:next");
+    keep_last_queue
+        .complete_job(
+            &keep_last_next_claim.id,
+            lock_token(&keep_last_next_claim),
+            serde_json::json!({ "next": "done" }),
+            Utc::now(),
+        )
+        .await
+        .expect("dynamic keep-last next should complete");
+    assert_eq!(
+        keep_last_queue
+            .get_job(&keep_last_parent.id)
+            .await
+            .expect("dynamic keep-last parent after next should load")
+            .expect("dynamic keep-last parent should exist")
+            .state,
+        JobState::Waiting
+    );
+
     cleanup_namespace(&redis_url, &namespace).await
 }
 

@@ -669,21 +669,49 @@ impl InMemoryJobQueue {
             }
         }
 
+        let mut deduplicated_children = HashMap::new();
+        let mut deduplicated_next_children = HashMap::new();
+        let mut deduplicated_next_child_by_id = HashMap::new();
         let mut flow_deduplication_ids = HashSet::new();
         for child in &child_jobs {
             if duplicated_children.contains(&child.id) {
                 continue;
             }
             if let Some(deduplication_id) = active_deduplication_id(child, now) {
-                if find_active_deduplication_id(
+                if let Some(existing) = find_active_deduplication_id(
                     &inner.jobs,
                     &inner.released_deduplication_owners,
                     deduplication_id,
                     now,
                 )
-                .is_some()
-                    || !flow_deduplication_ids.insert(deduplication_id.to_string())
+                .cloned()
                 {
+                    if flow_child_deduplication_requires_next(child, &existing) {
+                        if !Self::store_deduplicated_next_locked(&mut inner, child, &existing) {
+                            return Err(LaneError::ConfigError(format!(
+                                "flow child deduplication id `{deduplication_id}` is already active on job {}",
+                                existing.id
+                            )));
+                        }
+                        if let Some(previous_child_id) = deduplicated_next_child_by_id
+                            .insert(deduplication_id.to_string(), child.id.clone())
+                        {
+                            deduplicated_next_children.remove(&previous_child_id);
+                        }
+                        deduplicated_children.insert(child.id.clone(), existing.clone());
+                        deduplicated_next_children.insert(child.id.clone(), existing);
+                        continue;
+                    }
+                    Self::extend_deduplication_expiration_locked(
+                        &mut inner.jobs,
+                        child,
+                        &existing.id,
+                        now,
+                    );
+                    deduplicated_children.insert(child.id.clone(), existing);
+                    continue;
+                }
+                if !flow_deduplication_ids.insert(deduplication_id.to_string()) {
                     return Err(LaneError::ConfigError(format!(
                         "flow deduplication id `{deduplication_id}` already active"
                     )));
@@ -693,7 +721,10 @@ impl InMemoryJobQueue {
 
         let mut flow_repeat_keys = HashSet::new();
         for child in &child_jobs {
-            if duplicated_children.contains(&child.id) {
+            if duplicated_children.contains(&child.id)
+                || deduplicated_children.contains_key(&child.id)
+                || deduplicated_next_children.contains_key(&child.id)
+            {
                 continue;
             }
             if let Some(repeat_key) = active_repeat_key(child) {
@@ -721,6 +752,11 @@ impl InMemoryJobQueue {
             parent.deferred_failure = None;
             parent.failed_reason = None;
             for child in &child_jobs {
+                if deduplicated_children.contains_key(&child.id)
+                    && !deduplicated_next_children.contains_key(&child.id)
+                {
+                    continue;
+                }
                 if !parent
                     .child_ids
                     .iter()
@@ -734,7 +770,9 @@ impl InMemoryJobQueue {
 
         let mut stored_child_jobs = Vec::with_capacity(child_jobs.len());
         for child in &mut child_jobs {
-            if duplicated_children.contains(&child.id) {
+            if let Some(existing) = deduplicated_children.get(&child.id) {
+                emit_deduplicated_events_locked(&mut inner, existing, child, now);
+            } else if duplicated_children.contains(&child.id) {
                 if let Some(existing) = inner.jobs.get_mut(&child.id) {
                     existing.parent_id = Some(parent_id.to_string());
                     let existing = existing.clone();
@@ -757,7 +795,9 @@ impl InMemoryJobQueue {
             now,
             BTreeMap::new(),
         );
-        Self::release_parent_if_ready_locked(&mut inner, parent_id, now);
+        if deduplicated_next_children.is_empty() {
+            Self::release_parent_if_ready_locked(&mut inner, parent_id, now);
+        }
 
         Ok(stored_child_jobs)
     }
