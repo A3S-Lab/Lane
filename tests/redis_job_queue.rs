@@ -471,6 +471,22 @@ async fn redis_backend_guards_manual_active_transitions_against_real_server() {
 }
 
 #[tokio::test]
+async fn redis_backend_auto_removes_terminal_jobs_and_logs_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_terminal_auto_remove_cleanup(redis_url),
+    )
+    .await
+    .expect("Redis terminal auto-remove cleanup integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_retries_completed_jobs_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -1148,6 +1164,216 @@ async fn run_manual_active_transition_guards(redis_url: String) -> redis::RedisR
     ));
 
     cleanup_namespace(&redis_url, &namespace).await
+}
+
+async fn run_terminal_auto_remove_cleanup(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue_name = "terminal-auto-remove";
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, queue_name)
+        .expect("valid Redis URL should build the terminal-auto-remove queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let remove_on_complete = queue
+        .add_job(
+            "remove-on-complete".to_string(),
+            serde_json::json!({ "path": "complete" }),
+            JobOptions::new().remove_on_complete(true),
+        )
+        .await
+        .expect("remove-on-complete job should add");
+    queue
+        .add_log(
+            &remove_on_complete.id,
+            "complete cleanup log".to_string(),
+            10,
+            Utc::now(),
+        )
+        .await
+        .expect("remove-on-complete log should append");
+    let remove_on_complete_claim = queue
+        .claim_next(
+            "worker-auto-remove-complete".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("remove-on-complete claim should return")
+        .expect("remove-on-complete job should be claimable");
+    assert_eq!(remove_on_complete_claim.id, remove_on_complete.id);
+    let completed_snapshot = queue
+        .complete_job(
+            &remove_on_complete_claim.id,
+            lock_token(&remove_on_complete_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("remove-on-complete job should complete");
+    assert_eq!(completed_snapshot.state, JobState::Completed);
+    assert_terminal_auto_removed(
+        &queue,
+        &mut conn,
+        &namespace,
+        queue_name,
+        &remove_on_complete.id,
+    )
+    .await?;
+
+    let remove_on_fail = queue
+        .add_job(
+            "remove-on-fail".to_string(),
+            serde_json::json!({ "path": "fail" }),
+            JobOptions::new().remove_on_fail(true),
+        )
+        .await
+        .expect("remove-on-fail job should add");
+    queue
+        .add_log(
+            &remove_on_fail.id,
+            "fail cleanup log".to_string(),
+            10,
+            Utc::now(),
+        )
+        .await
+        .expect("remove-on-fail log should append");
+    let remove_on_fail_claim = queue
+        .claim_next(
+            "worker-auto-remove-fail".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("remove-on-fail claim should return")
+        .expect("remove-on-fail job should be claimable");
+    assert_eq!(remove_on_fail_claim.id, remove_on_fail.id);
+    let failed_snapshot = queue
+        .fail_job(
+            &remove_on_fail_claim.id,
+            lock_token(&remove_on_fail_claim),
+            "terminal failure".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("remove-on-fail job should fail");
+    assert_eq!(failed_snapshot.state, JobState::Failed);
+    assert_terminal_auto_removed(
+        &queue,
+        &mut conn,
+        &namespace,
+        queue_name,
+        &remove_on_fail.id,
+    )
+    .await?;
+
+    let remove_on_stalled_fail = queue
+        .add_job(
+            "remove-on-stalled-fail".to_string(),
+            serde_json::json!({ "path": "stalled" }),
+            JobOptions::new()
+                .remove_on_fail(true)
+                .with_max_stalled_count(0),
+        )
+        .await
+        .expect("remove-on-stalled-fail job should add");
+    queue
+        .add_log(
+            &remove_on_stalled_fail.id,
+            "stalled cleanup log".to_string(),
+            10,
+            Utc::now(),
+        )
+        .await
+        .expect("remove-on-stalled-fail log should append");
+    let remove_on_stalled_claim = queue
+        .claim_next(
+            "worker-auto-remove-stalled".to_string(),
+            Duration::from_millis(80),
+            Utc::now(),
+        )
+        .await
+        .expect("remove-on-stalled-fail claim should return")
+        .expect("remove-on-stalled-fail job should be claimable");
+    assert_eq!(remove_on_stalled_claim.id, remove_on_stalled_fail.id);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        queue
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("remove-on-stalled-fail recovery should mark candidate"),
+        0
+    );
+    assert_eq!(
+        queue
+            .recover_stalled_jobs(Utc::now())
+            .await
+            .expect("remove-on-stalled-fail recovery should terminally remove"),
+        1
+    );
+    assert_terminal_auto_removed(
+        &queue,
+        &mut conn,
+        &namespace,
+        queue_name,
+        &remove_on_stalled_fail.id,
+    )
+    .await?;
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
+async fn assert_terminal_auto_removed(
+    queue: &RedisJobQueue,
+    conn: &mut redis::aio::ConnectionManager,
+    namespace: &str,
+    queue_name: &str,
+    job_id: &str,
+) -> redis::RedisResult<()> {
+    assert!(queue
+        .get_job(job_id)
+        .await
+        .expect("auto-removed job lookup should return")
+        .is_none());
+
+    let stored: Option<String> = conn
+        .hget(format!("{namespace}:{queue_name}:jobs"), job_id)
+        .await?;
+    assert!(stored.is_none());
+
+    for state in [
+        "waiting",
+        "delayed",
+        "active",
+        "waiting_children",
+        "completed",
+        "failed",
+    ] {
+        let score: Option<f64> = conn
+            .zscore(format!("{namespace}:{queue_name}:{state}"), job_id)
+            .await?;
+        assert!(
+            score.is_none(),
+            "auto-removed job should not remain in the {state} index"
+        );
+    }
+
+    let lock_exists: usize = conn
+        .exists(format!("{namespace}:{queue_name}:locks:{job_id}"))
+        .await?;
+    assert_eq!(lock_exists, 0);
+    let logs_len: usize = conn
+        .llen(format!("{namespace}:{queue_name}:logs:{job_id}"))
+        .await?;
+    assert_eq!(logs_len, 0);
+    let stalled_member: bool = conn
+        .sismember(format!("{namespace}:{queue_name}:stalled"), job_id)
+        .await?;
+    assert!(!stalled_member);
+
+    Ok(())
 }
 
 async fn run_completed_retry(redis_url: String) -> redis::RedisResult<()> {
