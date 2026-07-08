@@ -1621,6 +1621,7 @@ local duplicated_child_ids = {}
 local deduplicated_child_owner_ids = {}
 local deduplicated_next_child_ids = {}
 local deduplicated_next_child_id_by_deduplication = {}
+local duplicated_parent_id = nil
 local parent_raw = ARGV[3]
 local child_raws = {}
 local child_jobs = {}
@@ -1639,17 +1640,18 @@ for index = 1, count do
   local existing_raw_by_id = redis.call('HGET', KEYS[1], id)
   if existing_raw_by_id then
     if index == 1 then
-      return {'exists', id}
+      duplicated_parent_id = id
+    else
+      local existing_child = cjson.decode(existing_raw_by_id)
+      local existing_parent_id = existing_child["parent_id"]
+      if existing_parent_id and existing_parent_id ~= cjson.null and existing_parent_id ~= ARGV[2] and redis.call('HGET', KEYS[1], existing_parent_id) then
+        return {'parent_conflict', id, existing_parent_id}
+      end
+      duplicated_child_ids[id] = true
     end
-    local existing_child = cjson.decode(existing_raw_by_id)
-    local existing_parent_id = existing_child["parent_id"]
-    if existing_parent_id and existing_parent_id ~= cjson.null and existing_parent_id ~= ARGV[2] and redis.call('HGET', KEYS[1], existing_parent_id) then
-      return {'parent_conflict', id, existing_parent_id}
-    end
-    duplicated_child_ids[id] = true
   end
   local deduplicated_id = nil
-  if not duplicated_child_ids[id] then
+  if not duplicated_child_ids[id] and not (index == 1 and duplicated_parent_id) then
     deduplicated_id = active_deduplication_id(KEYS[1], deduplication_prefix, deduplication_id)
   end
   if deduplicated_id then
@@ -1693,7 +1695,7 @@ for index = 1, count do
       end
     end
   end
-  if not skipped_job_ids[id] and not duplicated_child_ids[id] then
+  if not skipped_job_ids[id] and not duplicated_child_ids[id] and not (index == 1 and duplicated_parent_id) then
     if deduplication_id ~= '' then
       if staged_deduplication_ids[deduplication_id] then
         return {'deduplicated', staged_deduplication_ids[deduplication_id]}
@@ -1724,7 +1726,12 @@ for index = 1, count do
   local deduplication_id = ARGV[offset + 5]
   local repeat_key = ARGV[offset + 6]
 
-  if skipped_job_ids[id] then
+  if index == 1 and duplicated_parent_id then
+    local existing_parent_raw = redis.call('HGET', KEYS[1], id)
+    if existing_parent_raw then
+      redis.call('XADD', KEYS[6], 'MAXLEN', '~', max_events, '*', 'event', 'duplicated', 'jobId', id)
+    end
+  elseif skipped_job_ids[id] then
     local owner_raw = redis.call('HGET', KEYS[1], deduplicated_child_owner_ids[id])
     if owner_raw then
       emit_deduplicated_events(KEYS[6], max_events, cjson.decode(owner_raw), cjson.decode(raw))
@@ -1779,10 +1786,36 @@ for index = 1, count do
   offset = offset + per_job_args
 end
 
-if count > 1 and ARGV[4] == 'waiting_children' then
+if duplicated_parent_id then
+  local existing_parent_raw = redis.call('HGET', KEYS[1], ARGV[2])
+  if existing_parent_raw then
+    local existing_parent = cjson.decode(existing_parent_raw)
+    if not existing_parent["child_ids"] or existing_parent["child_ids"] == cjson.null then
+      existing_parent["child_ids"] = {}
+    end
+    local existing_child_ids = {}
+    for _, child_id in ipairs(existing_parent["child_ids"]) do
+      existing_child_ids[child_id] = true
+    end
+    local child_offset = 2 + per_job_args
+    for index = 2, count do
+      local child_id = ARGV[child_offset]
+      if (not skipped_job_ids[child_id] or deduplicated_next_child_ids[child_id]) and not existing_child_ids[child_id] then
+        existing_parent["child_ids"][#existing_parent["child_ids"] + 1] = child_id
+        existing_child_ids[child_id] = true
+      end
+      child_offset = child_offset + per_job_args
+    end
+    redis.call('HSET', KEYS[1], ARGV[2], cjson.encode(existing_parent))
+  end
+end
+
+if count > 1 and (ARGV[4] == 'waiting_children' or duplicated_parent_id) then
   local parent_id = ARGV[2]
   local dependency_key = dependency_prefix .. parent_id
-  redis.call('DEL', dependency_key)
+  if not duplicated_parent_id then
+    redis.call('DEL', dependency_key)
+  end
 
   local child_offset = 2 + per_job_args
   for index = 2, count do

@@ -432,11 +432,13 @@ impl InMemoryJobQueue {
         validate_flow_job_ids(&parent_job, &child_jobs)?;
 
         let mut inner = self.inner.lock().await;
-        if inner.jobs.contains_key(&parent_job.id) {
-            return Err(LaneError::ConfigError(format!(
-                "flow job id `{}` already exists",
-                parent_job.id
-            )));
+        if let Some(existing_parent) = inner.jobs.get(&parent_job.id).cloned() {
+            return Self::add_flow_for_existing_parent_locked(
+                &mut inner,
+                existing_parent,
+                child_jobs,
+                now,
+            );
         }
         let candidate_flow = JobFlow {
             parent: parent_job.clone(),
@@ -587,6 +589,161 @@ impl InMemoryJobQueue {
 
         Ok(JobFlow {
             parent: parent_job,
+            children: stored_child_jobs,
+        })
+    }
+
+    fn add_flow_for_existing_parent_locked(
+        inner: &mut InMemoryJobQueueState,
+        existing_parent: Job,
+        mut child_jobs: Vec<Job>,
+        now: DateTime<Utc>,
+    ) -> Result<JobFlow> {
+        let parent_id = existing_parent.id.clone();
+        emit_duplicated_event_locked(inner, &existing_parent, now);
+
+        let existing_child_ids = existing_parent
+            .child_ids
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut duplicated_children = HashSet::new();
+        for child in &child_jobs {
+            if let Some(existing) = inner.jobs.get(&child.id) {
+                Self::validate_existing_flow_child_parent_locked(inner, &parent_id, &child.id)?;
+                if existing_child_ids.contains(&child.id)
+                    && existing.parent_id.as_deref() != Some(parent_id.as_str())
+                {
+                    return Err(LaneError::ConfigError(format!(
+                        "flow child id `{}` already exists",
+                        child.id
+                    )));
+                }
+                duplicated_children.insert(child.id.clone());
+            } else if existing_child_ids.contains(&child.id) {
+                return Err(LaneError::ConfigError(format!(
+                    "flow child id `{}` already exists",
+                    child.id
+                )));
+            }
+        }
+
+        let mut deduplicated_children = HashMap::new();
+        let mut deduplicated_next_children = HashMap::new();
+        let mut deduplicated_next_child_by_id = HashMap::new();
+        let mut flow_deduplication_ids = HashSet::new();
+        for child in &child_jobs {
+            if duplicated_children.contains(&child.id) {
+                continue;
+            }
+            if let Some(deduplication_id) = active_deduplication_id(child, now) {
+                if let Some(existing) = find_active_deduplication_id(
+                    &inner.jobs,
+                    &inner.released_deduplication_owners,
+                    deduplication_id,
+                    now,
+                )
+                .cloned()
+                {
+                    if flow_child_deduplication_requires_next(child, &existing) {
+                        if !Self::store_deduplicated_next_locked(inner, child, &existing) {
+                            return Err(LaneError::ConfigError(format!(
+                                "flow child deduplication id `{deduplication_id}` is already active on job {}",
+                                existing.id
+                            )));
+                        }
+                        if let Some(previous_child_id) = deduplicated_next_child_by_id
+                            .insert(deduplication_id.to_string(), child.id.clone())
+                        {
+                            deduplicated_next_children.remove(&previous_child_id);
+                        }
+                        deduplicated_children.insert(child.id.clone(), existing.clone());
+                        deduplicated_next_children.insert(child.id.clone(), existing);
+                        continue;
+                    }
+                    Self::extend_deduplication_expiration_locked(
+                        &mut inner.jobs,
+                        child,
+                        &existing.id,
+                        now,
+                    );
+                    deduplicated_children.insert(child.id.clone(), existing);
+                    continue;
+                }
+                if !flow_deduplication_ids.insert(deduplication_id.to_string()) {
+                    return Err(LaneError::ConfigError(format!(
+                        "flow deduplication id `{deduplication_id}` already active"
+                    )));
+                }
+            }
+        }
+
+        let mut flow_repeat_keys = HashSet::new();
+        for child in &child_jobs {
+            if duplicated_children.contains(&child.id)
+                || deduplicated_children.contains_key(&child.id)
+                || deduplicated_next_children.contains_key(&child.id)
+            {
+                continue;
+            }
+            if let Some(repeat_key) = active_repeat_key(child) {
+                if find_active_repeat_key(&inner.jobs, repeat_key).is_some()
+                    || !flow_repeat_keys.insert(repeat_key.to_string())
+                {
+                    return Err(LaneError::ConfigError(format!(
+                        "flow repeat key `{repeat_key}` already active"
+                    )));
+                }
+            }
+        }
+
+        if let Some(parent) = inner.jobs.get_mut(&parent_id) {
+            for child in &child_jobs {
+                if deduplicated_children.contains_key(&child.id)
+                    && !deduplicated_next_children.contains_key(&child.id)
+                {
+                    continue;
+                }
+                if !parent
+                    .child_ids
+                    .iter()
+                    .any(|child_id| child_id == &child.id)
+                {
+                    parent.child_ids.push(child.id.clone());
+                }
+            }
+        }
+
+        let mut stored_child_jobs = Vec::with_capacity(child_jobs.len());
+        for child in &mut child_jobs {
+            if let Some(existing) = deduplicated_children.get(&child.id) {
+                emit_deduplicated_events_locked(inner, existing, child, now);
+            } else if duplicated_children.contains(&child.id) {
+                if let Some(existing) = inner.jobs.get_mut(&child.id) {
+                    existing.parent_id = Some(parent_id.clone());
+                    let existing = existing.clone();
+                    emit_duplicated_event_locked(inner, &existing, now);
+                    stored_child_jobs.push(existing);
+                }
+            } else {
+                assign_waiting_order(&mut inner.sequence, child);
+                Self::forget_released_deduplication_owner_locked(inner, child);
+                inner.jobs.insert(child.id.clone(), child.clone());
+                Self::emit_job_created_events_locked(inner, child, now);
+                stored_child_jobs.push(child.clone());
+            }
+        }
+        if deduplicated_next_children.is_empty() {
+            Self::release_parent_if_ready_locked(inner, &parent_id, now);
+        }
+        let parent = inner
+            .jobs
+            .get(&parent_id)
+            .cloned()
+            .unwrap_or(existing_parent);
+
+        Ok(JobFlow {
+            parent,
             children: stored_child_jobs,
         })
     }

@@ -3372,6 +3372,72 @@ async fn run_flow_duplicate_job_ids(redis_url: String) -> redis::RedisResult<()>
         Some(&serde_json::json!({ "done": true }))
     );
 
+    let parent_duplicate_queue =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-duplicate-parent")
+            .expect("valid Redis URL should build the duplicate-parent queue");
+    let parent_duplicate_first = parent_duplicate_queue
+        .add_flow_at(
+            JobSpec::new("original-parent", serde_json::json!({ "version": 1 }))
+                .with_options(JobOptions::new().with_job_id("flow-duplicate:parent-retry")),
+            vec![
+                JobSpec::new("original-child", serde_json::json!({ "child": 1 }))
+                    .with_options(JobOptions::new().with_job_id("flow-duplicate:parent-child-a")),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("first duplicate-parent flow should add");
+    let parent_duplicate_second = parent_duplicate_queue
+        .add_flow_at(
+            JobSpec::new("candidate-parent", serde_json::json!({ "version": 2 })).with_options(
+                JobOptions::new().with_job_id(parent_duplicate_first.parent.id.clone()),
+            ),
+            vec![
+                JobSpec::new("candidate-child", serde_json::json!({ "child": 2 }))
+                    .with_options(JobOptions::new().with_job_id("flow-duplicate:parent-child-b")),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("duplicate parent flow should add new child");
+    assert_eq!(
+        parent_duplicate_second.parent.id,
+        parent_duplicate_first.parent.id
+    );
+    assert_eq!(parent_duplicate_second.parent.name, "original-parent");
+    assert_eq!(parent_duplicate_second.children.len(), 1);
+    assert_eq!(
+        parent_duplicate_second.children[0].id,
+        "flow-duplicate:parent-child-b"
+    );
+    let parent_duplicate_parent = parent_duplicate_queue
+        .get_job(&parent_duplicate_first.parent.id)
+        .await
+        .expect("duplicate parent should load")
+        .expect("duplicate parent should exist");
+    assert_eq!(
+        parent_duplicate_parent.child_ids,
+        vec![
+            "flow-duplicate:parent-child-a".to_string(),
+            "flow-duplicate:parent-child-b".to_string()
+        ]
+    );
+    let parent_duplicate_counts = parent_duplicate_queue
+        .get_flow_dependency_counts(&parent_duplicate_first.parent.id)
+        .await
+        .expect("duplicate parent counts should load")
+        .expect("duplicate parent should exist");
+    assert_eq!(parent_duplicate_counts.unprocessed, 2);
+    assert_eq!(parent_duplicate_counts.processed, 0);
+    let parent_duplicate_events = parent_duplicate_queue
+        .read_events("-", "+", 20)
+        .await
+        .expect("duplicate parent events should read");
+    assert!(parent_duplicate_events.iter().any(|event| {
+        event.event == "duplicated"
+            && event.job_id.as_deref() == Some(parent_duplicate_first.parent.id.as_str())
+    }));
+
     cleanup_namespace(&redis_url, &namespace).await?;
     Ok(())
 }

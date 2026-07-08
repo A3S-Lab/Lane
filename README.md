@@ -373,7 +373,7 @@ A3S stack and language SDKs.
 | Job management API | In progress | Add/get/get-state/get-job-finished-result/get-job-counts/get-job-count/count-pending/remove/remove-repeat/upsert-repeat/remove-deduplication-key/get-deduplication-job-id/list-repeats/get-repeat/count-repeats/list-repeats-page/add-flow-children/get-flow-dependencies/get-flow-dependency-counts/get-flow-children-values/get-flow-ignored-children-failures/remove-unprocessed-children/remove-child-dependency/promote/reschedule/delay-active/release-active/retry/update-priority/update-priority-with-lifo/update-data/save-stacktrace/pause/resume/is-paused/drain/clean/obliterate APIs, multi-state pagination, ascending/descending listing, waiting priority counts, add-log/get-logs/clear-job-logs, read-events/trim-events, progress updates, single and bulk lease renewal, Redis terminal metrics. |
 | Worker runtime | In progress | `JobWorker` claims jobs from any `JobQueueBackend`, uses backend-native blocking claim hooks when available, routes jobs by name with `JobProcessorRouter`, runs async processors, completes/fails jobs, supports processor progress/log updates, cooperative lease-loss checks, timeouts, shared batch lease renewal for background loops, and stalled recovery loops. |
 | Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, FIFO/LIFO waiting score ordering, BullMQ-style Redis worker marker zset updates, Redis marker-backed blocking claim, Redis stream queue events, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership, Redis-backed repeat scheduler zset/hash metadata, listing/removal/upsert/pagination, static flow submission, dynamic flow child fan-out, flow dependency inspection, flow child-value and ignored-failure reads, dynamic flow child deduplication skip and keep-last materialization, flow parent and active flow-child keep-last materialization, delayed promotion and rescheduling, active-to-wait/delayed movement, single-job promote, state-index and finished-result queries, job count snapshots, terminal metrics, manual retry, priority update, progress update, stacktrace update, log append, list/stat snapshots, finished-job age/count retention during complete/fail/stalled scripts, drain, clean, obliterate, claim, Redis-shared rate limit, max-active, flow parent release/failure events, repeat successor enqueue, complete, fail, renew, remove, and stalled candidate-set recovery semantics. Postgres/NATS backends remain planned. |
-| Flow jobs | In progress | Parent-child dependencies, waiting-children state, dependency inspection, child return-value inspection, ignored, removed, continued, and fail-parent child-failure release, static and dynamic fan-out, fan-in release, flow parent deduplication events, static and dynamic ordinary flow child deduplication skip semantics, active flow-child keep-last deduplication materialization, BullMQ-style existing child custom job-id attachment with `duplicated` events, in-memory/local flow-parent keep-last deduplication, and Redis flow-parent keep-last materialization on active parent completion, terminal failure, or stalled terminal failure are available. |
+| Flow jobs | In progress | Parent-child dependencies, waiting-children state, dependency inspection, child return-value inspection, ignored, removed, continued, and fail-parent child-failure release, static and dynamic fan-out, fan-in release, flow parent deduplication events, static and dynamic ordinary flow child deduplication skip semantics, active flow-child keep-last deduplication materialization, BullMQ-style existing parent and child custom job-id attachment with `duplicated` events, in-memory/local flow-parent keep-last deduplication, and Redis flow-parent keep-last materialization on active parent completion, terminal failure, or stalled terminal failure are available. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, end timestamps, repeat-key removal, upsert, single-key lookup, counts, and BullMQ-style next-time pagination are available across in-memory, local durable, and Redis backends. Redis additionally maintains scheduler zset/hash metadata in Lua so distributed readers and writers share one repeat-series state machine. |
 | SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
 
@@ -571,6 +571,10 @@ failures keep the parent blocked until the child retries and reaches a terminal
 outcome. Active parent jobs can also call `add_flow_children()` with their lock
 token to atomically add children and move themselves to `waiting_children`; this
 is the dynamic planner/fan-out shape behind BullMQ's `moveToWaitingChildren()`.
+When a submitted flow parent uses an existing custom job id, Lane follows
+BullMQ's `addParentJob` duplicate path: the stored parent data is kept,
+`duplicated` is emitted for the parent id, and the submitted children are still
+added, attached, deduplicated, or skipped according to the normal child rules.
 When a dynamically added child uses an existing custom job id, Lane keeps the
 existing child data, emits `duplicated`, updates `parent_id`, records a pending
 dependency for non-completed children, and lets completed children satisfy the
@@ -1245,16 +1249,20 @@ positive TTL and a retained job record remain valid deduplication owners until
 Redis expires the key.
 
 Redis flow submission is all-or-nothing: the flow add script writes the parent,
-new children, existing-child attachments, state indexes, queue events, and the
-parent's pending dependency set in one Redis turn. Duplicate ids inside the same
-submitted flow are rejected, and an existing parent id is still rejected. An
-existing child custom job id follows BullMQ's `handleDuplicatedJob` path when it
-has no conflicting retained parent: Lane keeps the original child data, updates
-its `parent_id`, emits `duplicated`, adds non-completed children to the new
-parent dependency set, and lets an already completed child satisfy the dependency
-immediately so the parent can leave `waiting_children` in the same turn. If the
-existing child still belongs to a different retained parent, the flow add returns
-a parent-conflict error without creating partial records. If a child candidate
+new children, existing-parent and existing-child attachments, state indexes,
+queue events, and the parent's pending dependency set in one Redis turn.
+Duplicate ids inside the same submitted flow are rejected. An existing parent
+custom job id follows BullMQ's `addParentJob` duplicate path: Lane keeps the
+stored parent snapshot, emits `duplicated`, preserves the current dependency set,
+and adds only the submitted children that are new, duplicated for that parent, or
+deduplication keep-last placeholders. An existing child custom job id follows
+BullMQ's `handleDuplicatedJob` path when it has no conflicting retained parent:
+Lane keeps the original child data, updates its `parent_id`, emits `duplicated`,
+adds non-completed children to the new parent dependency set, and lets an
+already completed child satisfy the dependency immediately so the parent can
+leave `waiting_children` in the same turn. If the existing child still belongs
+to a different retained parent, the flow add returns a parent-conflict error
+without creating partial records. If a child candidate
 deduplicates against an existing owner, the add script handles that before
 dependency insertion: ordinary candidates are skipped, the existing owner is not
 attached to the new parent, and the returned flow contains only the children that
