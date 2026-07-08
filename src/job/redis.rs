@@ -8778,23 +8778,68 @@ if count < 1 then
   count = 1
 end
 
+local parent = cjson.decode(parent_raw)
+
+local function append_retained_dependency_fallback(entries, kind)
+  if cursor ~= 0 then
+    return entries
+  end
+
+  local has_dependency_set = redis.call('EXISTS', KEYS[2]) == 1
+  for _, child_id in ipairs(parent['child_ids'] or {}) do
+    local is_pending = redis.call('SISMEMBER', KEYS[2], child_id) == 1
+    local is_indexed =
+      is_pending
+      or redis.call('HEXISTS', KEYS[3], child_id) == 1
+      or redis.call('HEXISTS', KEYS[4], child_id) == 1
+      or redis.call('ZSCORE', KEYS[5], child_id)
+
+    if not is_indexed then
+      local child_raw = redis.call('HGET', KEYS[1], child_id)
+      if child_raw then
+        local child = cjson.decode(child_raw)
+        if kind == 'processed' and child["state"] == "completed" then
+          local return_value = child["return_value"]
+          if return_value == nil then
+            return_value = cjson.null
+          end
+          entries[#entries + 1] = child_id
+          entries[#entries + 1] = cjson.encode(return_value)
+        elseif kind == 'unprocessed' and not has_dependency_set and child["state"] ~= "completed" and child["state"] ~= "failed" then
+          entries[#entries + 1] = child_id
+        elseif kind == 'ignored' and child["state"] == "failed" and child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["continue_parent_on_failure"] == true) then
+          entries[#entries + 1] = child_id
+          entries[#entries + 1] = child["failed_reason"] or ""
+        elseif kind == 'failed' and child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["continue_parent_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true)) then
+          entries[#entries + 1] = child_id
+        end
+      end
+    end
+  end
+
+  return entries
+end
+
 local result = {'ok', kind}
 if kind == 'processed' then
   local scanned = redis.call('HSCAN', KEYS[3], cursor, 'COUNT', count)
   result[#result + 1] = tostring(scanned[1])
-  for _, entry in ipairs(scanned[2]) do
+  local entries = append_retained_dependency_fallback(scanned[2], kind)
+  for _, entry in ipairs(entries) do
     result[#result + 1] = entry
   end
 elseif kind == 'unprocessed' then
   local scanned = redis.call('SSCAN', KEYS[2], cursor, 'COUNT', count)
   result[#result + 1] = tostring(scanned[1])
-  for _, entry in ipairs(scanned[2]) do
+  local entries = append_retained_dependency_fallback(scanned[2], kind)
+  for _, entry in ipairs(entries) do
     result[#result + 1] = entry
   end
 elseif kind == 'ignored' then
   local scanned = redis.call('HSCAN', KEYS[4], cursor, 'COUNT', count)
   result[#result + 1] = tostring(scanned[1])
-  for _, entry in ipairs(scanned[2]) do
+  local entries = append_retained_dependency_fallback(scanned[2], kind)
+  for _, entry in ipairs(entries) do
     result[#result + 1] = entry
   end
 elseif kind == 'failed' then
@@ -8815,6 +8860,7 @@ elseif kind == 'failed' then
   end
 
   result[#result + 1] = tostring(next_cursor)
+  entries = append_retained_dependency_fallback(entries, kind)
   for _, entry in ipairs(entries) do
     result[#result + 1] = entry
   end
@@ -8834,6 +8880,47 @@ end
 local result = {'ok'}
 local request_count = math.floor((#ARGV - 1) / 3)
 result[#result + 1] = tostring(request_count)
+local parent = cjson.decode(parent_raw)
+
+local function append_retained_dependency_fallback(entries, kind, cursor)
+  if cursor ~= 0 then
+    return entries
+  end
+
+  local has_dependency_set = redis.call('EXISTS', KEYS[2]) == 1
+  for _, child_id in ipairs(parent['child_ids'] or {}) do
+    local is_pending = redis.call('SISMEMBER', KEYS[2], child_id) == 1
+    local is_indexed =
+      is_pending
+      or redis.call('HEXISTS', KEYS[3], child_id) == 1
+      or redis.call('HEXISTS', KEYS[4], child_id) == 1
+      or redis.call('ZSCORE', KEYS[5], child_id)
+
+    if not is_indexed then
+      local child_raw = redis.call('HGET', KEYS[1], child_id)
+      if child_raw then
+        local child = cjson.decode(child_raw)
+        if kind == 'processed' and child["state"] == "completed" then
+          local return_value = child["return_value"]
+          if return_value == nil then
+            return_value = cjson.null
+          end
+          entries[#entries + 1] = child_id
+          entries[#entries + 1] = cjson.encode(return_value)
+        elseif kind == 'unprocessed' and not has_dependency_set and child["state"] ~= "completed" and child["state"] ~= "failed" then
+          entries[#entries + 1] = child_id
+        elseif kind == 'ignored' and child["state"] == "failed" and child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["continue_parent_on_failure"] == true) then
+          entries[#entries + 1] = child_id
+          entries[#entries + 1] = child["failed_reason"] or ""
+        elseif kind == 'failed' and child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["continue_parent_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true)) then
+          entries[#entries + 1] = child_id
+        end
+      end
+    end
+  end
+
+  return entries
+end
 
 local function append_scan_page(kind, next_cursor, entries, count)
   result[#result + 1] = kind
@@ -8856,13 +8943,13 @@ for request_index = 0, request_count - 1 do
 
   if kind == 'processed' then
     local scanned = redis.call('HSCAN', KEYS[3], cursor, 'COUNT', count)
-    append_scan_page(kind, scanned[1], scanned[2], count)
+    append_scan_page(kind, scanned[1], append_retained_dependency_fallback(scanned[2], kind, cursor), count)
   elseif kind == 'unprocessed' then
     local scanned = redis.call('SSCAN', KEYS[2], cursor, 'COUNT', count)
-    append_scan_page(kind, scanned[1], scanned[2], count)
+    append_scan_page(kind, scanned[1], append_retained_dependency_fallback(scanned[2], kind, cursor), count)
   elseif kind == 'ignored' then
     local scanned = redis.call('HSCAN', KEYS[4], cursor, 'COUNT', count)
-    append_scan_page(kind, scanned[1], scanned[2], count)
+    append_scan_page(kind, scanned[1], append_retained_dependency_fallback(scanned[2], kind, cursor), count)
   elseif kind == 'failed' then
     local total = redis.call('ZCARD', KEYS[5])
     local start = cursor
@@ -8880,7 +8967,7 @@ for request_index = 0, request_count - 1 do
       next_cursor = start + #entries
     end
 
-    append_scan_page(kind, next_cursor, entries, count)
+    append_scan_page(kind, next_cursor, append_retained_dependency_fallback(entries, kind, cursor), count)
   else
     return {'invalid_kind', kind}
   end
@@ -13949,6 +14036,10 @@ mod tests {
         assert!(FLOW_DEPENDENCY_VALUES_SCRIPT
             .contains("for _, child_id in ipairs(parent['child_ids'] or {}) do"));
         assert!(FLOW_DEPENDENCY_VALUES_SCRIPT.contains("redis.call('HGET', KEYS[1], child_id)"));
+        assert!(FLOW_DEPENDENCY_PAGE_SCRIPT.contains("append_retained_dependency_fallback"));
+        assert!(FLOW_DEPENDENCY_PAGE_SCRIPT.contains("if cursor ~= 0 then"));
+        assert!(FLOW_DEPENDENCY_PAGES_SCRIPT.contains("append_retained_dependency_fallback"));
+        assert!(FLOW_DEPENDENCY_PAGES_SCRIPT.contains("if cursor ~= 0 then"));
         assert!(FLOW_DEPENDENCY_PAGE_SCRIPT.contains("redis.call('HSCAN', KEYS[3]"));
         assert!(FLOW_DEPENDENCY_PAGE_SCRIPT.contains("redis.call('SSCAN', KEYS[2]"));
         assert!(FLOW_DEPENDENCY_PAGE_SCRIPT.contains("redis.call('HSCAN', KEYS[4]"));

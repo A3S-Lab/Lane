@@ -1392,7 +1392,10 @@ available.
 the BullMQ result order and reads all requested buckets in one Lua turn instead
 of stitching together multiple client round trips. The `count` option is a Redis
 scan hint for hash and set buckets, just like BullMQ; callers should keep reading
-with the returned cursor until it becomes `0`.
+with the returned cursor until it becomes `0`. For mixed upgrade data, the
+initial `cursor = 0` page also appends retained child snapshot fallback entries
+that are not covered by side indexes; later cursor pages remain pure Redis
+cursor scans.
 When a child completes, fails with `ignore_dependency_on_failure` or
 `continue_parent_on_failure`, fails with `fail_parent_on_failure`, or when a
 static flow or active parent fan-out reuses an existing completed child by custom

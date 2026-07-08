@@ -3728,6 +3728,105 @@ async fn run_flow_side_index_snapshot_merge(redis_url: String) -> redis::RedisRe
     assert!(values.unprocessed.is_empty());
     assert!(values.failed.is_empty());
 
+    let processed_page = queue
+        .get_flow_dependency_page(
+            &flow.parent.id,
+            JobFlowDependencyPageOptions::new(JobFlowDependencyKind::Processed).with_count(20),
+        )
+        .await
+        .expect("merged processed dependency page should load")
+        .expect("merged processed dependency page should exist");
+    let processed_page_values = processed_page
+        .items
+        .iter()
+        .map(|item| match item {
+            JobFlowDependencyPageItem::Processed { child_id, value } => (
+                child_id.clone(),
+                value["value"].as_str().unwrap().to_string(),
+            ),
+            other => panic!("unexpected processed dependency page item: {other:?}"),
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        processed_page_values,
+        BTreeSet::from([
+            (flow.children[0].id.clone(), "legacy-completed".to_string()),
+            (flow.children[2].id.clone(), "indexed-completed".to_string()),
+        ])
+    );
+
+    let ignored_page = queue
+        .get_flow_dependency_page(
+            &flow.parent.id,
+            JobFlowDependencyPageOptions::new(JobFlowDependencyKind::Ignored).with_count(20),
+        )
+        .await
+        .expect("merged ignored dependency page should load")
+        .expect("merged ignored dependency page should exist");
+    let ignored_page_values = ignored_page
+        .items
+        .iter()
+        .map(|item| match item {
+            JobFlowDependencyPageItem::Ignored {
+                child_id,
+                failed_reason,
+            } => (child_id.clone(), failed_reason.clone()),
+            other => panic!("unexpected ignored dependency page item: {other:?}"),
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        ignored_page_values,
+        BTreeSet::from([
+            (
+                flow.children[1].id.clone(),
+                "legacy ignored failure".to_string()
+            ),
+            (
+                flow.children[3].id.clone(),
+                "indexed ignored failure".to_string()
+            ),
+        ])
+    );
+
+    let pages = queue
+        .get_flow_dependency_pages(
+            &flow.parent.id,
+            JobFlowDependencyPagesOptions::new()
+                .with_processed(JobFlowDependencyPageCursor::new().with_count(20))
+                .with_ignored(JobFlowDependencyPageCursor::new().with_count(20)),
+        )
+        .await
+        .expect("merged dependency pages should load")
+        .expect("merged dependency pages should exist");
+    let multi_processed_values = pages
+        .get(JobFlowDependencyKind::Processed)
+        .expect("processed multi page should exist")
+        .items
+        .iter()
+        .map(|item| match item {
+            JobFlowDependencyPageItem::Processed { child_id, value } => (
+                child_id.clone(),
+                value["value"].as_str().unwrap().to_string(),
+            ),
+            other => panic!("unexpected multi processed dependency item: {other:?}"),
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(multi_processed_values, processed_page_values);
+    let multi_ignored_values = pages
+        .get(JobFlowDependencyKind::Ignored)
+        .expect("ignored multi page should exist")
+        .items
+        .iter()
+        .map(|item| match item {
+            JobFlowDependencyPageItem::Ignored {
+                child_id,
+                failed_reason,
+            } => (child_id.clone(), failed_reason.clone()),
+            other => panic!("unexpected multi ignored dependency item: {other:?}"),
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(multi_ignored_values, ignored_page_values);
+
     cleanup_namespace(&redis_url, &namespace).await
 }
 
