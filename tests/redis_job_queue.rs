@@ -103,6 +103,22 @@ async fn redis_backend_reads_job_finished_results_against_real_server() {
 }
 
 #[tokio::test]
+async fn redis_backend_removes_orphaned_jobs_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_orphaned_job_removal(redis_url),
+    )
+    .await
+    .expect("Redis orphaned-job removal integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_saves_stacktrace_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -1551,6 +1567,106 @@ async fn run_job_finished_results(redis_url: String) -> redis::RedisResult<()> {
             .expect("missing finished status should load"),
         None
     );
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
+async fn run_orphaned_job_removal(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "orphan-clean")
+        .expect("valid Redis URL should build the orphan-clean queue");
+    let referenced = queue
+        .add_job(
+            "referenced".to_string(),
+            serde_json::json!({ "kind": "referenced" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("referenced job should add");
+    let stalled = queue
+        .add_job(
+            "stalled-reference".to_string(),
+            serde_json::json!({ "kind": "stalled" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("stalled-reference job should add");
+    let orphaned = queue
+        .add_job(
+            "orphaned".to_string(),
+            serde_json::json!({ "kind": "orphaned" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("orphaned job should add");
+    queue
+        .add_log(&orphaned.id, "orphaned log".to_string(), 10, Utc::now())
+        .await
+        .expect("orphaned log should append");
+
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let waiting_key = format!("{namespace}:orphan-clean:waiting");
+    let jobs_key = format!("{namespace}:orphan-clean:jobs");
+    let stalled_key = format!("{namespace}:orphan-clean:stalled");
+    let orphaned_logs_key = format!("{namespace}:orphan-clean:logs:{}", orphaned.id);
+    let orphaned_dependencies_key =
+        format!("{namespace}:orphan-clean:dependencies:{}", orphaned.id);
+    let orphaned_lock_key = format!("{namespace}:orphan-clean:locks:{}", orphaned.id);
+
+    let _: usize = conn.zrem(&waiting_key, &orphaned.id).await?;
+    let _: usize = conn.zrem(&waiting_key, &stalled.id).await?;
+    let _: usize = conn.sadd(&stalled_key, &stalled.id).await?;
+    let _: usize = conn.sadd(&orphaned_dependencies_key, "stale-child").await?;
+    let _: () = conn.set(&orphaned_lock_key, "stale-lock").await?;
+
+    let removed = queue
+        .remove_orphaned_jobs(1, 1)
+        .await
+        .expect("orphaned job cleanup should run");
+    assert_eq!(removed, 1);
+    let orphaned_hash: Option<String> = conn.hget(&jobs_key, &orphaned.id).await?;
+    assert!(orphaned_hash.is_none());
+    let orphaned_logs_len: usize = conn.llen(&orphaned_logs_key).await?;
+    assert_eq!(orphaned_logs_len, 0);
+    let orphaned_dependencies_exists: usize = conn.exists(&orphaned_dependencies_key).await?;
+    assert_eq!(orphaned_dependencies_exists, 0);
+    let orphaned_lock_exists: usize = conn.exists(&orphaned_lock_key).await?;
+    assert_eq!(orphaned_lock_exists, 0);
+
+    assert!(queue
+        .get_job(&referenced.id)
+        .await
+        .expect("referenced job lookup should return")
+        .is_some());
+    assert!(queue
+        .get_job(&stalled.id)
+        .await
+        .expect("stalled-reference job lookup should return")
+        .is_some());
+
+    let no_more = queue
+        .remove_orphaned_jobs(1, 0)
+        .await
+        .expect("second orphaned job cleanup should run");
+    assert_eq!(no_more, 0);
+
+    let _: usize = conn.srem(&stalled_key, &stalled.id).await?;
+    let removed_after_stalled_clear = queue
+        .remove_orphaned_jobs(1, 0)
+        .await
+        .expect("stalled-clear orphaned job cleanup should run");
+    assert_eq!(removed_after_stalled_clear, 1);
+    let stalled_hash: Option<String> = conn.hget(&jobs_key, &stalled.id).await?;
+    assert!(stalled_hash.is_none());
+    assert!(queue
+        .get_job(&referenced.id)
+        .await
+        .expect("referenced job lookup after cleanup should return")
+        .is_some());
 
     cleanup_namespace(&redis_url, &namespace).await
 }

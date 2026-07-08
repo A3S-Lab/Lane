@@ -8005,6 +8005,67 @@ end
 return removed_jobs
 "#;
 
+const REMOVE_ORPHANED_JOBS_SCRIPT: &str = r#"
+local jobs_key = KEYS[1]
+local cursor = ARGV[1]
+local scan_count = tonumber(ARGV[2]) or 1000
+local limit = tonumber(ARGV[3]) or 0
+local dependencies_prefix = ARGV[4]
+local logs_prefix = ARGV[5]
+local lock_prefix = ARGV[6]
+
+if scan_count <= 0 then
+  scan_count = 1000
+end
+
+local reference_key_types = {}
+for index = 2, #KEYS do
+  reference_key_types[index] = redis.call('TYPE', KEYS[index])['ok']
+end
+
+local page = redis.call('HSCAN', jobs_key, cursor, 'COUNT', scan_count)
+local next_cursor = page[1]
+local entries = page[2]
+local removed_count = 0
+
+for index = 1, #entries, 2 do
+  if limit > 0 and removed_count >= limit then
+    break
+  end
+
+  local job_id = entries[index]
+  local referenced = false
+
+  for key_index = 2, #KEYS do
+    local key_type = reference_key_types[key_index]
+    if key_type == 'zset' then
+      if redis.call('ZSCORE', KEYS[key_index], job_id) then
+        referenced = true
+        break
+      end
+    elseif key_type == 'set' then
+      if redis.call('SISMEMBER', KEYS[key_index], job_id) == 1 then
+        referenced = true
+        break
+      end
+    elseif key_type == 'list' then
+      if redis.call('LPOS', KEYS[key_index], job_id) then
+        referenced = true
+        break
+      end
+    end
+  end
+
+  if not referenced then
+    redis.call('HDEL', jobs_key, job_id)
+    redis.call('DEL', dependencies_prefix .. job_id, logs_prefix .. job_id, lock_prefix .. job_id)
+    removed_count = removed_count + 1
+  end
+end
+
+return {next_cursor, removed_count}
+"#;
+
 const LIST_JOBS_SCRIPT: &str = r#"
 local function iso_sort_key(value)
   if not value or value == cjson.null then
@@ -10033,6 +10094,61 @@ impl RedisJobQueue {
             .await
             .map_err(redis_error)?;
         decode_metrics_result(&result, state)
+    }
+
+    /// Remove retained job records that are no longer referenced by Redis indexes.
+    ///
+    /// This is a Redis maintenance helper for BullMQ-style orphan cleanup. It
+    /// scans the Lane job hash in batches, checks the lifecycle indexes and the
+    /// stalled candidate set atomically for each candidate, and deletes only job
+    /// hash fields that have no Redis-side reference. A `count` of zero uses a
+    /// scan count of 1000. A `limit` of zero removes every orphan found by the
+    /// scan; otherwise no more than `limit` jobs are removed.
+    pub async fn remove_orphaned_jobs(&self, count: usize, limit: usize) -> Result<usize> {
+        let mut conn = self.connection().await?;
+        let scan_count = if count == 0 { 1000 } else { count };
+        let mut cursor = 0_u64;
+        let mut total_removed = 0_usize;
+
+        loop {
+            let remaining = if limit == 0 {
+                0
+            } else {
+                limit.saturating_sub(total_removed)
+            };
+            if limit > 0 && remaining == 0 {
+                break;
+            }
+
+            let (next_cursor, removed): (u64, usize) = redis::cmd("EVAL")
+                .arg(REMOVE_ORPHANED_JOBS_SCRIPT)
+                .arg(8)
+                .arg(self.jobs_key())
+                .arg(self.state_key(JobState::Waiting))
+                .arg(self.state_key(JobState::Delayed))
+                .arg(self.state_key(JobState::Active))
+                .arg(self.state_key(JobState::WaitingChildren))
+                .arg(self.state_key(JobState::Completed))
+                .arg(self.state_key(JobState::Failed))
+                .arg(self.stalled_key())
+                .arg(cursor)
+                .arg(scan_count)
+                .arg(remaining)
+                .arg(self.dependencies_key_prefix())
+                .arg(self.logs_key_prefix())
+                .arg(self.lock_key_prefix())
+                .query_async(&mut conn)
+                .await
+                .map_err(redis_error)?;
+
+            total_removed = total_removed.saturating_add(removed);
+            if next_cursor == 0 || (limit > 0 && total_removed >= limit) {
+                break;
+            }
+            cursor = next_cursor;
+        }
+
+        Ok(total_removed)
     }
 
     async fn connection(&self) -> Result<ConnectionManager> {
@@ -12898,6 +13014,17 @@ mod tests {
         assert!(RELEASE_ACTIVE_JOB_SCRIPT.contains("redis.call('SREM', KEYS[7], ARGV[1])"));
         assert!(RECOVER_STALLED_SCRIPT
             .contains("emit_parent_waiting_children_transition_event(KEYS[12], ARGV[12]"));
+    }
+
+    #[test]
+    fn orphaned_job_cleanup_scans_hash_and_checks_redis_references() {
+        assert!(REMOVE_ORPHANED_JOBS_SCRIPT.contains("redis.call('HSCAN', jobs_key"));
+        assert!(REMOVE_ORPHANED_JOBS_SCRIPT.contains("redis.call('ZSCORE', KEYS[key_index]"));
+        assert!(REMOVE_ORPHANED_JOBS_SCRIPT.contains("redis.call('SISMEMBER', KEYS[key_index]"));
+        assert!(REMOVE_ORPHANED_JOBS_SCRIPT.contains("redis.call('HDEL', jobs_key, job_id)"));
+        assert!(
+            REMOVE_ORPHANED_JOBS_SCRIPT.contains("redis.call('DEL', dependencies_prefix .. job_id")
+        );
     }
 
     #[test]
