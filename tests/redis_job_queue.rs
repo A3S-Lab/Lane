@@ -1908,6 +1908,187 @@ async fn run_dynamic_flow_children(redis_url: String) -> redis::RedisResult<()> 
         .expect("dynamic parent should be claimable after children complete");
     assert_eq!(claimed_parent.id, parent.id);
 
+    let reuse_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-dynamic-reuse")
+        .expect("valid Redis URL should build the dynamic reuse queue");
+    let existing = reuse_queue
+        .add_job(
+            "existing-child".to_string(),
+            serde_json::json!({ "original": true }),
+            JobOptions::new().with_job_id("flow-dynamic:existing-child"),
+        )
+        .await
+        .expect("existing dynamic child should add");
+    let reuse_parent = reuse_queue
+        .add_job(
+            "planner".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_priority(1),
+        )
+        .await
+        .expect("dynamic reuse parent should add");
+    let active_reuse_parent = reuse_queue
+        .claim_next(
+            "worker-dynamic-reuse-parent".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("dynamic reuse parent claim should return")
+        .expect("dynamic reuse parent should be claimable");
+    assert_eq!(active_reuse_parent.id, reuse_parent.id);
+    let reused_children = reuse_queue
+        .add_flow_children_at(
+            &active_reuse_parent.id,
+            lock_token(&active_reuse_parent),
+            vec![
+                JobSpec::new("candidate-child", serde_json::json!({ "candidate": true }))
+                    .with_options(JobOptions::new().with_job_id(existing.id.clone())),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("dynamic flow should reuse existing child id");
+    assert_eq!(reused_children.len(), 1);
+    assert_eq!(reused_children[0].id, existing.id);
+    assert_eq!(reused_children[0].name, "existing-child");
+    assert_eq!(
+        reused_children[0].payload,
+        serde_json::json!({ "original": true })
+    );
+    assert_eq!(
+        reused_children[0].parent_id.as_deref(),
+        Some(reuse_parent.id.as_str())
+    );
+    let reuse_dependency_key = format!(
+        "{namespace}:flow-dynamic-reuse:dependencies:{}",
+        reuse_parent.id
+    );
+    let reuse_pending_count: usize = conn.scard(&reuse_dependency_key).await?;
+    assert_eq!(reuse_pending_count, 1);
+    let reuse_counts = reuse_queue
+        .get_flow_dependency_counts(&reuse_parent.id)
+        .await
+        .expect("dynamic reuse dependency counts should load")
+        .expect("dynamic reuse parent should exist");
+    assert_eq!(reuse_counts.unprocessed, 1);
+    assert_eq!(reuse_counts.processed, 0);
+    let duplicated_events = reuse_queue
+        .read_events("-", "+", 20)
+        .await
+        .expect("dynamic reuse events should read")
+        .into_iter()
+        .filter(|event| {
+            event.event == "duplicated" && event.job_id.as_deref() == Some(existing.id.as_str())
+        })
+        .count();
+    assert_eq!(duplicated_events, 1);
+    let reused_claim = reuse_queue
+        .claim_next(
+            "worker-dynamic-reuse-child".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("dynamic reused child claim should return")
+        .expect("dynamic reused child should be claimable");
+    assert_eq!(reused_claim.id, existing.id);
+    reuse_queue
+        .complete_job(
+            &reused_claim.id,
+            lock_token(&reused_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("dynamic reused child should complete");
+    assert_eq!(
+        reuse_queue
+            .get_job(&reuse_parent.id)
+            .await
+            .expect("dynamic reuse parent should load")
+            .expect("dynamic reuse parent should exist")
+            .state,
+        JobState::Waiting
+    );
+
+    let completed_reuse_queue =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-dynamic-completed")
+            .expect("valid Redis URL should build the dynamic completed reuse queue");
+    let completed_existing = completed_reuse_queue
+        .add_job(
+            "completed-child".to_string(),
+            serde_json::json!({ "original": true }),
+            JobOptions::new().with_job_id("flow-dynamic:completed-child"),
+        )
+        .await
+        .expect("dynamic completed child should add");
+    let completed_existing_claim = completed_reuse_queue
+        .claim_next(
+            "worker-dynamic-completed-child".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("dynamic completed child claim should return")
+        .expect("dynamic completed child should be claimable");
+    completed_reuse_queue
+        .complete_job(
+            &completed_existing_claim.id,
+            lock_token(&completed_existing_claim),
+            serde_json::json!({ "done": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("dynamic completed child should finish");
+    let completed_parent = completed_reuse_queue
+        .add_job(
+            "planner".to_string(),
+            serde_json::json!({}),
+            JobOptions::new().with_priority(1),
+        )
+        .await
+        .expect("dynamic completed parent should add");
+    let active_completed_parent = completed_reuse_queue
+        .claim_next(
+            "worker-dynamic-completed-parent".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("dynamic completed parent claim should return")
+        .expect("dynamic completed parent should be claimable");
+    assert_eq!(active_completed_parent.id, completed_parent.id);
+    let completed_reused_children = completed_reuse_queue
+        .add_flow_children_at(
+            &active_completed_parent.id,
+            lock_token(&active_completed_parent),
+            vec![JobSpec::new("candidate-child", serde_json::json!({}))
+                .with_options(JobOptions::new().with_job_id(completed_existing.id.clone()))],
+            Utc::now(),
+        )
+        .await
+        .expect("dynamic flow should reuse completed child id");
+    assert_eq!(completed_reused_children.len(), 1);
+    assert_eq!(completed_reused_children[0].id, completed_existing.id);
+    assert_eq!(completed_reused_children[0].state, JobState::Completed);
+    let completed_released_parent = completed_reuse_queue
+        .get_job(&completed_parent.id)
+        .await
+        .expect("dynamic completed parent should load")
+        .expect("dynamic completed parent should exist");
+    assert_eq!(completed_released_parent.state, JobState::Waiting);
+    assert_eq!(
+        completed_released_parent.child_ids,
+        vec![completed_existing.id.clone()]
+    );
+    let completed_reuse_counts = completed_reuse_queue
+        .get_flow_dependency_counts(&completed_parent.id)
+        .await
+        .expect("dynamic completed dependency counts should load")
+        .expect("dynamic completed parent should exist");
+    assert_eq!(completed_reuse_counts.processed, 1);
+    assert_eq!(completed_reuse_counts.unprocessed, 0);
+
     cleanup_namespace(&redis_url, &namespace).await
 }
 

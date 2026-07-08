@@ -1862,6 +1862,37 @@ local function refresh_delay_marker(marker_key, delayed_key)
   end
 end
 
+local function release_parent_if_no_pending_dependencies(parent_id, dependency_key, waiting_score_bucket, max_events)
+  if redis.call('SCARD', dependency_key) ~= 0 then
+    return
+  end
+
+  local parent_raw = redis.call('HGET', KEYS[1], parent_id)
+  if not parent_raw then
+    return
+  end
+
+  local parent = cjson.decode(parent_raw)
+  if parent["state"] ~= "waiting_children" then
+    return
+  end
+
+  redis.call('DEL', dependency_key)
+  redis.call('ZREM', KEYS[4], parent_id)
+  parent["processed_at"] = cjson.null
+  parent["finished_at"] = cjson.null
+  parent["worker_id"] = cjson.null
+  parent["lock_token"] = cjson.null
+  parent["lease_expires_at"] = cjson.null
+  parent["deferred_failure"] = cjson.null
+  parent["failed_reason"] = cjson.null
+  parent["state"] = "waiting"
+
+  local priority = tonumber(parent["priority"] or '1000') or 1000
+  enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[6], parent, parent_id, priority, waiting_score_bucket, KEYS[9])
+  redis.call('XADD', KEYS[7], 'MAXLEN', '~', max_events, '*', 'event', 'waiting', 'jobId', parent_id, 'prev', 'waiting-children')
+end
+
 local function active_deduplication_id(jobs_key, deduplication_prefix, deduplication_id)
   if not deduplication_id or deduplication_id == '' then
     return nil
@@ -2090,6 +2121,7 @@ local dependency_key = dependency_prefix .. parent_id
 local staged_ids = {}
 local staged_deduplication_ids = {}
 local staged_repeat_keys = {}
+local duplicated_child_ids = {}
 local existing_child_ids = {}
 
 for _, child_id in ipairs(parent["child_ids"] or {}) do
@@ -2100,31 +2132,44 @@ for index = 1, count do
   local id = ARGV[offset]
   local deduplication_id = ARGV[offset + 5]
   local repeat_key = ARGV[offset + 6]
-  if id == parent_id or staged_ids[id] or existing_child_ids[id] or redis.call('HGET', KEYS[1], id) then
+  local existing_raw_by_id = redis.call('HGET', KEYS[1], id)
+  if id == parent_id or staged_ids[id] then
+    return {'exists', id}
+  end
+  if existing_raw_by_id then
+    local existing_child = cjson.decode(existing_raw_by_id)
+    local existing_parent_id = existing_child["parent_id"]
+    if existing_parent_id and existing_parent_id ~= cjson.null and existing_parent_id ~= parent_id and redis.call('HGET', KEYS[1], existing_parent_id) then
+      return {'parent_conflict', id, existing_parent_id}
+    end
+    duplicated_child_ids[id] = true
+  elseif existing_child_ids[id] then
     return {'exists', id}
   end
   staged_ids[id] = true
 
-  local deduplicated_id = active_deduplication_id(KEYS[1], deduplication_prefix, deduplication_id)
-  if deduplicated_id then
-    return {'deduplicated', deduplicated_id}
-  end
-  if deduplication_id ~= '' then
-    if staged_deduplication_ids[deduplication_id] then
-      return {'deduplicated', staged_deduplication_ids[deduplication_id]}
+  if not duplicated_child_ids[id] then
+    local deduplicated_id = active_deduplication_id(KEYS[1], deduplication_prefix, deduplication_id)
+    if deduplicated_id then
+      return {'deduplicated', deduplicated_id}
     end
-    staged_deduplication_ids[deduplication_id] = id
-  end
+    if deduplication_id ~= '' then
+      if staged_deduplication_ids[deduplication_id] then
+        return {'deduplicated', staged_deduplication_ids[deduplication_id]}
+      end
+      staged_deduplication_ids[deduplication_id] = id
+    end
 
-  local repeat_owner_id = active_repeat_id(KEYS[1], repeat_prefix, repeat_key)
-  if repeat_owner_id then
-    return {'repeat', repeat_owner_id}
-  end
-  if repeat_key ~= '' then
-    if staged_repeat_keys[repeat_key] then
-      return {'repeat', staged_repeat_keys[repeat_key]}
+    local repeat_owner_id = active_repeat_id(KEYS[1], repeat_prefix, repeat_key)
+    if repeat_owner_id then
+      return {'repeat', repeat_owner_id}
     end
-    staged_repeat_keys[repeat_key] = id
+    if repeat_key ~= '' then
+      if staged_repeat_keys[repeat_key] then
+        return {'repeat', staged_repeat_keys[repeat_key]}
+      end
+      staged_repeat_keys[repeat_key] = id
+    end
   end
 
   offset = offset + per_job_args
@@ -2157,30 +2202,45 @@ for index = 1, count do
   local repeat_key = ARGV[offset + 6]
   local child = cjson.decode(raw)
 
-  table.insert(parent["child_ids"], id)
-  redis.call('HSET', KEYS[1], id, raw)
-  redis.call('SADD', dependency_key, id)
-  if state == 'waiting' then
-    enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[6], child, id, priority, waiting_score_bucket, KEYS[9])
-  elseif state == 'delayed' then
-    redis.call('ZADD', KEYS[3], scheduled_score, id)
-    refresh_delay_marker(KEYS[9], KEYS[3])
-  elseif state == 'waiting_children' then
-    redis.call('ZADD', KEYS[4], scheduled_score, id)
+  if not existing_child_ids[id] then
+    table.insert(parent["child_ids"], id)
   end
-  if deduplication_id ~= '' then
-    set_deduplication_key(child, id, deduplication_prefix)
+  if duplicated_child_ids[id] then
+    local existing_raw = redis.call('HGET', KEYS[1], id)
+    if existing_raw then
+      local existing_child = cjson.decode(existing_raw)
+      existing_child["parent_id"] = parent_id
+      redis.call('HSET', KEYS[1], id, cjson.encode(existing_child))
+      if existing_child["state"] ~= "completed" then
+        redis.call('SADD', dependency_key, id)
+      end
+      redis.call('XADD', KEYS[7], 'MAXLEN', '~', max_events, '*', 'event', 'duplicated', 'jobId', id)
+    end
+  else
+    redis.call('HSET', KEYS[1], id, raw)
+    redis.call('SADD', dependency_key, id)
+    if state == 'waiting' then
+      enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[6], child, id, priority, waiting_score_bucket, KEYS[9])
+    elseif state == 'delayed' then
+      redis.call('ZADD', KEYS[3], scheduled_score, id)
+      refresh_delay_marker(KEYS[9], KEYS[3])
+    elseif state == 'waiting_children' then
+      redis.call('ZADD', KEYS[4], scheduled_score, id)
+    end
+    if deduplication_id ~= '' then
+      set_deduplication_key(child, id, deduplication_prefix)
+    end
+    if repeat_key ~= '' then
+      redis.call('SET', repeat_prefix .. repeat_key, id)
+      store_repeat_scheduler(child, id, repeat_prefix, scheduled_score)
+    end
+    redis.call('XADD', KEYS[7], 'MAXLEN', '~', max_events, '*', 'event', 'added', 'jobId', id, 'name', child["name"] or '')
+    local event_state = state
+    if event_state == 'waiting_children' then
+      event_state = 'waiting-children'
+    end
+    redis.call('XADD', KEYS[7], 'MAXLEN', '~', max_events, '*', 'event', event_state, 'jobId', id)
   end
-  if repeat_key ~= '' then
-    redis.call('SET', repeat_prefix .. repeat_key, id)
-    store_repeat_scheduler(child, id, repeat_prefix, scheduled_score)
-  end
-  redis.call('XADD', KEYS[7], 'MAXLEN', '~', max_events, '*', 'event', 'added', 'jobId', id, 'name', child["name"] or '')
-  local event_state = state
-  if event_state == 'waiting_children' then
-    event_state = 'waiting-children'
-  end
-  redis.call('XADD', KEYS[7], 'MAXLEN', '~', max_events, '*', 'event', event_state, 'jobId', id)
 
   offset = offset + per_job_args
 end
@@ -2188,6 +2248,7 @@ end
 redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
 redis.call('ZADD', KEYS[4], ARGV[9 + count * per_job_args], parent_id)
 redis.call('XADD', KEYS[7], 'MAXLEN', '~', max_events, '*', 'event', 'waiting-children', 'jobId', parent_id, 'prev', 'active')
+release_parent_if_no_pending_dependencies(parent_id, dependency_key, waiting_score_bucket, max_events)
 
 return {'ok'}
 "#;
@@ -11739,6 +11800,13 @@ fn decode_add_flow_children_result(result: &[String], parent_id: &str) -> Result
             let id = result.get(1).map(String::as_str).unwrap_or("unknown");
             Err(LaneError::ConfigError(format!(
                 "flow child id `{id}` already exists"
+            )))
+        }
+        Some("parent_conflict") => {
+            let id = result.get(1).map(String::as_str).unwrap_or("unknown");
+            let parent_id = result.get(2).map(String::as_str).unwrap_or("unknown");
+            Err(LaneError::JobStateConflict(format!(
+                "flow child id `{id}` already belongs to parent `{parent_id}`"
             )))
         }
         Some("deduplicated") => {

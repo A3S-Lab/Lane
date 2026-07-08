@@ -648,8 +648,20 @@ impl InMemoryJobQueue {
             .get(parent_id)
             .map(|parent| parent.child_ids.iter().cloned().collect::<HashSet<_>>())
             .unwrap_or_default();
+        let mut duplicated_children = HashSet::new();
         for child in &child_jobs {
-            if inner.jobs.contains_key(&child.id) || existing_child_ids.contains(&child.id) {
+            if let Some(existing) = inner.jobs.get(&child.id) {
+                Self::validate_existing_flow_child_parent_locked(&inner, parent_id, &child.id)?;
+                if existing_child_ids.contains(&child.id)
+                    && existing.parent_id.as_deref() != Some(parent_id)
+                {
+                    return Err(LaneError::ConfigError(format!(
+                        "flow child id `{}` already exists",
+                        child.id
+                    )));
+                }
+                duplicated_children.insert(child.id.clone());
+            } else if existing_child_ids.contains(&child.id) {
                 return Err(LaneError::ConfigError(format!(
                     "flow child id `{}` already exists",
                     child.id
@@ -659,6 +671,9 @@ impl InMemoryJobQueue {
 
         let mut flow_deduplication_ids = HashSet::new();
         for child in &child_jobs {
+            if duplicated_children.contains(&child.id) {
+                continue;
+            }
             if let Some(deduplication_id) = active_deduplication_id(child, now) {
                 if find_active_deduplication_id(
                     &inner.jobs,
@@ -678,6 +693,9 @@ impl InMemoryJobQueue {
 
         let mut flow_repeat_keys = HashSet::new();
         for child in &child_jobs {
+            if duplicated_children.contains(&child.id) {
+                continue;
+            }
             if let Some(repeat_key) = active_repeat_key(child) {
                 if find_active_repeat_key(&inner.jobs, repeat_key).is_some()
                     || !flow_repeat_keys.insert(repeat_key.to_string())
@@ -702,17 +720,34 @@ impl InMemoryJobQueue {
             parent.lease_expires_at = None;
             parent.deferred_failure = None;
             parent.failed_reason = None;
-            parent
-                .child_ids
-                .extend(child_jobs.iter().map(|child| child.id.clone()));
+            for child in &child_jobs {
+                if !parent
+                    .child_ids
+                    .iter()
+                    .any(|child_id| child_id == &child.id)
+                {
+                    parent.child_ids.push(child.id.clone());
+                }
+            }
             parent.clone()
         };
 
+        let mut stored_child_jobs = Vec::with_capacity(child_jobs.len());
         for child in &mut child_jobs {
-            assign_waiting_order(&mut inner.sequence, child);
-            Self::forget_released_deduplication_owner_locked(&mut inner, child);
-            inner.jobs.insert(child.id.clone(), child.clone());
-            Self::emit_job_created_events_locked(&mut inner, child, now);
+            if duplicated_children.contains(&child.id) {
+                if let Some(existing) = inner.jobs.get_mut(&child.id) {
+                    existing.parent_id = Some(parent_id.to_string());
+                    let existing = existing.clone();
+                    emit_duplicated_event_locked(&mut inner, &existing, now);
+                    stored_child_jobs.push(existing);
+                }
+            } else {
+                assign_waiting_order(&mut inner.sequence, child);
+                Self::forget_released_deduplication_owner_locked(&mut inner, child);
+                inner.jobs.insert(child.id.clone(), child.clone());
+                Self::emit_job_created_events_locked(&mut inner, child, now);
+                stored_child_jobs.push(child.clone());
+            }
         }
         emit_event_locked(
             &mut inner,
@@ -722,8 +757,9 @@ impl InMemoryJobQueue {
             now,
             BTreeMap::new(),
         );
+        Self::release_parent_if_ready_locked(&mut inner, parent_id, now);
 
-        Ok(child_jobs)
+        Ok(stored_child_jobs)
     }
 
     /// Return a parent flow's current child dependency snapshot.

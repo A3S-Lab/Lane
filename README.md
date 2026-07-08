@@ -485,9 +485,9 @@ BullMQ-style default descending pagination,
 and missing child ids, `get_flow_dependency_counts()` returns processed,
 unprocessed, failed, ignored, and missing child counts,
 flow parents cannot be completed while blocking child dependencies remain,
-`add_flow_children()` lets an active, token-owned parent add child jobs and move
-itself to `waiting_children`, mirroring BullMQ's dynamic
-`moveToWaitingChildren()` fan-out path,
+`add_flow_children()` lets an active, token-owned parent add new or existing
+custom-id child jobs and move itself to `waiting_children`, mirroring BullMQ's
+dynamic `moveToWaitingChildren()` fan-out path,
 `remove_unprocessed_children()`
 removes children that are still unprocessed and not active,
 `remove_child_dependency()` detaches one unfinished child from its parent without
@@ -571,6 +571,10 @@ failures keep the parent blocked until the child retries and reaches a terminal
 outcome. Active parent jobs can also call `add_flow_children()` with their lock
 token to atomically add children and move themselves to `waiting_children`; this
 is the dynamic planner/fan-out shape behind BullMQ's `moveToWaitingChildren()`.
+When a dynamically added child uses an existing custom job id, Lane keeps the
+existing child data, emits `duplicated`, updates `parent_id`, records a pending
+dependency for non-completed children, and lets completed children satisfy the
+dependency immediately.
 Optional children can use
 `JobOptions::new().with_ignore_dependency_on_failure(true)` to mirror BullMQ's
 `ignoreDependencyOnFailure`: terminal failure removes that child from the
@@ -1299,9 +1303,10 @@ BullMQ's dependency-removal mechanism: cleanup that removes a child also updates
 the parent dependency state instead of relying on a later client-side cleanup
 pass.
 Dynamic flow fan-out is Redis-atomic as well: `add_flow_children()` checks the
-parent lock, inserts the children, updates `dependencies:<parent_id>`, removes
-the parent from `active`, deletes its lock, and writes the parent into
-`waiting_children` in one Lua script.
+parent lock, inserts new children or attaches existing custom-id children,
+updates `dependencies:<parent_id>`, removes the parent from `active`, deletes its
+lock, writes the parent into `waiting_children`, and releases it immediately when
+all attached children were already completed in one Lua script.
 `ignore_dependency_on_failure`, `remove_dependency_on_failure`,
 `continue_parent_on_failure`, and `fail_parent_on_failure` use Redis-side
 failure-policy paths for terminal `fail_job()` and stalled terminal failure.
