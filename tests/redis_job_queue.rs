@@ -455,6 +455,22 @@ async fn redis_backend_release_active_pushes_back_waiting_jobs_against_real_serv
 }
 
 #[tokio::test]
+async fn redis_backend_guards_manual_active_transitions_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_manual_active_transition_guards(redis_url),
+    )
+    .await
+    .expect("Redis manual active-transition guard integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_retries_completed_jobs_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -775,6 +791,361 @@ async fn run_release_active_waiting_front(redis_url: String) -> redis::RedisResu
             .expect("release-front job should be claimable");
         assert_eq!(claimed.id, expected.id);
     }
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
+async fn run_manual_active_transition_guards(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "manual-active-guards")
+        .expect("valid Redis URL should build the manual-active-guards queue");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let active_key = format!("{namespace}:manual-active-guards:active");
+    let delayed_key = format!("{namespace}:manual-active-guards:delayed");
+    let waiting_key = format!("{namespace}:manual-active-guards:waiting");
+    let stalled_key = format!("{namespace}:manual-active-guards:stalled");
+
+    let transition = queue
+        .add_job(
+            "manual-active-transition".to_string(),
+            serde_json::json!({ "kind": "delay" }),
+            JobOptions::new().with_priority(4),
+        )
+        .await
+        .expect("manual active-transition job should add");
+    let claimed_transition = queue
+        .claim_next(
+            "worker-manual-active-transition".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("manual active-transition claim should return")
+        .expect("manual active-transition job should claim");
+    assert_eq!(claimed_transition.id, transition.id);
+
+    let active_remove = queue
+        .remove_job(&claimed_transition.id)
+        .await
+        .expect_err("active leased jobs must not be removed");
+    assert!(matches!(active_remove, LaneError::JobLeaseConflict(_)));
+    let active_after_failed_remove: Option<f64> =
+        conn.zscore(&active_key, &claimed_transition.id).await?;
+    assert!(active_after_failed_remove.is_some());
+    assert_eq!(
+        queue
+            .get_job(&claimed_transition.id)
+            .await
+            .expect("active job should load after failed remove")
+            .expect("active job should still exist after failed remove")
+            .state,
+        JobState::Active
+    );
+
+    let unlocked_active = queue
+        .add_job(
+            "manual-active-unlocked-remove".to_string(),
+            serde_json::json!({ "kind": "lost-lock" }),
+            JobOptions::new().with_priority(5),
+        )
+        .await
+        .expect("unlocked active job should add");
+    let unlocked_active_claim = queue
+        .claim_next(
+            "worker-manual-active-unlocked-remove".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("unlocked active claim should return")
+        .expect("unlocked active job should claim");
+    assert_eq!(unlocked_active_claim.id, unlocked_active.id);
+    queue
+        .add_log(
+            &unlocked_active.id,
+            "active removal log".to_string(),
+            10,
+            Utc::now(),
+        )
+        .await
+        .expect("unlocked active removal log should append");
+    let unlocked_lock_key = format!(
+        "{namespace}:manual-active-guards:locks:{}",
+        unlocked_active.id
+    );
+    let unlocked_logs_key = format!(
+        "{namespace}:manual-active-guards:logs:{}",
+        unlocked_active.id
+    );
+    let removed_unlocked_lock: usize = conn.del(&unlocked_lock_key).await?;
+    assert_eq!(removed_unlocked_lock, 1);
+    let stalled_unlocked: usize = conn.sadd(&stalled_key, &unlocked_active.id).await?;
+    assert_eq!(stalled_unlocked, 1);
+
+    let removed_unlocked = queue
+        .remove_job(&unlocked_active.id)
+        .await
+        .expect("unlocked active job should remove")
+        .expect("unlocked active job should be returned");
+    assert_eq!(removed_unlocked.id, unlocked_active.id);
+    assert_eq!(removed_unlocked.state, JobState::Active);
+    assert!(queue
+        .get_job(&unlocked_active.id)
+        .await
+        .expect("unlocked active lookup should return")
+        .is_none());
+    let unlocked_active_score_after: Option<f64> =
+        conn.zscore(&active_key, &unlocked_active.id).await?;
+    assert!(unlocked_active_score_after.is_none());
+    let unlocked_logs_len: usize = conn.llen(&unlocked_logs_key).await?;
+    assert_eq!(unlocked_logs_len, 0);
+    let unlocked_stalled_after: bool = conn.sismember(&stalled_key, &unlocked_active.id).await?;
+    assert!(!unlocked_stalled_after);
+
+    let wrong_delay_token = queue
+        .delay_active_job(
+            &claimed_transition.id,
+            "wrong-token",
+            Duration::from_millis(50),
+            Utc::now(),
+        )
+        .await
+        .expect_err("wrong token must not delay an active job");
+    assert!(matches!(wrong_delay_token, LaneError::JobLeaseConflict(_)));
+    let delayed_again = queue
+        .delay_active_job(
+            &claimed_transition.id,
+            lock_token(&claimed_transition),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("active job should move back to delayed");
+    assert_eq!(delayed_again.state, JobState::Delayed);
+    assert_eq!(delayed_again.options.delay, Some(Duration::from_secs(30)));
+    assert!(delayed_again.worker_id.is_none());
+    assert!(delayed_again.lease_expires_at.is_none());
+    let active_after_delay: Option<f64> = conn.zscore(&active_key, &claimed_transition.id).await?;
+    assert!(active_after_delay.is_none());
+    let delayed_after_delay: Option<f64> =
+        conn.zscore(&delayed_key, &claimed_transition.id).await?;
+    assert!(delayed_after_delay.is_some());
+    let lock_after_delay_exists: usize = conn
+        .exists(format!(
+            "{namespace}:manual-active-guards:locks:{}",
+            claimed_transition.id
+        ))
+        .await?;
+    assert_eq!(lock_after_delay_exists, 0);
+    let complete_after_delay = queue
+        .complete_job(
+            &claimed_transition.id,
+            lock_token(&claimed_transition),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect_err("delayed job must not complete with the old active token");
+    assert!(matches!(
+        complete_after_delay,
+        LaneError::JobStateConflict(_)
+    ));
+    assert!(queue
+        .claim_next(
+            "worker-manual-active-delayed-early".to_string(),
+            Duration::from_secs(30),
+            Utc::now()
+        )
+        .await
+        .expect("early delayed-again claim should return")
+        .is_none());
+    assert_eq!(
+        queue
+            .promote_due_jobs(delayed_again.scheduled_at + chrono::Duration::milliseconds(1))
+            .await
+            .expect("delayed-again job should promote"),
+        1
+    );
+    let reclaimed_delayed = queue
+        .claim_next(
+            "worker-manual-active-delayed-again".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("delayed-again claim should return")
+        .expect("delayed-again job should be claimable");
+    assert_eq!(reclaimed_delayed.id, claimed_transition.id);
+    queue
+        .complete_job(
+            &reclaimed_delayed.id,
+            lock_token(&reclaimed_delayed),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("delayed-again job should complete");
+
+    let release_active = queue
+        .add_job(
+            "manual-active-release".to_string(),
+            serde_json::json!({ "kind": "yield" }),
+            JobOptions::new().with_priority(3),
+        )
+        .await
+        .expect("release-active job should add");
+    let claimed_release = queue
+        .claim_next(
+            "worker-manual-active-release".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("release-active claim should return")
+        .expect("release-active job should be claimable");
+    assert_eq!(claimed_release.id, release_active.id);
+    let wrong_release_token = queue
+        .release_active_job(&claimed_release.id, "wrong-token", Utc::now())
+        .await
+        .expect_err("wrong token must not release an active job");
+    assert!(matches!(
+        wrong_release_token,
+        LaneError::JobLeaseConflict(_)
+    ));
+    let released_active = queue
+        .release_active_job(
+            &claimed_release.id,
+            lock_token(&claimed_release),
+            Utc::now(),
+        )
+        .await
+        .expect("active job should release back to waiting");
+    assert_eq!(released_active.state, JobState::Waiting);
+    assert_eq!(released_active.attempts_made, claimed_release.attempts_made);
+    assert!(released_active.worker_id.is_none());
+    assert!(released_active.lock_token.is_none());
+    assert!(released_active.lease_expires_at.is_none());
+    let release_active_score: Option<f64> = conn.zscore(&active_key, &claimed_release.id).await?;
+    assert!(release_active_score.is_none());
+    let release_waiting_score: Option<f64> = conn.zscore(&waiting_key, &claimed_release.id).await?;
+    assert!(release_waiting_score.is_some());
+    let release_lock_exists: usize = conn
+        .exists(format!(
+            "{namespace}:manual-active-guards:locks:{}",
+            claimed_release.id
+        ))
+        .await?;
+    assert_eq!(release_lock_exists, 0);
+    let complete_after_release = queue
+        .complete_job(
+            &claimed_release.id,
+            lock_token(&claimed_release),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect_err("waiting job must not complete with the old active token");
+    assert!(matches!(
+        complete_after_release,
+        LaneError::JobStateConflict(_)
+    ));
+    let reclaimed_release = queue
+        .claim_next(
+            "worker-manual-active-release-again".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("released job claim should return")
+        .expect("released job should be claimable again");
+    assert_eq!(reclaimed_release.id, claimed_release.id);
+    assert_eq!(
+        reclaimed_release.attempts_made,
+        claimed_release.attempts_made + 1
+    );
+    queue
+        .complete_job(
+            &reclaimed_release.id,
+            lock_token(&reclaimed_release),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("released job should complete after reclaim");
+
+    let stale_active_delay = queue
+        .add_job(
+            "manual-active-stale-delay".to_string(),
+            serde_json::json!({ "kind": "stale-active-index" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("stale active delay job should add");
+    let stale_active_claim = queue
+        .claim_next(
+            "worker-manual-active-stale-delay".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("stale active delay claim should return")
+        .expect("stale active delay job should be claimable");
+    assert_eq!(stale_active_claim.id, stale_active_delay.id);
+    let stale_removed_from_active: usize = conn.zrem(&active_key, &stale_active_claim.id).await?;
+    assert_eq!(stale_removed_from_active, 1);
+    let stale_active_delay_error = queue
+        .delay_active_job(
+            &stale_active_claim.id,
+            lock_token(&stale_active_claim),
+            Duration::from_millis(50),
+            Utc::now(),
+        )
+        .await
+        .expect_err("missing active zset membership should reject active delay");
+    assert!(matches!(
+        stale_active_delay_error,
+        LaneError::JobStateConflict(_)
+    ));
+    let stale_active_lock_exists: usize = conn
+        .exists(format!(
+            "{namespace}:manual-active-guards:locks:{}",
+            stale_active_claim.id
+        ))
+        .await?;
+    assert_eq!(stale_active_lock_exists, 1);
+    queue
+        .complete_job(
+            &stale_active_claim.id,
+            lock_token(&stale_active_claim),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("stale active delay job should still complete with valid lock");
+
+    let stale_reschedule = queue
+        .add_job(
+            "manual-active-stale-reschedule".to_string(),
+            serde_json::json!({ "kind": "stale-delayed-index" }),
+            JobOptions::new().with_delay(Duration::from_secs(30)),
+        )
+        .await
+        .expect("stale reschedule job should add");
+    let stale_removed_from_delayed: usize = conn.zrem(&delayed_key, &stale_reschedule.id).await?;
+    assert_eq!(stale_removed_from_delayed, 1);
+    let stale_reschedule_error = queue
+        .reschedule_job(&stale_reschedule.id, Duration::from_millis(50), Utc::now())
+        .await
+        .expect_err("missing delayed zset membership should reject reschedule");
+    assert!(matches!(
+        stale_reschedule_error,
+        LaneError::JobStateConflict(_)
+    ));
 
     cleanup_namespace(&redis_url, &namespace).await
 }
