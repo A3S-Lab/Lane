@@ -2471,11 +2471,43 @@ async fn run_queue_events(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect("deduplicated event duplicate should return owner");
     assert_eq!(dedup_duplicate.id, dedup_owner.id);
+    let replaced_dedup_owner = queue
+        .add_job(
+            "dedup-replace-old".to_string(),
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_job_id("events:dedup-replace-old")
+                .with_delay(Duration::from_secs(60))
+                .with_deduplication(
+                    DeduplicationOptions::new("events:dedup-replace").replace_delayed(true),
+                ),
+        )
+        .await
+        .expect("deduplicated delayed replacement owner should add");
+    let dedup_replacement = queue
+        .add_job(
+            "dedup-replace-new".to_string(),
+            serde_json::json!({}),
+            JobOptions::new()
+                .with_job_id("events:dedup-replace-new")
+                .with_delay(Duration::from_secs(120))
+                .with_deduplication(
+                    DeduplicationOptions::new("events:dedup-replace").replace_delayed(true),
+                ),
+        )
+        .await
+        .expect("deduplicated delayed replacement should add");
+    assert_ne!(dedup_replacement.id, replaced_dedup_owner.id);
+    assert!(queue
+        .get_job(&replaced_dedup_owner.id)
+        .await
+        .expect("replaced dedup owner lookup should return")
+        .is_none());
     queue.pause().await.expect("queue should pause");
     queue.resume().await.expect("queue should resume");
 
     let events = queue
-        .read_events("-", "+", 30)
+        .read_events("-", "+", 40)
         .await
         .expect("events should read");
     let names = events
@@ -2501,6 +2533,13 @@ async fn run_queue_events(redis_url: String) -> redis::RedisResult<()> {
             "waiting",
             "debounced",
             "deduplicated",
+            "added",
+            "delayed",
+            "removed",
+            "debounced",
+            "deduplicated",
+            "added",
+            "delayed",
             "paused",
             "resumed"
         ]
@@ -2540,6 +2579,31 @@ async fn run_queue_events(redis_url: String) -> redis::RedisResult<()> {
     assert_eq!(
         events[15].fields.get("deduplicatedJobId"),
         Some(&serde_json::json!("events:dedup-duplicate"))
+    );
+    assert_eq!(
+        events[18].job_id.as_deref(),
+        Some(replaced_dedup_owner.id.as_str())
+    );
+    assert_eq!(events[18].prev, Some(JobState::Delayed));
+    assert_eq!(
+        events[19].job_id.as_deref(),
+        Some(dedup_replacement.id.as_str())
+    );
+    assert_eq!(
+        events[19].fields.get("debounceId"),
+        Some(&serde_json::json!("events:dedup-replace"))
+    );
+    assert_eq!(
+        events[20].job_id.as_deref(),
+        Some(dedup_replacement.id.as_str())
+    );
+    assert_eq!(
+        events[20].fields.get("deduplicationId"),
+        Some(&serde_json::json!("events:dedup-replace"))
+    );
+    assert_eq!(
+        events[20].fields.get("deduplicatedJobId"),
+        Some(&serde_json::json!("events:dedup-replace-old"))
     );
 
     cleanup_namespace(&redis_url, &namespace).await?;

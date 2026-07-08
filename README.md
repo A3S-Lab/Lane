@@ -1091,7 +1091,9 @@ job, the add script first removes the old delayed zset member, then removes the
 old job hash and inserts the new owner only if that delayed removal succeeded,
 mirroring BullMQ's delayed replacement branch. With TTL-backed deduplication, the
 script updates the owner id with Redis `KEEPTTL` so replacement does not extend
-the remaining deduplication window unless `extend_ttl(true)` is also set. If
+the remaining deduplication window unless `extend_ttl(true)` is also set. That
+same branch emits BullMQ-style `removed prev=delayed`, `debounced`, and
+`deduplicated` events before the replacement job's own add/state events. If
 `keep_last_if_active(true)` is set and the current owner is present in the
 active sorted set, duplicate adds overwrite a
 `deduplication_next:<id>` proto-job record and `PERSIST` the owner key. For
@@ -1167,7 +1169,9 @@ same Lua turn releases or fails the parent;
 explicit removal writes `removed prev=<state>` for the removed job; `clean_jobs()`
 writes a queue-level `cleaned count=<n>` event after removing aged jobs;
 deduplicated adds write BullMQ-style `debounced` and `deduplicated` events with
-the owner job id, deduplication id, and skipped candidate job id; progress writes
+the owner job id, deduplication id, and skipped candidate job id; delayed-owner
+replacement also writes `removed prev=delayed` for the old owner followed by
+`debounced` and `deduplicated` events on the replacement job id; progress writes
 `progress data=<json>`; pause/resume write queue-level events.
 `read_events()` uses `XRANGE` over stream ids, and
 `trim_events()` uses BullMQ-style `XTRIM MAXLEN ~`. The in-memory and local

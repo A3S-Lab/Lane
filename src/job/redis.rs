@@ -222,11 +222,22 @@ local function deduplication_replace(candidate_job)
   return deduplication and deduplication ~= cjson.null and deduplication["replace"] == true
 end
 
+local function emit_deduplication_events(events_key, max_events, event_job_id, deduplication_id, deduplicated_job_id)
+  redis.call('XADD', events_key, 'MAXLEN', '~', max_events, '*', 'event', 'debounced', 'jobId', event_job_id, 'debounceId', deduplication_id)
+  redis.call('XADD', events_key, 'MAXLEN', '~', max_events, '*', 'event', 'deduplicated', 'jobId', event_job_id, 'deduplicationId', deduplication_id, 'deduplicatedJobId', deduplicated_job_id)
+end
+
 local function emit_deduplicated_events(events_key, max_events, owner_job, candidate_job)
   local deduplication = candidate_job["options"]["deduplication"]
   local deduplication_id = deduplication["id"]
-  redis.call('XADD', events_key, 'MAXLEN', '~', max_events, '*', 'event', 'debounced', 'jobId', owner_job["id"], 'debounceId', deduplication_id)
-  redis.call('XADD', events_key, 'MAXLEN', '~', max_events, '*', 'event', 'deduplicated', 'jobId', owner_job["id"], 'deduplicationId', deduplication_id, 'deduplicatedJobId', candidate_job["id"])
+  emit_deduplication_events(events_key, max_events, owner_job["id"], deduplication_id, candidate_job["id"])
+end
+
+local function emit_replaced_deduplicated_owner_events(events_key, max_events, candidate_job, existing_job)
+  local deduplication = candidate_job["options"]["deduplication"]
+  local deduplication_id = deduplication["id"]
+  redis.call('XADD', events_key, 'MAXLEN', '~', max_events, '*', 'event', 'removed', 'jobId', existing_job["id"], 'prev', 'delayed')
+  emit_deduplication_events(events_key, max_events, candidate_job["id"], deduplication_id, existing_job["id"])
 end
 
 local function active_repeat_raw(jobs_key, repeat_prefix, repeat_key)
@@ -367,6 +378,7 @@ if deduplicated then
     if removed > 0 then
       redis.call('HDEL', KEYS[1], existing_job["id"])
       redis.call('DEL', ARGV[12] .. existing_job["id"])
+      emit_replaced_deduplicated_owner_events(KEYS[7], ARGV[13], candidate_job, existing_job)
       replaced_deduplicated_owner = true
     else
       return {'deduplicated', deduplicated}

@@ -282,7 +282,10 @@ impl InMemoryJobQueue {
             if deduplication_replaces_delayed_owner(&job, &existing) {
                 preserve_replacement_deduplication_expiration(&mut job, &existing);
                 let existing_id = existing.id.clone();
-                Self::remove_job_record_locked(&mut inner, &existing_id);
+                if let Some(removed) = Self::remove_job_record_locked(&mut inner, &existing_id) {
+                    emit_removed_event_locked(&mut inner, &removed, now);
+                    emit_replaced_deduplicated_owner_events_locked(&mut inner, &job, &removed, now);
+                }
             } else {
                 Self::store_deduplicated_next_locked(&mut inner, &job, &existing);
                 Self::extend_deduplication_expiration_locked(
@@ -2669,6 +2672,35 @@ fn emit_deduplicated_events_locked(
         return;
     };
 
+    emit_deduplication_events_locked(inner, owner, deduplication_id, &candidate.id, timestamp);
+}
+
+fn emit_replaced_deduplicated_owner_events_locked(
+    inner: &mut InMemoryJobQueueState,
+    replacement: &Job,
+    removed_owner: &Job,
+    timestamp: DateTime<Utc>,
+) {
+    let Some(deduplication_id) = job_deduplication_id(replacement) else {
+        return;
+    };
+
+    emit_deduplication_events_locked(
+        inner,
+        replacement,
+        deduplication_id,
+        &removed_owner.id,
+        timestamp,
+    );
+}
+
+fn emit_deduplication_events_locked(
+    inner: &mut InMemoryJobQueueState,
+    event_job: &Job,
+    deduplication_id: &str,
+    deduplicated_job_id: &str,
+    timestamp: DateTime<Utc>,
+) {
     let mut debounced_fields = BTreeMap::new();
     debounced_fields.insert(
         "debounceId".to_string(),
@@ -2677,7 +2709,7 @@ fn emit_deduplicated_events_locked(
     emit_event_locked(
         inner,
         "debounced",
-        Some(owner),
+        Some(event_job),
         None,
         timestamp,
         debounced_fields,
@@ -2690,12 +2722,12 @@ fn emit_deduplicated_events_locked(
     );
     deduplicated_fields.insert(
         "deduplicatedJobId".to_string(),
-        Value::String(candidate.id.clone()),
+        Value::String(deduplicated_job_id.to_string()),
     );
     emit_event_locked(
         inner,
         "deduplicated",
-        Some(owner),
+        Some(event_job),
         None,
         timestamp,
         deduplicated_fields,

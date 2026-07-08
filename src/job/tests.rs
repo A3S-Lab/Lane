@@ -1158,6 +1158,40 @@ async fn deduplication_replace_swaps_delayed_owner() {
             .collect::<Vec<_>>(),
         vec![replacement.id.as_str()]
     );
+
+    let events = queue.read_events("-", "+", 10).await.unwrap();
+    let names = events
+        .iter()
+        .map(|event| event.event.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "added",
+            "delayed",
+            "removed",
+            "debounced",
+            "deduplicated",
+            "added",
+            "delayed"
+        ]
+    );
+    assert_eq!(events[2].job_id.as_deref(), Some(first.id.as_str()));
+    assert_eq!(events[2].prev, Some(JobState::Delayed));
+    assert_eq!(events[3].job_id.as_deref(), Some(replacement.id.as_str()));
+    assert_eq!(
+        events[3].fields.get("debounceId"),
+        Some(&Value::String("account:replace".to_string()))
+    );
+    assert_eq!(events[4].job_id.as_deref(), Some(replacement.id.as_str()));
+    assert_eq!(
+        events[4].fields.get("deduplicationId"),
+        Some(&Value::String("account:replace".to_string()))
+    );
+    assert_eq!(
+        events[4].fields.get("deduplicatedJobId"),
+        Some(&Value::String(first.id.clone()))
+    );
 }
 
 #[tokio::test]
