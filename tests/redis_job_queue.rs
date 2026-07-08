@@ -7483,6 +7483,23 @@ return {first_id, last_id, tostring(redis.call('XLEN', KEYS[1]))}
     assert_ne!(limited[0].id, first_id);
     assert!(limited.windows(2).all(|pair| pair[0].id <= pair[1].id));
 
+    let cleared = queue
+        .trim_events(0)
+        .await
+        .expect("trim event stream should clear with zero max length");
+    assert_eq!(cleared, after_len);
+    let cleared_len: usize = redis::cmd("XLEN")
+        .arg(&events_key)
+        .query_async(&mut conn)
+        .await
+        .expect("cleared event stream length should read");
+    assert_eq!(cleared_len, 0);
+    let cleared_events = queue
+        .read_events("-", "+", 1)
+        .await
+        .expect("cleared event stream should read as empty");
+    assert!(cleared_events.is_empty());
+
     cleanup_namespace_with_conn(&mut conn, &namespace).await
 }
 
