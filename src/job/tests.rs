@@ -3693,6 +3693,183 @@ async fn flow_parent_ignores_configured_stalled_child_terminal_failure() {
 }
 
 #[tokio::test]
+async fn flow_dependency_pages_classify_and_page_children() {
+    let queue = InMemoryJobQueue::new("flow-dependency-pages");
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("page-parent", serde_json::json!({ "kind": "aggregate" }))
+                .with_options(JobOptions::new().with_priority(10)),
+            vec![
+                JobSpec::new("processed-a", serde_json::json!({ "slot": "processed-a" }))
+                    .with_options(JobOptions::new().with_priority(1)),
+                JobSpec::new("processed-b", serde_json::json!({ "slot": "processed-b" }))
+                    .with_options(JobOptions::new().with_priority(2)),
+                JobSpec::new("ignored", serde_json::json!({ "slot": "ignored" })).with_options(
+                    JobOptions::new()
+                        .with_priority(3)
+                        .with_ignore_dependency_on_failure(true),
+                ),
+                JobSpec::new("failed", serde_json::json!({ "slot": "failed" })).with_options(
+                    JobOptions::new()
+                        .with_priority(4)
+                        .with_fail_parent_on_failure(true),
+                ),
+                JobSpec::new("pending", serde_json::json!({ "slot": "pending" }))
+                    .with_options(JobOptions::new().with_priority(5)),
+            ],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    for index in 0..2 {
+        let child = queue
+            .claim_next(
+                "worker".to_string(),
+                Duration::from_secs(30),
+                ts(1_100 + index),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child.id, flow.children[index as usize].id);
+        queue
+            .complete_job(
+                &child.id,
+                lock_token(&child),
+                serde_json::json!({ "done": index }),
+                ts(1_200 + index),
+            )
+            .await
+            .unwrap();
+    }
+
+    let ignored = queue
+        .claim_next("worker".to_string(), Duration::from_secs(30), ts(1_300))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ignored.id, flow.children[2].id);
+    queue
+        .fail_job(
+            &ignored.id,
+            lock_token(&ignored),
+            "optional child failed".to_string(),
+            ts(1_400),
+        )
+        .await
+        .unwrap();
+
+    let failed = queue
+        .claim_next("worker".to_string(), Duration::from_secs(30), ts(1_500))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed.id, flow.children[3].id);
+    queue
+        .fail_job(
+            &failed.id,
+            lock_token(&failed),
+            "required child failed".to_string(),
+            ts(1_600),
+        )
+        .await
+        .unwrap();
+
+    let processed_first = queue
+        .get_flow_dependency_page(
+            &flow.parent.id,
+            JobFlowDependencyPageOptions::new(JobFlowDependencyKind::Processed).with_count(1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(processed_first.count, 1);
+    assert_eq!(processed_first.next_cursor, 1);
+    assert_eq!(
+        processed_first.items,
+        vec![JobFlowDependencyPageItem::Processed {
+            child_id: flow.children[0].id.clone(),
+            value: serde_json::json!({ "done": 0 }),
+        }]
+    );
+
+    let processed_second = queue
+        .get_flow_dependency_page(
+            &flow.parent.id,
+            JobFlowDependencyPageOptions::new(JobFlowDependencyKind::Processed)
+                .with_cursor(processed_first.next_cursor)
+                .with_count(1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(processed_second.next_cursor, 0);
+    assert_eq!(
+        processed_second.items,
+        vec![JobFlowDependencyPageItem::Processed {
+            child_id: flow.children[1].id.clone(),
+            value: serde_json::json!({ "done": 1 }),
+        }]
+    );
+
+    let unprocessed = queue
+        .get_flow_dependency_page(
+            &flow.parent.id,
+            JobFlowDependencyPageOptions::new(JobFlowDependencyKind::Unprocessed),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        unprocessed.items,
+        vec![JobFlowDependencyPageItem::Unprocessed {
+            child_id: flow.children[4].id.clone(),
+        }]
+    );
+
+    let ignored_page = queue
+        .get_flow_dependency_page(
+            &flow.parent.id,
+            JobFlowDependencyPageOptions::new(JobFlowDependencyKind::Ignored),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ignored_page.items,
+        vec![JobFlowDependencyPageItem::Ignored {
+            child_id: flow.children[2].id.clone(),
+            failed_reason: "optional child failed".to_string(),
+        }]
+    );
+
+    let failed_page = queue
+        .get_flow_dependency_page(
+            &flow.parent.id,
+            JobFlowDependencyPageOptions::new(JobFlowDependencyKind::Failed),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        failed_page.items,
+        vec![JobFlowDependencyPageItem::Failed {
+            child_id: flow.children[3].id.clone(),
+        }]
+    );
+
+    assert!(queue
+        .get_flow_dependency_page(
+            "missing-parent",
+            JobFlowDependencyPageOptions::new(JobFlowDependencyKind::Processed),
+        )
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn flow_parent_continues_configured_stalled_child_terminal_failure() {
     let queue = InMemoryJobQueue::new("flow-continue-stalled");
     let flow = queue

@@ -2,10 +2,10 @@ use super::backend::JobQueueBackend;
 use super::memory::InMemoryJobQueue;
 use super::types::{
     Job, JobEvent, JobFinishedResult, JobFlow, JobFlowChildValues, JobFlowDependencies,
-    JobFlowDependencyCounts, JobFlowIgnoredFailures, JobId, JobListOptions, JobListPage,
-    JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueSnapshot, JobQueueStats,
-    JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobSpec, JobState, JobStateCount,
-    JobWorkerId,
+    JobFlowDependencyCounts, JobFlowDependencyPage, JobFlowDependencyPageOptions,
+    JobFlowIgnoredFailures, JobId, JobListOptions, JobListPage, JobLogPage, JobOptions,
+    JobPriority, JobPriorityCount, JobQueueSnapshot, JobQueueStats, JobRepeatEntry,
+    JobRepeatListOptions, JobRepeatPage, JobSpec, JobState, JobStateCount, JobWorkerId,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -160,6 +160,17 @@ impl LocalJobQueue {
         parent_id: &str,
     ) -> Result<Option<JobFlowDependencyCounts>> {
         self.inner.get_flow_dependency_counts(parent_id).await
+    }
+
+    /// Return one cursor page from a parent flow dependency bucket.
+    pub async fn get_flow_dependency_page(
+        &self,
+        parent_id: &str,
+        options: JobFlowDependencyPageOptions,
+    ) -> Result<Option<JobFlowDependencyPage>> {
+        self.inner
+            .get_flow_dependency_page(parent_id, options)
+            .await
     }
 
     /// Return completed child result values for a flow parent.
@@ -348,6 +359,14 @@ impl JobQueueBackend for LocalJobQueue {
         parent_id: &str,
     ) -> Result<Option<JobFlowDependencyCounts>> {
         LocalJobQueue::get_flow_dependency_counts(self, parent_id).await
+    }
+
+    async fn get_flow_dependency_page(
+        &self,
+        parent_id: &str,
+        options: JobFlowDependencyPageOptions,
+    ) -> Result<Option<JobFlowDependencyPage>> {
+        LocalJobQueue::get_flow_dependency_page(self, parent_id, options).await
     }
 
     async fn get_flow_children_values(

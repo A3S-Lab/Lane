@@ -1,10 +1,11 @@
 #![cfg(feature = "redis-backend")]
 
 use a3s_lane::{
-    job_processor_fn, DeduplicationOptions, Job, JobContext, JobFinishedResult, JobLeaseRenewal,
-    JobListOptions, JobLogEntry, JobOptions, JobPriorityCount, JobProcessor, JobQueueBackend,
-    JobRateLimit, JobRepeatListOptions, JobRetention, JobRunOutcome, JobSpec, JobState,
-    JobStateCount, JobWorker, JobWorkerConfig, LaneError, RedisJobQueue, RepeatOptions,
+    job_processor_fn, DeduplicationOptions, Job, JobContext, JobFinishedResult,
+    JobFlowDependencyKind, JobFlowDependencyPageItem, JobFlowDependencyPageOptions,
+    JobLeaseRenewal, JobListOptions, JobLogEntry, JobOptions, JobPriorityCount, JobProcessor,
+    JobQueueBackend, JobRateLimit, JobRepeatListOptions, JobRetention, JobRunOutcome, JobSpec,
+    JobState, JobStateCount, JobWorker, JobWorkerConfig, LaneError, RedisJobQueue, RepeatOptions,
     RetryPolicy, MAX_JOB_PRIORITY,
 };
 use chrono::{DateTime, TimeZone, Utc};
@@ -2521,6 +2522,241 @@ async fn run_deferred_flow_parent_failure(redis_url: String) -> redis::RedisResu
         Some(deferred_failure.as_str())
     );
     assert!(!processor_called.load(Ordering::SeqCst));
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
+#[tokio::test]
+async fn redis_backend_paginates_flow_dependencies_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_paginated_flow_dependencies(redis_url),
+    )
+    .await
+    .expect("Redis paginated flow dependency integration test timed out")
+    .unwrap();
+}
+
+async fn run_paginated_flow_dependencies(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-pages")
+        .expect("valid Redis URL should build the flow-pages queue");
+    let worker = RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-pages")
+        .expect("valid Redis URL should build the flow-pages worker");
+
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("page-parent", serde_json::json!({ "kind": "aggregate" }))
+                .with_options(JobOptions::new().with_priority(50)),
+            vec![
+                JobSpec::new("processed-a", serde_json::json!({ "slot": "processed-a" }))
+                    .with_options(JobOptions::new().with_priority(1)),
+                JobSpec::new("processed-b", serde_json::json!({ "slot": "processed-b" }))
+                    .with_options(JobOptions::new().with_priority(2)),
+                JobSpec::new("ignored", serde_json::json!({ "slot": "ignored" })).with_options(
+                    JobOptions::new()
+                        .with_priority(3)
+                        .with_ignore_dependency_on_failure(true),
+                ),
+                JobSpec::new("failed-a", serde_json::json!({ "slot": "failed-a" })).with_options(
+                    JobOptions::new()
+                        .with_priority(4)
+                        .with_fail_parent_on_failure(true),
+                ),
+                JobSpec::new("failed-b", serde_json::json!({ "slot": "failed-b" })).with_options(
+                    JobOptions::new()
+                        .with_priority(5)
+                        .with_fail_parent_on_failure(true),
+                ),
+                JobSpec::new("pending", serde_json::json!({ "slot": "pending" }))
+                    .with_options(JobOptions::new().with_priority(6)),
+            ],
+            ts(1_000),
+        )
+        .await
+        .expect("paginated dependency flow should be added");
+
+    for index in 0..2 {
+        let child = worker
+            .claim_next(
+                "worker-pages".to_string(),
+                Duration::from_secs(30),
+                ts(1_100 + index),
+            )
+            .await
+            .expect("processed child claim should return")
+            .expect("processed child should be claimable");
+        assert_eq!(child.id, flow.children[index as usize].id);
+        worker
+            .complete_job(
+                &child.id,
+                lock_token(&child),
+                serde_json::json!({ "done": index }),
+                ts(1_200 + index),
+            )
+            .await
+            .expect("processed child should complete");
+    }
+
+    let ignored = worker
+        .claim_next(
+            "worker-pages".to_string(),
+            Duration::from_secs(30),
+            ts(1_300),
+        )
+        .await
+        .expect("ignored child claim should return")
+        .expect("ignored child should be claimable");
+    assert_eq!(ignored.id, flow.children[2].id);
+    worker
+        .fail_job(
+            &ignored.id,
+            lock_token(&ignored),
+            "optional child failed".to_string(),
+            ts(1_400),
+        )
+        .await
+        .expect("ignored child should fail");
+
+    for index in 3..5 {
+        let child = worker
+            .claim_next(
+                "worker-pages".to_string(),
+                Duration::from_secs(30),
+                ts(1_500 + index),
+            )
+            .await
+            .expect("failed child claim should return")
+            .expect("failed child should be claimable");
+        assert_eq!(child.id, flow.children[index as usize].id);
+        worker
+            .fail_job(
+                &child.id,
+                lock_token(&child),
+                format!("required child {index} failed"),
+                ts(1_600 + index),
+            )
+            .await
+            .expect("failed child should fail");
+    }
+
+    let processed_page = queue
+        .get_flow_dependency_page(
+            &flow.parent.id,
+            JobFlowDependencyPageOptions::new(JobFlowDependencyKind::Processed).with_count(20),
+        )
+        .await
+        .expect("processed dependency page should load")
+        .expect("processed dependency page should exist");
+    assert_eq!(processed_page.kind, JobFlowDependencyKind::Processed);
+    assert_eq!(processed_page.count, 20);
+    let processed_items = processed_page
+        .items
+        .iter()
+        .map(|item| match item {
+            JobFlowDependencyPageItem::Processed { child_id, value } => {
+                (child_id.clone(), value["done"].as_i64().unwrap())
+            }
+            other => panic!("unexpected processed dependency item: {other:?}"),
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        processed_items,
+        BTreeSet::from([
+            (flow.children[0].id.clone(), 0),
+            (flow.children[1].id.clone(), 1),
+        ])
+    );
+
+    let unprocessed_page = queue
+        .get_flow_dependency_page(
+            &flow.parent.id,
+            JobFlowDependencyPageOptions::new(JobFlowDependencyKind::Unprocessed).with_count(20),
+        )
+        .await
+        .expect("unprocessed dependency page should load")
+        .expect("unprocessed dependency page should exist");
+    assert_eq!(unprocessed_page.kind, JobFlowDependencyKind::Unprocessed);
+    let unprocessed_items = unprocessed_page
+        .items
+        .iter()
+        .map(|item| match item {
+            JobFlowDependencyPageItem::Unprocessed { child_id } => child_id.clone(),
+            other => panic!("unexpected unprocessed dependency item: {other:?}"),
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        unprocessed_items,
+        BTreeSet::from([flow.children[5].id.clone()])
+    );
+
+    let ignored_page = queue
+        .get_flow_dependency_page(
+            &flow.parent.id,
+            JobFlowDependencyPageOptions::new(JobFlowDependencyKind::Ignored).with_count(20),
+        )
+        .await
+        .expect("ignored dependency page should load")
+        .expect("ignored dependency page should exist");
+    assert_eq!(ignored_page.kind, JobFlowDependencyKind::Ignored);
+    assert_eq!(
+        ignored_page.items,
+        vec![JobFlowDependencyPageItem::Ignored {
+            child_id: flow.children[2].id.clone(),
+            failed_reason: "optional child failed".to_string(),
+        }]
+    );
+
+    let failed_first = queue
+        .get_flow_dependency_page(
+            &flow.parent.id,
+            JobFlowDependencyPageOptions::new(JobFlowDependencyKind::Failed).with_count(1),
+        )
+        .await
+        .expect("first failed dependency page should load")
+        .expect("first failed dependency page should exist");
+    assert_eq!(failed_first.kind, JobFlowDependencyKind::Failed);
+    assert_eq!(failed_first.next_cursor, 1);
+    assert_eq!(
+        failed_first.items,
+        vec![JobFlowDependencyPageItem::Failed {
+            child_id: flow.children[3].id.clone(),
+        }]
+    );
+
+    let failed_second = queue
+        .get_flow_dependency_page(
+            &flow.parent.id,
+            JobFlowDependencyPageOptions::new(JobFlowDependencyKind::Failed)
+                .with_cursor(failed_first.next_cursor)
+                .with_count(1),
+        )
+        .await
+        .expect("second failed dependency page should load")
+        .expect("second failed dependency page should exist");
+    assert_eq!(failed_second.next_cursor, 0);
+    assert_eq!(
+        failed_second.items,
+        vec![JobFlowDependencyPageItem::Failed {
+            child_id: flow.children[4].id.clone(),
+        }]
+    );
+
+    assert!(queue
+        .get_flow_dependency_page(
+            "missing-parent",
+            JobFlowDependencyPageOptions::new(JobFlowDependencyKind::Processed),
+        )
+        .await
+        .expect("missing parent page lookup should return")
+        .is_none());
 
     cleanup_namespace(&redis_url, &namespace).await
 }

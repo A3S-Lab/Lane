@@ -399,6 +399,93 @@ pub struct JobFlowDependencyCounts {
     pub missing: usize,
 }
 
+/// Flow dependency bucket used by paginated dependency inspection.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JobFlowDependencyKind {
+    /// Completed children stored in the parent-scoped `:processed` hash.
+    Processed,
+    /// Children still stored in the parent-scoped pending dependency set.
+    Unprocessed,
+    /// Ignored or continued failures stored in the parent-scoped `:failed` hash.
+    Ignored,
+    /// Fail-parent failures stored in the parent-scoped `:unsuccessful` zset.
+    Failed,
+}
+
+impl JobFlowDependencyKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Processed => "processed",
+            Self::Unprocessed => "unprocessed",
+            Self::Ignored => "ignored",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Options for reading one flow dependency bucket incrementally.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobFlowDependencyPageOptions {
+    /// Dependency bucket to scan.
+    pub kind: JobFlowDependencyKind,
+    /// Redis cursor for hash/set buckets, or zset offset for failed dependencies.
+    pub cursor: u64,
+    /// Scan count hint or zset page size. BullMQ defaults this to 20.
+    pub count: usize,
+}
+
+impl JobFlowDependencyPageOptions {
+    /// Create dependency page options for one bucket.
+    pub fn new(kind: JobFlowDependencyKind) -> Self {
+        Self {
+            kind,
+            cursor: 0,
+            count: 20,
+        }
+    }
+
+    /// Set the cursor returned by the previous page.
+    pub fn with_cursor(mut self, cursor: u64) -> Self {
+        self.cursor = cursor;
+        self
+    }
+
+    /// Set the scan count hint or zset page size.
+    pub fn with_count(mut self, count: usize) -> Self {
+        self.count = count;
+        self
+    }
+}
+
+/// One entry from a paginated flow dependency bucket.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum JobFlowDependencyPageItem {
+    /// Completed child return value.
+    Processed { child_id: JobId, value: Value },
+    /// Pending child id.
+    Unprocessed { child_id: JobId },
+    /// Ignored or continued child failure reason.
+    Ignored {
+        child_id: JobId,
+        failed_reason: String,
+    },
+    /// Fail-parent child id.
+    Failed { child_id: JobId },
+}
+
+/// A cursor page for one flow dependency bucket.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobFlowDependencyPage {
+    pub kind: JobFlowDependencyKind,
+    pub items: Vec<JobFlowDependencyPageItem>,
+    /// Next cursor to pass back for this same bucket. `0` means the scan is done.
+    pub next_cursor: u64,
+    /// Requested scan count hint or zset page size.
+    pub count: usize,
+}
+
 /// Finished status for a retained job.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "status", rename_all = "snake_case")]

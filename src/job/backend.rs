@@ -1,9 +1,10 @@
 use super::types::{
     page_repeat_entries, Job, JobEvent, JobFinishedResult, JobFlow, JobFlowChildValues,
-    JobFlowDependencies, JobFlowDependencyCounts, JobFlowIgnoredFailures, JobId, JobLeaseRenewal,
-    JobListOptions, JobListPage, JobLogPage, JobOptions, JobPriority, JobPriorityCount,
-    JobQueueStats, JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobSpec, JobState,
-    JobStateCount, JobWorkerId,
+    JobFlowDependencies, JobFlowDependencyCounts, JobFlowDependencyPage,
+    JobFlowDependencyPageOptions, JobFlowIgnoredFailures, JobId, JobLeaseRenewal, JobListOptions,
+    JobListPage, JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueStats,
+    JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobSpec, JobState, JobStateCount,
+    JobWorkerId,
 };
 use crate::error::Result;
 use async_trait::async_trait;
@@ -46,6 +47,13 @@ pub trait JobQueueBackend: Send + Sync {
         &self,
         parent_id: &str,
     ) -> Result<Option<JobFlowDependencyCounts>>;
+
+    /// Return one cursor page from a parent flow dependency bucket.
+    async fn get_flow_dependency_page(
+        &self,
+        parent_id: &str,
+        options: JobFlowDependencyPageOptions,
+    ) -> Result<Option<JobFlowDependencyPage>>;
 
     /// Return completed child result values for a flow parent.
     ///
