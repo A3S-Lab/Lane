@@ -7017,6 +7017,7 @@ local function remove_finished_job(job_id)
   for index = 3, 8 do
     redis.call('ZREM', KEYS[index], job_id)
   end
+  redis.call('SREM', KEYS[12], job_id)
   redis.call('HDEL', KEYS[1], job_id)
   redis.call(
     'DEL',
@@ -7087,6 +7088,7 @@ end
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
   redis.call('DEL', KEYS[2])
+  redis.call('SREM', KEYS[12], ARGV[1])
   for index = 3, 8 do
     redis.call('ZREM', KEYS[index], ARGV[1])
   end
@@ -7102,11 +7104,12 @@ if not raw then
 end
 
 local job = cjson.decode(raw)
-if job["state"] == "active" then
+if job["state"] == "active" and redis.call('EXISTS', KEYS[2]) == 1 then
   return {'active'}
 end
 
 redis.call('DEL', KEYS[2])
+redis.call('SREM', KEYS[12], ARGV[1])
 release_deduplication_key(job, ARGV[1], ARGV[6], ARGV[9])
 release_repeat_key(job, ARGV[1], ARGV[7])
 for index = 3, 8 do
@@ -11042,7 +11045,7 @@ impl RedisJobQueue {
     ) -> Result<Option<Job>> {
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(REMOVE_JOB_SCRIPT)
-            .arg(11)
+            .arg(12)
             .arg(self.jobs_key())
             .arg(self.lock_key(job_id))
             .arg(self.state_key(JobState::Waiting))
@@ -11054,6 +11057,7 @@ impl RedisJobQueue {
             .arg(self.sequence_key())
             .arg(self.marker_key())
             .arg(self.events_key())
+            .arg(self.stalled_key())
             .arg(job_id)
             .arg(now.to_rfc3339())
             .arg(millis(now))
@@ -14161,6 +14165,14 @@ mod tests {
         assert!(CLEAN_JOBS_SCRIPT.contains("job[\"state\"] == state and not active_locked"));
         assert!(!CLEAN_JOBS_SCRIPT.contains("if state == 'active' or limit <= 0 then"));
         assert!(CLEAN_JOBS_SCRIPT.contains("redis.call('SREM', KEYS[11], candidate.id)"));
+    }
+
+    #[test]
+    fn remove_job_script_rejects_only_locked_active_jobs() {
+        assert!(REMOVE_JOB_SCRIPT
+            .contains("job[\"state\"] == \"active\" and redis.call('EXISTS', KEYS[2]) == 1"));
+        assert!(REMOVE_JOB_SCRIPT.contains("redis.call('SREM', KEYS[12], ARGV[1])"));
+        assert!(REMOVE_JOB_SCRIPT.contains("redis.call('SREM', KEYS[12], job_id)"));
     }
 
     #[test]

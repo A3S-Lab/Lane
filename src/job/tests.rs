@@ -7679,6 +7679,58 @@ async fn local_job_queue_cleans_unlocked_active_jobs_after_reopen() {
 }
 
 #[tokio::test]
+async fn local_job_queue_removes_unlocked_active_jobs_after_reopen() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let snapshot_path = temp_dir.path().join("jobs").join("remove-active.json");
+    let queue = LocalJobQueue::open("durable-remove-active", &snapshot_path)
+        .await
+        .unwrap();
+    let job = queue
+        .add_at(
+            "active",
+            serde_json::json!({}),
+            JobOptions::new(),
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+    let claimed = queue
+        .claim_next(
+            "worker-remove-active".to_string(),
+            Duration::from_secs(30),
+            ts(1_100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, job.id);
+    assert!(matches!(
+        queue.remove_job(&job.id).await.unwrap_err(),
+        LaneError::JobLeaseConflict(_)
+    ));
+
+    let reopened = LocalJobQueue::open("durable-remove-active", &snapshot_path)
+        .await
+        .unwrap();
+    let restored = reopened
+        .get_job(&job.id)
+        .await
+        .unwrap()
+        .expect("active job should be restored");
+    assert_eq!(restored.state, JobState::Active);
+    assert!(restored.lock_token.is_none());
+
+    let removed = reopened
+        .remove_job(&job.id)
+        .await
+        .unwrap()
+        .expect("unlocked active job should remove");
+    assert_eq!(removed.id, job.id);
+    assert_eq!(removed.state, JobState::Active);
+    assert!(reopened.get_job(&job.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn local_job_queue_persists_priority_updates() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let snapshot_path = temp_dir.path().join("jobs").join("priority.json");

@@ -468,7 +468,7 @@ changes stored job priority, `update_priority_with_lifo()` also chooses the
 same-priority waiting reinsert side, `renew_lease()` extends an active worker
 lease with the claim token, `renew_leases()` renews multiple claimed
 leases and returns the job ids that failed renewal,
-`remove_job()` removes non-active jobs,
+`remove_job()` removes jobs that are not protected by an active worker lock,
 `remove_repeat()` removes the current non-active owner for a repeat key and, in
 Redis, can fall back to scheduler metadata when the owner key is stale or
 missing,
@@ -1760,13 +1760,15 @@ repeat ownership. If the fast `repeat:<key>` owner key is missing but
 `repeat_meta:<key>.jid` still names the stalled occurrence, the recovery script
 restores the fast owner key before requeueing it.
 
-`remove_job()` uses a Redis script to reject active jobs and remove the job
-hash, lock key, all state indexes, retained log list, and any child dependency
-set in one Redis turn. A remove request for a missing job still prunes orphaned
-indexes, locks, dependency sets, and log lists for that id. If the removed job is
-a flow child, the same script updates the parent's dependency set and atomically
-moves the parent from `waiting_children` to `waiting`, `delayed`, or `failed` as
-appropriate.
+`remove_job()` uses a Redis script to reject active jobs only while their worker
+lock key still exists, matching BullMQ's `removeJob` `isLocked` guard. An active
+job whose lock has already disappeared can be removed as stale work; the script
+removes the job hash, lock key, all state indexes, stalled candidate entry,
+retained log list, and any child dependency set in one Redis turn. A remove
+request for a missing job still prunes orphaned indexes, locks, dependency sets,
+and log lists for that id. If the removed job is a flow child, the same script
+updates the parent's dependency set and atomically moves the parent from
+`waiting_children` to `waiting`, `delayed`, or `failed` as appropriate.
 
 Run the Redis integration test against any reachable Redis server:
 

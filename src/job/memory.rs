@@ -3982,7 +3982,7 @@ fn ensure_flow_dependencies_have_not_failed(
 }
 
 fn require_removable(job: &Job) -> Result<()> {
-    if job.state == JobState::Active {
+    if job.state == JobState::Active && job.lock_token.is_some() {
         Err(LaneError::JobLeaseConflict(format!(
             "cannot remove active leased job {}",
             job.id

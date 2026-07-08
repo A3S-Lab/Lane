@@ -13335,6 +13335,67 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             .state,
         JobState::Active
     );
+
+    let unlocked_active = producer
+        .add_job(
+            "remove-unlocked-active".to_string(),
+            serde_json::json!({ "kind": "lost-lock" }),
+            JobOptions::new().with_priority(4),
+        )
+        .await
+        .expect("unlocked active remove job should add");
+    let unlocked_active_claim = worker
+        .claim_next(
+            "worker-remove-unlocked-active".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("unlocked active remove claim should return")
+        .expect("unlocked active remove job should claim");
+    assert_eq!(unlocked_active_claim.id, unlocked_active.id);
+    producer
+        .add_log(
+            &unlocked_active.id,
+            "active removal log".to_string(),
+            10,
+            Utc::now(),
+        )
+        .await
+        .expect("unlocked active removal log should append");
+    let unlocked_active_lock_key = format!("{namespace}:jobs:locks:{}", unlocked_active.id);
+    let unlocked_active_logs_key = format!("{namespace}:jobs:logs:{}", unlocked_active.id);
+    let jobs_stalled_key = format!("{namespace}:jobs:stalled");
+    let removed_unlocked_active_lock: usize =
+        remove_index_conn.del(&unlocked_active_lock_key).await?;
+    assert_eq!(removed_unlocked_active_lock, 1);
+    let stalled_unlocked_active: usize = remove_index_conn
+        .sadd(&jobs_stalled_key, &unlocked_active.id)
+        .await?;
+    assert_eq!(stalled_unlocked_active, 1);
+    let removed_unlocked_active = producer
+        .remove_job(&unlocked_active.id)
+        .await
+        .expect("unlocked active job should remove")
+        .expect("unlocked active job should be returned");
+    assert_eq!(removed_unlocked_active.id, unlocked_active.id);
+    assert_eq!(removed_unlocked_active.state, JobState::Active);
+    assert!(producer
+        .get_job(&unlocked_active.id)
+        .await
+        .expect("unlocked active lookup should return")
+        .is_none());
+    let unlocked_active_score_after: Option<f64> = remove_index_conn
+        .zscore(format!("{namespace}:jobs:active"), &unlocked_active.id)
+        .await?;
+    assert!(unlocked_active_score_after.is_none());
+    let unlocked_active_logs_len: usize = remove_index_conn.llen(&unlocked_active_logs_key).await?;
+    assert_eq!(unlocked_active_logs_len, 0);
+    let unlocked_active_stalled_after: bool = remove_index_conn
+        .sismember(&jobs_stalled_key, &unlocked_active.id)
+        .await?;
+    assert!(!unlocked_active_stalled_after);
+
     let wrong_delay_token = producer
         .delay_active_job(
             &claimed_delayed.id,
