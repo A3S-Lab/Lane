@@ -432,12 +432,11 @@ impl InMemoryJobQueue {
         validate_flow_job_ids(&parent_job, &child_jobs)?;
 
         let mut inner = self.inner.lock().await;
-        for id in std::iter::once(&parent_job.id).chain(child_jobs.iter().map(|job| &job.id)) {
-            if inner.jobs.contains_key(id) {
-                return Err(LaneError::ConfigError(format!(
-                    "flow job id `{id}` already exists"
-                )));
-            }
+        if inner.jobs.contains_key(&parent_job.id) {
+            return Err(LaneError::ConfigError(format!(
+                "flow job id `{}` already exists",
+                parent_job.id
+            )));
         }
         let candidate_flow = JobFlow {
             parent: parent_job.clone(),
@@ -464,6 +463,17 @@ impl InMemoryJobQueue {
             emit_deduplicated_events_locked(&mut inner, &existing, &parent_job, now);
             return Ok(Self::flow_for_existing_owner_locked(&inner, &existing));
         }
+        let mut duplicated_children = HashSet::new();
+        for child in &child_jobs {
+            if inner.jobs.contains_key(&child.id) {
+                Self::validate_existing_flow_child_parent_locked(
+                    &inner,
+                    &parent_job.id,
+                    &child.id,
+                )?;
+                duplicated_children.insert(child.id.clone());
+            }
+        }
         let mut deduplicated_children = HashMap::new();
         let mut deduplicated_next_children = HashMap::new();
         let mut deduplicated_next_child_by_id = HashMap::new();
@@ -472,6 +482,9 @@ impl InMemoryJobQueue {
             flow_deduplication_ids.insert(deduplication_id.to_string());
         }
         for child in &child_jobs {
+            if duplicated_children.contains(&child.id) {
+                continue;
+            }
             if let Some(deduplication_id) = active_deduplication_id(child, now) {
                 if let Some(existing) = find_active_deduplication_id(
                     &inner.jobs,
@@ -523,7 +536,8 @@ impl InMemoryJobQueue {
         }
         let mut flow_repeat_keys = HashSet::new();
         for job in std::iter::once(&parent_job).chain(child_jobs.iter().filter(|child| {
-            !deduplicated_children.contains_key(&child.id)
+            !duplicated_children.contains(&child.id)
+                && !deduplicated_children.contains_key(&child.id)
                 && !deduplicated_next_children.contains_key(&child.id)
         })) {
             if let Some(repeat_key) = active_repeat_key(job) {
@@ -547,6 +561,13 @@ impl InMemoryJobQueue {
                 .or_else(|| deduplicated_next_children.get(&child.id))
             {
                 emit_deduplicated_events_locked(&mut inner, existing, &child, now);
+            } else if duplicated_children.contains(&child.id) {
+                if let Some(existing) = inner.jobs.get_mut(&child.id) {
+                    existing.parent_id = Some(parent_job.id.clone());
+                    let existing = existing.clone();
+                    emit_duplicated_event_locked(&mut inner, &existing, now);
+                    stored_child_jobs.push(existing);
+                }
             } else {
                 assign_waiting_order(&mut inner.sequence, &mut child);
                 Self::forget_released_deduplication_owner_locked(&mut inner, &child);
@@ -555,6 +576,14 @@ impl InMemoryJobQueue {
                 stored_child_jobs.push(child);
             }
         }
+        if deduplicated_next_children.is_empty() {
+            Self::release_parent_if_ready_locked(&mut inner, &parent_job.id, now);
+        }
+        let parent_job = inner
+            .jobs
+            .get(&parent_job.id)
+            .cloned()
+            .unwrap_or(parent_job);
 
         Ok(JobFlow {
             parent: parent_job,
@@ -1892,6 +1921,24 @@ impl InMemoryJobQueue {
         Some(parent)
     }
 
+    fn validate_existing_flow_child_parent_locked(
+        inner: &InMemoryJobQueueState,
+        parent_id: &str,
+        child_id: &str,
+    ) -> Result<()> {
+        let Some(child) = inner.jobs.get(child_id) else {
+            return Ok(());
+        };
+        if let Some(existing_parent_id) = &child.parent_id {
+            if existing_parent_id != parent_id && inner.jobs.contains_key(existing_parent_id) {
+                return Err(LaneError::JobStateConflict(format!(
+                    "flow child id `{child_id}` already belongs to parent `{existing_parent_id}`"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn fail_waiting_parent_locked(
         inner: &mut InMemoryJobQueueState,
         parent_id: &str,
@@ -2694,6 +2741,21 @@ fn emit_removed_event_locked(
         "removed",
         Some(job),
         Some(job.state),
+        timestamp,
+        BTreeMap::new(),
+    );
+}
+
+fn emit_duplicated_event_locked(
+    inner: &mut InMemoryJobQueueState,
+    job: &Job,
+    timestamp: DateTime<Utc>,
+) {
+    emit_event_locked(
+        inner,
+        "duplicated",
+        Some(job),
+        None,
         timestamp,
         BTreeMap::new(),
     );

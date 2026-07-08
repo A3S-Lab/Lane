@@ -1138,6 +1138,22 @@ async fn redis_backend_records_flow_dedup_events_against_real_server() {
 }
 
 #[tokio::test]
+async fn redis_backend_reuses_flow_duplicate_job_ids_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_flow_duplicate_job_ids(redis_url),
+    )
+    .await
+    .expect("Redis flow duplicate job-id integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_emits_retries_exhausted_event_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -2758,6 +2774,164 @@ async fn run_bulk_dedup_events(redis_url: String) -> redis::RedisResult<()> {
     assert_eq!(
         events[8].fields.get("deduplicatedJobId"),
         Some(&serde_json::json!("bulk-events:replace-old"))
+    );
+
+    cleanup_namespace(&redis_url, &namespace).await?;
+    Ok(())
+}
+
+async fn run_flow_duplicate_job_ids(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-duplicate-ids")
+        .expect("valid Redis URL should build the flow duplicate-id queue");
+    let existing = queue
+        .add_job(
+            "existing-child".to_string(),
+            serde_json::json!({ "original": true }),
+            JobOptions::new().with_job_id("flow-duplicate:existing-child"),
+        )
+        .await
+        .expect("existing child should add");
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({}))
+                .with_options(JobOptions::new().with_job_id("flow-duplicate:parent")),
+            vec![
+                JobSpec::new("candidate-child", serde_json::json!({ "candidate": true }))
+                    .with_options(JobOptions::new().with_job_id(existing.id.clone())),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("flow should reuse existing child id");
+    assert_eq!(flow.parent.state, JobState::WaitingChildren);
+    assert_eq!(flow.parent.child_ids, vec![existing.id.clone()]);
+    assert_eq!(flow.children.len(), 1);
+    assert_eq!(flow.children[0].id, existing.id);
+    assert_eq!(flow.children[0].name, "existing-child");
+    assert_eq!(
+        flow.children[0].payload,
+        serde_json::json!({ "original": true })
+    );
+    assert_eq!(
+        flow.children[0].parent_id.as_deref(),
+        Some(flow.parent.id.as_str())
+    );
+    let counts = queue
+        .get_flow_dependency_counts(&flow.parent.id)
+        .await
+        .expect("flow dependency counts should load")
+        .expect("flow dependency counts should exist");
+    assert_eq!(counts.processed, 0);
+    assert_eq!(counts.unprocessed, 1);
+    assert_eq!(counts.failed, 0);
+    assert_eq!(counts.missing, 0);
+
+    let duplicated_events = queue
+        .read_events("-", "+", 20)
+        .await
+        .expect("duplicate-id events should read")
+        .into_iter()
+        .filter(|event| {
+            event.event == "duplicated" && event.job_id.as_deref() == Some(existing.id.as_str())
+        })
+        .count();
+    assert_eq!(duplicated_events, 1);
+
+    let claimed = queue
+        .claim_next(
+            "worker-existing-child".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("existing child claim should return")
+        .expect("existing child should be claimable");
+    assert_eq!(claimed.id, existing.id);
+    queue
+        .complete_job(
+            &claimed.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("existing child should complete");
+    assert_eq!(
+        queue
+            .get_job(&flow.parent.id)
+            .await
+            .expect("parent should load")
+            .expect("parent should exist")
+            .state,
+        JobState::Waiting
+    );
+
+    let completed_queue =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-duplicate-completed")
+            .expect("valid Redis URL should build the completed duplicate-id queue");
+    let completed_existing = completed_queue
+        .add_job(
+            "completed-child".to_string(),
+            serde_json::json!({ "original": true }),
+            JobOptions::new().with_job_id("flow-duplicate:completed-child"),
+        )
+        .await
+        .expect("completed child should add");
+    let completed_claim = completed_queue
+        .claim_next(
+            "worker-completed-child".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("completed child claim should return")
+        .expect("completed child should be claimable");
+    completed_queue
+        .complete_job(
+            &completed_claim.id,
+            lock_token(&completed_claim),
+            serde_json::json!({ "done": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("completed child should finish");
+    let completed_flow = completed_queue
+        .add_flow_at(
+            JobSpec::new("completed-parent", serde_json::json!({}))
+                .with_options(JobOptions::new().with_job_id("flow-duplicate:completed-parent")),
+            vec![
+                JobSpec::new("candidate-completed-child", serde_json::json!({}))
+                    .with_options(JobOptions::new().with_job_id(completed_existing.id.clone())),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("flow should reuse completed child id");
+    assert_eq!(completed_flow.parent.state, JobState::Waiting);
+    assert_eq!(
+        completed_flow.parent.child_ids,
+        vec![completed_existing.id.clone()]
+    );
+    let completed_counts = completed_queue
+        .get_flow_dependency_counts(&completed_flow.parent.id)
+        .await
+        .expect("completed duplicate counts should load")
+        .expect("completed duplicate counts should exist");
+    assert_eq!(completed_counts.processed, 1);
+    assert_eq!(completed_counts.unprocessed, 0);
+    assert_eq!(completed_counts.failed, 0);
+    assert_eq!(completed_counts.missing, 0);
+    let completed_values = completed_queue
+        .get_flow_children_values(&completed_flow.parent.id)
+        .await
+        .expect("completed duplicate values should load")
+        .expect("completed duplicate values should exist");
+    assert_eq!(
+        completed_values.get(&completed_existing.id),
+        Some(&serde_json::json!({ "done": true }))
     );
 
     cleanup_namespace(&redis_url, &namespace).await?;
@@ -11195,55 +11369,66 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             serde_json::json!({ "kind": "existing" }),
             JobOptions::new()
                 .with_job_id(existing_flow_child_id.clone())
-                .with_delay(Duration::from_secs(60)),
+                .with_delay(Duration::from_secs(3_600)),
         )
         .await
         .expect("existing flow child id should be added");
-    let rejected_flow_parent_id = format!("{namespace}:flow:rejected-parent");
-    let rejected_flow_new_child_id = format!("{namespace}:flow:rejected-new-child");
-    let rejected_flow = producer
+    let reused_flow_parent_id = format!("{namespace}:flow:reused-parent");
+    let reused_flow_new_child_id = format!("{namespace}:flow:reused-new-child");
+    let reused_flow = producer
         .add_flow_at(
             JobSpec::new(
-                "rejected-flow-parent",
+                "reused-flow-parent",
                 serde_json::json!({ "kind": "aggregate" }),
             )
-            .with_options(JobOptions::new().with_job_id(rejected_flow_parent_id.clone())),
+            .with_options(JobOptions::new().with_job_id(reused_flow_parent_id.clone())),
             vec![
                 JobSpec::new("duplicate-flow-child", serde_json::json!({ "n": 1 }))
                     .with_options(JobOptions::new().with_job_id(existing_flow_child_id.clone())),
-                JobSpec::new("new-flow-child", serde_json::json!({ "n": 2 })).with_options(
-                    JobOptions::new().with_job_id(rejected_flow_new_child_id.clone()),
-                ),
+                JobSpec::new("new-flow-child", serde_json::json!({ "n": 2 }))
+                    .with_options(JobOptions::new().with_job_id(reused_flow_new_child_id.clone())),
             ],
             Utc::now(),
         )
         .await
-        .expect_err("flow with an existing Redis job id should be rejected");
-    assert!(matches!(rejected_flow, LaneError::ConfigError(_)));
-    assert!(producer
-        .get_job(&rejected_flow_parent_id)
-        .await
-        .expect("rejected flow parent lookup should return")
-        .is_none());
-    assert!(producer
-        .get_job(&rejected_flow_new_child_id)
-        .await
-        .expect("rejected flow child lookup should return")
-        .is_none());
-    let rejected_parent_waiting_children_score: Option<f64> = flow_index_conn
+        .expect("flow should reuse an existing Redis child id");
+    assert_eq!(reused_flow.parent.state, JobState::WaitingChildren);
+    assert_eq!(
+        reused_flow.parent.child_ids,
+        vec![
+            existing_flow_child_id.clone(),
+            reused_flow_new_child_id.clone()
+        ]
+    );
+    assert_eq!(reused_flow.children.len(), 2);
+    assert_eq!(reused_flow.children[0].id, existing_flow_child_id);
+    assert_eq!(reused_flow.children[0].name, "existing-flow-child");
+    assert_eq!(
+        reused_flow.children[0].parent_id.as_deref(),
+        Some(reused_flow.parent.id.as_str())
+    );
+    let reused_flow_dependencies_key =
+        format!("{namespace}:jobs:dependencies:{}", reused_flow.parent.id);
+    let reused_flow_dependencies: usize =
+        flow_index_conn.scard(&reused_flow_dependencies_key).await?;
+    assert_eq!(reused_flow_dependencies, 2);
+    let reused_parent_waiting_children_score: Option<f64> = flow_index_conn
         .zscore(
             format!("{namespace}:jobs:waiting_children"),
-            &rejected_flow_parent_id,
+            &reused_flow_parent_id,
         )
         .await?;
-    assert!(rejected_parent_waiting_children_score.is_none());
-    let rejected_child_waiting_score: Option<f64> = flow_index_conn
-        .zscore(
-            format!("{namespace}:jobs:waiting"),
-            &rejected_flow_new_child_id,
-        )
-        .await?;
-    assert!(rejected_child_waiting_score.is_none());
+    assert!(reused_parent_waiting_children_score.is_some());
+    let removed_reused_children = producer
+        .remove_unprocessed_children(&reused_flow.parent.id, Utc::now())
+        .await
+        .expect("reused flow children should be removable")
+        .expect("reused flow parent should exist");
+    assert_eq!(removed_reused_children.len(), 2);
+    producer
+        .remove_job(&reused_flow.parent.id)
+        .await
+        .expect("reused flow parent should be removable");
 
     let flow = producer
         .add_flow_at(
