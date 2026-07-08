@@ -3086,6 +3086,16 @@ local function retention_limit(retention)
   return limit
 end
 
+local function remove_dependency_keys(dependency_prefix, job_id)
+  redis.call(
+    'DEL',
+    dependency_prefix .. job_id,
+    dependency_prefix .. job_id .. ':processed',
+    dependency_prefix .. job_id .. ':failed',
+    dependency_prefix .. job_id .. ':unsuccessful'
+  )
+end
+
 local function remove_finished_job(jobs_key, job_id, dependency_prefix, deduplication_prefix, repeat_prefix, logs_prefix)
   local raw = redis.call('HGET', jobs_key, job_id)
   if raw then
@@ -3093,7 +3103,7 @@ local function remove_finished_job(jobs_key, job_id, dependency_prefix, deduplic
     release_repeat_key(removed, job_id, repeat_prefix)
   end
   redis.call('HDEL', jobs_key, job_id)
-  redis.call('DEL', dependency_prefix .. job_id)
+  remove_dependency_keys(dependency_prefix, job_id)
   redis.call('DEL', logs_prefix .. job_id)
 end
 
@@ -3407,6 +3417,10 @@ end
 
 if redis.call('SCARD', ARGV[13] .. ARGV[1]) > 0 then
   return {'pending_dependencies'}
+end
+
+if redis.call('ZCARD', ARGV[13] .. ARGV[1] .. ':unsuccessful') > 0 then
+  return {'failed_dependencies'}
 end
 
 for _, child_id in ipairs(job["child_ids"] or {}) do
@@ -3907,6 +3921,16 @@ local function retention_limit(retention)
   return limit
 end
 
+local function remove_dependency_keys(dependency_prefix, job_id)
+  redis.call(
+    'DEL',
+    dependency_prefix .. job_id,
+    dependency_prefix .. job_id .. ':processed',
+    dependency_prefix .. job_id .. ':failed',
+    dependency_prefix .. job_id .. ':unsuccessful'
+  )
+end
+
 local function remove_finished_job(jobs_key, job_id, dependency_prefix, deduplication_prefix, repeat_prefix, logs_prefix)
   local raw = redis.call('HGET', jobs_key, job_id)
   if raw then
@@ -3914,7 +3938,7 @@ local function remove_finished_job(jobs_key, job_id, dependency_prefix, deduplic
     release_repeat_key(removed, job_id, repeat_prefix)
   end
   redis.call('HDEL', jobs_key, job_id)
-  redis.call('DEL', dependency_prefix .. job_id)
+  remove_dependency_keys(dependency_prefix, job_id)
   redis.call('DEL', logs_prefix .. job_id)
 end
 
@@ -4300,6 +4324,7 @@ if parent_id and parent_id ~= cjson.null then
           if redis.call('EXISTS', dependency_key) == 1 then
             redis.call('SREM', dependency_key, ARGV[1])
           end
+          redis.call('ZADD', dependency_key .. ':unsuccessful', ARGV[8], ARGV[1])
           fail_parent = true
         elseif continue_parent_failure then
           if redis.call('EXISTS', dependency_key) == 1 then
@@ -5191,6 +5216,16 @@ local function retention_limit(retention)
   return limit
 end
 
+local function remove_dependency_keys(dependency_prefix, job_id)
+  redis.call(
+    'DEL',
+    dependency_prefix .. job_id,
+    dependency_prefix .. job_id .. ':processed',
+    dependency_prefix .. job_id .. ':failed',
+    dependency_prefix .. job_id .. ':unsuccessful'
+  )
+end
+
 local function remove_finished_job(jobs_key, job_id, dependency_prefix, deduplication_prefix, repeat_prefix, logs_prefix)
   local raw = redis.call('HGET', jobs_key, job_id)
   if raw then
@@ -5198,7 +5233,7 @@ local function remove_finished_job(jobs_key, job_id, dependency_prefix, deduplic
     release_repeat_key(removed, job_id, repeat_prefix)
   end
   redis.call('HDEL', jobs_key, job_id)
-  redis.call('DEL', dependency_prefix .. job_id)
+  remove_dependency_keys(dependency_prefix, job_id)
   redis.call('DEL', logs_prefix .. job_id)
 end
 
@@ -5624,6 +5659,7 @@ for _, id in ipairs(ids) do
                     if redis.call('EXISTS', dependency_key) == 1 then
                       redis.call('SREM', dependency_key, id)
                     end
+                    redis.call('ZADD', dependency_key .. ':unsuccessful', ARGV[1], id)
                     fail_parent = true
                   elseif continue_parent_failure then
                     if redis.call('EXISTS', dependency_key) == 1 then
@@ -6370,6 +6406,8 @@ if parent_id and parent_id ~= cjson.null then
     if owns_child and parent["state"] ~= "completed" and parent["state"] ~= "failed" and parent["state"] ~= "active" then
       local parent_previous_state = parent["state"] or ""
       redis.call('SADD', ARGV[10] .. parent_id, ARGV[1])
+      redis.call('ZREM', ARGV[10] .. parent_id .. ':unsuccessful', ARGV[1])
+      redis.call('HDEL', ARGV[10] .. parent_id .. ':failed', ARGV[1])
       redis.call('ZREM', KEYS[3], parent_id)
       redis.call('ZREM', KEYS[6], parent_id)
       redis.call('ZREM', KEYS[7], parent_id)
@@ -6930,7 +6968,13 @@ local function remove_finished_job(job_id)
     redis.call('ZREM', KEYS[index], job_id)
   end
   redis.call('HDEL', KEYS[1], job_id)
-  redis.call('DEL', ARGV[5] .. job_id)
+  redis.call(
+    'DEL',
+    ARGV[5] .. job_id,
+    ARGV[5] .. job_id .. ':processed',
+    ARGV[5] .. job_id .. ':failed',
+    ARGV[5] .. job_id .. ':unsuccessful'
+  )
   redis.call('DEL', ARGV[8] .. job_id)
 end
 
@@ -6996,7 +7040,13 @@ if not raw then
   for index = 3, 8 do
     redis.call('ZREM', KEYS[index], ARGV[1])
   end
-  redis.call('DEL', ARGV[5] .. ARGV[1])
+  redis.call(
+    'DEL',
+    ARGV[5] .. ARGV[1],
+    ARGV[5] .. ARGV[1] .. ':processed',
+    ARGV[5] .. ARGV[1] .. ':failed',
+    ARGV[5] .. ARGV[1] .. ':unsuccessful'
+  )
   redis.call('DEL', ARGV[8] .. ARGV[1])
   return {'missing'}
 end
@@ -7013,7 +7063,13 @@ for index = 3, 8 do
   redis.call('ZREM', KEYS[index], ARGV[1])
 end
 redis.call('HDEL', KEYS[1], ARGV[1])
-redis.call('DEL', ARGV[5] .. ARGV[1])
+redis.call(
+  'DEL',
+  ARGV[5] .. ARGV[1],
+  ARGV[5] .. ARGV[1] .. ':processed',
+  ARGV[5] .. ARGV[1] .. ':failed',
+  ARGV[5] .. ARGV[1] .. ':unsuccessful'
+)
 redis.call('DEL', ARGV[8] .. ARGV[1])
 
 local parent_id = job["parent_id"]
@@ -7345,7 +7401,13 @@ local function remove_finished_job(job_id)
   end
   remove_state_indexes(job_id)
   redis.call('HDEL', KEYS[1], job_id)
-  redis.call('DEL', ARGV[8] .. job_id)
+  redis.call(
+    'DEL',
+    ARGV[8] .. job_id,
+    ARGV[8] .. job_id .. ':processed',
+    ARGV[8] .. job_id .. ':failed',
+    ARGV[8] .. job_id .. ':unsuccessful'
+  )
   redis.call('DEL', ARGV[12] .. job_id)
 end
 
@@ -7560,7 +7622,13 @@ for index = 1, count do
   for key_index = 2, 7 do
     redis.call('ZREM', KEYS[key_index], candidate.id)
   end
-  redis.call('DEL', ARGV[8] .. candidate.id)
+  redis.call(
+    'DEL',
+    ARGV[8] .. candidate.id,
+    ARGV[8] .. candidate.id .. ':processed',
+    ARGV[8] .. candidate.id .. ':failed',
+    ARGV[8] .. candidate.id .. ':unsuccessful'
+  )
   redis.call('DEL', ARGV[12] .. candidate.id)
   release_deduplication_key(candidate.job, candidate.id, ARGV[10], ARGV[13])
   release_repeat_key(candidate.job, candidate.id, ARGV[11])
@@ -7783,7 +7851,13 @@ local function remove_finished_job(job_id)
   end
   remove_state_indexes(job_id)
   redis.call('HDEL', KEYS[1], job_id)
-  redis.call('DEL', ARGV[6] .. job_id)
+  redis.call(
+    'DEL',
+    ARGV[6] .. job_id,
+    ARGV[6] .. job_id .. ':processed',
+    ARGV[6] .. job_id .. ':failed',
+    ARGV[6] .. job_id .. ':unsuccessful'
+  )
   redis.call('DEL', ARGV[9] .. job_id)
 end
 
@@ -7976,7 +8050,13 @@ local removed = {}
 for index, candidate in ipairs(candidates) do
   redis.call('DEL', ARGV[5] .. candidate.id)
   remove_state_indexes(candidate.id)
-  redis.call('DEL', ARGV[6] .. candidate.id)
+  redis.call(
+    'DEL',
+    ARGV[6] .. candidate.id,
+    ARGV[6] .. candidate.id .. ':processed',
+    ARGV[6] .. candidate.id .. ':failed',
+    ARGV[6] .. candidate.id .. ':unsuccessful'
+  )
   redis.call('DEL', ARGV[9] .. candidate.id)
   release_deduplication_key(candidate.job, candidate.id, ARGV[7], ARGV[10])
   release_repeat_key(candidate.job, candidate.id, ARGV[8])
@@ -8072,7 +8152,15 @@ for index = 1, #entries, 2 do
 
   if not referenced then
     redis.call('HDEL', jobs_key, job_id)
-    redis.call('DEL', dependencies_prefix .. job_id, logs_prefix .. job_id, lock_prefix .. job_id)
+    redis.call(
+      'DEL',
+      dependencies_prefix .. job_id,
+      dependencies_prefix .. job_id .. ':processed',
+      dependencies_prefix .. job_id .. ':failed',
+      dependencies_prefix .. job_id .. ':unsuccessful',
+      logs_prefix .. job_id,
+      lock_prefix .. job_id
+    )
     removed_count = removed_count + 1
   end
 end
@@ -8733,7 +8821,13 @@ local function remove_finished_job(job_id)
   end
   remove_state_indexes(job_id)
   redis.call('HDEL', KEYS[1], job_id)
-  redis.call('DEL', ARGV[6] .. job_id)
+  redis.call(
+    'DEL',
+    ARGV[6] .. job_id,
+    ARGV[6] .. job_id .. ':processed',
+    ARGV[6] .. job_id .. ':failed',
+    ARGV[6] .. job_id .. ':unsuccessful'
+  )
   redis.call('DEL', ARGV[9] .. job_id)
 end
 
@@ -8784,7 +8878,13 @@ local function remove_job_record(job_id, job)
   remove_state_indexes(job_id)
   redis.call('HDEL', KEYS[1], job_id)
   redis.call('DEL', ARGV[5] .. job_id)
-  redis.call('DEL', ARGV[6] .. job_id)
+  redis.call(
+    'DEL',
+    ARGV[6] .. job_id,
+    ARGV[6] .. job_id .. ':processed',
+    ARGV[6] .. job_id .. ':failed',
+    ARGV[6] .. job_id .. ':unsuccessful'
+  )
   redis.call('DEL', ARGV[9] .. job_id)
 end
 
@@ -9129,7 +9229,13 @@ local function remove_finished_job(job_id)
   end
   remove_state_indexes(job_id)
   redis.call('HDEL', KEYS[1], job_id)
-  redis.call('DEL', ARGV[5] .. job_id)
+  redis.call(
+    'DEL',
+    ARGV[5] .. job_id,
+    ARGV[5] .. job_id .. ':processed',
+    ARGV[5] .. job_id .. ':failed',
+    ARGV[5] .. job_id .. ':unsuccessful'
+  )
   redis.call('DEL', ARGV[8] .. job_id)
 end
 
@@ -13036,9 +13142,20 @@ mod tests {
         assert!(REMOVE_ORPHANED_JOBS_SCRIPT.contains("redis.call('ZSCORE', KEYS[key_index]"));
         assert!(REMOVE_ORPHANED_JOBS_SCRIPT.contains("redis.call('SISMEMBER', KEYS[key_index]"));
         assert!(REMOVE_ORPHANED_JOBS_SCRIPT.contains("redis.call('HDEL', jobs_key, job_id)"));
-        assert!(
-            REMOVE_ORPHANED_JOBS_SCRIPT.contains("redis.call('DEL', dependencies_prefix .. job_id")
-        );
+        assert!(REMOVE_ORPHANED_JOBS_SCRIPT.contains("dependencies_prefix .. job_id"));
+        assert!(REMOVE_ORPHANED_JOBS_SCRIPT
+            .contains("dependencies_prefix .. job_id .. ':unsuccessful'"));
+    }
+
+    #[test]
+    fn move_to_finished_scripts_track_unsuccessful_flow_dependencies() {
+        assert!(COMPLETE_SCRIPT.contains("ARGV[13] .. ARGV[1] .. ':unsuccessful'"));
+        assert!(FAIL_SCRIPT
+            .contains("redis.call('ZADD', dependency_key .. ':unsuccessful', ARGV[8], ARGV[1])"));
+        assert!(RECOVER_STALLED_SCRIPT
+            .contains("redis.call('ZADD', dependency_key .. ':unsuccessful', ARGV[1], id)"));
+        assert!(RETRY_JOB_SCRIPT
+            .contains("redis.call('ZREM', ARGV[10] .. parent_id .. ':unsuccessful', ARGV[1])"));
     }
 
     #[test]

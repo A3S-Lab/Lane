@@ -1301,11 +1301,13 @@ one turn and returns processed, unprocessed, failed, ignored, and missing totals
 without returning every child snapshot to the client. Removed failed
 dependencies are intentionally omitted from the failed and ignored totals,
 matching BullMQ's `removeDependencyOnFailure` behavior.
-Completing a flow parent checks the Redis dependency set before leaving the
-active state, matching BullMQ's `moveToFinished` guard that rejects jobs with
-pending dependencies. When `continueParentOnFailure` releases a parent early,
-later child completion still removes that child from the dependency set so the
-parent can only finish after the remaining required fan-in has resolved.
+Completing a flow parent checks both the Redis dependency set and
+`dependencies:<parent_id>:unsuccessful` before leaving the active state, matching
+BullMQ's `moveToFinished` guard that rejects jobs with pending dependencies or
+unsuccessful child dependencies. When `continueParentOnFailure` releases a
+parent early, later child completion still removes that child from the dependency
+set so the parent can only finish after the remaining required fan-in has
+resolved.
 `get_flow_children_values()` and `get_flow_ignored_children_failures()` follow
 BullMQ's `getChildrenValues()` and `getIgnoredChildrenFailures()` fan-in
 semantics. BullMQ reads parent-scoped `:processed` and `:failed` hashes; Lane
@@ -1352,14 +1354,15 @@ Ignored and removed failures remove the failed child from
 `dependencies:<parent_id>` and release or delay the parent only when the
 remaining dependency set is empty. Continued failures remove the failed child and
 move the parent to `waiting` or `delayed` immediately, leaving other pending
-dependencies inspectable. Fail-parent failures remove the failed child, keep the
-remaining dependencies inspectable, store a deferred failure on the parent, and
-let the worker fail the parent before processor execution, matching BullMQ's
-`fpof` plus `defa` path. The failed child remains retained for inspection.
-Ignored and continued failures are reported through the ignored dependency
-count; removed failures are retained but omitted from failed and ignored
-dependency counts, while fail-parent failures remain in the failed dependency
-count.
+dependencies inspectable. Fail-parent failures remove the failed child, write the
+child id into `dependencies:<parent_id>:unsuccessful`, keep the remaining
+dependencies inspectable, store a deferred failure on the parent, and let the
+worker fail the parent before processor execution, matching BullMQ's `fpof` plus
+`defa` path. Retrying that child removes the unsuccessful entry and restores the
+parent dependency set. The failed child remains retained for inspection. Ignored
+and continued failures are reported through the ignored dependency count; removed
+failures are retained but omitted from failed and ignored dependency counts,
+while fail-parent failures remain in the failed dependency count.
 
 Repeat successors are created during the Redis completion script too. The
 worker computes the next occurrence from `RepeatOptions`, then the Lua script

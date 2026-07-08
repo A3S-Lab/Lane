@@ -2727,6 +2727,193 @@ async fn run_retry_restores_flow_dependency(redis_url: String) -> redis::RedisRe
 }
 
 #[tokio::test]
+async fn redis_backend_guards_flow_parent_completion_with_unsuccessful_index_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_flow_parent_unsuccessful_dependency_index(redis_url),
+    )
+    .await
+    .expect("Redis unsuccessful dependency index integration test timed out")
+    .unwrap();
+}
+
+async fn run_flow_parent_unsuccessful_dependency_index(
+    redis_url: String,
+) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let guard_queue =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-unsuccessful-guard")
+            .expect("valid Redis URL should build the flow-unsuccessful-guard queue");
+    let guard_worker =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-unsuccessful-guard")
+            .expect("valid Redis URL should build the flow-unsuccessful-guard worker");
+    let retry_queue =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-unsuccessful-retry")
+            .expect("valid Redis URL should build the flow-unsuccessful-retry queue");
+    let retry_worker =
+        RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-unsuccessful-retry")
+            .expect("valid Redis URL should build the flow-unsuccessful-retry worker");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let guard_flow = guard_queue
+        .add_flow_at(
+            JobSpec::new(
+                "unsuccessful-guard-parent",
+                serde_json::json!({ "kind": "aggregate" }),
+            )
+            .with_options(JobOptions::new().with_priority(1)),
+            vec![JobSpec::new(
+                "unsuccessful-guard-child",
+                serde_json::json!({ "required": true }),
+            )
+            .with_options(
+                JobOptions::new()
+                    .with_priority(1)
+                    .with_fail_parent_on_failure(true),
+            )],
+            Utc::now(),
+        )
+        .await
+        .expect("unsuccessful guard flow should be added");
+    let guard_unsuccessful_key = format!(
+        "{namespace}:flow-unsuccessful-guard:dependencies:{}:unsuccessful",
+        guard_flow.parent.id
+    );
+
+    let guard_child = guard_worker
+        .claim_next(
+            "worker-unsuccessful-guard-child".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("unsuccessful guard child claim should return")
+        .expect("unsuccessful guard child should be claimable");
+    assert_eq!(guard_child.id, guard_flow.children[0].id);
+    guard_worker
+        .fail_job(
+            &guard_child.id,
+            lock_token(&guard_child),
+            "required child failed".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("unsuccessful guard child should fail");
+
+    let guard_unsuccessful_score: Option<f64> = conn
+        .zscore(&guard_unsuccessful_key, &guard_flow.children[0].id)
+        .await?;
+    assert!(guard_unsuccessful_score.is_some());
+
+    let guard_parent = guard_worker
+        .claim_next(
+            "worker-unsuccessful-guard-parent".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("unsuccessful guard parent claim should return")
+        .expect("unsuccessful guard parent should be claimable");
+    assert_eq!(guard_parent.id, guard_flow.parent.id);
+    let complete_error = guard_worker
+        .complete_job(
+            &guard_parent.id,
+            lock_token(&guard_parent),
+            serde_json::json!({ "unexpected": true }),
+            Utc::now(),
+        )
+        .await
+        .expect_err("unsuccessful parent should not complete");
+    assert!(matches!(
+        complete_error,
+        LaneError::JobStateConflict(message) if message.contains("failed flow dependencies")
+    ));
+
+    let retry_flow = retry_queue
+        .add_flow_at(
+            JobSpec::new(
+                "unsuccessful-retry-parent",
+                serde_json::json!({ "kind": "aggregate" }),
+            )
+            .with_options(JobOptions::new().with_priority(1)),
+            vec![JobSpec::new(
+                "unsuccessful-retry-child",
+                serde_json::json!({ "retryable": true }),
+            )
+            .with_options(
+                JobOptions::new()
+                    .with_priority(1)
+                    .with_fail_parent_on_failure(true),
+            )],
+            Utc::now(),
+        )
+        .await
+        .expect("unsuccessful retry flow should be added");
+    let retry_dependency_key = format!(
+        "{namespace}:flow-unsuccessful-retry:dependencies:{}",
+        retry_flow.parent.id
+    );
+    let retry_unsuccessful_key = format!("{retry_dependency_key}:unsuccessful");
+
+    let retry_child = retry_worker
+        .claim_next(
+            "worker-unsuccessful-retry-child".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("unsuccessful retry child claim should return")
+        .expect("unsuccessful retry child should be claimable");
+    assert_eq!(retry_child.id, retry_flow.children[0].id);
+    retry_worker
+        .fail_job(
+            &retry_child.id,
+            lock_token(&retry_child),
+            "retryable child failed".to_string(),
+            Utc::now(),
+        )
+        .await
+        .expect("unsuccessful retry child should fail");
+
+    let retry_unsuccessful_score: Option<f64> = conn
+        .zscore(&retry_unsuccessful_key, &retry_flow.children[0].id)
+        .await?;
+    assert!(retry_unsuccessful_score.is_some());
+
+    let retried_child = retry_queue
+        .retry_job(&retry_flow.children[0].id, Utc::now())
+        .await
+        .expect("unsuccessful child should retry");
+    assert_eq!(retried_child.state, JobState::Waiting);
+    let cleared_unsuccessful_score: Option<f64> = conn
+        .zscore(&retry_unsuccessful_key, &retry_flow.children[0].id)
+        .await?;
+    assert!(cleared_unsuccessful_score.is_none());
+    let restored_dependency: bool = conn
+        .sismember(&retry_dependency_key, &retry_flow.children[0].id)
+        .await?;
+    assert!(restored_dependency);
+    let retry_parent = retry_queue
+        .get_job(&retry_flow.parent.id)
+        .await
+        .expect("retry parent should load")
+        .expect("retry parent should exist");
+    assert_eq!(retry_parent.state, JobState::WaitingChildren);
+    assert!(retry_parent.deferred_failure.is_none());
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
+#[tokio::test]
 async fn redis_backend_adds_dynamic_flow_children_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
