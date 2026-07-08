@@ -11,7 +11,7 @@ use a3s_lane::{
 };
 use chrono::{DateTime, TimeZone, Utc};
 use redis::AsyncCommands;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -3560,6 +3560,8 @@ async fn run_flow_side_index_snapshot_merge(redis_url: String) -> redis::RedisRe
                         .with_priority(4)
                         .with_ignore_dependency_on_failure(true),
                 ),
+                JobSpec::new("merge-completed-null-legacy", serde_json::json!({ "n": 5 }))
+                    .with_options(JobOptions::new().with_priority(5)),
             ],
             Utc::now(),
         )
@@ -3652,9 +3654,31 @@ async fn run_flow_side_index_snapshot_merge(redis_url: String) -> redis::RedisRe
         .await
         .expect("indexed ignored child should fail");
 
+    let completed_null_legacy = worker
+        .claim_next(
+            "worker-merge-completed-null-legacy".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("legacy null completed child claim should return")
+        .expect("legacy null completed child should be claimable");
+    assert_eq!(completed_null_legacy.id, flow.children[4].id);
+    worker
+        .complete_job(
+            &completed_null_legacy.id,
+            lock_token(&completed_null_legacy),
+            serde_json::Value::Null,
+            Utc::now(),
+        )
+        .await
+        .expect("legacy null completed child should complete");
+
     let removed_processed: usize = conn.hdel(&processed_key, &flow.children[0].id).await?;
+    let removed_null_processed: usize = conn.hdel(&processed_key, &flow.children[4].id).await?;
     let removed_failed: usize = conn.hdel(&failed_key, &flow.children[1].id).await?;
     assert_eq!(removed_processed, 1);
+    assert_eq!(removed_null_processed, 1);
     assert_eq!(removed_failed, 1);
     let processed_side_index_len: usize = conn.hlen(&processed_key).await?;
     let failed_side_index_len: usize = conn.hlen(&failed_key).await?;
@@ -3673,6 +3697,10 @@ async fn run_flow_side_index_snapshot_merge(redis_url: String) -> redis::RedisRe
     assert_eq!(
         child_values.get(&flow.children[2].id),
         Some(&serde_json::json!({ "value": "indexed-completed" }))
+    );
+    assert_eq!(
+        child_values.get(&flow.children[4].id),
+        Some(&serde_json::Value::Null)
     );
 
     let ignored_failures = queue
@@ -3698,7 +3726,7 @@ async fn run_flow_side_index_snapshot_merge(redis_url: String) -> redis::RedisRe
         .await
         .expect("merged dependency counts should load")
         .expect("merged dependency counts should exist");
-    assert_eq!(counts.processed, 2);
+    assert_eq!(counts.processed, 3);
     assert_eq!(counts.unprocessed, 0);
     assert_eq!(counts.failed, 0);
     assert_eq!(counts.ignored, 2);
@@ -3716,6 +3744,10 @@ async fn run_flow_side_index_snapshot_merge(redis_url: String) -> redis::RedisRe
     assert_eq!(
         values.processed.get(&flow.children[2].id),
         Some(&serde_json::json!({ "value": "indexed-completed" }))
+    );
+    assert_eq!(
+        values.processed.get(&flow.children[4].id),
+        Some(&serde_json::Value::Null)
     );
     assert_eq!(
         values.ignored.get(&flow.children[1].id).map(String::as_str),
@@ -3740,18 +3772,24 @@ async fn run_flow_side_index_snapshot_merge(redis_url: String) -> redis::RedisRe
         .items
         .iter()
         .map(|item| match item {
-            JobFlowDependencyPageItem::Processed { child_id, value } => (
-                child_id.clone(),
-                value["value"].as_str().unwrap().to_string(),
-            ),
+            JobFlowDependencyPageItem::Processed { child_id, value } => {
+                (child_id.clone(), value.clone())
+            }
             other => panic!("unexpected processed dependency page item: {other:?}"),
         })
-        .collect::<BTreeSet<_>>();
+        .collect::<BTreeMap<_, _>>();
     assert_eq!(
         processed_page_values,
-        BTreeSet::from([
-            (flow.children[0].id.clone(), "legacy-completed".to_string()),
-            (flow.children[2].id.clone(), "indexed-completed".to_string()),
+        BTreeMap::from([
+            (
+                flow.children[0].id.clone(),
+                serde_json::json!({ "value": "legacy-completed" }),
+            ),
+            (
+                flow.children[2].id.clone(),
+                serde_json::json!({ "value": "indexed-completed" }),
+            ),
+            (flow.children[4].id.clone(), serde_json::Value::Null),
         ])
     );
 
@@ -3804,13 +3842,12 @@ async fn run_flow_side_index_snapshot_merge(redis_url: String) -> redis::RedisRe
         .items
         .iter()
         .map(|item| match item {
-            JobFlowDependencyPageItem::Processed { child_id, value } => (
-                child_id.clone(),
-                value["value"].as_str().unwrap().to_string(),
-            ),
+            JobFlowDependencyPageItem::Processed { child_id, value } => {
+                (child_id.clone(), value.clone())
+            }
             other => panic!("unexpected multi processed dependency item: {other:?}"),
         })
-        .collect::<BTreeSet<_>>();
+        .collect::<BTreeMap<_, _>>();
     assert_eq!(multi_processed_values, processed_page_values);
     let multi_ignored_values = pages
         .get(JobFlowDependencyKind::Ignored)

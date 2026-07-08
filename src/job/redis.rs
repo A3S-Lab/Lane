@@ -8999,7 +8999,7 @@ for _, child_id in ipairs(parent['child_ids'] or {}) do
     local child_raw = redis.call('HGET', KEYS[1], child_id)
     if child_raw then
       local child = cjson.decode(child_raw)
-      if child["state"] == "completed" and child["return_value"] ~= nil and child["return_value"] ~= cjson.null then
+      if child["state"] == "completed" and child["return_value"] ~= nil then
         table.insert(result, child_id)
         table.insert(result, cjson.encode(child["return_value"]))
       end
@@ -14384,7 +14384,21 @@ mod tests {
         assert!(RETRY_JOB_SCRIPT
             .contains("redis.call('HDEL', ARGV[10] .. parent_id .. ':failed', ARGV[1])"));
         assert!(FLOW_CHILDREN_VALUES_SCRIPT.contains("redis.call('HGETALL', KEYS[2])"));
+        assert!(FLOW_CHILDREN_VALUES_SCRIPT
+            .contains("child[\"state\"] == \"completed\" and child[\"return_value\"] ~= nil"));
         assert!(FLOW_IGNORED_CHILDREN_FAILURES_SCRIPT.contains("redis.call('HGETALL', KEYS[2])"));
+    }
+
+    #[test]
+    fn decode_flow_children_values_result_accepts_json_null() {
+        let values = decode_flow_children_values_result(
+            &["ok".to_string(), "child-a".to_string(), "null".to_string()],
+            "parent",
+        )
+        .expect("child values should decode")
+        .expect("child values should exist");
+
+        assert_eq!(values.get("child-a"), Some(&serde_json::Value::Null));
     }
 
     #[test]

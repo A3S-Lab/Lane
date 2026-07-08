@@ -1418,6 +1418,8 @@ Redis read scripts now prefer those hashes as well, then merge retained child
 snapshots for any child id not covered by the side index. This preserves
 compatibility for mixed upgrade data where some children completed before the
 side indexes existed and later children wrote the new parent-scoped hashes.
+Completed children whose return value is JSON `null` remain visible through both
+side-index reads and retained-snapshot fallback reads.
 `remove_unprocessed_children()` follows BullMQ's `removeUnprocessedChildren`
 script shape at the dependency-set level: it removes children that are still in
 the parent's pending dependency set, skips completed, failed, active, or locked
