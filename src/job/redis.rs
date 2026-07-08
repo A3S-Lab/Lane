@@ -9668,7 +9668,6 @@ local parent_id = child["parent_id"]
 if not parent_id or parent_id == cjson.null or parent_id == '' then
   return {'no_relationship'}
 end
-local child_is_terminal = child["state"] == "completed" or child["state"] == "failed"
 
 local parent_raw = redis.call('HGET', KEYS[1], parent_id)
 if not parent_raw then
@@ -9688,17 +9687,18 @@ for _, child_id in ipairs(parent["child_ids"] or {}) do
   end
 end
 
-if child_is_terminal and not dependency_removed then
+local processed_removed = redis.call('HDEL', dependency_key .. ':processed', ARGV[1]) == 1
+local failed_removed = redis.call('HDEL', dependency_key .. ':failed', ARGV[1]) == 1
+local unsuccessful_removed = redis.call('ZREM', dependency_key .. ':unsuccessful', ARGV[1]) == 1
+
+if not dependency_removed
+  and not child_id_removed
+  and not processed_removed
+  and not failed_removed
+  and not unsuccessful_removed then
   return {'no_relationship'}
 end
 
-if not dependency_removed and not child_id_removed then
-  return {'no_relationship'}
-end
-
-redis.call('HDEL', dependency_key .. ':processed', ARGV[1])
-redis.call('HDEL', dependency_key .. ':failed', ARGV[1])
-redis.call('ZREM', dependency_key .. ':unsuccessful', ARGV[1])
 parent["child_ids"] = child_ids
 child["parent_id"] = cjson.null
 redis.call('HSET', KEYS[1], ARGV[1], cjson.encode(child))
@@ -14138,11 +14138,15 @@ mod tests {
     #[test]
     fn remove_child_dependency_script_clears_dependency_side_buckets() {
         assert!(REMOVE_CHILD_DEPENDENCY_SCRIPT
-            .contains("redis.call('HDEL', dependency_key .. ':processed', ARGV[1])"));
+            .contains("local processed_removed = redis.call('HDEL', dependency_key .. ':processed', ARGV[1]) == 1"));
+        assert!(REMOVE_CHILD_DEPENDENCY_SCRIPT.contains(
+            "local failed_removed = redis.call('HDEL', dependency_key .. ':failed', ARGV[1]) == 1"
+        ));
         assert!(REMOVE_CHILD_DEPENDENCY_SCRIPT
-            .contains("redis.call('HDEL', dependency_key .. ':failed', ARGV[1])"));
-        assert!(REMOVE_CHILD_DEPENDENCY_SCRIPT
-            .contains("redis.call('ZREM', dependency_key .. ':unsuccessful', ARGV[1])"));
+            .contains("local unsuccessful_removed = redis.call('ZREM', dependency_key .. ':unsuccessful', ARGV[1]) == 1"));
+        assert!(REMOVE_CHILD_DEPENDENCY_SCRIPT.contains("and not processed_removed"));
+        assert!(REMOVE_CHILD_DEPENDENCY_SCRIPT.contains("and not failed_removed"));
+        assert!(REMOVE_CHILD_DEPENDENCY_SCRIPT.contains("and not unsuccessful_removed"));
     }
 
     #[test]

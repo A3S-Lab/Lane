@@ -5076,7 +5076,124 @@ async fn run_stale_terminal_child_dependency_removal(redis_url: String) -> redis
         .expect("stale dependency released parent should remain stored");
     assert_eq!(parent_after_release.state, JobState::Waiting);
 
-    cleanup_namespace(&redis_url, &namespace).await
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let side_bucket_namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &side_bucket_namespace).await?;
+
+    let side_bucket_queue = RedisJobQueue::with_namespace(
+        &redis_url,
+        &side_bucket_namespace,
+        "flow-side-bucket-dependency",
+    )
+    .expect("valid Redis URL should build the side-bucket dependency queue");
+    let side_bucket_worker = RedisJobQueue::with_namespace(
+        &redis_url,
+        &side_bucket_namespace,
+        "flow-side-bucket-dependency",
+    )
+    .expect("valid Redis URL should build the side-bucket dependency worker");
+
+    let side_bucket_flow = side_bucket_queue
+        .add_flow_at(
+            JobSpec::new(
+                "side-bucket-parent",
+                serde_json::json!({ "kind": "aggregate" }),
+            )
+            .with_options(JobOptions::new().with_priority(1)),
+            vec![
+                JobSpec::new("side-bucket-child-a", serde_json::json!({ "step": "a" }))
+                    .with_options(JobOptions::new().with_priority(1)),
+                JobSpec::new("side-bucket-child-b", serde_json::json!({ "step": "b" }))
+                    .with_options(JobOptions::new().with_priority(2)),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("side-bucket dependency flow should add");
+    let side_dependency_key = format!(
+        "{side_bucket_namespace}:flow-side-bucket-dependency:dependencies:{}",
+        side_bucket_flow.parent.id
+    );
+    let side_processed_key = format!("{side_dependency_key}:processed");
+
+    let side_child_a = side_bucket_worker
+        .claim_next(
+            "worker-side-bucket-dependency-a".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("side-bucket child A claim should return")
+        .expect("side-bucket child A should be claimable");
+    assert_eq!(side_child_a.id, side_bucket_flow.children[0].id);
+    side_bucket_worker
+        .complete_job(
+            &side_child_a.id,
+            lock_token(&side_child_a),
+            serde_json::json!({ "ok": "a" }),
+            Utc::now(),
+        )
+        .await
+        .expect("side-bucket child A should complete");
+
+    let side_child_a_pending: bool = conn
+        .sismember(&side_dependency_key, &side_child_a.id)
+        .await?;
+    assert!(!side_child_a_pending);
+    let side_child_a_processed_before_remove: Option<String> =
+        conn.hget(&side_processed_key, &side_child_a.id).await?;
+    assert!(side_child_a_processed_before_remove.is_some());
+
+    assert!(side_bucket_queue
+        .remove_child_dependency(&side_child_a.id, Utc::now())
+        .await
+        .expect("terminal side-bucket-only child dependency should remove"));
+    assert!(!side_bucket_queue
+        .remove_child_dependency(&side_child_a.id, Utc::now())
+        .await
+        .expect("terminal side-bucket-only child dependency should not remove twice"));
+
+    let side_child_a_after = side_bucket_queue
+        .get_job(&side_child_a.id)
+        .await
+        .expect("side-bucket child A lookup should load")
+        .expect("side-bucket child A should remain stored");
+    assert_eq!(side_child_a_after.state, JobState::Completed);
+    assert!(side_child_a_after.parent_id.is_none());
+    let side_child_a_processed_after_remove: Option<String> =
+        conn.hget(&side_processed_key, &side_child_a.id).await?;
+    assert!(side_child_a_processed_after_remove.is_none());
+    let side_dependency_values_after_remove = side_bucket_queue
+        .get_flow_dependency_values(&side_bucket_flow.parent.id)
+        .await
+        .expect("side-bucket dependency values after remove should load")
+        .expect("side-bucket dependency values after remove should exist");
+    assert!(!side_dependency_values_after_remove
+        .processed
+        .contains_key(&side_child_a.id));
+
+    let side_parent_after_remove = side_bucket_queue
+        .get_job(&side_bucket_flow.parent.id)
+        .await
+        .expect("side-bucket parent lookup should load")
+        .expect("side-bucket parent should remain stored");
+    assert_eq!(side_parent_after_remove.state, JobState::WaitingChildren);
+    assert_eq!(
+        side_parent_after_remove.child_ids,
+        vec![side_bucket_flow.children[1].id.clone()]
+    );
+    let side_counts_after_remove = side_bucket_queue
+        .get_flow_dependency_counts(&side_bucket_flow.parent.id)
+        .await
+        .expect("side-bucket dependency counts should load")
+        .expect("side-bucket dependency counts should exist");
+    assert_eq!(side_counts_after_remove.processed, 0);
+    assert_eq!(side_counts_after_remove.unprocessed, 1);
+    assert_eq!(side_counts_after_remove.failed, 0);
+    assert_eq!(side_counts_after_remove.missing, 0);
+
+    cleanup_namespace(&redis_url, &side_bucket_namespace).await
 }
 
 async fn run_finished_retention(redis_url: String) -> redis::RedisResult<()> {

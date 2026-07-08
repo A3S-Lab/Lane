@@ -498,8 +498,8 @@ custom-id child jobs and move itself to `waiting_children`, mirroring BullMQ's
 dynamic `moveToWaitingChildren()` fan-out path,
 `remove_unprocessed_children()`
 removes children that are still unprocessed and not active,
-`remove_child_dependency()` detaches one unfinished child from its parent without
-deleting the child job,
+`remove_child_dependency()` detaches one child dependency from its parent
+without deleting the child job,
 `drain_jobs(false)` removes waiting jobs, `drain_jobs(true)` also removes
 ordinary delayed jobs while preserving current delayed repeat owners,
 `clean_jobs()` removes old records by state, `obliterate(false)` pauses the
@@ -1412,15 +1412,14 @@ checks whether the parent can leave `waiting_children`. Lane returns the removed
 child snapshots for auditability while preserving the parent `child_ids`, so
 later dependency inspection reports removed children as missing.
 `remove_child_dependency()` follows BullMQ's `removeChildDependency` path: it
-removes one child from the parent's pending dependency set, clears the child's
-parent reference, keeps the child job itself, and releases the parent when no
-pending dependencies remain. Redis treats the pending dependency set as
-authoritative here, so a stale dependency entry for an already terminal child is
-still removed just like BullMQ's `SREM` path. Because Lane stores parent child
-references in the parent snapshot and parent-scoped dependency side buckets, it
-also removes that child id from `child_ids`, `:processed`, `:failed`, and
-`:unsuccessful` so later dependency reads reflect the broken relationship
-instead of treating the child as missing or returning a ghost bucket entry.
+removes one child from the parent's pending dependency set when present, clears
+the child's parent reference, keeps the child job itself, and releases the
+parent when no pending dependencies remain. Redis treats the pending dependency
+set, parent `child_ids`, and parent-scoped `:processed`, `:failed`, and
+`:unsuccessful` buckets as relationship evidence, so terminal children that have
+already left the pending set can still be detached without leaving ghost
+dependency values behind. A stale dependency entry for an already terminal child
+is still removed just like BullMQ's `SREM` path.
 
 Flow fan-in is also protected in Redis transitions. Redis flow submission writes
 a pending dependency set for the parent, and child completion, removal, and
