@@ -1506,9 +1506,11 @@ invalid update cannot partially rewrite the job hash or waiting index.
 Redis job management mutations are script-backed too. `update_data()` follows
 BullMQ's `updateData` existence check and write shape, adapted to Lane's Redis
 hash layout by decoding the stored job JSON, replacing `payload`, and writing the
-job snapshot back in one Lua turn. `update_progress()` checks the current state
-and writes the progress value plus an `XADD event=progress` entry in one Redis
-turn. `save_stacktrace()` mirrors BullMQ's `saveStacktrace` storage behavior:
+job snapshot back in one Lua turn. `update_progress()` mirrors BullMQ's
+`updateProgress-3.lua` existence-only guard: any retained job, including a
+terminal job, can receive a new progress value, and the script writes that value
+plus an `XADD event=progress` entry in one Redis turn. `save_stacktrace()`
+mirrors BullMQ's `saveStacktrace` storage behavior:
 the Lua script verifies that the retained job exists, decodes Lane's stored job
 JSON, replaces the stacktrace array and failure reason together, and writes the
 updated snapshot back in one Redis turn. `add_log()` follows BullMQ's `addLog` shape at the key level: the script

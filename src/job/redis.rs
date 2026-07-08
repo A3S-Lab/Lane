@@ -8173,10 +8173,6 @@ if not raw then
 end
 
 local job = cjson.decode(raw)
-if job["state"] == "completed" or job["state"] == "failed" then
-  return {'state', job["state"] or ''}
-end
-
 job["progress"] = cjson.decode(ARGV[2])
 local updated = cjson.encode(job)
 redis.call('HSET', KEYS[1], ARGV[1], updated)

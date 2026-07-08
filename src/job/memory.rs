@@ -1732,7 +1732,7 @@ impl InMemoryJobQueue {
         Ok(removed)
     }
 
-    /// Update progress for a non-terminal job.
+    /// Update the stored payload for an existing job.
     pub async fn set_data(&self, job_id: &str, payload: Value) -> Result<Job> {
         let mut inner = self.inner.lock().await;
         let job = inner
@@ -1743,19 +1743,13 @@ impl InMemoryJobQueue {
         Ok(job.clone())
     }
 
-    /// Update progress for a non-terminal job.
+    /// Update progress for an existing job.
     pub async fn set_progress(&self, job_id: &str, progress: Value) -> Result<Job> {
         let mut inner = self.inner.lock().await;
         let job = inner
             .jobs
             .get_mut(job_id)
             .ok_or_else(|| LaneError::JobNotFound(job_id.to_string()))?;
-        if job.state.is_terminal() {
-            return Err(LaneError::JobStateConflict(format!(
-                "cannot update progress for terminal job {}",
-                job.id
-            )));
-        }
         job.progress = Some(progress.clone());
         let job = job.clone();
         let mut fields = BTreeMap::new();

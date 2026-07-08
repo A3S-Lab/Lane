@@ -2014,6 +2014,52 @@ async fn priority_updates_terminal_jobs_without_requeueing() {
 }
 
 #[tokio::test]
+async fn progress_updates_terminal_jobs_and_emit_events() {
+    let queue = InMemoryJobQueue::new("progress-terminal");
+    let now = ts(1_000);
+    let job = queue
+        .add_at("task", serde_json::json!({}), JobOptions::new(), now)
+        .await
+        .unwrap();
+    let claimed = queue
+        .claim_next("worker-a".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .unwrap();
+    queue
+        .complete_job(&job.id, lock_token(&claimed), serde_json::json!({}), now)
+        .await
+        .unwrap();
+
+    let updated = queue
+        .update_progress(&job.id, serde_json::json!({ "percent": 100 }))
+        .await
+        .unwrap();
+    assert_eq!(updated.state, JobState::Completed);
+    assert_eq!(
+        updated.progress,
+        Some(serde_json::json!({ "percent": 100 }))
+    );
+    assert!(queue
+        .claim_next("worker-b".to_string(), Duration::from_secs(30), now)
+        .await
+        .unwrap()
+        .is_none());
+
+    let events = queue.read_events("-", "+", 20).await.unwrap();
+    let progress = events
+        .iter()
+        .rev()
+        .find(|event| event.event == "progress")
+        .expect("terminal progress update should emit a progress event");
+    assert_eq!(progress.job_id.as_deref(), Some(job.id.as_str()));
+    assert_eq!(
+        progress.fields.get("data"),
+        Some(&serde_json::json!({ "percent": 100 }))
+    );
+}
+
+#[tokio::test]
 async fn repeatable_jobs_schedule_next_occurrence_after_completion() {
     let queue = InMemoryJobQueue::new("repeat");
     let now = ts(1_000);

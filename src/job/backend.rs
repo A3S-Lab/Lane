@@ -296,6 +296,11 @@ pub trait JobQueueBackend: Send + Sync {
 
     async fn update_data(&self, job_id: &str, payload: Value) -> Result<Job>;
 
+    /// Update an existing job's stored progress and emit a progress event.
+    ///
+    /// This mirrors BullMQ's `updateProgress` script behavior: any retained job
+    /// can be updated, including terminal jobs, and missing job records return
+    /// `JobNotFound`.
     async fn update_progress(&self, job_id: &str, progress: Value) -> Result<Job>;
 
     /// Save retained failure diagnostics for a job.

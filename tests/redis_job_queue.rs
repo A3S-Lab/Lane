@@ -186,6 +186,22 @@ async fn redis_backend_matches_bullmq_priority_update_guards_against_real_server
     .unwrap();
 }
 
+#[tokio::test]
+async fn redis_backend_allows_terminal_progress_updates_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_terminal_progress_update(redis_url),
+    )
+    .await
+    .expect("Redis terminal progress integration test timed out")
+    .unwrap();
+}
+
 async fn run_priority_update_limit(redis_url: String) -> redis::RedisResult<()> {
     let namespace = unique_namespace();
     cleanup_namespace(&redis_url, &namespace).await?;
@@ -288,6 +304,69 @@ async fn run_priority_update_limit(redis_url: String) -> redis::RedisResult<()> 
         .expect("second priority-limit job should remain waiting");
     assert_eq!(next_claimed.id, second.id);
     assert_ne!(next_claimed.id, first.id);
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
+async fn run_terminal_progress_update(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "terminal-progress")
+        .expect("valid Redis URL should build the terminal-progress queue");
+    let job = queue
+        .add_job("task".to_string(), serde_json::json!({}), JobOptions::new())
+        .await
+        .expect("terminal progress job should add");
+    let claimed = queue
+        .claim_next(
+            "worker-terminal-progress".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("terminal progress claim should return")
+        .expect("terminal progress job should be claimable");
+    queue
+        .complete_job(
+            &job.id,
+            lock_token(&claimed),
+            serde_json::json!({ "ok": true }),
+            Utc::now(),
+        )
+        .await
+        .expect("terminal progress job should complete");
+
+    let updated = queue
+        .update_progress(&job.id, serde_json::json!({ "percent": 100 }))
+        .await
+        .expect("terminal progress update should succeed");
+    assert_eq!(updated.state, JobState::Completed);
+    assert_eq!(
+        updated.progress,
+        Some(serde_json::json!({ "percent": 100 }))
+    );
+
+    let stored = queue
+        .get_job(&job.id)
+        .await
+        .expect("terminal progress stored job should load")
+        .expect("terminal progress stored job should remain");
+    assert_eq!(stored.progress, Some(serde_json::json!({ "percent": 100 })));
+    let events = queue
+        .read_events("-", "+", 100)
+        .await
+        .expect("terminal progress events should load");
+    let progress = events
+        .iter()
+        .rev()
+        .find(|event| event.event == "progress")
+        .expect("terminal progress update should emit an event");
+    assert_eq!(progress.job_id.as_deref(), Some(job.id.as_str()));
+    assert_eq!(
+        progress.fields.get("data"),
+        Some(&serde_json::json!({ "percent": 100 }))
+    );
 
     cleanup_namespace(&redis_url, &namespace).await
 }
@@ -10794,8 +10873,12 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     let terminal_progress = worker
         .update_progress(&first.id, serde_json::json!({ "percent": 100 }))
         .await
-        .expect_err("terminal completed jobs must reject progress updates");
-    assert!(matches!(terminal_progress, LaneError::JobStateConflict(_)));
+        .expect("terminal retained jobs should allow progress updates");
+    assert_eq!(terminal_progress.state, JobState::Completed);
+    assert_eq!(
+        terminal_progress.progress,
+        Some(serde_json::json!({ "percent": 100 }))
+    );
     let terminal_data = worker
         .update_data(
             &first.id,
@@ -11714,7 +11797,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     );
     assert_eq!(
         stored_high.progress,
-        Some(serde_json::json!({ "percent": 50 }))
+        Some(serde_json::json!({ "percent": 100 }))
     );
     assert_eq!(stored_high.logs.len(), 2);
     assert_eq!(stored_high.logs[0].line, "provider accepted");
