@@ -1330,6 +1330,14 @@ local function release_parent_if_no_pending_dependencies(parent_id, dependency_k
   end
 end
 
+local function record_processed_child_dependency(dependency_key, child_id, child)
+  local return_value = child["return_value"]
+  if return_value == nil then
+    return_value = cjson.null
+  end
+  redis.call('HSET', dependency_key .. ':processed', child_id, cjson.encode(return_value))
+end
+
 local function active_deduplication_id(jobs_key, deduplication_prefix, deduplication_id)
   if not deduplication_id or deduplication_id == '' then
     return nil
@@ -1825,7 +1833,9 @@ if count > 1 and (ARGV[4] == 'waiting_children' or duplicated_parent_id) then
         local existing_child_raw = redis.call('HGET', KEYS[1], child_id)
         if existing_child_raw then
           local existing_child = cjson.decode(existing_child_raw)
-          if existing_child["state"] ~= "completed" then
+          if existing_child["state"] == "completed" then
+            record_processed_child_dependency(dependency_key, child_id, existing_child)
+          else
             redis.call('SADD', dependency_key, child_id)
           end
         end
@@ -1924,6 +1934,14 @@ local function release_parent_if_no_pending_dependencies(parent_id, dependency_k
   local priority = tonumber(parent["priority"] or '1000') or 1000
   enqueue_waiting_job(KEYS[1], KEYS[2], KEYS[6], parent, parent_id, priority, waiting_score_bucket, KEYS[9])
   redis.call('XADD', KEYS[7], 'MAXLEN', '~', max_events, '*', 'event', 'waiting', 'jobId', parent_id, 'prev', 'waiting-children')
+end
+
+local function record_processed_child_dependency(dependency_key, child_id, child)
+  local return_value = child["return_value"]
+  if return_value == nil then
+    return_value = cjson.null
+  end
+  redis.call('HSET', dependency_key .. ':processed', child_id, cjson.encode(return_value))
 end
 
 local function active_deduplication_id(jobs_key, deduplication_prefix, deduplication_id)
@@ -2324,7 +2342,9 @@ for index = 1, count do
       local existing_child = cjson.decode(existing_raw)
       existing_child["parent_id"] = parent_id
       redis.call('HSET', KEYS[1], id, cjson.encode(existing_child))
-      if existing_child["state"] ~= "completed" then
+      if existing_child["state"] == "completed" then
+        record_processed_child_dependency(dependency_key, id, existing_child)
+      else
         redis.call('SADD', dependency_key, id)
       end
       redis.call('XADD', KEYS[7], 'MAXLEN', '~', max_events, '*', 'event', 'duplicated', 'jobId', id)
@@ -13220,6 +13240,11 @@ mod tests {
         assert!(COMPLETE_SCRIPT.contains("ARGV[13] .. ARGV[1] .. ':unsuccessful'"));
         assert!(COMPLETE_SCRIPT
             .contains("redis.call('HSET', dependency_key .. ':processed', ARGV[1], ARGV[4])"));
+        assert!(ADD_FLOW_SCRIPT.contains(
+            "record_processed_child_dependency(dependency_key, child_id, existing_child)"
+        ));
+        assert!(ADD_FLOW_CHILDREN_SCRIPT
+            .contains("record_processed_child_dependency(dependency_key, id, existing_child)"));
         assert!(FAIL_SCRIPT
             .contains("redis.call('HSET', dependency_key .. ':failed', ARGV[1], ARGV[4])"));
         assert!(FAIL_SCRIPT

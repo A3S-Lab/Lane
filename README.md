@@ -1303,6 +1303,12 @@ reads those side indexes in one turn and returns processed, unprocessed, failed,
 ignored, and missing totals without returning every child snapshot to the client.
 Removed failed dependencies are intentionally omitted from the failed and ignored
 totals, matching BullMQ's `removeDependencyOnFailure` behavior.
+When a static flow or an active parent fan-out reuses an existing completed child
+by custom id, Lane mirrors BullMQ's `updateExistingJobsParent` path by writing
+that retained return value into `dependencies:<parent_id>:processed` instead of
+only relying on the child snapshot fallback. Mixed flows with reused completed
+children and newly completed children therefore read one authoritative processed
+hash.
 Completing a flow parent checks both the Redis dependency set and
 `dependencies:<parent_id>:unsuccessful` before leaving the active state, matching
 BullMQ's `moveToFinished` guard that rejects jobs with pending dependencies or
