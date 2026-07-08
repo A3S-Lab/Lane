@@ -3234,6 +3234,41 @@ async fn run_flow_parent_unsuccessful_dependency_index(
         Some(lock_token(&guard_parent))
     );
 
+    let cleared_unsuccessful_entries: usize = conn.del(&guard_unsuccessful_key).await?;
+    assert_eq!(cleared_unsuccessful_entries, 1);
+    let legacy_fanout_error = guard_queue
+        .add_flow_children_at(
+            &guard_parent.id,
+            lock_token(&guard_parent),
+            vec![JobSpec::new(
+                "legacy-late-child",
+                serde_json::json!({ "unexpected": true }),
+            )
+            .with_options(JobOptions::new().with_job_id("unsuccessful-guard-legacy-late-child"))],
+            Utc::now(),
+        )
+        .await
+        .expect_err("failed child snapshots should block legacy dynamic fan-out");
+    assert!(matches!(
+        legacy_fanout_error,
+        LaneError::JobStateConflict(message) if message.contains("failed flow dependencies")
+    ));
+    let legacy_late_child = guard_queue
+        .get_job("unsuccessful-guard-legacy-late-child")
+        .await
+        .expect("legacy late child lookup should load");
+    assert!(legacy_late_child.is_none());
+    let guard_parent_after_legacy_fanout = guard_queue
+        .get_job(&guard_parent.id)
+        .await
+        .expect("guard parent after legacy fan-out rejection should load")
+        .expect("guard parent after legacy fan-out rejection should exist");
+    assert_eq!(guard_parent_after_legacy_fanout.state, JobState::Active);
+    assert_eq!(
+        guard_parent_after_legacy_fanout.lock_token.as_deref(),
+        Some(lock_token(&guard_parent))
+    );
+
     let retry_flow = retry_queue
         .add_flow_at(
             JobSpec::new(

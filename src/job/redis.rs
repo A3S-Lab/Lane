@@ -2212,6 +2212,15 @@ local dependency_key = dependency_prefix .. parent_id
 if redis.call('ZCARD', dependency_key .. ':unsuccessful') ~= 0 then
   return {'failed_dependencies'}
 end
+for _, child_id in ipairs(parent["child_ids"] or {}) do
+  local child_raw = redis.call('HGET', KEYS[1], child_id)
+  if child_raw then
+    local child = cjson.decode(child_raw)
+    if child["state"] == "failed" and not (child["options"] and child["options"] ~= cjson.null and (child["options"]["ignore_dependency_on_failure"] == true or child["options"]["remove_dependency_on_failure"] == true or child["options"]["continue_parent_on_failure"] == true)) then
+      return {'failed_dependencies'}
+    end
+  end
+end
 local staged_ids = {}
 local staged_deduplication_ids = {}
 local staged_repeat_keys = {}
@@ -14147,6 +14156,8 @@ mod tests {
             .contains("record_processed_child_dependency(dependency_key, id, existing_child)"));
         assert!(ADD_FLOW_CHILDREN_SCRIPT
             .contains("redis.call('ZCARD', dependency_key .. ':unsuccessful')"));
+        assert!(ADD_FLOW_CHILDREN_SCRIPT
+            .contains("for _, child_id in ipairs(parent[\"child_ids\"] or {}) do"));
         assert!(FAIL_SCRIPT
             .contains("redis.call('HSET', dependency_key .. ':failed', ARGV[1], ARGV[4])"));
         assert!(FAIL_SCRIPT
