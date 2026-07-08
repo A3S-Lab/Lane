@@ -307,6 +307,22 @@ async fn redis_backend_removes_orphaned_jobs_against_real_server() {
 }
 
 #[tokio::test]
+async fn redis_backend_remove_missing_prunes_orphaned_indexes_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_missing_remove_orphan_prune(redis_url),
+    )
+    .await
+    .expect("Redis missing remove orphan-prune integration test timed out")
+    .unwrap();
+}
+
+#[tokio::test]
 async fn redis_backend_saves_stacktrace_against_real_server() {
     let Some(redis_url) = redis_url() else {
         eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
@@ -2452,6 +2468,122 @@ async fn run_orphaned_job_removal(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect("referenced job lookup after cleanup should return")
         .is_some());
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
+async fn run_missing_remove_orphan_prune(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue_name = "missing-remove-prune";
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, queue_name)
+        .expect("valid Redis URL should build the missing-remove-prune queue");
+    let referenced = queue
+        .add_job(
+            "referenced".to_string(),
+            serde_json::json!({ "kind": "referenced" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("referenced job should add");
+
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+    let missing_job_id = "missing-job-with-stale-redis-state";
+    for state in [
+        "waiting",
+        "delayed",
+        "active",
+        "waiting_children",
+        "completed",
+        "failed",
+    ] {
+        let _: usize = conn
+            .zadd(
+                format!("{namespace}:{queue_name}:{state}"),
+                missing_job_id,
+                0.0,
+            )
+            .await?;
+    }
+    let _: () = conn
+        .set(
+            format!("{namespace}:{queue_name}:locks:{missing_job_id}"),
+            "stale-lock",
+        )
+        .await?;
+    let _: usize = conn
+        .sadd(format!("{namespace}:{queue_name}:stalled"), missing_job_id)
+        .await?;
+    let _: usize = conn
+        .sadd(
+            format!("{namespace}:{queue_name}:dependencies:{missing_job_id}"),
+            "stale-child",
+        )
+        .await?;
+    let _: usize = conn
+        .rpush(
+            format!("{namespace}:{queue_name}:logs:{missing_job_id}"),
+            "{\"line\":\"stale\"}",
+        )
+        .await?;
+
+    assert!(queue
+        .remove_job(missing_job_id)
+        .await
+        .expect("missing job remove should return")
+        .is_none());
+
+    let stored_missing: Option<String> = conn
+        .hget(format!("{namespace}:{queue_name}:jobs"), missing_job_id)
+        .await?;
+    assert!(stored_missing.is_none());
+    for state in [
+        "waiting",
+        "delayed",
+        "active",
+        "waiting_children",
+        "completed",
+        "failed",
+    ] {
+        let score: Option<f64> = conn
+            .zscore(format!("{namespace}:{queue_name}:{state}"), missing_job_id)
+            .await?;
+        assert!(
+            score.is_none(),
+            "missing remove should prune the orphaned {state} index"
+        );
+    }
+    let missing_lock_exists: usize = conn
+        .exists(format!("{namespace}:{queue_name}:locks:{missing_job_id}"))
+        .await?;
+    assert_eq!(missing_lock_exists, 0);
+    let missing_stalled_member: bool = conn
+        .sismember(format!("{namespace}:{queue_name}:stalled"), missing_job_id)
+        .await?;
+    assert!(!missing_stalled_member);
+    let missing_dependencies_exist: usize = conn
+        .exists(format!(
+            "{namespace}:{queue_name}:dependencies:{missing_job_id}"
+        ))
+        .await?;
+    assert_eq!(missing_dependencies_exist, 0);
+    let missing_logs_len: usize = conn
+        .llen(format!("{namespace}:{queue_name}:logs:{missing_job_id}"))
+        .await?;
+    assert_eq!(missing_logs_len, 0);
+
+    assert!(queue
+        .get_job(&referenced.id)
+        .await
+        .expect("referenced job lookup should return")
+        .is_some());
+    let referenced_waiting_score: Option<f64> = conn
+        .zscore(format!("{namespace}:{queue_name}:waiting"), &referenced.id)
+        .await?;
+    assert!(referenced_waiting_score.is_some());
 
     cleanup_namespace(&redis_url, &namespace).await
 }
