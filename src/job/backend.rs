@@ -1,11 +1,11 @@
 use super::types::{
     page_repeat_entries, Job, JobEvent, JobFinishedResult, JobFlow, JobFlowChildValues,
-    JobFlowDependencies, JobFlowDependencyCounts, JobFlowDependencyPage,
-    JobFlowDependencyPageOptions, JobFlowDependencyPages, JobFlowDependencyPagesOptions,
-    JobFlowDependencyValues, JobFlowIgnoredFailures, JobId, JobLeaseRenewal, JobListOptions,
-    JobListPage, JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueStats,
-    JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobSpec, JobState, JobStateCount,
-    JobWorkerId,
+    JobFlowDependencies, JobFlowDependencyCountOptions, JobFlowDependencyCounts,
+    JobFlowDependencyPage, JobFlowDependencyPageOptions, JobFlowDependencyPages,
+    JobFlowDependencyPagesOptions, JobFlowDependencySelectedCounts, JobFlowDependencyValues,
+    JobFlowIgnoredFailures, JobId, JobLeaseRenewal, JobListOptions, JobListPage, JobLogPage,
+    JobOptions, JobPriority, JobPriorityCount, JobQueueStats, JobRepeatEntry, JobRepeatListOptions,
+    JobRepeatPage, JobSpec, JobState, JobStateCount, JobWorkerId,
 };
 use crate::error::Result;
 use async_trait::async_trait;
@@ -48,6 +48,13 @@ pub trait JobQueueBackend: Send + Sync {
         &self,
         parent_id: &str,
     ) -> Result<Option<JobFlowDependencyCounts>>;
+
+    /// Return selected BullMQ-style dependency counts for a flow parent.
+    async fn get_flow_dependency_selected_counts(
+        &self,
+        parent_id: &str,
+        options: JobFlowDependencyCountOptions,
+    ) -> Result<Option<JobFlowDependencySelectedCounts>>;
 
     /// Return BullMQ-style full dependency buckets for a flow parent.
     async fn get_flow_dependency_values(

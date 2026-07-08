@@ -2,11 +2,12 @@
 
 use a3s_lane::{
     job_processor_fn, DeduplicationOptions, Job, JobContext, JobFinishedResult,
-    JobFlowDependencyKind, JobFlowDependencyPageCursor, JobFlowDependencyPageItem,
-    JobFlowDependencyPageOptions, JobFlowDependencyPagesOptions, JobLeaseRenewal, JobListOptions,
-    JobLogEntry, JobOptions, JobPriorityCount, JobProcessor, JobQueueBackend, JobRateLimit,
-    JobRepeatListOptions, JobRetention, JobRunOutcome, JobSpec, JobState, JobStateCount, JobWorker,
-    JobWorkerConfig, LaneError, RedisJobQueue, RepeatOptions, RetryPolicy, MAX_JOB_PRIORITY,
+    JobFlowDependencyCountOptions, JobFlowDependencyKind, JobFlowDependencyPageCursor,
+    JobFlowDependencyPageItem, JobFlowDependencyPageOptions, JobFlowDependencyPagesOptions,
+    JobLeaseRenewal, JobListOptions, JobLogEntry, JobOptions, JobPriorityCount, JobProcessor,
+    JobQueueBackend, JobRateLimit, JobRepeatListOptions, JobRetention, JobRunOutcome, JobSpec,
+    JobState, JobStateCount, JobWorker, JobWorkerConfig, LaneError, RedisJobQueue, RepeatOptions,
+    RetryPolicy, MAX_JOB_PRIORITY,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use redis::AsyncCommands;
@@ -2740,6 +2741,21 @@ async fn run_paginated_flow_dependencies(redis_url: String) -> redis::RedisResul
         values.failed,
         vec![flow.children[3].id.clone(), flow.children[4].id.clone()]
     );
+
+    let selected_counts = queue
+        .get_flow_dependency_selected_counts(
+            &flow.parent.id,
+            JobFlowDependencyCountOptions::new()
+                .with_processed(true)
+                .with_failed(true),
+        )
+        .await
+        .expect("selected dependency counts should load")
+        .expect("selected dependency counts should exist");
+    assert_eq!(selected_counts.processed, Some(2));
+    assert_eq!(selected_counts.failed, Some(2));
+    assert_eq!(selected_counts.unprocessed, None);
+    assert_eq!(selected_counts.ignored, None);
 
     let failed_first = queue
         .get_flow_dependency_page(

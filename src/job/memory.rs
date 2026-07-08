@@ -1,9 +1,10 @@
 use super::backend::JobQueueBackend;
 use super::types::{
     deduplication_expiration, page_repeat_entries, validate_job_priority, Job, JobEvent,
-    JobFinishedResult, JobFlow, JobFlowChildValues, JobFlowDependencies, JobFlowDependencyCounts,
-    JobFlowDependencyKind, JobFlowDependencyPage, JobFlowDependencyPageItem,
-    JobFlowDependencyPageOptions, JobFlowDependencyPages, JobFlowDependencyPagesOptions,
+    JobFinishedResult, JobFlow, JobFlowChildValues, JobFlowDependencies,
+    JobFlowDependencyCountOptions, JobFlowDependencyCounts, JobFlowDependencyKind,
+    JobFlowDependencyPage, JobFlowDependencyPageItem, JobFlowDependencyPageOptions,
+    JobFlowDependencyPages, JobFlowDependencyPagesOptions, JobFlowDependencySelectedCounts,
     JobFlowDependencyValues, JobFlowIgnoredFailures, JobId, JobListOptions, JobListPage,
     JobLogEntry, JobLogPage, JobOptions, JobPriority, JobPriorityCount, JobQueueSnapshot,
     JobQueueStats, JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobRetention, JobSpec,
@@ -1005,6 +1006,24 @@ impl InMemoryJobQueue {
         };
 
         Ok(Some(flow_dependency_counts(parent, &inner.jobs)))
+    }
+
+    /// Return selected BullMQ-style dependency counts for a flow parent.
+    pub async fn get_flow_dependency_selected_counts(
+        &self,
+        parent_id: &str,
+        options: JobFlowDependencyCountOptions,
+    ) -> Result<Option<JobFlowDependencySelectedCounts>> {
+        let inner = self.inner.lock().await;
+        let Some(parent) = inner.jobs.get(parent_id) else {
+            return Ok(None);
+        };
+
+        Ok(Some(flow_dependency_selected_counts(
+            parent,
+            &inner.jobs,
+            options,
+        )))
     }
 
     /// Return BullMQ-style full dependency buckets for a flow parent.
@@ -2409,6 +2428,14 @@ impl JobQueueBackend for InMemoryJobQueue {
         InMemoryJobQueue::get_flow_dependency_counts(self, parent_id).await
     }
 
+    async fn get_flow_dependency_selected_counts(
+        &self,
+        parent_id: &str,
+        options: JobFlowDependencyCountOptions,
+    ) -> Result<Option<JobFlowDependencySelectedCounts>> {
+        InMemoryJobQueue::get_flow_dependency_selected_counts(self, parent_id, options).await
+    }
+
     async fn get_flow_dependency_values(
         &self,
         parent_id: &str,
@@ -3367,6 +3394,25 @@ fn flow_dependency_counts(parent: &Job, jobs: &HashMap<JobId, Job>) -> JobFlowDe
     }
 
     counts
+}
+
+fn flow_dependency_selected_counts(
+    parent: &Job,
+    jobs: &HashMap<JobId, Job>,
+    options: JobFlowDependencyCountOptions,
+) -> JobFlowDependencySelectedCounts {
+    let counts = flow_dependency_counts(parent, jobs);
+    let mut selected = JobFlowDependencySelectedCounts::default();
+    for kind in options.selected() {
+        let count = match kind {
+            JobFlowDependencyKind::Processed => counts.processed,
+            JobFlowDependencyKind::Unprocessed => counts.unprocessed,
+            JobFlowDependencyKind::Ignored => counts.ignored,
+            JobFlowDependencyKind::Failed => counts.failed,
+        };
+        selected.insert(kind, count);
+    }
+    selected
 }
 
 fn flow_dependency_values(parent: &Job, jobs: &HashMap<JobId, Job>) -> JobFlowDependencyValues {

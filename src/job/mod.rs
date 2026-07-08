@@ -21,9 +21,10 @@ pub use memory::InMemoryJobQueue;
 pub use redis::RedisJobQueue;
 pub use types::{
     DeduplicationOptions, Job, JobEvent, JobFinishedResult, JobFlow, JobFlowChildValues,
-    JobFlowDependencies, JobFlowDependencyCounts, JobFlowDependencyKind, JobFlowDependencyPage,
-    JobFlowDependencyPageCursor, JobFlowDependencyPageItem, JobFlowDependencyPageOptions,
-    JobFlowDependencyPages, JobFlowDependencyPagesOptions, JobFlowDependencyValues,
+    JobFlowDependencies, JobFlowDependencyCountOptions, JobFlowDependencyCounts,
+    JobFlowDependencyKind, JobFlowDependencyPage, JobFlowDependencyPageCursor,
+    JobFlowDependencyPageItem, JobFlowDependencyPageOptions, JobFlowDependencyPages,
+    JobFlowDependencyPagesOptions, JobFlowDependencySelectedCounts, JobFlowDependencyValues,
     JobFlowIgnoredFailures, JobId, JobLeaseRenewal, JobListOptions, JobListPage, JobLockToken,
     JobLogEntry, JobLogPage, JobMetrics, JobMetricsMeta, JobOptions, JobPriority, JobPriorityCount,
     JobQueueSnapshot, JobQueueStats, JobRateLimit, JobRepeatEntry, JobRepeatListOptions,

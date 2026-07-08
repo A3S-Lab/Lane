@@ -2,11 +2,12 @@ use super::backend::JobQueueBackend;
 use super::memory::InMemoryJobQueue;
 use super::types::{
     Job, JobEvent, JobFinishedResult, JobFlow, JobFlowChildValues, JobFlowDependencies,
-    JobFlowDependencyCounts, JobFlowDependencyPage, JobFlowDependencyPageOptions,
-    JobFlowDependencyPages, JobFlowDependencyPagesOptions, JobFlowDependencyValues,
-    JobFlowIgnoredFailures, JobId, JobListOptions, JobListPage, JobLogPage, JobOptions,
-    JobPriority, JobPriorityCount, JobQueueSnapshot, JobQueueStats, JobRepeatEntry,
-    JobRepeatListOptions, JobRepeatPage, JobSpec, JobState, JobStateCount, JobWorkerId,
+    JobFlowDependencyCountOptions, JobFlowDependencyCounts, JobFlowDependencyPage,
+    JobFlowDependencyPageOptions, JobFlowDependencyPages, JobFlowDependencyPagesOptions,
+    JobFlowDependencySelectedCounts, JobFlowDependencyValues, JobFlowIgnoredFailures, JobId,
+    JobListOptions, JobListPage, JobLogPage, JobOptions, JobPriority, JobPriorityCount,
+    JobQueueSnapshot, JobQueueStats, JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobSpec,
+    JobState, JobStateCount, JobWorkerId,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -161,6 +162,17 @@ impl LocalJobQueue {
         parent_id: &str,
     ) -> Result<Option<JobFlowDependencyCounts>> {
         self.inner.get_flow_dependency_counts(parent_id).await
+    }
+
+    /// Return selected BullMQ-style dependency counts for a flow parent.
+    pub async fn get_flow_dependency_selected_counts(
+        &self,
+        parent_id: &str,
+        options: JobFlowDependencyCountOptions,
+    ) -> Result<Option<JobFlowDependencySelectedCounts>> {
+        self.inner
+            .get_flow_dependency_selected_counts(parent_id, options)
+            .await
     }
 
     /// Return BullMQ-style full dependency buckets for a flow parent.
@@ -379,6 +391,14 @@ impl JobQueueBackend for LocalJobQueue {
         parent_id: &str,
     ) -> Result<Option<JobFlowDependencyCounts>> {
         LocalJobQueue::get_flow_dependency_counts(self, parent_id).await
+    }
+
+    async fn get_flow_dependency_selected_counts(
+        &self,
+        parent_id: &str,
+        options: JobFlowDependencyCountOptions,
+    ) -> Result<Option<JobFlowDependencySelectedCounts>> {
+        LocalJobQueue::get_flow_dependency_selected_counts(self, parent_id, options).await
     }
 
     async fn get_flow_dependency_values(

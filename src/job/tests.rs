@@ -3690,6 +3690,20 @@ async fn flow_parent_ignores_configured_stalled_child_terminal_failure() {
             missing: 0,
         }
     );
+    let selected_counts = queue
+        .get_flow_dependency_selected_counts(
+            &flow.parent.id,
+            JobFlowDependencyCountOptions::new()
+                .with_processed(true)
+                .with_ignored(true),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected_counts.processed, Some(0));
+    assert_eq!(selected_counts.ignored, Some(1));
+    assert_eq!(selected_counts.unprocessed, None);
+    assert_eq!(selected_counts.failed, None);
 }
 
 #[tokio::test]

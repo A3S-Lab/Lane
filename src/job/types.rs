@@ -399,6 +399,122 @@ pub struct JobFlowDependencyCounts {
     pub missing: usize,
 }
 
+/// Flow dependency count buckets to read.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobFlowDependencyCountOptions {
+    pub processed: bool,
+    pub unprocessed: bool,
+    pub ignored: bool,
+    pub failed: bool,
+}
+
+impl JobFlowDependencyCountOptions {
+    /// Create empty count options; empty options default to all buckets when read.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Read all BullMQ dependency count buckets.
+    pub fn all() -> Self {
+        Self {
+            processed: true,
+            unprocessed: true,
+            ignored: true,
+            failed: true,
+        }
+    }
+
+    /// Include the processed bucket.
+    pub fn with_processed(mut self, enabled: bool) -> Self {
+        self.processed = enabled;
+        self
+    }
+
+    /// Include the unprocessed bucket.
+    pub fn with_unprocessed(mut self, enabled: bool) -> Self {
+        self.unprocessed = enabled;
+        self
+    }
+
+    /// Include the ignored-failure bucket.
+    pub fn with_ignored(mut self, enabled: bool) -> Self {
+        self.ignored = enabled;
+        self
+    }
+
+    /// Include the fail-parent bucket.
+    pub fn with_failed(mut self, enabled: bool) -> Self {
+        self.failed = enabled;
+        self
+    }
+
+    /// Include one bucket by kind.
+    pub fn with_kind(mut self, kind: JobFlowDependencyKind, enabled: bool) -> Self {
+        match kind {
+            JobFlowDependencyKind::Processed => self.processed = enabled,
+            JobFlowDependencyKind::Unprocessed => self.unprocessed = enabled,
+            JobFlowDependencyKind::Ignored => self.ignored = enabled,
+            JobFlowDependencyKind::Failed => self.failed = enabled,
+        }
+        self
+    }
+
+    pub(crate) fn selected(&self) -> Vec<JobFlowDependencyKind> {
+        let mut kinds = Vec::new();
+        if self.processed {
+            kinds.push(JobFlowDependencyKind::Processed);
+        }
+        if self.unprocessed {
+            kinds.push(JobFlowDependencyKind::Unprocessed);
+        }
+        if self.ignored {
+            kinds.push(JobFlowDependencyKind::Ignored);
+        }
+        if self.failed {
+            kinds.push(JobFlowDependencyKind::Failed);
+        }
+        if kinds.is_empty() {
+            kinds.extend_from_slice(&[
+                JobFlowDependencyKind::Processed,
+                JobFlowDependencyKind::Unprocessed,
+                JobFlowDependencyKind::Ignored,
+                JobFlowDependencyKind::Failed,
+            ]);
+        }
+        kinds
+    }
+}
+
+/// Selected BullMQ-style dependency counts for a flow parent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobFlowDependencySelectedCounts {
+    pub processed: Option<usize>,
+    pub unprocessed: Option<usize>,
+    pub ignored: Option<usize>,
+    pub failed: Option<usize>,
+}
+
+impl JobFlowDependencySelectedCounts {
+    /// Return the count for one dependency bucket, when it was requested.
+    pub fn get(&self, kind: JobFlowDependencyKind) -> Option<usize> {
+        match kind {
+            JobFlowDependencyKind::Processed => self.processed,
+            JobFlowDependencyKind::Unprocessed => self.unprocessed,
+            JobFlowDependencyKind::Ignored => self.ignored,
+            JobFlowDependencyKind::Failed => self.failed,
+        }
+    }
+
+    pub(crate) fn insert(&mut self, kind: JobFlowDependencyKind, count: usize) {
+        match kind {
+            JobFlowDependencyKind::Processed => self.processed = Some(count),
+            JobFlowDependencyKind::Unprocessed => self.unprocessed = Some(count),
+            JobFlowDependencyKind::Ignored => self.ignored = Some(count),
+            JobFlowDependencyKind::Failed => self.failed = Some(count),
+        }
+    }
+}
+
 /// BullMQ-style full dependency buckets for a flow parent.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct JobFlowDependencyValues {

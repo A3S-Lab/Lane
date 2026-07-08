@@ -2,13 +2,14 @@ use super::backend::JobQueueBackend;
 use super::types::{
     add_duration, deduplication_expiration, page_repeat_entries, validate_job_priority, Job,
     JobEvent, JobFinishedResult, JobFlow, JobFlowChildValues, JobFlowDependencies,
-    JobFlowDependencyCounts, JobFlowDependencyKind, JobFlowDependencyPage,
-    JobFlowDependencyPageItem, JobFlowDependencyPageOptions, JobFlowDependencyPages,
-    JobFlowDependencyPagesOptions, JobFlowDependencyValues, JobFlowIgnoredFailures, JobId,
-    JobLeaseRenewal, JobListOptions, JobListPage, JobLogEntry, JobLogPage, JobMetrics,
-    JobMetricsMeta, JobOptions, JobPriority, JobPriorityCount, JobQueueStats, JobRateLimit,
-    JobRepeatEntry, JobRepeatListOptions, JobRepeatPage, JobSpec, JobState, JobStateCount,
-    JobWorkerId, QueueName, DEFAULT_JOB_EVENT_RETENTION, DEFAULT_JOB_METRICS_RETENTION,
+    JobFlowDependencyCountOptions, JobFlowDependencyCounts, JobFlowDependencyKind,
+    JobFlowDependencyPage, JobFlowDependencyPageItem, JobFlowDependencyPageOptions,
+    JobFlowDependencyPages, JobFlowDependencyPagesOptions, JobFlowDependencySelectedCounts,
+    JobFlowDependencyValues, JobFlowIgnoredFailures, JobId, JobLeaseRenewal, JobListOptions,
+    JobListPage, JobLogEntry, JobLogPage, JobMetrics, JobMetricsMeta, JobOptions, JobPriority,
+    JobPriorityCount, JobQueueStats, JobRateLimit, JobRepeatEntry, JobRepeatListOptions,
+    JobRepeatPage, JobSpec, JobState, JobStateCount, JobWorkerId, QueueName,
+    DEFAULT_JOB_EVENT_RETENTION, DEFAULT_JOB_METRICS_RETENTION,
 };
 use crate::error::{LaneError, Result};
 use async_trait::async_trait;
@@ -8629,6 +8630,32 @@ end
 return {'ok', tostring(processed), tostring(unprocessed), tostring(failed), tostring(ignored), tostring(missing)}
 "#;
 
+const FLOW_DEPENDENCY_SELECTED_COUNTS_SCRIPT: &str = r#"
+local parent_raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not parent_raw then
+  return {'missing'}
+end
+
+local result = {'ok'}
+for index = 2, #ARGV do
+  local kind = ARGV[index]
+  result[#result + 1] = kind
+  if kind == 'processed' then
+    result[#result + 1] = tostring(redis.call('HLEN', KEYS[3]))
+  elseif kind == 'unprocessed' then
+    result[#result + 1] = tostring(redis.call('SCARD', KEYS[2]))
+  elseif kind == 'ignored' then
+    result[#result + 1] = tostring(redis.call('HLEN', KEYS[4]))
+  elseif kind == 'failed' then
+    result[#result + 1] = tostring(redis.call('ZCARD', KEYS[5]))
+  else
+    return {'invalid_kind', kind}
+  end
+end
+
+return result
+"#;
+
 const FLOW_DEPENDENCY_VALUES_SCRIPT: &str = r#"
 local parent_raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not parent_raw then
@@ -10339,6 +10366,31 @@ impl RedisJobQueue {
         decode_flow_dependency_counts_result(&result, parent_id)
     }
 
+    /// Return selected BullMQ-style dependency counts for a flow parent.
+    pub async fn get_flow_dependency_selected_counts(
+        &self,
+        parent_id: &str,
+        options: JobFlowDependencyCountOptions,
+    ) -> Result<Option<JobFlowDependencySelectedCounts>> {
+        let mut conn = self.connection().await?;
+        let dependency_key = self.dependencies_key(parent_id);
+        let mut command = redis::cmd("EVAL");
+        command
+            .arg(FLOW_DEPENDENCY_SELECTED_COUNTS_SCRIPT)
+            .arg(5)
+            .arg(self.jobs_key())
+            .arg(&dependency_key)
+            .arg(format!("{dependency_key}:processed"))
+            .arg(format!("{dependency_key}:failed"))
+            .arg(format!("{dependency_key}:unsuccessful"))
+            .arg(parent_id);
+        for kind in options.selected() {
+            command.arg(kind.as_str());
+        }
+        let result: Vec<String> = command.query_async(&mut conn).await.map_err(redis_error)?;
+        decode_flow_dependency_selected_counts_result(&result, parent_id)
+    }
+
     /// Return BullMQ-style full dependency buckets for a flow parent.
     pub async fn get_flow_dependency_values(
         &self,
@@ -11251,6 +11303,14 @@ impl JobQueueBackend for RedisJobQueue {
         parent_id: &str,
     ) -> Result<Option<JobFlowDependencyCounts>> {
         RedisJobQueue::get_flow_dependency_counts(self, parent_id).await
+    }
+
+    async fn get_flow_dependency_selected_counts(
+        &self,
+        parent_id: &str,
+        options: JobFlowDependencyCountOptions,
+    ) -> Result<Option<JobFlowDependencySelectedCounts>> {
+        RedisJobQueue::get_flow_dependency_selected_counts(self, parent_id, options).await
     }
 
     async fn get_flow_dependency_values(
@@ -12596,6 +12656,43 @@ fn decode_flow_dependency_counts_result(
     }
 }
 
+fn decode_flow_dependency_selected_counts_result(
+    result: &[String],
+    parent_id: &str,
+) -> Result<Option<JobFlowDependencySelectedCounts>> {
+    match result.first().map(String::as_str) {
+        Some("missing") => Ok(None),
+        Some("ok") => {
+            let payload = &result[1..];
+            if !payload.len().is_multiple_of(2) {
+                return Err(LaneError::Other(format!(
+                    "Redis flow dependency selected count script returned an odd pair count for {parent_id}"
+                )));
+            }
+            let mut counts = JobFlowDependencySelectedCounts::default();
+            for pair in payload.chunks_exact(2) {
+                let kind = decode_flow_dependency_kind(&pair[0], parent_id)?;
+                let count = decode_usize_field(&pair[1], kind.as_str(), parent_id)?;
+                counts.insert(kind, count);
+            }
+            Ok(Some(counts))
+        }
+        Some("invalid_kind") => Err(LaneError::Other(format!(
+            "Redis flow dependency selected count script rejected kind `{}` for {parent_id}",
+            result
+                .get(1)
+                .map(String::as_str)
+                .unwrap_or("<missing kind>")
+        ))),
+        Some(other) => Err(LaneError::Other(format!(
+            "unexpected Redis flow dependency selected count script status `{other}` for {parent_id}"
+        ))),
+        None => Err(LaneError::Other(format!(
+            "Redis flow dependency selected count script returned no status for {parent_id}"
+        ))),
+    }
+}
+
 fn decode_flow_dependency_values_result(
     result: &[String],
     parent_id: &str,
@@ -13745,6 +13842,10 @@ mod tests {
 
     #[test]
     fn flow_dependency_page_script_scans_bullmq_side_indexes() {
+        assert!(FLOW_DEPENDENCY_SELECTED_COUNTS_SCRIPT.contains("redis.call('HLEN', KEYS[3])"));
+        assert!(FLOW_DEPENDENCY_SELECTED_COUNTS_SCRIPT.contains("redis.call('SCARD', KEYS[2])"));
+        assert!(FLOW_DEPENDENCY_SELECTED_COUNTS_SCRIPT.contains("redis.call('HLEN', KEYS[4])"));
+        assert!(FLOW_DEPENDENCY_SELECTED_COUNTS_SCRIPT.contains("redis.call('ZCARD', KEYS[5])"));
         assert!(FLOW_DEPENDENCY_VALUES_SCRIPT.contains("redis.call('HGETALL', KEYS[3]"));
         assert!(FLOW_DEPENDENCY_VALUES_SCRIPT.contains("redis.call('SMEMBERS', KEYS[2]"));
         assert!(FLOW_DEPENDENCY_VALUES_SCRIPT.contains("redis.call('HGETALL', KEYS[4]"));
@@ -13757,6 +13858,34 @@ mod tests {
         assert!(FLOW_DEPENDENCY_PAGES_SCRIPT.contains("redis.call('SSCAN', KEYS[2]"));
         assert!(FLOW_DEPENDENCY_PAGES_SCRIPT.contains("redis.call('HSCAN', KEYS[4]"));
         assert!(FLOW_DEPENDENCY_PAGES_SCRIPT.contains("redis.call('ZRANGE', KEYS[5]"));
+    }
+
+    #[test]
+    fn decode_flow_dependency_selected_counts_result_builds_requested_counts() {
+        let counts = decode_flow_dependency_selected_counts_result(
+            &[
+                "ok".to_string(),
+                "processed".to_string(),
+                "3".to_string(),
+                "failed".to_string(),
+                "1".to_string(),
+            ],
+            "parent",
+        )
+        .expect("selected counts should decode")
+        .expect("selected counts should exist");
+
+        assert_eq!(counts.processed, Some(3));
+        assert_eq!(counts.failed, Some(1));
+        assert_eq!(counts.unprocessed, None);
+        assert_eq!(counts.ignored, None);
+
+        let missing = decode_flow_dependency_selected_counts_result(
+            &["missing".to_string()],
+            "missing-parent",
+        )
+        .expect("missing parent should decode");
+        assert!(missing.is_none());
     }
 
     #[test]
