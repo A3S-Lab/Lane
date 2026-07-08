@@ -3374,6 +3374,22 @@ async fn redis_backend_removes_flow_dependency_failure_against_real_server() {
     .unwrap();
 }
 
+#[tokio::test]
+async fn redis_backend_removes_stale_terminal_child_dependency_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        run_stale_terminal_child_dependency_removal(redis_url),
+    )
+    .await
+    .expect("Redis stale terminal child dependency removal test timed out")
+    .unwrap();
+}
+
 async fn run_removed_flow_dependency_failure(redis_url: String) -> redis::RedisResult<()> {
     let namespace = unique_namespace();
     cleanup_namespace(&redis_url, &namespace).await?;
@@ -3525,6 +3541,144 @@ async fn run_removed_flow_dependency_failure(redis_url: String) -> redis::RedisR
         child_values.get(&flow.children[1].id),
         Some(&serde_json::json!({ "ok": true }))
     );
+
+    cleanup_namespace(&redis_url, &namespace).await
+}
+
+async fn run_stale_terminal_child_dependency_removal(redis_url: String) -> redis::RedisResult<()> {
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await?;
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-stale-dependency")
+        .expect("valid Redis URL should build the stale dependency queue");
+    let worker = RedisJobQueue::with_namespace(&redis_url, &namespace, "flow-stale-dependency")
+        .expect("valid Redis URL should build the stale dependency worker");
+    let mut conn = redis::Client::open(redis_url.as_str())?
+        .get_connection_manager()
+        .await?;
+
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new(
+                "stale-dependency-parent",
+                serde_json::json!({ "kind": "aggregate" }),
+            )
+            .with_options(JobOptions::new().with_priority(1)),
+            vec![
+                JobSpec::new(
+                    "stale-dependency-child-a",
+                    serde_json::json!({ "step": "a" }),
+                )
+                .with_options(JobOptions::new().with_priority(1)),
+                JobSpec::new(
+                    "stale-dependency-child-b",
+                    serde_json::json!({ "step": "b" }),
+                )
+                .with_options(JobOptions::new().with_priority(2)),
+            ],
+            Utc::now(),
+        )
+        .await
+        .expect("stale dependency flow should add");
+    let dependency_key = format!(
+        "{namespace}:flow-stale-dependency:dependencies:{}",
+        flow.parent.id
+    );
+
+    let child_a = worker
+        .claim_next(
+            "worker-stale-dependency-a".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("stale dependency child A claim should return")
+        .expect("stale dependency child A should be claimable");
+    assert_eq!(child_a.id, flow.children[0].id);
+    worker
+        .complete_job(
+            &child_a.id,
+            lock_token(&child_a),
+            serde_json::json!({ "ok": "a" }),
+            Utc::now(),
+        )
+        .await
+        .expect("stale dependency child A should complete");
+
+    let child_a_pending: bool = conn.sismember(&dependency_key, &child_a.id).await?;
+    assert!(!child_a_pending);
+    let child_b_pending: bool = conn
+        .sismember(&dependency_key, &flow.children[1].id)
+        .await?;
+    assert!(child_b_pending);
+    let stale_inserted: usize = conn.sadd(&dependency_key, &child_a.id).await?;
+    assert_eq!(stale_inserted, 1);
+
+    assert!(queue
+        .remove_child_dependency(&child_a.id, Utc::now())
+        .await
+        .expect("stale terminal child dependency should remove"));
+    assert!(!queue
+        .remove_child_dependency(&child_a.id, Utc::now())
+        .await
+        .expect("stale terminal child dependency should not remove twice"));
+
+    let child_a_after = queue
+        .get_job(&child_a.id)
+        .await
+        .expect("stale dependency child A lookup should load")
+        .expect("stale dependency child A should remain stored");
+    assert_eq!(child_a_after.state, JobState::Completed);
+    assert!(child_a_after.parent_id.is_none());
+    let child_a_pending_after: bool = conn.sismember(&dependency_key, &child_a.id).await?;
+    assert!(!child_a_pending_after);
+
+    let parent_after_remove = queue
+        .get_job(&flow.parent.id)
+        .await
+        .expect("stale dependency parent lookup should load")
+        .expect("stale dependency parent should remain stored");
+    assert_eq!(parent_after_remove.state, JobState::WaitingChildren);
+    assert_eq!(
+        parent_after_remove.child_ids,
+        vec![flow.children[1].id.clone()]
+    );
+    let counts_after_remove = queue
+        .get_flow_dependency_counts(&flow.parent.id)
+        .await
+        .expect("stale dependency counts should load")
+        .expect("stale dependency counts should exist");
+    assert_eq!(counts_after_remove.processed, 0);
+    assert_eq!(counts_after_remove.unprocessed, 1);
+    assert_eq!(counts_after_remove.failed, 0);
+    assert_eq!(counts_after_remove.missing, 0);
+
+    let child_b = worker
+        .claim_next(
+            "worker-stale-dependency-b".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("stale dependency child B claim should return")
+        .expect("stale dependency child B should be claimable");
+    assert_eq!(child_b.id, flow.children[1].id);
+    worker
+        .complete_job(
+            &child_b.id,
+            lock_token(&child_b),
+            serde_json::json!({ "ok": "b" }),
+            Utc::now(),
+        )
+        .await
+        .expect("stale dependency child B should complete");
+
+    let parent_after_release = queue
+        .get_job(&flow.parent.id)
+        .await
+        .expect("stale dependency released parent lookup should load")
+        .expect("stale dependency released parent should remain stored");
+    assert_eq!(parent_after_release.state, JobState::Waiting);
 
     cleanup_namespace(&redis_url, &namespace).await
 }

@@ -9189,9 +9189,7 @@ local parent_id = child["parent_id"]
 if not parent_id or parent_id == cjson.null or parent_id == '' then
   return {'no_relationship'}
 end
-if child["state"] == "completed" or child["state"] == "failed" then
-  return {'no_relationship'}
-end
+local child_is_terminal = child["state"] == "completed" or child["state"] == "failed"
 
 local parent_raw = redis.call('HGET', KEYS[1], parent_id)
 if not parent_raw then
@@ -9209,6 +9207,10 @@ for _, child_id in ipairs(parent["child_ids"] or {}) do
   else
     child_ids[#child_ids + 1] = child_id
   end
+end
+
+if child_is_terminal and not dependency_removed then
+  return {'no_relationship'}
 end
 
 if not dependency_removed and not child_id_removed then

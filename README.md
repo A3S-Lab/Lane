@@ -1319,10 +1319,12 @@ returns the removed child snapshots for auditability while preserving the parent
 `remove_child_dependency()` follows BullMQ's `removeChildDependency` path: it
 removes one child from the parent's pending dependency set, clears the child's
 parent reference, keeps the child job itself, and releases the parent when no
-pending dependencies remain. Because Lane stores parent child references in the
-parent snapshot, it also removes that child id from `child_ids` so later
-dependency reads reflect the broken relationship instead of treating the child as
-missing.
+pending dependencies remain. Redis treats the pending dependency set as
+authoritative here, so a stale dependency entry for an already terminal child is
+still removed just like BullMQ's `SREM` path. Because Lane stores parent child
+references in the parent snapshot, it also removes that child id from
+`child_ids` so later dependency reads reflect the broken relationship instead of
+treating the child as missing.
 
 Flow fan-in is also protected in Redis transitions. Redis flow submission writes
 a pending dependency set for the parent, and child completion, removal, and
