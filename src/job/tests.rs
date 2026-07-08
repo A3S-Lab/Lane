@@ -6444,6 +6444,95 @@ async fn flow_remove_child_dependency_detaches_completed_child_values() {
 }
 
 #[tokio::test]
+async fn flow_remove_child_dependency_detaches_ignored_failed_child_values() {
+    let queue = InMemoryJobQueue::new("flow-remove-ignored-failed-child-dependency");
+    let flow = queue
+        .add_flow_at(
+            JobSpec::new("parent", serde_json::json!({ "kind": "aggregate" }))
+                .with_options(JobOptions::new().with_priority(1)),
+            vec![
+                JobSpec::new("optional-child", serde_json::json!({ "optional": true }))
+                    .with_options(
+                        JobOptions::new()
+                            .with_priority(1)
+                            .with_ignore_dependency_on_failure(true),
+                    ),
+                JobSpec::new("required-child", serde_json::json!({ "required": true }))
+                    .with_options(JobOptions::new().with_priority(2)),
+            ],
+            ts(1_000),
+        )
+        .await
+        .unwrap();
+
+    let optional_child = queue
+        .claim_next(
+            "worker-optional".to_string(),
+            Duration::from_secs(30),
+            ts(1_100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(optional_child.id, flow.children[0].id);
+    queue
+        .fail_job(
+            &optional_child.id,
+            lock_token(&optional_child),
+            "optional source failed".to_string(),
+            ts(1_200),
+        )
+        .await
+        .unwrap();
+
+    let values = queue
+        .get_flow_dependency_values(&flow.parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        values.ignored.get(&flow.children[0].id).map(String::as_str),
+        Some("optional source failed")
+    );
+
+    assert!(queue
+        .remove_child_dependency(&flow.children[0].id, ts(1_300))
+        .await
+        .unwrap());
+
+    let failed_child = queue
+        .get_job(&flow.children[0].id)
+        .await
+        .unwrap()
+        .expect("failed child should remain stored");
+    assert_eq!(failed_child.state, JobState::Failed);
+    assert!(failed_child.parent_id.is_none());
+
+    let counts = queue
+        .get_flow_dependency_counts(&flow.parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        counts,
+        JobFlowDependencyCounts {
+            processed: 0,
+            unprocessed: 1,
+            failed: 0,
+            ignored: 0,
+            missing: 0,
+        }
+    );
+    let values = queue
+        .get_flow_dependency_values(&flow.parent.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(values.ignored.is_empty());
+    assert_eq!(values.unprocessed, vec![flow.children[1].id.clone()]);
+}
+
+#[tokio::test]
 async fn flow_rejects_duplicate_custom_job_ids() {
     let queue = InMemoryJobQueue::new("flow-ids");
     let error = queue
