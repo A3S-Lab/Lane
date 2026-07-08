@@ -4347,6 +4347,18 @@ if parent_id and parent_id ~= cjson.null then
   local parent_raw = redis.call('HGET', KEYS[1], parent_id)
   if parent_raw then
 	    local parent = cjson.decode(parent_raw)
+      local dependency_key = ARGV[10] .. parent_id
+      local releases_dependency_after_parent_release = job["options"] and job["options"] ~= cjson.null and (job["options"]["ignore_dependency_on_failure"] == true or job["options"]["remove_dependency_on_failure"] == true or job["options"]["continue_parent_on_failure"] == true or job["options"]["fail_parent_on_failure"] == true)
+      if releases_dependency_after_parent_release and redis.call('EXISTS', dependency_key) == 1 then
+        local removed_dependency = redis.call('SREM', dependency_key, ARGV[1]) == 1
+        if removed_dependency then
+          if job["options"]["fail_parent_on_failure"] == true then
+            redis.call('ZADD', dependency_key .. ':unsuccessful', ARGV[8], ARGV[1])
+          elseif job["options"]["ignore_dependency_on_failure"] == true or job["options"]["continue_parent_on_failure"] == true then
+            redis.call('HSET', dependency_key .. ':failed', ARGV[1], ARGV[4])
+          end
+        end
+      end
 	    if parent["state"] == "waiting_children" then
 	      local ignore_parent_failure = job["options"] and job["options"] ~= cjson.null and job["options"]["ignore_dependency_on_failure"] == true
 	      local continue_parent_failure = job["options"] and job["options"] ~= cjson.null and job["options"]["continue_parent_on_failure"] == true
@@ -5687,6 +5699,18 @@ for _, id in ipairs(ids) do
             local parent_raw = redis.call('HGET', KEYS[1], parent_id)
             if parent_raw then
 	              local parent = cjson.decode(parent_raw)
+                local dependency_key = ARGV[6] .. parent_id
+                local releases_dependency_after_parent_release = job["options"] and job["options"] ~= cjson.null and (job["options"]["ignore_dependency_on_failure"] == true or job["options"]["remove_dependency_on_failure"] == true or job["options"]["continue_parent_on_failure"] == true or job["options"]["fail_parent_on_failure"] == true)
+                if releases_dependency_after_parent_release and redis.call('EXISTS', dependency_key) == 1 then
+                  local removed_dependency = redis.call('SREM', dependency_key, id) == 1
+                  if removed_dependency then
+                    if job["options"]["fail_parent_on_failure"] == true then
+                      redis.call('ZADD', dependency_key .. ':unsuccessful', ARGV[1], id)
+                    elseif job["options"]["ignore_dependency_on_failure"] == true or job["options"]["continue_parent_on_failure"] == true then
+                      redis.call('HSET', dependency_key .. ':failed', id, job["failed_reason"])
+                    end
+                  end
+                end
 	              if parent["state"] == "waiting_children" then
 	                local ignore_parent_failure = job["options"] and job["options"] ~= cjson.null and job["options"]["ignore_dependency_on_failure"] == true
 	                local continue_parent_failure = job["options"] and job["options"] ~= cjson.null and job["options"]["continue_parent_on_failure"] == true
@@ -6390,6 +6414,7 @@ end
 local raw = redis.call('HGET', KEYS[1], ARGV[1])
 if not raw then
   redis.call('ZREM', KEYS[2], ARGV[1])
+  redis.call('ZREM', KEYS[3], ARGV[1])
   return {'missing'}
 end
 
@@ -6397,7 +6422,28 @@ local job = cjson.decode(raw)
 local previous_state = job["state"] or ''
 if previous_state ~= "failed" and previous_state ~= "completed" then
   redis.call('ZREM', KEYS[2], ARGV[1])
+  redis.call('ZREM', KEYS[3], ARGV[1])
   return {'state', previous_state}
+end
+
+local completed_indexed = redis.call('ZSCORE', KEYS[2], ARGV[1])
+local failed_indexed = redis.call('ZSCORE', KEYS[3], ARGV[1])
+if previous_state == "completed" then
+  if failed_indexed then
+    redis.call('ZREM', KEYS[3], ARGV[1])
+    return {'state', 'failed'}
+  end
+  if not completed_indexed then
+    return {'state', 'completed_index_missing'}
+  end
+elseif previous_state == "failed" then
+  if completed_indexed then
+    redis.call('ZREM', KEYS[2], ARGV[1])
+    return {'state', 'completed'}
+  end
+  if not failed_indexed then
+    return {'state', 'failed_index_missing'}
+  end
 end
 
 local retry_deduplication_id = deduplication_id(job)
@@ -6412,9 +6458,16 @@ if repeat_owner then
   return {'repeat', repeat_owner}
 end
 
-local removed_from_failed = redis.call('ZREM', KEYS[2], ARGV[1])
-if removed_from_failed == 0 then
-  return {'state', 'failed_index_missing'}
+local terminal_key = KEYS[3]
+local terminal_index_missing = 'failed_index_missing'
+if previous_state == "completed" then
+  terminal_key = KEYS[2]
+  terminal_index_missing = 'completed_index_missing'
+end
+
+local removed_from_terminal = redis.call('ZREM', terminal_key, ARGV[1])
+if removed_from_terminal == 0 then
+  return {'state', terminal_index_missing}
 end
 
 job["state"] = "waiting"
@@ -6436,8 +6489,8 @@ if retry_deduplication_id then
 end
 
 local priority = tonumber(job["priority"] or '1000') or 1000
-local updated = enqueue_waiting_job(KEYS[1], KEYS[3], KEYS[4], job, ARGV[1], priority, ARGV[3], KEYS[#KEYS])
-redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[8], '*', 'event', 'waiting', 'jobId', ARGV[1], 'prev', previous_state)
+local updated = enqueue_waiting_job(KEYS[1], KEYS[4], KEYS[5], job, ARGV[1], priority, ARGV[3], KEYS[#KEYS])
+redis.call('XADD', KEYS[6], 'MAXLEN', '~', ARGV[8], '*', 'event', 'waiting', 'jobId', ARGV[1], 'prev', previous_state)
 
 local parent_id = job["parent_id"]
 if parent_id and parent_id ~= cjson.null then
@@ -6458,11 +6511,11 @@ if parent_id and parent_id ~= cjson.null then
       redis.call('HDEL', ARGV[10] .. parent_id .. ':processed', ARGV[1])
       redis.call('ZREM', ARGV[10] .. parent_id .. ':unsuccessful', ARGV[1])
       redis.call('HDEL', ARGV[10] .. parent_id .. ':failed', ARGV[1])
-      redis.call('ZREM', KEYS[3], parent_id)
-      redis.call('ZREM', KEYS[6], parent_id)
+      redis.call('ZREM', KEYS[4], parent_id)
       redis.call('ZREM', KEYS[7], parent_id)
+      redis.call('ZREM', KEYS[8], parent_id)
       if parent_previous_state == "delayed" then
-        refresh_delay_marker(KEYS[#KEYS], KEYS[7])
+        refresh_delay_marker(KEYS[#KEYS], KEYS[8])
       end
       parent["state"] = "waiting_children"
       parent["processed_at"] = cjson.null
@@ -6473,13 +6526,13 @@ if parent_id and parent_id ~= cjson.null then
       parent["deferred_failure"] = cjson.null
       parent["failed_reason"] = cjson.null
       redis.call('HSET', KEYS[1], parent_id, cjson.encode(parent))
-      redis.call('ZADD', KEYS[6], ARGV[9], parent_id)
+      redis.call('ZADD', KEYS[7], ARGV[9], parent_id)
       if parent_previous_state ~= "waiting_children" then
         local prev_event_state = parent_previous_state
         if prev_event_state == "waiting_children" then
           prev_event_state = "waiting-children"
         end
-        redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[8], '*', 'event', 'waiting-children', 'jobId', parent_id, 'prev', prev_event_state)
+        redis.call('XADD', KEYS[6], 'MAXLEN', '~', ARGV[8], '*', 'event', 'waiting-children', 'jobId', parent_id, 'prev', prev_event_state)
       end
     end
   end
@@ -7637,21 +7690,23 @@ for _, id in ipairs(ids) do
   local raw = redis.call('HGET', KEYS[1], id)
   if raw then
     local job = cjson.decode(raw)
-    local active_locked = state == 'active' and redis.call('EXISTS', lock_prefix .. id) == 1
-    if job["state"] == state and not active_locked then
-      local reference = job["finished_at"]
-      if not reference or reference == cjson.null then
-        reference = job["processed_at"]
-      end
-      if not reference or reference == cjson.null then
-        reference = job["scheduled_at"]
-      end
+    if job["state"] == state then
+      local active_locked = state == 'active' and redis.call('EXISTS', lock_prefix .. id) == 1
+      if not active_locked then
+        local reference = job["finished_at"]
+        if not reference or reference == cjson.null then
+          reference = job["processed_at"]
+        end
+        if not reference or reference == cjson.null then
+          reference = job["scheduled_at"]
+        end
 
-      if reference and reference ~= cjson.null then
-        local reference_millis = iso_to_millis(reference)
-        if reference_millis <= cutoff_millis
-          and not is_current_repeat_owner(job, id, ARGV[11]) then
-          table.insert(candidates, { id = id, reference_millis = reference_millis, raw = raw, job = job })
+        if reference and reference ~= cjson.null then
+          local reference_millis = iso_to_millis(reference)
+          if reference_millis <= cutoff_millis
+            and not is_current_repeat_owner(job, id, ARGV[11]) then
+            table.insert(candidates, { id = id, reference_millis = reference_millis, raw = raw, job = job })
+          end
         end
       end
     else
@@ -11087,7 +11142,15 @@ impl RedisJobQueue {
             .hget(self.jobs_key(), job_id)
             .await
             .map_err(redis_error)?;
-        raw.map(|raw| decode_job(&raw)).transpose()
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+
+        let mut job = decode_job(&raw)?;
+        if job.state == JobState::Active {
+            job.lock_token = conn.get(self.lock_key(job_id)).await.map_err(redis_error)?;
+        }
+        Ok(Some(job))
     }
 
     async fn load_flow_for_parent(
@@ -11856,13 +11919,6 @@ impl JobQueueBackend for RedisJobQueue {
     async fn retry_job(&self, job_id: &str, now: DateTime<Utc>) -> Result<Job> {
         let mut conn = self.connection().await?;
         let retry_job = self.load_job(&mut conn, job_id).await?;
-        let retry_state_key = retry_job
-            .as_ref()
-            .map(|job| match job.state {
-                JobState::Completed => self.state_key(JobState::Completed),
-                _ => self.state_key(JobState::Failed),
-            })
-            .unwrap_or_else(|| self.state_key(JobState::Failed));
         let deduplication_expires_at = retry_job
             .as_ref()
             .and_then(|job| deduplication_expiration(&job.options, now))
@@ -11875,9 +11931,10 @@ impl JobQueueBackend for RedisJobQueue {
             .unwrap_or_default();
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(RETRY_JOB_SCRIPT)
-            .arg(8)
+            .arg(9)
             .arg(self.jobs_key())
-            .arg(retry_state_key)
+            .arg(self.state_key(JobState::Completed))
+            .arg(self.state_key(JobState::Failed))
             .arg(self.state_key(JobState::Waiting))
             .arg(self.sequence_key())
             .arg(self.events_key())
@@ -12023,7 +12080,7 @@ impl JobQueueBackend for RedisJobQueue {
         limit: usize,
         now: DateTime<Utc>,
     ) -> Result<Vec<Job>> {
-        if state == JobState::Active || limit == 0 {
+        if limit == 0 {
             return Ok(Vec::new());
         }
 
@@ -14312,7 +14369,9 @@ mod tests {
         assert!(CLEAN_JOBS_SCRIPT.contains(
             "local active_locked = state == 'active' and redis.call('EXISTS', lock_prefix .. id) == 1"
         ));
-        assert!(CLEAN_JOBS_SCRIPT.contains("job[\"state\"] == state and not active_locked"));
+        assert!(CLEAN_JOBS_SCRIPT.contains("if job[\"state\"] == state then"));
+        assert!(CLEAN_JOBS_SCRIPT.contains("if not active_locked then"));
+        assert!(!CLEAN_JOBS_SCRIPT.contains("job[\"state\"] == state and not active_locked"));
         assert!(!CLEAN_JOBS_SCRIPT.contains("if state == 'active' or limit <= 0 then"));
         assert!(CLEAN_JOBS_SCRIPT.contains("redis.call('SREM', KEYS[11], candidate.id)"));
     }
@@ -14372,17 +14431,21 @@ mod tests {
             .contains("redis.call('HSET', dependency_key .. ':failed', ARGV[1], ARGV[4])"));
         assert!(FAIL_SCRIPT
             .contains("redis.call('ZADD', dependency_key .. ':unsuccessful', ARGV[8], ARGV[1])"));
+        assert!(FAIL_SCRIPT.contains("releases_dependency_after_parent_release"));
         assert!(RECOVER_STALLED_SCRIPT.contains(
             "redis.call('HSET', dependency_key .. ':failed', id, job[\"failed_reason\"])"
         ));
         assert!(RECOVER_STALLED_SCRIPT
             .contains("redis.call('ZADD', dependency_key .. ':unsuccessful', ARGV[1], id)"));
+        assert!(RECOVER_STALLED_SCRIPT.contains("releases_dependency_after_parent_release"));
         assert!(RETRY_JOB_SCRIPT
             .contains("redis.call('HDEL', ARGV[10] .. parent_id .. ':processed', ARGV[1])"));
         assert!(RETRY_JOB_SCRIPT
             .contains("redis.call('ZREM', ARGV[10] .. parent_id .. ':unsuccessful', ARGV[1])"));
         assert!(RETRY_JOB_SCRIPT
             .contains("redis.call('HDEL', ARGV[10] .. parent_id .. ':failed', ARGV[1])"));
+        assert!(RETRY_JOB_SCRIPT.contains("local completed_indexed = redis.call('ZSCORE'"));
+        assert!(RETRY_JOB_SCRIPT.contains("local failed_indexed = redis.call('ZSCORE'"));
         assert!(FLOW_CHILDREN_VALUES_SCRIPT.contains("redis.call('HGETALL', KEYS[2])"));
         assert!(FLOW_CHILDREN_VALUES_SCRIPT
             .contains("child[\"state\"] == \"completed\" and child[\"return_value\"] ~= nil"));

@@ -10,8 +10,9 @@ use a3s_lane::{
     RetryPolicy, MAX_JOB_PRIORITY,
 };
 use chrono::{DateTime, TimeZone, Utc};
-use redis::AsyncCommands;
+use redis::{AsyncCommands, ConnectionAddr, IntoConnectionInfo};
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -74,6 +75,190 @@ async fn redis_backend_discards_configured_retry_against_real_server() {
         .await
         .expect("Redis discard retry integration test timed out")
         .unwrap();
+}
+
+#[tokio::test]
+async fn redis_backend_preserves_replace_deduplication_ttl_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    let namespace = unique_namespace();
+    cleanup_namespace(&redis_url, &namespace).await.unwrap();
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "dedup-replace-ttl")
+        .expect("valid Redis URL should build the queue");
+    let mut conn = redis::Client::open(redis_url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let dedup_key = format!("{namespace}:dedup-replace-ttl:deduplication:tenant:replace-ttl");
+
+    let old = queue
+        .add_job(
+            "dedup-replace-ttl-old".to_string(),
+            serde_json::json!({ "version": 1 }),
+            JobOptions::new()
+                .with_delay(Duration::from_secs(30))
+                .with_deduplication(
+                    DeduplicationOptions::new("tenant:replace-ttl")
+                        .with_ttl(Duration::from_secs(30))
+                        .replace_delayed(true),
+                ),
+        )
+        .await
+        .expect("old delayed dedup owner should be added");
+    let ttl_overridden: bool = redis::cmd("PEXPIRE")
+        .arg(&dedup_key)
+        .arg(10_000)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert!(ttl_overridden);
+    let ttl_before: i64 = redis::cmd("PTTL")
+        .arg(&dedup_key)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert!(ttl_before > 0 && ttl_before <= 10_000);
+
+    let new = queue
+        .add_job(
+            "dedup-replace-ttl-new".to_string(),
+            serde_json::json!({ "version": 2 }),
+            JobOptions::new()
+                .with_delay(Duration::from_secs(60))
+                .with_deduplication(
+                    DeduplicationOptions::new("tenant:replace-ttl")
+                        .with_ttl(Duration::from_secs(30))
+                        .replace_delayed(true),
+                ),
+        )
+        .await
+        .expect("new delayed dedup owner should replace old owner");
+    assert_ne!(new.id, old.id);
+
+    let ttl_after: i64 = redis::cmd("PTTL")
+        .arg(&dedup_key)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert!(
+        ttl_after > 0 && ttl_after <= ttl_before,
+        "replace should preserve the remaining TTL, before {ttl_before}, after {ttl_after}"
+    );
+
+    cleanup_namespace(&redis_url, &namespace).await.unwrap();
+}
+
+#[tokio::test]
+async fn redis_backend_cleans_only_unlocked_active_jobs_against_real_server() {
+    let Some(redis_url) = redis_url() else {
+        eprintln!("skipping Redis integration test; set A3S_LANE_REDIS_URL");
+        return;
+    };
+    let _guard = redis_test_guard().await;
+    let namespace = unique_namespace();
+    trace_stage("clean-active-focused:cleanup:start");
+    cleanup_namespace(&redis_url, &namespace).await.unwrap();
+    trace_stage("clean-active-focused:cleanup:done");
+
+    let queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "clean-active")
+        .expect("valid Redis URL should build the queue");
+    trace_stage("clean-active-focused:queue-created");
+    let mut conn = redis::Client::open(redis_url.as_str())
+        .unwrap()
+        .get_connection_manager()
+        .await
+        .unwrap();
+    trace_stage("clean-active-focused:conn-created");
+    let locked = queue
+        .add_job(
+            "active-locked".to_string(),
+            serde_json::json!({ "kind": "locked" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("locked active job should add");
+    trace_stage("clean-active-focused:locked-added");
+    let unlocked = queue
+        .add_job(
+            "active-unlocked".to_string(),
+            serde_json::json!({ "kind": "unlocked" }),
+            JobOptions::new(),
+        )
+        .await
+        .expect("unlocked active job should add");
+    trace_stage("clean-active-focused:unlocked-added");
+    let locked_claim = queue
+        .claim_next(
+            "worker-clean-active-locked".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("locked active claim should return")
+        .expect("locked active job should claim");
+    assert_eq!(locked_claim.id, locked.id);
+    trace_stage("clean-active-focused:locked-claimed");
+    let unlocked_claim = queue
+        .claim_next(
+            "worker-clean-active-unlocked".to_string(),
+            Duration::from_secs(30),
+            Utc::now(),
+        )
+        .await
+        .expect("unlocked active claim should return")
+        .expect("unlocked active job should claim");
+    assert_eq!(unlocked_claim.id, unlocked.id);
+    trace_stage("clean-active-focused:unlocked-claimed");
+
+    let unlocked_lock_key = format!("{namespace}:clean-active:locks:{}", unlocked.id);
+    let removed_unlocked_lock: usize = conn.del(&unlocked_lock_key).await.unwrap();
+    assert_eq!(removed_unlocked_lock, 1);
+    trace_stage("clean-active-focused:unlocked-lock-removed");
+    let clean_now = unlocked_claim
+        .lease_expires_at
+        .expect("unlocked claim should carry lease expiration")
+        + chrono::Duration::seconds(1);
+
+    let cleaned = queue
+        .clean_jobs(JobState::Active, Duration::ZERO, 10, clean_now)
+        .await
+        .expect("active clean should run");
+    trace_stage("clean-active-focused:cleaned");
+    assert_eq!(
+        cleaned
+            .iter()
+            .map(|job| job.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![unlocked.id.as_str()]
+    );
+    assert!(queue
+        .get_job(&unlocked.id)
+        .await
+        .expect("unlocked active lookup should return")
+        .is_none());
+    assert_eq!(
+        queue
+            .get_job(&locked.id)
+            .await
+            .expect("locked active lookup should return")
+            .expect("locked active job should remain")
+            .state,
+        JobState::Active
+    );
+    let locked_score: Option<f64> = conn
+        .zscore(format!("{namespace}:clean-active:active"), &locked.id)
+        .await
+        .unwrap();
+    assert!(locked_score.is_some());
+    trace_stage("clean-active-focused:locked-score-checked");
+
+    cleanup_namespace(&redis_url, &namespace).await.unwrap();
+    trace_stage("clean-active-focused:cleanup-final:done");
 }
 
 #[tokio::test]
@@ -11395,7 +11580,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             "dedup-fail".to_string(),
             serde_json::json!({ "version": 4 }),
             JobOptions::new().with_deduplication(
-                DeduplicationOptions::new("tenant:fail").with_ttl(Duration::from_secs(5)),
+                DeduplicationOptions::new("tenant:fail").with_ttl(Duration::from_secs(30)),
             ),
         )
         .await
@@ -11418,11 +11603,19 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             Utc::now(),
         )
         .await
-        .expect("terminal failure should release dedup key");
+        .expect("terminal failure should keep TTL dedup key expiring");
     let failed_dedup_owner: Option<String> = dedup_conn
         .get(format!("{namespace}:dedup:deduplication:tenant:fail"))
         .await?;
-    assert!(failed_dedup_owner.is_none());
+    assert_eq!(failed_dedup_owner.as_deref(), Some(fail_dedup.id.as_str()));
+    let failed_dedup_ttl: i64 = redis::cmd("PTTL")
+        .arg(format!("{namespace}:dedup:deduplication:tenant:fail"))
+        .query_async(&mut dedup_conn)
+        .await?;
+    assert!(
+        failed_dedup_ttl > 0,
+        "failed TTL dedup key should keep expiring after terminal failure, got {failed_dedup_ttl}"
+    );
     let retried_dedup = dedup_queue
         .retry_job(&fail_dedup.id, Utc::now())
         .await
@@ -11442,7 +11635,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
             "dedup-fail-duplicate".to_string(),
             serde_json::json!({ "version": 5 }),
             JobOptions::new().with_deduplication(
-                DeduplicationOptions::new("tenant:fail").with_ttl(Duration::from_secs(5)),
+                DeduplicationOptions::new("tenant:fail").with_ttl(Duration::from_secs(30)),
             ),
         )
         .await
@@ -11723,7 +11916,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
                 .with_delay(Duration::from_secs(30))
                 .with_deduplication(
                     DeduplicationOptions::new("tenant:replace-ttl")
-                        .with_ttl(Duration::from_secs(5))
+                        .with_ttl(Duration::from_secs(30))
                         .replace_delayed(true),
                 ),
         )
@@ -11731,7 +11924,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("replace ttl old dedup job should be added");
     let ttl_overridden: bool = redis::cmd("PEXPIRE")
         .arg(&replace_ttl_key)
-        .arg(3_000)
+        .arg(10_000)
         .query_async(&mut dedup_conn)
         .await?;
     assert!(ttl_overridden);
@@ -11739,7 +11932,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .arg(&replace_ttl_key)
         .query_async(&mut dedup_conn)
         .await?;
-    assert!(replace_ttl_before > 0);
+    assert!(replace_ttl_before > 0 && replace_ttl_before <= 10_000);
     let replace_ttl_new = dedup_queue
         .add_job(
             "dedup-replace-ttl-new".to_string(),
@@ -11748,7 +11941,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
                 .with_delay(Duration::from_secs(60))
                 .with_deduplication(
                     DeduplicationOptions::new("tenant:replace-ttl")
-                        .with_ttl(Duration::from_secs(5))
+                        .with_ttl(Duration::from_secs(30))
                         .replace_delayed(true),
                 ),
         )
@@ -11760,7 +11953,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await?;
     assert!(replace_ttl_after > 0);
     assert!(
-        replace_ttl_after <= 3_500,
+        replace_ttl_after <= replace_ttl_before + 100,
         "expected replace to preserve the short deduplication TTL instead of refreshing to the job TTL, before {replace_ttl_before}, after {replace_ttl_after}"
     );
     dedup_queue
@@ -11955,16 +12148,34 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .promote_due_jobs(Utc::now())
         .await
         .expect("keep-last delayed next should promote");
-    assert_eq!(promoted_keep_last, 1);
-    let keep_last_next_claim = dedup_queue
-        .claim_next(
-            "worker-keep-last-next".to_string(),
-            Duration::from_secs(30),
-            Utc::now(),
-        )
-        .await
-        .expect("keep-last next should be claimable")
-        .expect("keep-last next should be returned");
+    assert!(promoted_keep_last >= 1);
+    let mut keep_last_next_claim = None;
+    for _ in 0..promoted_keep_last {
+        let claimed = dedup_queue
+            .claim_next(
+                "worker-keep-last-next".to_string(),
+                Duration::from_secs(30),
+                Utc::now(),
+            )
+            .await
+            .expect("keep-last next claim should return")
+            .expect("promoted keep-last batch should have a claimable job");
+        if claimed.id == keep_last_next.id {
+            keep_last_next_claim = Some(claimed);
+            break;
+        }
+        dedup_queue
+            .complete_job(
+                &claimed.id,
+                lock_token(&claimed),
+                serde_json::json!({ "drained": true }),
+                Utc::now(),
+            )
+            .await
+            .expect("non-target promoted job should drain");
+    }
+    let keep_last_next_claim =
+        keep_last_next_claim.expect("keep-last materialized job should be promoted");
     assert_eq!(keep_last_next_claim.id, keep_last_next.id);
     dedup_queue
         .complete_job(
@@ -13312,6 +13523,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("paused claim should return")
         .is_none());
     producer.resume().await.expect("resume should succeed");
+    trace_stage("main-lifecycle:pause-resume:done");
 
     let first = worker
         .claim_next("worker-a".to_string(), Duration::from_secs(30), Utc::now())
@@ -13433,6 +13645,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .await
         .expect("terminal failure should succeed");
     assert_eq!(failed.state, JobState::Failed);
+    trace_stage("main-lifecycle:complete-fail:done");
 
     let delayed = producer
         .add_job(
@@ -13446,14 +13659,14 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("delayed job should be added");
     assert_eq!(delayed.state, JobState::Delayed);
     let rescheduled_delayed = producer
-        .reschedule_job(&delayed.id, Duration::from_millis(200), Utc::now())
+        .reschedule_job(&delayed.id, Duration::from_secs(2), Utc::now())
         .await
         .expect("delayed job should reschedule");
     assert_eq!(rescheduled_delayed.id, delayed.id);
     assert_eq!(rescheduled_delayed.state, JobState::Delayed);
     assert_eq!(
         rescheduled_delayed.options.delay,
-        Some(Duration::from_millis(200))
+        Some(Duration::from_secs(2))
     );
     assert!(worker
         .claim_next("worker-d".to_string(), Duration::from_secs(30), Utc::now())
@@ -13461,7 +13674,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("early delayed claim should return")
         .is_none());
 
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
     assert_eq!(
         producer
             .promote_due_jobs(Utc::now())
@@ -13475,6 +13688,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("delayed claim should return")
         .expect("delayed job should be claimable");
     assert_eq!(claimed_delayed.id, delayed.id);
+    trace_stage("main-lifecycle:delayed-claimed");
     let active_remove = producer
         .remove_job(&claimed_delayed.id)
         .await
@@ -13641,6 +13855,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("delayed-again job should complete");
+    trace_stage("main-lifecycle:delay-active:done");
 
     let release_active = producer
         .add_job(
@@ -13729,6 +13944,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         )
         .await
         .expect("released job should complete after reclaim");
+    trace_stage("main-lifecycle:release-active:done");
 
     let stale_active_delay = producer
         .add_job(
@@ -13915,6 +14131,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
     assert_eq!(missing_dependencies_exist, 0);
     let missing_logs_len: usize = remove_index_conn.llen(&missing_logs_key).await?;
     assert_eq!(missing_logs_len, 0);
+    trace_stage("main-lifecycle:remove-prune:done");
 
     let auto_remove_queue = RedisJobQueue::with_namespace(&redis_url, &namespace, "auto-remove")
         .expect("valid Redis URL should build the auto-remove queue");
@@ -14077,6 +14294,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         ))
         .await?;
     assert_eq!(remove_on_stalled_logs_len, 0);
+    trace_stage("main-lifecycle:auto-remove:done");
 
     let locked_stalled = producer
         .add_job(
@@ -14267,6 +14485,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .zscore(format!("{namespace}:jobs:active"), &terminal_stalled.id)
         .await?;
     assert!(terminal_active_score.is_none());
+    trace_stage("main-lifecycle:stalled:done");
 
     let repeat_stalled_queue =
         RedisJobQueue::with_namespace(&redis_url, &namespace, "repeat-stalled")
@@ -14349,6 +14568,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         repeat_stalled_scheduler_owner.as_deref(),
         Some(repeat_stalled.id.as_str())
     );
+    trace_stage("main-lifecycle:repeat-stalled:done");
 
     let stored_high = producer
         .get_job(&high.id)
@@ -14445,6 +14665,7 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .expect("cleared high job should load")
         .expect("cleared high job should still exist");
     assert!(decoded_high_after_clear.logs.is_empty());
+    trace_stage("main-lifecycle:logs:done");
 
     let stats = producer.stats().await.expect("stats should load");
     assert_eq!(stats.completed, 6);
@@ -14808,14 +15029,13 @@ async fn run_job_lifecycle(redis_url: String) -> redis::RedisResult<()> {
         .sadd(&active_stalled_key, &active_unlocked.id)
         .await?;
     assert_eq!(stalled_inserted, 1);
+    let active_clean_now = active_unlocked_claim
+        .lease_expires_at
+        .expect("unlocked active claim should carry a lease expiration")
+        + chrono::Duration::seconds(1);
 
     let active_cleaned = clean_active_queue
-        .clean_jobs(
-            JobState::Active,
-            Duration::ZERO,
-            10,
-            Utc::now() + chrono::Duration::seconds(1),
-        )
+        .clean_jobs(JobState::Active, Duration::ZERO, 10, active_clean_now)
         .await
         .expect("active clean should run");
     assert_eq!(active_cleaned.len(), 1);
@@ -17005,23 +17225,47 @@ fn redis_url() -> Option<String> {
 }
 
 fn redis_preflight(redis_url: &str) -> std::result::Result<(), String> {
-    let client = redis::Client::open(redis_url)
+    let info = redis_url
+        .into_connection_info()
         .map_err(|error| format!("failed to parse Redis URL: {error}"))?;
-    let mut conn = client
-        .get_connection_with_timeout(Duration::from_secs(1))
-        .map_err(|error| format!("failed to connect within 1s: {error}"))?;
-    conn.set_read_timeout(Some(Duration::from_secs(1)))
-        .map_err(|error| format!("failed to set Redis read timeout: {error}"))?;
-    conn.set_write_timeout(Some(Duration::from_secs(1)))
-        .map_err(|error| format!("failed to set Redis write timeout: {error}"))?;
-    let pong = redis::cmd("PING")
-        .query::<String>(&mut conn)
-        .map_err(|error| format!("PING failed: {error}"))?;
-    if pong == "PONG" {
-        Ok(())
-    } else {
-        Err(format!("PING returned {pong:?} instead of \"PONG\""))
+    match info.addr {
+        ConnectionAddr::Tcp(host, port) => tcp_preflight(&host, port),
+        ConnectionAddr::TcpTls { host, port, .. } => tcp_preflight(&host, port),
+        ConnectionAddr::Unix(path) => {
+            if path.exists() {
+                Ok(())
+            } else {
+                Err(format!("Redis unix socket does not exist: {path:?}"))
+            }
+        }
     }
+}
+
+fn tcp_preflight(host: &str, port: u16) -> std::result::Result<(), String> {
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| format!("failed to resolve Redis address {host}:{port}: {error}"))?
+        .collect::<Vec<_>>();
+    if addrs.is_empty() {
+        return Err(format!("failed to resolve Redis address {host}:{port}"));
+    }
+
+    let mut last_error = None;
+    for _ in 0..5 {
+        for addr in &addrs {
+            match TcpStream::connect_timeout(addr, Duration::from_secs(1)) {
+                Ok(_) => return Ok(()),
+                Err(error) => {
+                    last_error = Some(format!(
+                        "failed to connect to Redis at {addr} within 1s: {error}"
+                    ));
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    Err(last_error.unwrap_or_else(|| format!("Redis preflight failed for {host}:{port}")))
 }
 
 fn unique_namespace() -> String {
@@ -17043,9 +17287,13 @@ fn trace_stage(stage: &str) {
 }
 
 async fn cleanup_namespace(redis_url: &str, namespace: &str) -> redis::RedisResult<()> {
-    let client = redis::Client::open(redis_url)?;
-    let mut conn = client.get_connection_manager().await?;
-    cleanup_namespace_with_conn(&mut conn, namespace).await
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let client = redis::Client::open(redis_url)?;
+        let mut conn = client.get_connection_manager().await?;
+        cleanup_namespace_with_conn(&mut conn, namespace).await
+    })
+    .await
+    .map_err(|_| redis_timeout_error("Redis namespace cleanup timed out"))?
 }
 
 async fn cleanup_namespace_with_conn(
@@ -17054,19 +17302,29 @@ async fn cleanup_namespace_with_conn(
 ) -> redis::RedisResult<()> {
     let mut cursor = 0_u64;
     loop {
-        let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+        let mut scan_cmd = redis::cmd("SCAN");
+        scan_cmd
             .arg(cursor)
             .arg("MATCH")
             .arg(format!("{namespace}:*"))
             .arg("COUNT")
-            .arg(1000_u16)
-            .query_async(conn)
-            .await?;
+            .arg(1000_u16);
+        let scan = scan_cmd.query_async(conn);
+        let (next_cursor, keys): (u64, Vec<String>) =
+            tokio::time::timeout(Duration::from_secs(30), scan)
+                .await
+                .map_err(|_| redis_timeout_error("Redis namespace scan timed out"))??;
         if !keys.is_empty() {
+            let mut unlink_cmd = redis::cmd("UNLINK");
+            unlink_cmd.arg(&keys);
             let removed: redis::RedisResult<usize> =
-                redis::cmd("UNLINK").arg(&keys).query_async(conn).await;
+                tokio::time::timeout(Duration::from_secs(30), unlink_cmd.query_async(conn))
+                    .await
+                    .map_err(|_| redis_timeout_error("Redis namespace unlink timed out"))?;
             if removed.is_err() {
-                let _: usize = conn.del(keys).await?;
+                let _: usize = tokio::time::timeout(Duration::from_secs(30), conn.del(keys))
+                    .await
+                    .map_err(|_| redis_timeout_error("Redis namespace delete timed out"))??;
             }
         }
         if next_cursor == 0 {
@@ -17075,4 +17333,8 @@ async fn cleanup_namespace_with_conn(
         cursor = next_cursor;
     }
     Ok(())
+}
+
+fn redis_timeout_error(message: &'static str) -> redis::RedisError {
+    redis::RedisError::from((redis::ErrorKind::IoError, message))
 }

@@ -1032,7 +1032,9 @@ and transition leased jobs. The Redis backend follows the core BullMQ locking
 mechanism: a claim creates an independent TTL lock key for the job, and
 complete, fail, release, delay, and renew operations must prove ownership by
 matching the lock token before the script mutates the
-active/completed/failed/delayed indexes. `renew_leases()` mirrors BullMQ's
+active/completed/failed/delayed indexes. Active `get_job()` snapshots read that
+lock key back so management callers can inspect the current lease token.
+`renew_leases()` mirrors BullMQ's
 `extendLocks` shape: Redis checks every token in one Lua turn, renews valid lock
 keys, updates active lease scores and retained job snapshots, removes successful
 jobs from the `stalled` candidate set, and returns only the failed job ids.
@@ -1482,10 +1484,13 @@ child id into `dependencies:<parent_id>:unsuccessful`, keep the remaining
 dependencies inspectable, store a deferred failure on the parent, and let the
 worker fail the parent before processor execution, matching BullMQ's `fpof` plus
 `defa` path. Retrying that child removes the unsuccessful entry and restores the
-parent dependency set. The failed child remains retained for inspection. Ignored
-and continued failures are reported through the ignored dependency count; removed
-failures are retained but omitted from failed and ignored dependency counts,
-while fail-parent failures remain in the failed dependency count.
+parent dependency set. If a failure policy has already released the parent,
+later terminal child failures still remove their pending dependency and update
+the parent-scoped failure indexes instead of remaining visible as unprocessed.
+The failed child remains retained for inspection. Ignored and continued failures
+are reported through the ignored dependency count; removed failures are retained
+but omitted from failed and ignored dependency counts, while fail-parent failures
+remain in the failed dependency count.
 
 Repeat successors are created during the Redis completion script too. The
 worker computes the next occurrence from `RepeatOptions`, then the Lua script
@@ -1599,6 +1604,7 @@ instead of leaving the repeat series split across stale Redis keys. They do not
 overwrite a scheduler record that already points at another owner.
 `retry_job()` follows BullMQ's `reprocessJob` shape for retained failed and
 completed jobs: it treats the matching terminal zset as the Redis movement gate,
+rejects inconsistent completed/failed index drift after pruning the stale side,
 clears terminal metadata (`failed_reason` for failed jobs, `return_value` for
 completed jobs, plus processed/finished timestamps), emits `waiting` with
 `prev=failed` or `prev=completed`, and moves the job back to waiting inside one
