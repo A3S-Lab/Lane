@@ -8,9 +8,6 @@ Used in the A3S ecosystem to guarantee control commands (pause/cancel) always pr
 
 ## Install
 
-A3S Lane is published as a Rust crate only. The former Python and Node.js
-bindings have been removed; use the Rust API directly from this crate.
-
 ```toml
 [dependencies]
 a3s-lane = "0.4"
