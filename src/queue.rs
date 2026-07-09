@@ -54,10 +54,10 @@ pub trait Command: Send + Sync {
     fn command_type(&self) -> &str;
 }
 
-/// A simple JSON-based command for SDK usage.
+/// A simple JSON-based command for data-driven Rust usage.
 ///
-/// Returns the payload as-is when executed. Useful for language bindings
-/// (Python, Node.js) where commands are represented as JSON data.
+/// Returns the payload as-is when executed. Useful when commands are represented
+/// as JSON data but still run through the Rust queue API.
 pub struct JsonCommand {
     command_type: String,
     payload: serde_json::Value,

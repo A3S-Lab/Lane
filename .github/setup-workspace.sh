@@ -4,7 +4,7 @@
 # recreate the workspace structure for standalone CI builds.
 #
 # This script restructures the CURRENT directory in-place:
-#   Before: ./ = Lane repo root (Cargo.toml, src/, sdk/, ...)
+#   Before: ./ = Lane repo root (Cargo.toml, src/, examples/, ...)
 #   After:  ./ = workspace root with crates/lane/
 
 set -euo pipefail

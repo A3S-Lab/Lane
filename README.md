@@ -5,8 +5,6 @@ Lane-based priority queue for concurrent async tasks. Commands are organized int
 Used in the A3S ecosystem to guarantee control commands (pause/cancel) always preempt LLM generation: `control` (P=1) beats `prompt` (P=5) regardless of arrival order.
 
 [![crates.io](https://img.shields.io/crates/v/a3s-lane.svg)](https://crates.io/crates/a3s-lane)
-[![PyPI](https://img.shields.io/pypi/v/a3s-lane.svg)](https://pypi.org/project/a3s-lane/)
-[![npm](https://img.shields.io/npm/v/@a3s-lab/lane.svg)](https://www.npmjs.com/package/@a3s-lab/lane)
 
 ## Install
 
@@ -256,87 +254,6 @@ let queue = Arc::new(LocalDistributedQueue::auto());
 
 Custom distributed queue: implement `DistributedQueue` (`enqueue`, `dequeue`, `complete`, `num_partitions`, `worker_id`).
 
-## SDKs
-
-```bash
-pip install a3s-lane        # Python (PyO3/maturin)
-npm install @a3s-lab/lane   # Node.js (napi-rs)
-```
-
-Both SDKs expose the full v0.4 API: default lanes, custom lanes, submit, subscribe, drain.
-
-### Python
-
-```python
-from a3s_lane import Lane, LaneConfig
-
-# Default lanes
-lane = Lane()
-lane.start()
-
-# Custom lanes
-lane = Lane.with_lanes([
-    LaneConfig("high", priority=0, min_concurrency=1, max_concurrency=4),
-    LaneConfig("low",  priority=1, min_concurrency=1, max_concurrency=2),
-])
-lane.start()
-
-# Submit — blocks until the command completes
-result = lane.submit("high", "my_command", {"key": "value"})
-
-# Subscribe — blocks until the next event (optional timeout)
-stream = lane.subscribe()
-event = stream.recv(timeout_ms=5000)   # returns None on timeout
-if event:
-    print(event.key, event.payload)
-
-# Filtered subscription — exact key match
-failures = lane.subscribe_filtered([
-    "queue.command.failed",
-    "queue.command.timeout",
-])
-
-# Graceful shutdown
-lane.shutdown()
-lane.drain(timeout_secs=30.0)
-```
-
-### Node.js
-
-```js
-const { Lane } = require('@a3s-lab/lane');
-
-// Default lanes
-const lane = new Lane();
-lane.start();
-
-// Custom lanes
-const lane = Lane.withLanes([
-  { laneId: 'high', priority: 0, minConcurrency: 1, maxConcurrency: 4 },
-  { laneId: 'low',  priority: 1, minConcurrency: 1, maxConcurrency: 2 },
-]);
-lane.start();
-
-// Submit — returns JSON string
-const result = JSON.parse(lane.submit('high', 'my_command', JSON.stringify({ key: 'value' })));
-
-// Subscribe — callback receives (err, event) for every event
-lane.subscribe((err, event) => {
-  if (err) throw err;
-  console.log(event.key, JSON.parse(event.payload));
-});
-
-// Filtered subscription — exact key match
-lane.subscribeFiltered(
-  ['queue.command.failed', 'queue.command.timeout'],
-  (err, event) => { console.error('failure:', event.key); }
-);
-
-// Graceful shutdown
-lane.shutdown();
-lane.drain(30_000);  // timeout in ms
-```
-
 ## Development
 
 ```bash
@@ -364,7 +281,7 @@ Works standalone for any priority-based async scheduling: web servers, backgroun
 
 A3S Lane is evolving from an in-process lane scheduler into a general
 distributed priority job queue. The direction is BullMQ-like, but native to the
-A3S stack and language SDKs.
+A3S stack and Rust API.
 
 | Phase | Status | Scope |
 | --- | --- | --- |
@@ -375,7 +292,7 @@ A3S stack and language SDKs.
 | Durable backend | In progress | `LocalJobQueue` JSON snapshot persistence is available, including parent-scoped flow dependency side indexes; `RedisJobQueue` is available behind `redis-backend` with Lua-backed add, bulk add, FIFO/LIFO waiting score ordering, BullMQ-style Redis worker marker zset updates, Redis marker-backed blocking claim, Redis stream queue events, simple deduplication with TTL, debounce TTL extension, delayed-owner replace, keep-last-if-active requeue, deduplication-key removal, repeat-key ownership, Redis-backed repeat scheduler zset/hash metadata, listing/removal/upsert/pagination, static flow submission, dynamic flow child fan-out, flow dependency inspection, BullMQ-style selected/full dependency bucket counts and reads, single/multi-bucket paginated dependency reads, flow child-value and ignored-failure reads, dynamic flow child deduplication skip and keep-last materialization, flow parent and active flow-child keep-last materialization, delayed promotion and rescheduling, active-to-wait/delayed movement, single-job promote, state-index and finished-result queries, job count snapshots, terminal metrics, manual retry, priority update, progress update, stacktrace update, log append, list/stat snapshots, finished-job age/count retention during complete/fail/stalled scripts, drain, clean, orphaned-job cleanup, obliterate, claim, Redis-shared rate limit, max-active, flow parent release/failure events, repeat successor enqueue, complete, fail, renew, remove, and stalled candidate-set recovery semantics. Postgres/NATS backends remain planned. |
 | Flow jobs | In progress | Parent-child dependencies, waiting-children state, dependency inspection, BullMQ-style selected/full dependency bucket counts and reads, single/multi-bucket paginated dependency inspection, child return-value inspection, ignored, removed, continued, and fail-parent child-failure release, static and dynamic fan-out, fan-in release, flow parent deduplication events, static and dynamic ordinary flow child deduplication skip semantics, active flow-child keep-last deduplication materialization, BullMQ-style existing parent and child custom job-id attachment with `duplicated` events, in-memory/local flow-parent keep-last deduplication, and Redis flow-parent keep-last materialization on active parent completion, terminal failure, or stalled terminal failure are available. |
 | Repeat jobs | In progress | Fixed-interval and UTC cron repeatable jobs with repeat keys, limits, end timestamps, repeat-key removal, upsert, single-key lookup, counts, and BullMQ-style next-time pagination are available across in-memory, local durable, and Redis backends. Redis additionally maintains scheduler zset/hash metadata in Lua so distributed readers and writers share one repeat-series state machine. |
-| SDK and framework parity | Planned | Node/Python typed job APIs, NestJS module, migration guide from BullMQ-compatible concepts. |
+| Framework integrations | Planned | NestJS module and migration guide from BullMQ-compatible concepts. |
 
 The generic job runtime is exposed through the `JobQueueBackend` trait.
 `InMemoryJobQueue` is process-local and intended for tests, embedded runtimes,
@@ -1572,7 +1489,7 @@ asc)` read side: entries are ordered by next scheduled time, defaulting to
 descending order. Lane still models repeat work as
 a Rust-native repeat-series owner and successor enqueue flow rather than a full
 BullMQ JS template engine, so exact BullMQ scheduler field-for-field parity
-remains a later SDK/runtime compatibility item.
+remains a later runtime feature-parity item.
 
 Manual lifecycle management follows the same Redis-side state movement rule:
 `promote_job()` removes a delayed job from the delayed zset and inserts it into
