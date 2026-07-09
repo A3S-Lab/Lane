@@ -542,6 +542,7 @@ pub enum JobFlowDependencyKind {
     Failed,
 }
 
+#[cfg(feature = "redis-backend")]
 impl JobFlowDependencyKind {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
