@@ -59,6 +59,7 @@ pub mod error;
 pub mod event;
 pub mod job;
 pub mod manager;
+pub mod priority_queue;
 pub mod queue;
 pub mod retry;
 pub mod storage;
@@ -103,6 +104,7 @@ pub use job::{
     DEFAULT_JOB_METRICS_RETENTION, DEFAULT_JOB_PRIORITY, MAX_JOB_PRIORITY,
 };
 pub use manager::{QueueManager, QueueManagerBuilder};
+pub use priority_queue::{PriorityItem, PriorityQueue};
 pub use queue::{
     lane_ids, priorities, Command, CommandId, CommandQueue, JsonCommand, Lane, LaneId, LaneStatus,
     Priority,

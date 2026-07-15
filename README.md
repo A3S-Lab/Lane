@@ -1,8 +1,8 @@
 # a3s-lane
 
-Lane-based priority queue for concurrent async tasks. Commands are organized into named lanes with configurable concurrency and priority — the highest-priority lane with pending work is always scheduled next.
+Lane-based priority queues for concurrent async tasks. Commands can be organized into named lanes with configurable concurrency and priority, or retained as typed host-owned values until the host is ready to execute them.
 
-Used in the A3S ecosystem to guarantee control commands (pause/cancel) always preempt LLM generation: `control` (P=1) beats `prompt` (P=5) regardless of arrival order.
+Priority controls which pending item is admitted next. It does not interrupt an already-running future; active work still needs an explicit cancellation and settlement contract.
 
 [![crates.io](https://img.shields.io/crates/v/a3s-lane.svg)](https://crates.io/crates/a3s-lane)
 
@@ -10,21 +10,21 @@ Used in the A3S ecosystem to guarantee control commands (pause/cancel) always pr
 
 ```toml
 [dependencies]
-a3s-lane = "0.4"
+a3s-lane = "0.5"
 ```
 
 All four features (`distributed`, `metrics`, `monitoring`, `telemetry`) are on by default. Core queue only:
 
 ```toml
-a3s-lane = { version = "0.4", default-features = false }
+a3s-lane = { version = "0.5", default-features = false }
 # or pick selectively:
-a3s-lane = { version = "0.4", default-features = false, features = ["metrics", "distributed"] }
+a3s-lane = { version = "0.5", default-features = false, features = ["metrics", "distributed"] }
 ```
 
 Enable the optional Redis generic job backend for multi-process workers:
 
 ```toml
-a3s-lane = { version = "0.4", features = ["redis-backend"] }
+a3s-lane = { version = "0.5", features = ["redis-backend"] }
 ```
 
 ## Usage
@@ -96,6 +96,41 @@ QueueManagerBuilder::new(emitter)
     .with_lane("low",   LaneConfig::new(1, 2), 1)
     .build().await?;
 ```
+
+## Host-owned typed queue
+
+Use `PriorityQueue<T>` when the host must keep ownership of typed state and
+decide when execution starts, as a terminal or web event loop does. Lower
+numeric values run first and equal-priority items remain FIFO:
+
+```rust
+use a3s_lane::{PriorityItem, PriorityQueue};
+
+let mut turns = PriorityQueue::new();
+turns.push(1, "automatic continuation");
+turns.push(0, "first user turn");
+turns.push(0, "second user turn");
+
+let claimed = turns.pop().expect("queued turn");
+assert_eq!(claimed.value(), &"first user turn");
+
+// If admission fails before execution starts, preserve its original FIFO slot.
+turns.restore(claimed);
+let order = turns
+    .ordered()
+    .into_iter()
+    .map(PriorityItem::value)
+    .copied()
+    .collect::<Vec<_>>();
+assert_eq!(
+    order,
+    ["first user turn", "second user turn", "automatic continuation"]
+);
+```
+
+`ordered()` is a non-mutating projection for queue UIs. A claimed item keeps
+its priority and insertion sequence, so `restore()` can put a failed admission
+back without moving it behind newer work.
 
 ## LaneConfig
 
@@ -268,7 +303,11 @@ Optional: `cargo install cargo-llvm-cov`, `brew install lcov` (HTML coverage).
 
 ## In the A3S ecosystem
 
-a3s-lane is the scheduling layer of the A3S Agent OS. Each a3s-code agent session gets its own instance, ensuring control commands always preempt LLM work:
+a3s-lane is the scheduling layer of the A3S Agent OS. A3S Code uses the typed
+queue for host-owned pending turns and can optionally create a per-session lane
+manager for tool execution. Conversation execution itself remains
+single-flight: cancellation settles the active worker before the next queued
+turn is admitted.
 
 ```
 a3s-gateway → a3s-box (MicroVM) → SafeClaw → a3s-code → a3s-lane

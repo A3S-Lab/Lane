@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 #[cfg(feature = "telemetry")]
 use std::time::Instant;
@@ -94,6 +94,8 @@ struct CommandWrapper {
     attempt: u32,
     lane_id: LaneId,
     command_type: String,
+    /// Keeps queue-level ownership alive from admission through terminal completion.
+    _work_permit: Option<WorkPermit>,
     /// Submission time used by the priority booster to calculate deadline proximity
     #[cfg(feature = "distributed")]
     enqueue_time: chrono::DateTime<chrono::Utc>,
@@ -114,6 +116,9 @@ struct LaneState {
     /// Active command count
     active: usize,
 
+    /// Commands waiting for their retry backoff to expire
+    delayed_retries: usize,
+
     /// Semaphore for concurrency control
     semaphore: Arc<Semaphore>,
 
@@ -129,6 +134,7 @@ impl LaneState {
             priority,
             pending: VecDeque::new(),
             active: 0,
+            delayed_retries: 0,
             semaphore,
             is_pressured: false,
         }
@@ -238,6 +244,15 @@ impl Lane {
         &self,
         command: Box<dyn Command>,
     ) -> tokio::sync::oneshot::Receiver<Result<serde_json::Value>> {
+        self.enqueue_with_permit(command, None).await
+    }
+
+    /// Enqueue a command with queue-level lifecycle ownership.
+    async fn enqueue_with_permit(
+        &self,
+        command: Box<dyn Command>,
+        work_permit: Option<WorkPermit>,
+    ) -> tokio::sync::oneshot::Receiver<Result<serde_json::Value>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let state = self.state.lock().await;
         let timeout = state.config.default_timeout;
@@ -255,6 +270,7 @@ impl Lane {
             attempt: 0,
             lane_id: self.id.clone(),
             command_type: command_type.clone(),
+            _work_permit: work_permit,
             #[cfg(feature = "distributed")]
             enqueue_time: Utc::now(),
         };
@@ -284,11 +300,18 @@ impl Lane {
     async fn retry_command(&self, mut wrapper: CommandWrapper, delay: std::time::Duration) {
         wrapper.attempt += 1;
 
-        // Spawn a task to re-enqueue after delay
+        // Count delayed retries as outstanding lane work before the active attempt is released.
+        {
+            let mut state = self.state.lock().await;
+            state.delayed_retries += 1;
+        }
+
+        // Spawn a task to re-enqueue after delay.
         let state_clone = Arc::clone(&self.state);
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
             let mut state = state_clone.lock().await;
+            state.delayed_retries = state.delayed_retries.saturating_sub(1);
             state.pending.push_back(wrapper);
         });
     }
@@ -319,11 +342,16 @@ impl Lane {
     pub async fn status(&self) -> LaneStatus {
         let state = self.state.lock().await;
         LaneStatus {
-            pending: state.pending.len(),
+            pending: state.pending.len() + state.delayed_retries,
             active: state.active,
             min: state.config.min_concurrency,
             max: state.config.max_concurrency,
         }
+    }
+
+    async fn is_idle(&self) -> bool {
+        let state = self.state.lock().await;
+        state.pending.is_empty() && state.active == 0 && state.delayed_retries == 0
     }
 
     /// Check for pressure state transitions.
@@ -360,6 +388,70 @@ pub struct LaneStatus {
     pub max: usize,
 }
 
+/// Admission and outstanding-work state shared by all commands in a queue.
+struct QueueLifecycle {
+    /// Serializes the submit admission decision with shutdown.
+    admission_gate: Mutex<()>,
+    is_shutting_down: AtomicBool,
+    outstanding: AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+
+impl QueueLifecycle {
+    fn new() -> Self {
+        Self {
+            admission_gate: Mutex::new(()),
+            is_shutting_down: AtomicBool::new(false),
+            outstanding: AtomicUsize::new(0),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn admit(self: &Arc<Self>) -> Result<WorkPermit> {
+        let _gate = self.admission_gate.lock().await;
+        if self.is_shutting_down.load(Ordering::Acquire) {
+            return Err(LaneError::ShutdownInProgress);
+        }
+
+        self.outstanding.fetch_add(1, Ordering::AcqRel);
+        Ok(WorkPermit {
+            lifecycle: Arc::clone(self),
+        })
+    }
+
+    async fn begin_shutdown(&self) -> bool {
+        let _gate = self.admission_gate.lock().await;
+        let started = !self.is_shutting_down.swap(true, Ordering::AcqRel);
+        drop(_gate);
+        self.changed.notify_waiters();
+        started
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.is_shutting_down.load(Ordering::Acquire)
+    }
+
+    fn is_idle(&self) -> bool {
+        self.outstanding.load(Ordering::Acquire) == 0
+    }
+
+    fn notify_changed(&self) {
+        self.changed.notify_waiters();
+    }
+}
+
+/// RAII ownership for one command accepted by [`CommandQueue::submit`].
+struct WorkPermit {
+    lifecycle: Arc<QueueLifecycle>,
+}
+
+impl Drop for WorkPermit {
+    fn drop(&mut self) {
+        self.lifecycle.outstanding.fetch_sub(1, Ordering::AcqRel);
+        self.lifecycle.notify_changed();
+    }
+}
+
 /// Command queue
 #[allow(dead_code)]
 pub struct CommandQueue {
@@ -367,8 +459,7 @@ pub struct CommandQueue {
     event_emitter: EventEmitter,
     dlq: Option<DeadLetterQueue>,
     storage: Option<Arc<dyn Storage>>,
-    is_shutting_down: Arc<AtomicBool>,
-    shutdown_notify: Arc<tokio::sync::Notify>,
+    lifecycle: Arc<QueueLifecycle>,
 }
 
 impl CommandQueue {
@@ -379,8 +470,7 @@ impl CommandQueue {
             event_emitter,
             dlq: None,
             storage: None,
-            is_shutting_down: Arc::new(AtomicBool::new(false)),
-            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            lifecycle: Arc::new(QueueLifecycle::new()),
         }
     }
 
@@ -391,8 +481,7 @@ impl CommandQueue {
             event_emitter,
             dlq: Some(DeadLetterQueue::new(dlq_size)),
             storage: None,
-            is_shutting_down: Arc::new(AtomicBool::new(false)),
-            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            lifecycle: Arc::new(QueueLifecycle::new()),
         }
     }
 
@@ -403,8 +492,7 @@ impl CommandQueue {
             event_emitter,
             dlq: None,
             storage: Some(storage),
-            is_shutting_down: Arc::new(AtomicBool::new(false)),
-            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            lifecycle: Arc::new(QueueLifecycle::new()),
         }
     }
 
@@ -419,8 +507,7 @@ impl CommandQueue {
             event_emitter,
             dlq: Some(DeadLetterQueue::new(dlq_size)),
             storage: Some(storage),
-            is_shutting_down: Arc::new(AtomicBool::new(false)),
-            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            lifecycle: Arc::new(QueueLifecycle::new()),
         }
     }
 
@@ -436,46 +523,56 @@ impl CommandQueue {
 
     /// Check if shutdown is in progress
     pub fn is_shutting_down(&self) -> bool {
-        self.is_shutting_down.load(Ordering::SeqCst)
+        self.lifecycle.is_shutting_down()
     }
 
     /// Initiate graceful shutdown - stop accepting new commands
     pub async fn shutdown(&self) {
-        self.is_shutting_down.store(true, Ordering::SeqCst);
-        self.event_emitter
-            .emit(LaneEvent::empty(events::QUEUE_SHUTDOWN_STARTED));
+        if self.lifecycle.begin_shutdown().await {
+            self.event_emitter
+                .emit(LaneEvent::empty(events::QUEUE_SHUTDOWN_STARTED));
+        }
     }
 
     /// Wait for all pending commands to complete (with timeout)
     pub async fn drain(&self, timeout: std::time::Duration) -> Result<()> {
-        let start = std::time::Instant::now();
-
-        loop {
-            // Check if all lanes are empty and idle
-            let lanes = self.lanes.lock().await;
-            let mut all_idle = true;
-
-            for lane in lanes.values() {
-                let status = lane.status().await;
-                if status.pending > 0 || status.active > 0 {
-                    all_idle = false;
-                    break;
-                }
-            }
-            drop(lanes);
-
-            if all_idle {
-                return Ok(());
-            }
-
-            // Check timeout
-            if start.elapsed() >= timeout {
-                return Err(LaneError::Timeout(timeout));
-            }
-
-            // Wait a bit before checking again
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        match tokio::time::timeout(timeout, self.wait_for_idle()).await {
+            Ok(()) => Ok(()),
+            Err(_) => Err(LaneError::Timeout(timeout)),
         }
+    }
+
+    pub(crate) async fn wait_for_idle(&self) {
+        loop {
+            let changed = self.lifecycle.changed.notified();
+            if self.is_idle().await {
+                return;
+            }
+
+            tokio::select! {
+                _ = changed => {}
+                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+            }
+        }
+    }
+
+    async fn is_idle(&self) -> bool {
+        if !self.lifecycle.is_idle() {
+            return false;
+        }
+
+        let lanes = {
+            let lanes = self.lanes.lock().await;
+            lanes.values().cloned().collect::<Vec<_>>()
+        };
+
+        for lane in lanes {
+            if !lane.is_idle().await {
+                return false;
+            }
+        }
+
+        true
     }
 
     /// Register a lane
@@ -490,16 +587,17 @@ impl CommandQueue {
         lane_id: &str,
         command: Box<dyn Command>,
     ) -> Result<tokio::sync::oneshot::Receiver<Result<serde_json::Value>>> {
-        // Reject new commands during shutdown
-        if self.is_shutting_down() {
-            return Err(LaneError::ShutdownInProgress);
-        }
-
-        let lanes = self.lanes.lock().await;
-        let lane = lanes
-            .get(lane_id)
-            .ok_or_else(|| LaneError::LaneNotFound(lane_id.to_string()))?;
-        let rx = lane.enqueue(command).await;
+        let work_permit = self.lifecycle.admit().await?;
+        let lane = {
+            let lanes = self.lanes.lock().await;
+            Arc::clone(
+                lanes
+                    .get(lane_id)
+                    .ok_or_else(|| LaneError::LaneNotFound(lane_id.to_string()))?,
+            )
+        };
+        let rx = lane.enqueue_with_permit(command, Some(work_permit)).await;
+        self.lifecycle.notify_changed();
 
         self.event_emitter.emit(LaneEvent::with_map(
             events::QUEUE_COMMAND_SUBMITTED,
@@ -511,22 +609,41 @@ impl CommandQueue {
 
     /// Start the scheduler
     pub async fn start_scheduler(self: Arc<Self>) {
+        std::mem::drop(self.spawn_scheduler());
+    }
+
+    pub(crate) fn spawn_scheduler(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {
                 self.schedule_next().await;
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                if self.is_shutting_down() && self.is_idle().await {
+                    self.event_emitter
+                        .emit(LaneEvent::empty(events::QUEUE_SHUTDOWN_COMPLETE));
+                    return;
+                }
+
+                tokio::select! {
+                    _ = self.lifecycle.changed.notified() => {}
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => {}
+                }
             }
-        });
+        })
     }
 
     /// Schedule the next command
     async fn schedule_next(&self) {
         // Find the highest-priority lane with pending commands.
         // effective_priority applies any deadline-based boost configured on the lane.
-        let lanes = self.lanes.lock().await;
+        let lanes = {
+            let lanes = self.lanes.lock().await;
+            lanes
+                .iter()
+                .map(|(id, lane)| (id.clone(), Arc::clone(lane)))
+                .collect::<Vec<_>>()
+        };
 
         // Check pressure transitions for all lanes and emit events
-        for (lane_id, lane) in lanes.iter() {
+        for (lane_id, lane) in &lanes {
             if let Some(event_key) = lane.check_pressure().await {
                 self.event_emitter.emit(LaneEvent::with_map(
                     event_key,
@@ -536,7 +653,7 @@ impl CommandQueue {
         }
 
         let mut lane_priorities = Vec::new();
-        for lane in lanes.values() {
+        for (_, lane) in &lanes {
             let priority = lane.effective_priority().await;
             lane_priorities.push((priority, Arc::clone(lane)));
         }
@@ -615,6 +732,8 @@ impl CommandQueue {
                                     "a3s.lane.retry: retrying command"
                                 );
 
+                                lane_clone.retry_command(wrapper, delay).await;
+
                                 event_emitter.emit(LaneEvent::with_map(
                                     events::QUEUE_COMMAND_RETRY,
                                     HashMap::from([
@@ -623,8 +742,6 @@ impl CommandQueue {
                                         ("attempt".to_string(), serde_json::json!(attempt + 1)),
                                     ]),
                                 ));
-
-                                lane_clone.retry_command(wrapper, delay).await;
                                 lane_clone.mark_completed().await;
                             } else {
                                 #[cfg(feature = "telemetry")]
@@ -705,11 +822,17 @@ impl CommandQueue {
 
     /// Get queue status for all lanes
     pub async fn status(&self) -> HashMap<LaneId, LaneStatus> {
-        let lanes = self.lanes.lock().await;
+        let lanes = {
+            let lanes = self.lanes.lock().await;
+            lanes
+                .iter()
+                .map(|(id, lane)| (id.clone(), Arc::clone(lane)))
+                .collect::<Vec<_>>()
+        };
         let mut status = HashMap::new();
 
-        for (id, lane) in lanes.iter() {
-            status.insert(id.clone(), lane.status().await);
+        for (id, lane) in lanes {
+            status.insert(id, lane.status().await);
         }
 
         status
@@ -729,6 +852,46 @@ pub mod lane_ids {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::StoredDeadLetter;
+
+    #[derive(Default)]
+    struct BlockingStorage {
+        save_started: tokio::sync::Notify,
+        release_save: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl Storage for BlockingStorage {
+        async fn save_command(&self, _command: StoredCommand) -> Result<()> {
+            self.save_started.notify_one();
+            self.release_save.notified().await;
+            Ok(())
+        }
+
+        async fn load_commands(&self) -> Result<Vec<StoredCommand>> {
+            Ok(Vec::new())
+        }
+
+        async fn remove_command(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn save_dead_letter(&self, _letter: StoredDeadLetter) -> Result<()> {
+            Ok(())
+        }
+
+        async fn load_dead_letters(&self) -> Result<Vec<StoredDeadLetter>> {
+            Ok(Vec::new())
+        }
+
+        async fn clear_dead_letters(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn clear_all(&self) -> Result<()> {
+            Ok(())
+        }
+    }
 
     /// Test command implementation
     struct TestCommand {
@@ -1406,6 +1569,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_shutdown_preserves_submit_admitted_before_close() {
+        let emitter = EventEmitter::new(100);
+        let storage = Arc::new(BlockingStorage::default());
+        let queue = Arc::new(CommandQueue::with_storage(
+            emitter,
+            Arc::clone(&storage) as Arc<dyn Storage>,
+        ));
+        let lane = Arc::new(Lane::with_storage(
+            "test-lane",
+            LaneConfig::new(1, 4),
+            priorities::QUERY,
+            Arc::clone(&storage) as Arc<dyn Storage>,
+        ));
+        queue.register_lane(lane).await;
+        let scheduler = Arc::clone(&queue).spawn_scheduler();
+
+        let submit_queue = Arc::clone(&queue);
+        let submit = tokio::spawn(async move {
+            submit_queue
+                .submit(
+                    "test-lane",
+                    Box::new(TestCommand::new(serde_json::json!({"accepted": true}))),
+                )
+                .await
+        });
+
+        storage.save_started.notified().await;
+        assert!(
+            queue.lanes.try_lock().is_ok(),
+            "submit must not retain the lane map lock during storage I/O"
+        );
+
+        queue.shutdown().await;
+        let rejected = queue
+            .submit(
+                "test-lane",
+                Box::new(TestCommand::new(serde_json::json!({}))),
+            )
+            .await;
+        assert!(matches!(rejected, Err(LaneError::ShutdownInProgress)));
+        assert_eq!(queue.lifecycle.outstanding.load(Ordering::Acquire), 1);
+
+        storage.release_save.notify_one();
+        let receiver = submit.await.expect("submit task should join").unwrap();
+        let result = receiver.await.expect("result channel should remain open");
+        assert_eq!(result.unwrap()["accepted"], true);
+
+        queue
+            .drain(std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        scheduler.await.expect("scheduler should exit after drain");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_drain_waits_for_delayed_retry() {
+        use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
+        struct FailOnceCommand {
+            attempts: Arc<AtomicU32>,
+        }
+
+        #[async_trait]
+        impl Command for FailOnceCommand {
+            async fn execute(&self) -> Result<serde_json::Value> {
+                if self.attempts.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                    Err(LaneError::Other("retry".to_string()))
+                } else {
+                    Ok(serde_json::json!({"retried": true}))
+                }
+            }
+
+            fn command_type(&self) -> &str {
+                "fail_once"
+            }
+        }
+
+        let emitter = EventEmitter::new(100);
+        let mut retries =
+            emitter.subscribe_filtered(|event| event.key == events::QUEUE_COMMAND_RETRY);
+        let queue = Arc::new(CommandQueue::new(emitter));
+        let retry_delay = std::time::Duration::from_secs(60);
+        let lane = Arc::new(Lane::new(
+            "test-lane",
+            LaneConfig::new(1, 4).with_retry_policy(RetryPolicy::fixed(1, retry_delay)),
+            priorities::QUERY,
+        ));
+        queue.register_lane(Arc::clone(&lane)).await;
+        let scheduler = Arc::clone(&queue).spawn_scheduler();
+
+        let receiver = queue
+            .submit(
+                "test-lane",
+                Box::new(FailOnceCommand {
+                    attempts: Arc::new(AtomicU32::new(0)),
+                }),
+            )
+            .await
+            .unwrap();
+        retries.recv().await.expect("retry event should be emitted");
+        assert_eq!(lane.status().await.pending, 1);
+
+        queue.shutdown().await;
+        let drain_queue = Arc::clone(&queue);
+        let drain =
+            tokio::spawn(
+                async move { drain_queue.drain(std::time::Duration::from_secs(120)).await },
+            );
+        tokio::task::yield_now().await;
+        assert!(
+            !drain.is_finished(),
+            "retry backoff must remain owned by drain"
+        );
+
+        tokio::time::advance(retry_delay).await;
+        let result = receiver.await.expect("result channel should remain open");
+        assert_eq!(result.unwrap()["retried"], true);
+        drain.await.expect("drain task should join").unwrap();
+        scheduler.await.expect("scheduler should exit after drain");
+    }
+
+    #[tokio::test]
     async fn test_drain_waits_for_completion() {
         let emitter = EventEmitter::new(100);
         let queue = Arc::new(CommandQueue::new(emitter));
@@ -1467,6 +1752,25 @@ mod tests {
         } else {
             panic!("Expected Timeout error");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_drain_deadline_includes_lane_map_lock_wait() {
+        let queue = Arc::new(CommandQueue::new(EventEmitter::new(100)));
+        let lanes_guard = queue.lanes.lock().await;
+        let timeout = std::time::Duration::from_secs(5);
+        let drain_queue = Arc::clone(&queue);
+        let drain = tokio::spawn(async move { drain_queue.drain(timeout).await });
+
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished());
+        tokio::time::advance(timeout).await;
+
+        assert!(matches!(
+            drain.await.expect("drain task should join"),
+            Err(LaneError::Timeout(duration)) if duration == timeout
+        ));
+        drop(lanes_guard);
     }
 
     #[tokio::test]

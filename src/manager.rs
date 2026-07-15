@@ -3,7 +3,7 @@
 #[cfg(feature = "monitoring")]
 use crate::alerts::AlertManager;
 use crate::config::LaneConfig;
-use crate::error::Result;
+use crate::error::{LaneError, Result};
 use crate::event::{EventEmitter, EventStream, LaneEvent};
 #[cfg(feature = "metrics")]
 use crate::metrics::QueueMetrics;
@@ -17,7 +17,7 @@ use std::sync::Arc;
 #[allow(dead_code)]
 pub struct QueueManager {
     queue: Arc<CommandQueue>,
-    scheduler_handle: tokio::sync::Mutex<Option<()>>,
+    scheduler_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     #[cfg(feature = "metrics")]
     metrics: Option<QueueMetrics>,
     #[cfg(feature = "monitoring")]
@@ -57,8 +57,20 @@ impl QueueManager {
     /// Start the queue scheduler
     pub async fn start(&self) -> Result<()> {
         tracing::info!("Starting queue scheduler");
-        let queue = Arc::clone(&self.queue);
-        queue.start_scheduler().await;
+        let mut scheduler_handle = self.scheduler_handle.lock().await;
+        if let Some(handle) = scheduler_handle.as_mut() {
+            if !handle.is_finished() {
+                return Ok(());
+            }
+
+            let join_result = handle.await;
+            scheduler_handle.take();
+            join_result.map_err(|error| {
+                LaneError::Other(format!("Queue scheduler task failed: {error}"))
+            })?;
+        }
+
+        *scheduler_handle = Some(Arc::clone(&self.queue).spawn_scheduler());
         Ok(())
     }
 
@@ -123,7 +135,27 @@ impl QueueManager {
 
     /// Wait for all pending commands to complete (with timeout)
     pub async fn drain(&self, timeout: std::time::Duration) -> Result<()> {
-        self.queue.drain(timeout).await
+        let drain = async {
+            self.queue.wait_for_idle().await;
+
+            if self.queue.is_shutting_down() {
+                let mut scheduler_handle = self.scheduler_handle.lock().await;
+                if let Some(handle) = scheduler_handle.as_mut() {
+                    let join_result = handle.await;
+                    scheduler_handle.take();
+                    join_result.map_err(|error| {
+                        LaneError::Other(format!("Queue scheduler task failed: {error}"))
+                    })?;
+                }
+            }
+
+            Ok(())
+        };
+
+        match tokio::time::timeout(timeout, drain).await {
+            Ok(result) => result,
+            Err(_) => Err(LaneError::Timeout(timeout)),
+        }
     }
 
     /// Check if shutdown is in progress
@@ -726,6 +758,25 @@ mod tests {
         let drain_result = manager.drain(std::time::Duration::from_secs(2)).await;
 
         assert!(drain_result.is_ok());
+        assert!(
+            manager.scheduler_handle.lock().await.is_none(),
+            "drain should join and clear the stopped scheduler"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manager_drain_joins_idle_scheduler() {
+        let manager = make_manager().await;
+        manager.start().await.unwrap();
+        assert!(manager.scheduler_handle.lock().await.is_some());
+
+        manager.shutdown().await;
+        manager
+            .drain(std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert!(manager.scheduler_handle.lock().await.is_none());
     }
 
     // ========================================================================
