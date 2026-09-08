@@ -1,14 +1,14 @@
-# a3s-lane
+# a3s 车道
 
-<p align="center">
+<p>
   <strong>Language / 语言:</strong>
   <a href="README.md">English</a> ·
   <a href="README.zh-CN.md">中文</a>
 </p>
 
-基于 lane 的优先级队列，用于并发异步任务。命令可组织到具名 lane 中，并配置并发与优先级；也可作为类型化的宿主自有值保留，直到宿主准备执行。
+用于并发异步任务的基于通道的优先级队列。命令可以组织到具有可配置并发性和优先级的命名通道中，或者保留为键入的主机拥有的值，直到主机准备好执行它们。
 
-优先级控制下一个被接纳的 pending 项；它不会中断已在运行的 future——活跃工作仍需要显式的取消与结算合约。
+优先级控制接下来允许哪个待处理项目。它不会打断已经运行的未来；主动工作仍需要明确的取消和结算合同。
 
 [![crates.io](https://img.shields.io/crates/v/a3s-lane.svg)](https://crates.io/crates/a3s-lane)
 
@@ -19,15 +19,15 @@
 a3s-lane = "0.5"
 ```
 
-四个 feature（`distributed`、`metrics`、`monitoring`、`telemetry`）默认开启。仅核心队列：
+默认情况下，所有四个功能（`distributed`、`metrics`、`monitoring`、`telemetry`）均处于启用状态。仅核心队列：
 
 ```toml
 a3s-lane = { version = "0.5", default-features = false }
-# 或按需选择：
+# or pick selectively:
 a3s-lane = { version = "0.5", default-features = false, features = ["metrics", "distributed"] }
 ```
 
-为跨进程 worker 启用可选的 Redis 通用 job 后端：
+为多进程工作人员启用可选的 Redis 通用作业后端：
 
 ```toml
 a3s-lane = { version = "0.5", features = ["redis-backend"] }
@@ -35,7 +35,7 @@ a3s-lane = { version = "0.5", features = ["redis-backend"] }
 
 ## 用法
 
-为每种任务类型实现 `Command` trait：
+为每个任务类型实现 `Command` 特征：
 
 ```rust
 #[async_trait]
@@ -45,7 +45,7 @@ pub trait Command: Send + Sync {
 }
 ```
 
-然后构建 manager、启动 scheduler 并提交：
+然后构建一个管理器，启动调度器，并提交：
 
 ```rust
 use a3s_lane::{QueueManagerBuilder, EventEmitter, Command, Result};
@@ -81,20 +81,20 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`submit()` 返回 `oneshot::Receiver<Result<Value>>`——`??` 会解包 channel 发送与命令结果两层。
+`submit()` 返回 `oneshot::Receiver<Result<Value>>` — `??` 解包通道发送和命令结果。
 
-## Lane 模型
+## 车道模型
 
-| Lane | 优先级 | 最大并发 | 用例 |
+|车道 |优先|最大并发数 |使用案例|
 |------|----------|-----------------|----------|
-| `system` | 0（最高） | 5 | 系统级操作 |
-| `control` | 1 | 3 | 暂停 / 取消 |
-| `query` | 2 | 10 | 只读查询 |
-| `session` | 3 | 5 | 会话管理 |
-| `skill` | 4 | 3 | 工具执行 |
-| `prompt` | 5（最低） | 2 | LLM 生成 |
+| `system` | 0（最高）| 5 |系统级操作 |
+| `control` | 1 | 3 |暂停/取消 |
+| `query` | 2 | 10 | 10只读查询 |
+| `session` | 3 | 5 |会话管理 |
+| `skill` | 4 | 3 |工具执行 |
+| `prompt` | 5（最低）| 2 |法学硕士一代|
 
-自定义 lane 可替换或扩展默认值：
+自定义通道替换或扩展默认通道：
 
 ```rust
 QueueManagerBuilder::new(emitter)
@@ -103,9 +103,11 @@ QueueManagerBuilder::new(emitter)
     .build().await?;
 ```
 
-## 宿主自有类型化队列
+## 主机拥有的类型化队列
 
-当宿主必须保留类型化状态的所有权并决定何时开始执行时（例如终端或 Web 事件循环），使用 `PriorityQueue<T>`。数值越小越先运行，同优先级项保持 FIFO：
+当主机必须保留类型化状态的所有权并且
+决定执行何时开始，就像终端或 Web 事件循环一样。较低
+数值首先运行，同等优先级的项目保持 FIFO：
 
 ```rust
 use a3s_lane::{PriorityItem, PriorityQueue};
@@ -118,7 +120,7 @@ turns.push(0, "second user turn");
 let claimed = turns.pop().expect("queued turn");
 assert_eq!(claimed.value(), &"first user turn");
 
-// 若在执行开始前 admission 失败，保留其原始 FIFO 槽位。
+// If admission fails before execution starts, preserve its original FIFO slot.
 turns.restore(claimed);
 let order = turns
     .ordered()
@@ -132,40 +134,42 @@ assert_eq!(
 );
 ```
 
-`ordered()` 是对队列 UI 的非变更投影。已 claim 的项保留其优先级与插入顺序，因此 `restore()` 可将 admission 失败的项放回原位，而不会排到较新工作之后。
+`ordered()` 是队列 UI 的非变异投影。已认领的物品会保留
+它的优先级和插入顺序，因此`restore()`可以放置失败的接纳
+返回而不将其移到新的工作后面。
 
-## LaneConfig
+## 车道配置
 
-所有选项使用 builder 模式，可链式调用：
+所有选项都使用构建器模式并且可以链接：
 
 ```rust
 LaneConfig::new(min_concurrency, max_concurrency)
     .with_timeout(Duration::from_secs(30))
-    .with_retry_policy(RetryPolicy::exponential(3))     // 100ms 初始，2× 退避，30s 上限
-    .with_pressure_threshold(50)                        // 发出 queue.lane.pressure / queue.lane.idle
-    .with_rate_limit(RateLimitConfig::per_second(100))  // 需要 `distributed` feature
-    .with_priority_boost(PriorityBoostConfig::standard( // 需要 `distributed` feature
+    .with_retry_policy(RetryPolicy::exponential(3))     // 100ms initial, 2× backoff, 30s cap
+    .with_pressure_threshold(50)                        // emit queue.lane.pressure / queue.lane.idle
+    .with_rate_limit(RateLimitConfig::per_second(100))  // requires `distributed` feature
+    .with_priority_boost(PriorityBoostConfig::standard( // requires `distributed` feature
         Duration::from_secs(300),
     ))
 ```
 
-**RetryPolicy**：`exponential(max_retries)`、`fixed(max_retries, delay)`、`none()`。
+**重试策略**：`exponential(max_retries)`、`fixed(max_retries, delay)`、`none()`。
 
-**RateLimitConfig**：`per_second(n)`、`per_minute(n)`、`per_hour(n)`、`unlimited()`。
+**速率限制配置**：`per_second(n)`、`per_minute(n)`、`per_hour(n)`、`unlimited()`。
 
-**PriorityBoostConfig**：`standard(deadline)`（在 deadline 剩余 75/50/25% 时提升）、`aggressive(deadline)`、`disabled()`。
+**PriorityBoostConfig**：`standard(deadline)`（以剩余截止日期的 75/50/25% 提升）、`aggressive(deadline)`、`disabled()`。
 
-## 事件
+## 活动
 
-`EventStream` 实现 `futures_core::Stream`——通过 `StreamExt` 使用 `.next().await`，或使用 `.recv()` 便捷方法。可直接从 manager 订阅，无需手动传递 `EventEmitter`：
+`EventStream` 实现 `futures_core::Stream` — 通过 `StreamExt` 或 `.recv()` 便捷方法使用 `.next().await`。直接从管理器订阅，无需手动线程`EventEmitter`：
 
 ```rust
 use tokio_stream::StreamExt;
 
-// 全部事件
+// All events
 let mut stream = manager.subscribe();
 
-// 过滤——仅失败
+// Filtered — only failures
 let mut failures = manager.subscribe_filtered(|e| {
     e.key == "queue.command.failed" || e.key == "queue.command.timeout"
 });
@@ -177,22 +181,22 @@ tokio::spawn(async move {
 });
 ```
 
-各队列阶段自动发出的事件：
+在每个队列阶段自动发出事件：
 
-| 事件键 | 时机 | 载荷字段 |
-|-----------|------|----------------|
-| `queue.command.submitted` | `submit()` 被接受 | `lane_id` |
-| `queue.command.started` | Scheduler 已派发 | `lane_id`、`command_id`、`command_type` |
-| `queue.command.completed` | 返回 `Ok` | `lane_id`、`command_id` |
-| `queue.command.retry` | 失败，将重试 | `lane_id`、`command_id`、`attempt` |
-| `queue.command.dead_lettered` | 移入 DLQ | `lane_id`、`command_id`、`command_type` |
-| `queue.command.failed` | 终态失败 | `lane_id`、`command_id`、`error` |
-| `queue.command.timeout` | 超时 | `lane_id`、`command_id`、`error` |
-| `queue.shutdown.started` | 调用 `shutdown()` | — |
-| `queue.lane.pressure` | `pending >= threshold`，首次跨越 | `lane_id` |
-| `queue.lane.idle` | 受压后 `pending == 0` | `lane_id` |
+|事件键|当 |有效负载字段 |
+|------------|------|----------------|
+| `queue.command.submitted` | `submit()` 已接受 | `lane_id` |
+| `queue.command.started` |调度程序已调度 | `lane_id`、`command_id`、`command_type` |
+| `queue.command.completed` |已退货`Ok` | `lane_id`、`command_id` |
+| `queue.command.retry` |失败，将重试 | `lane_id`、`command_id`、`attempt` |
+| `queue.command.dead_lettered` |移至 DLQ | `lane_id`、`command_id`、`command_type` |
+| `queue.command.failed` |终端故障| `lane_id`、`command_id`、`error` |
+| `queue.command.timeout` |超时 | `lane_id`、`command_id`、`error` |
+| `queue.shutdown.started` | `shutdown()` 称为 | — |
+| `queue.lane.pressure` | `pending >= threshold`，第一次穿越| `lane_id` |
+| `queue.lane.idle` | `pending == 0` 受压后 | `lane_id` |
 
-`queue.lane.pressure` 与 `queue.lane.idle` 需要在 lane 配置上设置 `with_pressure_threshold(n)`。
+`queue.lane.pressure` 和 `queue.lane.idle` 在通道配置上需要 `with_pressure_threshold(n)`。
 
 ## 可靠性
 
@@ -202,13 +206,13 @@ tokio::spawn(async move {
 let dlq = DeadLetterQueue::new(1000);
 let queue = CommandQueue::with_dlq(emitter, dlq.clone());
 
-// 运行后检查失败命令
+// Inspect failed commands after running
 for letter in dlq.list().await {
     println!("{}: {}", letter.command_type, letter.error);
 }
 ```
 
-### 持久化存储
+### 持久存储
 
 ```rust
 let storage = Arc::new(LocalStorage::new(PathBuf::from("./queue_data")).await?);
@@ -218,40 +222,40 @@ let manager = QueueManagerBuilder::new(emitter)
     .build().await?;
 ```
 
-自定义后端：实现 `Storage` trait（`save_command`、`load_commands`、`remove_command`、`save_dead_letter`、`load_dead_letters`、`clear_all`）。
+自定义后端：实现 `Storage` 特征（`save_command`、`load_commands`、`remove_command`、`save_dead_letter`、`load_dead_letters`、`clear_all`）。
 
 ### 优雅关闭
 
 ```rust
-manager.shutdown().await;                           // 停止接受新命令
-manager.drain(Duration::from_secs(30)).await?;      // 等待进行中的任务完成
+manager.shutdown().await;                           // stop accepting new commands
+manager.drain(Duration::from_secs(30)).await?;      // wait for in-flight to finish
 ```
 
-## 可观测性
+## 可观察性
 
 ### 指标
 
 ```rust
-let metrics = QueueMetrics::local();  // 内存内；或自带 MetricsBackend
+let metrics = QueueMetrics::local();  // in-memory; or bring your own MetricsBackend
 let manager = QueueManagerBuilder::new(emitter)
     .with_metrics(metrics.clone())
     .build().await?;
 
 let snap = metrics.snapshot().await;
-// snap.counters  →  各 lane 的 submit/complete/fail/timeout/retry/dead-letter 计数
-// snap.histograms →  各 lane 的延迟 p50/p90/p95/p99
+// snap.counters  →  submit/complete/fail/timeout/retry/dead-letter counts per lane
+// snap.histograms →  latency p50/p90/p95/p99 per lane
 ```
 
-OpenTelemetry OTLP 导出：使用 `OtelMetricsBackend`（需要 `telemetry` feature）。
+OpenTelemetry OTLP 导出：使用`OtelMetricsBackend`（需要`telemetry` 功能）。
 
-自定义后端：实现 `MetricsBackend`（`increment_counter`、`set_gauge`、`record_histogram`、`snapshot`、`reset`）。
+自定义后端：实现`MetricsBackend`（`increment_counter`、`set_gauge`、`record_histogram`、`snapshot`、`reset`）。
 
-### 告警与监控
+### 警报和监控
 
 ```rust
 let alerts = Arc::new(AlertManager::with_queue_depth_alerts(
-    100,  // 警告阈值
-    200,  // 严重阈值
+    100,  // warning threshold
+    200,  // critical threshold
 ));
 alerts.add_callback(|a| eprintln!("[{:?}] {}: {}", a.level, a.lane_id, a.message)).await;
 
@@ -260,7 +264,7 @@ let manager = QueueManagerBuilder::new(emitter)
     .build().await?;
 ```
 
-后台 monitor（按间隔轮询）：
+后台监视器（按时间间隔轮询）：
 
 ```rust
 let monitor = Arc::new(QueueMonitor::with_config(manager.queue(), MonitorConfig {
@@ -274,66 +278,68 @@ let stats = monitor.stats().await;
 println!("pending={} active={}", stats.total_pending, stats.total_active);
 ```
 
-## 可扩展性（`distributed` feature）
+## 可扩展性（`distributed` 功能）
 
 ```rust
-// 限流——在 dequeue 时执行，而非 submit 时
+// Rate limiting — enforced at dequeue time, not submit time
 LaneConfig::new(1, 10).with_rate_limit(RateLimitConfig::per_second(100))
 
-// 优先级提升——接近 deadline 的命令获得更高优先级
+// Priority boost — commands approaching their deadline get elevated priority
 LaneConfig::new(1, 10).with_priority_boost(
     PriorityBoostConfig::standard(Duration::from_secs(300))
 )
 
-// 多核分区——自动检测 CPU 核心数
+// Multi-core partitioning — auto-detects CPU cores
 let queue = Arc::new(LocalDistributedQueue::auto());
 ```
 
-自定义分布式队列：实现 `DistributedQueue`（`enqueue`、`dequeue`、`complete`、`num_partitions`、`worker_id`）。
+自定义分布式队列：实现`DistributedQueue`（`enqueue`、`dequeue`、`complete`、`num_partitions`、`worker_id`）。
 
-## 开发
+## 发展
 
 ```bash
-just test       # 420 个库测试，--all-features
+just test       # 420 library tests, --all-features
 just ci         # fmt + clippy + test
-just bench      # Criterion 基准 → target/criterion/report/index.html
-just cov        # 覆盖率报告（需要 cargo-llvm-cov）
-just doc        # 生成并打开 rustdoc
+just bench      # Criterion benchmarks → target/criterion/report/index.html
+just cov        # coverage report (requires cargo-llvm-cov)
+just doc        # generate and open rustdoc
 ```
 
-可选：`cargo install cargo-llvm-cov`、`brew install lcov`（HTML 覆盖率）。
+可选：`cargo install cargo-llvm-cov`、`brew install lcov`（HTML 覆盖范围）。
 
-## 在 A3S 生态中
+## 在A3S生态系统中
 
-a3s-lane 是 A3S Agent OS 的调度层。A3S Code 将类型化队列用于宿主自有的 pending turn，并可选择为工具执行创建 per-session lane manager。对话执行本身仍为 single-flight：在接纳下一个 queued turn 之前，取消会先结算活跃 worker。
+a3s-lane是A3S Agent OS的调度层。 A3S 代码使用键入的
+主机拥有的待处理轮次的队列，并且可以选择创建每个会话通道
+工具执行管理器。会话执行本身仍然存在
+单次航班：取消在下一个排队之前解决活动工作人员的问题
+轮流被承认。
 
 ```
 a3s-gateway → a3s-box (MicroVM) → SafeClaw → a3s-code → a3s-lane
-                                                          ↑ 此处
+                                                          ↑ here
 ```
 
-也可独立用于任何基于优先级的异步调度：Web 服务器、后台 job 处理器、限流 API 客户端。
+对于任何基于优先级的异步调度独立工作：Web 服务器、后台作业处理器、速率受限的 API 客户端。
 
-## 通用 job 队列路线图
+## 通用作业队列路线图
 
-A3S Lane is evolving from an in-process lane scheduler into a general
-distributed priority job queue. The direction is BullMQ-like, but native to the
-A3S stack and Rust API.
+A3S Lane 正在从进程内通道调度程序演变成通用的
+分布式优先级作业队列。该方向类似于 BullMQ，但原生于
+A3S 堆栈和 Rust API。
 
-| 阶段 | 状态 | 范围 |
-| --- | --- | --- |
-| Lane scheduler | 已完成 | Lane 优先级、per-lane 并发、命令重试、超时、DLQ、事件、指标、监控。 |
-| 通用 job 运行时 | 进行中 | JSON job、Lua 支持的 Redis 批量提交、幂等自定义 job ID、带可选 TTL 的简单去重、debounce TTL 延长、delayed-owner 替换、keep-last-if-active 重新入队、repeat-key 所有权与 upsert、显式 job 状态、优先级加 FIFO/LIFO 同优先级排序、按 age/count/limit 保留已完成 job、保留的队列事件流、延迟 job、token 拥有的 worker lease、active 到 wait/delayed 移动、完成/失败快照、重试退避、Redis 共享限流与 active 并发控制、BullMQ 风格两阶段 stalled 恢复（含 repeat scheduler 重新入队处理）、pause/resume。 |
-| Job 管理 API | 进行中 | add/get/get-state/get-job-finished-result/get-job-counts/get-job-count/count-pending/remove/remove-repeat/upsert-repeat/remove-deduplication-key/get-deduplication-job-id/list-repeats/get-repeat/count-repeats/list-repeats-page/add-flow-children/get-flow-dependencies/get-flow-dependency-counts/get-flow-dependency-selected-counts/get-flow-dependency-values/get-flow-dependency-page/get-flow-dependency-pages/get-flow-children-values/get-flow-ignored-children-failures/remove-unprocessed-children/remove-child-dependency/promote/reschedule/delay-active/release-active/retry/update-priority/update-priority-with-lifo/update-data/save-stacktrace/pause/resume/is-paused/drain/clean/obliterate/remove-orphaned Redis 维护 API、多状态分页、升序/降序列举、waiting 优先级计数、add-log/get-logs/clear-job-logs、read-events/trim-events、进度更新、单次与批量 lease 续期、Redis 终态指标。 |
-| Worker 运行时 | 进行中 | `JobWorker` 从任意 `JobQueueBackend` claim job，在可用时使用后端原生阻塞 claim 钩子，通过 `JobProcessorRouter` 按名称路由 job，运行 async processor，完成/失败 job，支持 processor 进度/日志更新、协作式 lease 丢失检查、超时、后台循环共享批量 lease 续期，以及 stalled 恢复循环。 |
-| 持久后端 | 进行中 | `LocalJobQueue` JSON 快照持久化可用，含 parent 作用域 flow 依赖侧索引；`RedisJobQueue` 在 `redis-backend` 后可用，含 Lua 支持的 add、bulk add、FIFO/LIFO waiting score 排序、BullMQ 风格 Redis worker marker zset 更新、Redis marker 支持的阻塞 claim、Redis stream 队列事件、带 TTL 的简单去重、debounce TTL 延长、delayed-owner 替换、keep-last-if-active 重新入队、deduplication-key 移除、repeat-key 所有权、Redis 支持的 repeat scheduler zset/hash 元数据、列举/移除/upsert/分页、静态 flow 提交、动态 flow 子 fan-out、flow 依赖检查、BullMQ 风格 selected/full 依赖 bucket 计数与读取、单/多 bucket 分页依赖读取、flow 子值与 ignored-failure 读取、动态 flow 子去重 skip 与 keep-last 物化、flow parent 与 active flow-child keep-last 物化、延迟提升与 reschedule、active 到 wait/delayed 移动、单 job promote、状态索引与 finished-result 查询、job 计数快照、终态指标、手动 retry、优先级更新、进度更新、stacktrace 更新、日志追加、list/stat 快照、complete/fail/stalled 脚本中的 finished-job age/count 保留、drain、clean、orphaned-job 清理、obliterate、claim、Redis 共享限流、max-active、flow parent release/failure 事件、repeat 后继入队、complete、fail、renew、remove，以及 stalled candidate-set 恢复语义。Postgres/NATS 后端仍计划中。 |
-| Flow job | 进行中 | 父子依赖、waiting-children 状态、依赖检查、BullMQ 风格 selected/full 依赖 bucket 计数与读取、单/多 bucket 分页依赖检查、子 return-value 检查、ignored/removed/continued/fail-parent 子失败 release、静态与动态 fan-out、fan-in release、flow parent 去重事件、静态与动态普通 flow 子去重 skip 语义、active flow-child keep-last 去重物化、BullMQ 风格现有 parent 与 child 自定义 job-id 附加及 `duplicated` 事件、内存/local flow-parent keep-last 去重，以及 Redis flow-parent keep-last 在 active parent 完成、终态失败或 stalled 终态失败时的物化，均已可用。 |
-| Repeat job | 进行中 | 固定间隔与 UTC cron 可重复 job，含 repeat key、limit、结束时间戳、repeat-key 移除、upsert、单 key 查找、计数，以及 BullMQ 风格 next-time 分页，在内存、local durable 与 Redis 后端可用。Redis  additionally 在 Lua 中维护 scheduler zset/hash 元数据，使分布式读写共享同一 repeat-series 状态机。 |
-| 框架集成 | 计划中 | NestJS 模块及从 BullMQ 兼容概念的迁移指南。 |
+|相|状态 |范围 |
+| ---| ---| ---|
+|车道调度器|完成 |通道优先级、每通道并发性、命令重试、超时、DLQ、事件、指标、监控。 |
+|通用作业运行时 |进行中 | JSON 作业、Lua 支持的 Redis 批量提交、幂等自定义作业 ID、带可选 TTL 的简单重复数据删除、反跳 TTL 扩展、延迟所有者替换、保留最后活动重新排队、重复密钥所有权和更新插入、显式作业状态、优先级加上 FIFO/LIFO 相同优先级排序、按年龄/计数/限制保留已完成作业、保留队列事件流、延迟作业、令牌拥有的工作器租赁、主动等待/延迟移动、完成/失败快照、重试退避、Redis 共享速率限制和主动并发控制、BullMQ 式两阶段停滞恢复（具有重复调度程序重新排队处理）、暂停/恢复。 ||作业管理 API |进行中 |添加/获取/获取状态/获取作业完成结果/获取作业计数/获取作业计数/计数待处理/删除/删除重复/upsert-重复/删除重复数据删除密钥/获取重复数据删除作业 ID/列表-重复/get-repeat/count-repeats/list-repeats-page/add-flow-children/get-flow-dependency/get-flow-dependency-counts/get-flow-dependency-selected-counts/get-flow-dependency-va lues/get-flow-dependency-page/get-flow-dependency-pages/get-flow-children-values/get-flow-ignored-children-failures/remove-unprocessed-children/remove-child-dependency/promote/重新安排/延迟活动/释放活动/重试/更新优先级/更新优先级with-lifo/更新数据/保存堆栈跟踪/暂停/恢复/已暂停/排空/清理/删除/删除孤立Redis 维护 API、多状态分页、升序/降序列表、等待优先级计数、添加日志/获取日志/清除作业日志、读取事件/修剪事件、进度更新、单个和批量租约续订、Redis 终端指标。 |
+|工人运行时 |进行中 | `JobWorker`从任何`JobQueueBackend`声明作业，在可用时使用后端本机阻塞声明挂钩，通过`JobProcessorRouter`按名称路由作业，运行异步处理器，完成/失败作业，支持处理器进度/日志更新，协作租约丢失检查，超时，后台循环的共享批量租约续订以及停滞的恢复循环。 ||耐用的后端 |进行中 | `LocalJobQueue` JSON快照持久化可用，包括父级范围的流依赖侧索引； `RedisJobQueue`可在`redis-backend`后面使用，具有Lua支持的添加、批量添加、先进先出/后进先出等待分数排序、BullMQ风格的Redis工作标记zset更新、Redis标记支持的阻塞声明、Redis流队列事件、使用TTL的简单重复数据删除、反跳TTL扩展、延迟所有者替换、保留最后一个活动重新排队、重复数据删除键删除、重复键所有权、Redis 支持的重复调度程序 zset/hash 元数据、列表/删除/更新插入/分页、静态流提交、动态流子扇出、流依赖项检查、BullMQ 样式选定/完整依赖项存储桶计数和读取、单/多存储桶分页依赖项读取、流子值和忽略失败读取、动态流子级重复数据删除跳过和保持最后实现、流父级和活动子级保持最后实现、延迟升级和重新安排、活动等待/延迟移动、单作业提升、状态索引和完成结果查询、作业计数快照、终端指标、手动重试、优先级更新、进度更新、堆栈跟踪更新、日志追加、列表/统计快照、完成/失败/停顿脚本期间的完成作业年龄/计数保留、排出、清理、孤立作业清理、删除、声明、Redis 共享速率限制、最大活动、流父级释放/失败事件、重复后继队列、完成、失败、更新、删除和停止候选集恢复语义。 Postgres/NATS 后端仍在计划中。 |
+|流动工作 |进行中 |父子依赖、等待子状态、依赖检查、BullMQ 风格的选定/完整依赖桶计数和读取、单/多桶分页依赖检查、子返回值检查、忽略、删除、继续和失败父子失败释放、静态和动态扇出、扇入释放、流父级重复数据删除事件、静态和动态普通流子级重复数据删除跳过语义、活动子流保持最后重复数据删除实现、BullMQ 风格现有父级和可以使用带有 `duplicated` 事件的子自定义作业 ID 附件、内存/本地流父级 keep-last 重复数据删除以及活动父级完成、终端故障或停滞终端故障时的 Redis 流父级 keep-last 实现。 |
+|重复工作 |进行中 |具有重复键、限制、结束时间戳、重复键删除、更新插入、单键查找、计数和 BullMQ 样式的下次分页的固定间隔和 UTC cron 可重复作业可跨内存、本地持久和 Redis 后端使用。 Redis 另外还在 Lua 中维护调度程序 zset/hash 元数据，因此分布式读取器和写入器共享一个重复系列状态机。 |
+|框架集成|计划| NestJS 模块和来自 BullMQ 兼容概念的迁移指南。 |
 
-The generic job runtime is exposed through the `JobQueueBackend` trait.
-`InMemoryJobQueue` is process-local and intended for tests, embedded runtimes,
-and reference semantics:
+通用作业运行时通过 `JobQueueBackend` 特征公开。
+`InMemoryJobQueue` 是进程本地的，用于测试、嵌入式运行时、
+和参考语义：
 
 ```rust
 use a3s_lane::{InMemoryJobQueue, JobListOptions, JobOptions, JobQueueBackend, JobState, RetryPolicy};
@@ -408,92 +414,89 @@ if let Some(claimed) = claimed {
 # }
 ```
 
-Management APIs are part of the backend contract: `list_jobs()` returns
-paginated `JobListPage` values with single-state, multi-state, ascending, and
-descending range options, `add_jobs()` submits a batch with the same
-idempotency semantics as `add_job()`, `promote_job()` moves delayed jobs to
-waiting, `reschedule_job()` changes a delayed job's due time relative to the
-current clock, `delay_active_job()` moves a token-owned active job back to
-delayed, `release_active_job()` moves a token-owned active job back to waiting,
-`get_job_state()` returns the current lifecycle state for a job id, `retry_job()`
-manually requeues retained failed or completed jobs, `fail_job_discarding_retry()`
-fails an active token-owned job without applying remaining automatic retries, `update_priority()`
-changes stored job priority, `update_priority_with_lifo()` also chooses the
-same-priority waiting reinsert side, `renew_lease()` extends an active worker
-lease with the claim token, `renew_leases()` renews multiple claimed
-leases and returns the job ids that failed renewal,
-`remove_job()` removes jobs that are not protected by an active worker lock,
-`remove_repeat()` removes the current non-active owner for a repeat key and, in
-Redis, can fall back to scheduler metadata when the owner key is stale or
-missing,
-`upsert_repeat()` creates or replaces the current non-active owner for a repeat
-key,
-`remove_deduplication_key()` clears the active owner for a deduplication id,
-`get_deduplication_job_id()` returns the current owner job id for a
-deduplication id, `list_repeats()` lists current non-terminal repeat-series
-owners, `get_repeat()` returns one current repeat owner by key,
-`count_repeats()` returns the current repeat-series count, and
-`list_repeats_page()` returns repeat series ordered by next scheduled time with
-BullMQ-style default descending pagination,
-`get_flow_dependencies()` returns a flow parent's child snapshots plus pending
-and missing child ids, `get_flow_dependency_counts()` returns processed,
-unprocessed, failed, ignored, and missing child counts,
-`get_flow_dependency_selected_counts()` returns only the requested BullMQ-style
-processed, unprocessed, ignored, and failed count buckets,
-`get_flow_dependency_values()` returns BullMQ-style processed, unprocessed,
-ignored, and failed dependency buckets,
-`get_flow_dependency_page()` returns one BullMQ-style cursor page from a
-processed, unprocessed, ignored, or failed flow dependency bucket, and
-`get_flow_dependency_pages()` returns several requested dependency bucket pages
-in one backend call,
-flow parents cannot be completed while blocking child dependencies remain,
-`add_flow_children()` lets an active, token-owned parent add new or existing
-custom-id child jobs and move itself to `waiting_children`, mirroring BullMQ's
-dynamic `moveToWaitingChildren()` fan-out path,
+管理 API 是后端合约的一部分：`list_jobs()` 返回
+分页 `JobListPage` 值，具有单状态、多状态、升序和
+降序范围选项，`add_jobs()` 提交具有相同的批次
+幂等性语义为 `add_job()`、`promote_job()` 将延迟作业移至
+等待，`reschedule_job()` 更改延迟作业相对于作业的到期时间
+当前时钟，`delay_active_job()` 将代币拥有的活动作业移回到
+延迟，`release_active_job()`将代币拥有的活动作业移回等待状态，
+`get_job_state()` 返回作业 ID 的当前生命周期状态，`retry_job()`
+手动重新排队保留的失败或已完成的作业，`fail_job_discarding_retry()`
+在不应用剩余自动重试的情况下使活动的令牌拥有的作业失败，`update_priority()`
+更改存储的作业优先级，`update_priority_with_lifo()` 还选择
+相同优先级等待重新插入侧，`renew_lease()`扩展了一个活跃的worker
+使用索赔代币进行租赁，`renew_leases()`续订多个索赔
+租用并返回续订失败的作业 ID，
+`remove_job()` 删除不受活动工作锁保护的作业，
+`remove_repeat()` 删除重复密钥的当前非活动所有者，并且，
+Redis，当所有者密钥过时或时可以回退到调度程序元数据
+失踪,
+`upsert_repeat()` 创建或替换当前非活动所有者以进行重复
+钥匙，
+`remove_deduplication_key()` 清除重复数据删除 ID 的活动所有者，
+`get_deduplication_job_id()` 返回当前所有者的作业 ID
+重复数据删除 ID，`list_repeats()` 列出当前非终端重复序列
+所有者，`get_repeat()` 通过键返回一个当前重复所有者，
+`count_repeats()` 返回当前重复序列计数，并且`list_repeats_page()` 返回按下一个计划时间排序的重复系列
+BullMQ 风格的默认降序分页，
+`get_flow_dependencies()` 返回流父级的子级快照以及待处理的快照
+并且缺少子 ID，`get_flow_dependency_counts()` 返回已处理，
+未处理、失败、忽略和丢失的子项计数，
+`get_flow_dependency_selected_counts()` 仅返回请求的 BullMQ 风格
+已处理、未处理、忽略和失败的计数桶，
+`get_flow_dependency_values()` 返回 BullMQ 风格的已处理、未处理、
+被忽略并且依赖项存储桶失败，
+`get_flow_dependency_page()` 从一个返回一个 BullMQ 风格的游标页
+已处理、未处理、忽略或失败的流依赖性存储桶，以及
+`get_flow_dependency_pages()` 返回多个请求的依赖桶页面
+在一次后端调用中，
+流父级无法完成，同时阻止子级依赖仍然存在，
+`add_flow_children()` 让活跃的、拥有代币的父级添加新的或现有的
+自定义 id 子作业并将其自身移动到 `waiting_children`，镜像 BullMQ
+动态`moveToWaitingChildren()`扇出路径，
 `remove_unprocessed_children()`
-removes children that are still unprocessed and not active,
-`remove_child_dependency()` detaches one child dependency from its parent
-without deleting the child job,
-`drain_jobs(false)` removes waiting jobs, `drain_jobs(true)` also removes
-ordinary delayed jobs while preserving current delayed repeat owners,
-`clean_jobs()` removes old records by state, `obliterate(false)` pauses the
-queue and removes all queue data only when no active jobs exist,
-`obliterate(true)` forces removal even with active jobs, `get_job_counts()`
-returns per-state counts, `get_job_count()` returns aggregate counts for
-selected states, `count_pending_jobs()` returns waiting, delayed, and
-waiting-children work, `get_counts_per_priority()` returns waiting-job counts
-for selected priorities, `get_job_finished_result()` returns `NotFinished`,
-completed return values, or terminal failure reasons for retained jobs,
-`RedisJobQueue::get_metrics()` returns BullMQ-style completed/failed
-per-minute terminal metrics, `update_data()` replaces a retained job payload,
-`save_stacktrace()` stores retained failure stack traces and a failure reason, `add_log()` appends retained job logs, and
-`get_job_logs()` returns a `JobLogPage` with Redis/BullMQ-style range semantics.
-`clear_job_logs(job_id, 0)` clears retained logs for a job, while positive
-values keep the newest entries. `read_events("-", "+", limit)` reads retained
-queue events in Redis stream id order, and `trim_events(max_len)` trims the
-queue event stream using the backend's retained-event mechanism.
-`pause()`, `resume()`, and `is_paused()` provide queue-level dispatch control.
-Cleanup paths can unblock flow parents when a pending child is removed.
-Set `JobOptions::with_job_id()` when producers need idempotent submission:
-adding the same job id again returns the existing job instead of enqueueing a
-duplicate. Custom job ids must not be `0` or start with `0:` because BullMQ
-reserves that shape for internal waiting-list markers, and pure integer custom
-ids are rejected to match BullMQ's `Job.validateOptions()` guard.
-`JobOptions::with_lifo(true)` changes the ready-job insertion semantics for
-jobs with the same priority: newer ready jobs are claimed before older ready
-jobs, while lower priority values still run first. Priorities follow BullMQ's
-integer range and must not exceed `2^21`; both add-time options and
-`update_priority()`/`update_priority_with_lifo()` enforce that limit before
-mutating backend state.
-Finished jobs are retained by default. `remove_on_complete(true)` and
-`remove_on_fail(true)` remain compatibility shorthands for deleting the current
-terminal job immediately, matching BullMQ's `removeOnComplete: true` and
-`removeOnFail: true`. Use `JobRetention` for BullMQ-style `KeepJobs` retention:
-with TTL-backed deduplication, Redis still keeps the raw deduplication owner key
-until its TTL expires even when the finished job record is removed immediately.
-`count` keeps the newest N completed or failed jobs, `age` evicts jobs older
-than a duration when another job reaches the same terminal state, and `limit`
-bounds each age-cleanup pass.
+删除仍未处理且不活跃的子项，
+`remove_child_dependency()` 将一个子依赖与其父依赖分离
+在不删除子作业的情况下，
+`drain_jobs(false)` 删除等待作业，`drain_jobs(true)` 也删除
+普通延迟的工作，同时保留当前延迟的回头客，
+`clean_jobs()` 按状态删除旧记录，`obliterate(false)` 暂停
+仅当不存在活动作业时才排队并删除所有队列数据，
+即使有活动作业，`obliterate(true)` 也会强制删除，`get_job_counts()`
+返回每个状态的计数，`get_job_count()`返回聚合计数
+选择状态，`count_pending_jobs()`返回等待、延迟和等待子进程工作，`get_counts_per_priority()` 返回等待作业计数
+对于选定的优先级，`get_job_finished_result()`返回`NotFinished`，
+已完成的返回值，或保留作业的终端失败原因，
+`RedisJobQueue::get_metrics()` 返回 BullMQ 风格的已完成/失败
+每分钟终端指标，`update_data()`取代保留的作业负载，
+`save_stacktrace()` 存储保留的失败堆栈跟踪和失败原因，`add_log()` 附加保留的作业日志，以及
+`get_job_logs()` 返回具有 Redis/BullMQ 风格范围语义的 `JobLogPage`。
+`clear_job_logs(job_id, 0)` 清除作业保留的日志，同时为正
+值保留最新条目。 `read_events("-", "+", limit)` 读取保留
+按 Redis 流 ID 顺序对事件进行队列，并且 `trim_events(max_len)` 修剪
+使用后端的保留事件机制对事件流进行队列。
+`pause()`、`resume()`和`is_paused()`提供队列级调度控制。
+当待处理的子级被删除时，清理路径可以解锁流父级。
+当生产者需要幂等提交时设置`JobOptions::with_job_id()`：
+再次添加相同的作业 ID 将返回现有作业，而不是排队
+重复。自定义作业 ID 不得为 `0` 或以 `0:` 开头，因为 BullMQ
+为内部等待列表标记保留该形状，以及纯整数自定义
+id 被拒绝匹配 BullMQ 的 `Job.validateOptions()` 守卫。
+`JobOptions::with_lifo(true)` 更改了就绪作业插入语义
+具有相同优先级的作业：较新的就绪作业先于较旧的就绪作业被声明
+作业，而较低优先级值仍然首先运行。优先级遵循 BullMQ 的
+整数范围且不得超过`2^21`；两个添加时间选项和`update_priority()`/`update_priority_with_lifo()` 之前强制执行该限制
+改变后端状态。
+默认情况下保留已完成的作业。 `remove_on_complete(true)` 和
+`remove_on_fail(true)` 保留删除当前的兼容性简写
+立即终端作业，匹配 BullMQ 的 `removeOnComplete: true` 和
+`removeOnFail: true`。使用 `JobRetention` 进行 BullMQ 样式的 `KeepJobs` 保留：
+通过 TTL 支持的重复数据删除，Redis 仍然保留原始重复数据删除所有者密钥
+直到其 TTL 过期，即使已完成的作业记录立即被删除。
+`count` 保留最新的 N 个已完成或失败的作业，`age` 驱逐较旧的作业
+比另一个作业达到相同终止状态的持续时间，并且 `limit`
+限制每个年龄清理过程。
 
 ```rust
 # use a3s_lane::{JobOptions, JobRetention};
@@ -523,60 +526,59 @@ queue.trim_events(10_000).await?;
 # }
 ```
 
-Every claimed job carries an opaque `lock_token`. Workers must pass that token
-to `complete_job()`, `fail_job()`, `fail_job_discarding_retry()`, and
-`renew_lease()`. This prevents a stale worker from completing or failing a job
-after its lease expired and another worker reclaimed it. Active leased jobs
-cannot be removed through the normal management API; run stalled recovery first
-when a worker lease has expired.
+每一份声称的工作都带有一个不透明的`lock_token`。工人必须传递该令牌
+至 `complete_job()`、`fail_job()`、`fail_job_discarding_retry()`，以及
+`renew_lease()`。这可以防止过时的工作人员完成或失败工作
+租约到期后，另一名工人收回了它。活跃的租赁职位
+无法通过普通管理API删除；首先运行停滞恢复
+当工人租约到期时。
 
-Flow jobs create a parent job and one or more child jobs in a single operation.
-The parent starts in `waiting_children`, children are claimed normally, and the
-parent is released to `waiting` after every remaining child completes or is
-removed. A terminal child failure fails the parent by default; retryable child
-failures keep the parent blocked until the child retries and reaches a terminal
-outcome. Active parent jobs can also call `add_flow_children()` with their lock
-token to atomically add children and move themselves to `waiting_children`; this
-is the dynamic planner/fan-out shape behind BullMQ's `moveToWaitingChildren()`.
-When a submitted flow parent uses an existing custom job id, Lane follows
-BullMQ's `addParentJob` duplicate path: the stored parent data is kept,
-`duplicated` is emitted for the parent id, and the submitted children are still
-added, attached, deduplicated, or skipped according to the normal child rules.
-When a dynamically added child uses an existing custom job id, Lane keeps the
-existing child data, emits `duplicated`, updates `parent_id`, records a pending
-dependency for non-completed children, and lets completed children satisfy the
-dependency immediately.
-Dynamic children follow the same BullMQ deduplication path as static flow
-children. A child candidate that matches an existing deduplication owner is
-skipped, emits `debounced` and `deduplicated` on the owner id, and is not
-attached to the active parent. If the matching owner is active and the candidate
-uses `keep_last_if_active(true)`, Lane stores the latest candidate as the next
-child for that parent; the parent stays in `waiting_children` until the owner
-finalizes and the next child materializes.
-Optional children can use
-`JobOptions::new().with_ignore_dependency_on_failure(true)` to mirror BullMQ's
-`ignoreDependencyOnFailure`: terminal failure removes that child from the
-parent's still-blocking dependency set, counts it as ignored, and releases the
-parent once the remaining dependencies finish.
-`JobOptions::new().with_remove_dependency_on_failure(true)` mirrors BullMQ's
-`removeDependencyOnFailure`: terminal failure also removes the child from the
-still-blocking dependency set, but does not add it to the ignored dependency
-count.
-`JobOptions::new().with_continue_parent_on_failure(true)` mirrors BullMQ's
-`continueParentOnFailure`: terminal failure removes the child from the
-still-blocking dependency set, records the failure for parent inspection, and
-moves the parent to `waiting` or `delayed` immediately instead of waiting for the
-remaining dependencies.
-`JobOptions::new().with_fail_parent_on_failure(true)` mirrors BullMQ's
-`failParentOnFailure`: terminal failure removes the child from the
-still-blocking dependency set, releases the parent early with a deferred failure,
-and lets the worker fail the parent before running the parent processor.
-Parents can call `get_flow_children_values()` after fan-in release to retrieve
-completed child return values, mirroring BullMQ's `getChildrenValues()`.
-`get_flow_ignored_children_failures()` mirrors BullMQ's
-`getIgnoredChildrenFailures()` and returns failures from children configured with
-`ignoreDependencyOnFailure` or `continueParentOnFailure`; removed dependency
-failures are intentionally omitted.
+流作业在单个操作中创建一个父作业和一个或多个子作业。
+父级从`waiting_children`开始，子级通常被认领，并且
+在每个剩余的子进程完成或完成后，父进程被释放到`waiting`
+已删除。默认情况下，终端子失败会导致父失败；可重试的孩子
+失败会使父进程阻塞，直到子进程重试并到达终端
+结果。活动的父作业也可以使用其锁调用 `add_flow_children()`
+原子添加子项并将其自身移动到 `waiting_children` 的令牌；这个
+是 BullMQ 的 `moveToWaitingChildren()` 背后的动态规划器/扇出形状。
+当提交的流程父级使用现有的自定义作业 ID 时，Lane 如下
+BullMQ的`addParentJob`重复路径：保留存储的父数据，
+为父 id 发出`duplicated`，提交的子项仍然是
+根据正常的子规则添加、附加、删除重复或跳过。
+当动态添加的子项使用现有的自定义作业 ID 时，Lane 会保留
+现有子数据，发出`duplicated`，更新`parent_id`，记录待处理
+为未完成的孩子提供依赖，并让完成的孩子满足
+立即产生依赖性。
+动态子项遵循与静态流相同的 BullMQ 重复数据删除路径
+孩子们。与现有重复数据删除所有者匹配的子候选者是
+跳过，在所有者 ID 上发出 `debounced` 和 `deduplicated`，并且不是
+附加到活动父级。如果匹配的所有者处于活动状态且候选者
+使用`keep_last_if_active(true)`，Lane将最新的候选者存储为下一个该父母的孩子；父母留在`waiting_children`直到主人
+最终确定，下一个孩子实现。
+可选儿童可以使用
+`JobOptions::new().with_ignore_dependency_on_failure(true)` 镜像 BullMQ
+`ignoreDependencyOnFailure`：终端故障将该子节点从
+父级仍然阻塞的依赖集，将其视为已忽略，并释放
+一旦剩余的依赖项完成，父级。
+`JobOptions::new().with_remove_dependency_on_failure(true)` 镜像 BullMQ
+`removeDependencyOnFailure`：终端故障也会将子进程从
+仍然阻塞的依赖项集，但不会将其添加到忽略的依赖项中
+计数。
+`JobOptions::new().with_continue_parent_on_failure(true)` 镜像 BullMQ
+`continueParentOnFailure`：终端故障将子进程从
+仍然阻塞的依赖集，记录父检查的失败，以及
+立即将父级移动到`waiting`或`delayed`，而不是等待
+剩余的依赖项。
+`JobOptions::new().with_fail_parent_on_failure(true)` 镜像 BullMQ
+`failParentOnFailure`：终端故障将子进程从
+仍然阻塞的依赖集，提前释放父级并延迟失败，
+并让工作进程在运行父处理器之前使父进程失败。
+家长可在扇入释放后拨打`get_flow_children_values()`取回
+完成的子返回值，镜像 BullMQ 的 `getChildrenValues()`。
+`get_flow_ignored_children_failures()` 镜像 BullMQ
+`getIgnoredChildrenFailures()` 并返回配置了子项的失败
+`ignoreDependencyOnFailure`或`continueParentOnFailure`；删除了依赖
+故意忽略失败。
 
 ```rust
 use a3s_lane::{
@@ -673,17 +675,17 @@ assert!(queue
 # }
 ```
 
-Repeat jobs schedule the next occurrence after a successful completion. Use
-`RepeatOptions::every()` for fixed intervals or `RepeatOptions::cron()` for a
-seven-field UTC cron expression. The repeat `limit` counts total executions,
-including the first job. A custom repeat key also acts as a series owner: while a
-non-terminal occurrence with the same repeat key exists, duplicate adds return
-that owner instead of creating a parallel repeat chain. In Redis, duplicate
-repeat adds can recover from a missing fast owner key by validating
-`repeat_meta:<key>.jid` and restoring `repeat:<key>` before returning the
-current owner. Adds, bulk adds, flow adds, dynamic flow children, and repeat
-upserts reject repeat options whose `end_at` is earlier than the add timestamp,
-matching BullMQ's `endDate` add-time guard and avoiding partial writes:
+重复作业在成功完成后安排下一次发生。使用
+`RepeatOptions::every()` 用于固定间隔或 `RepeatOptions::cron()` 用于固定间隔
+七字段 UTC cron 表达式。重复`limit`计算总执行次数，
+包括第一份工作。自定义重复键还充当系列所有者：而
+存在具有相同重复键的非终结符，重复添加返回
+该所有者而不是创建并行重复链。在Redis中，重复
+重复添加可以通过验证从丢失的快速所有者密钥中恢复
+`repeat_meta:<key>.jid` 并在返回之前恢复 `repeat:<key>`
+当前所有者。添加、批量添加、流添加、动态流子级和重复
+upserts 拒绝 `end_at` 早于添加时间戳的重复选项，
+匹配 BullMQ 的 `endDate` 添加时间保护并避免部分写入：
 
 ```rust
 use a3s_lane::{InMemoryJobQueue, JobOptions, JobSpec, RepeatOptions};
@@ -769,9 +771,9 @@ assert_eq!(
 # }
 ```
 
-Simple deduplication coalesces duplicate submissions while the first matching
-job owns its deduplication id. An optional TTL limits how long that owner key
-blocks duplicates, including when the owner has already completed or failed:
+简单的重复数据删除在第一次匹配时合并重复的提交
+作业拥有其重复数据删除 ID。可选的 TTL 限制所有者密钥的长度
+阻止重复项，包括当所有者已经完成或失败时：
 
 ```rust
 use a3s_lane::{DeduplicationOptions, InMemoryJobQueue, JobOptions, JobQueueBackend};
@@ -880,67 +882,65 @@ queue
 # }
 ```
 
-The current deduplication mode intentionally covers BullMQ's simple mode. A
-deduplication id without a TTL blocks duplicate adds until the owning job
-completes, fails terminally, is removed, or is cleaned. A TTL-backed
-deduplication id follows BullMQ's Redis finalization rule: completion and
-terminal failure keep the owner key while its Redis TTL is still positive, so
-duplicates continue to return the retained terminal owner until the TTL expires
-when that terminal job record is retained. When `remove_on_complete(true)`,
-`remove_on_fail(true)`, or finished-job retention deletes the job record in the
-same move-to-finished turn, the Redis deduplication key is still left to expire
-like BullMQ's Lua path, but Lane's high-level add/get APIs require a usable job
-snapshot and may prune a missing owner before accepting a later replacement.
-Removal-style paths such as explicit remove, clean, drain, and manual
-`remove_deduplication_key()` clear the owner immediately.
-`extend_ttl(true)` covers BullMQ's debounce extension path: duplicate adds
-return the current owner and refresh the deduplication TTL instead of allowing
-the owner key to expire at the original deadline.
-`replace_delayed(true)` also covers BullMQ's delayed-owner replace path: a new
-deduplicated add may remove a delayed standalone owner and insert the new job in
-the same operation when the old owner is still present in the delayed index.
-For TTL-backed delayed replacement, replacement preserves the existing owner
-key's remaining TTL by default; when `extend_ttl(true)` is also set, replacement
-refreshes the TTL instead.
-`keep_last_if_active(true)` covers BullMQ's active-owner keep-last path for
-standalone and repeat-series jobs: duplicates added while the current owner is
-active return that owner, overwrite a queue-local next-job record, and
-materialize only the latest duplicate when the owner completes, terminally fails,
-or exhausts stalled-job recovery. If that latest duplicate has a delay, the delay
-starts from the owner finalization timestamp. For repeat series, the latest
-duplicate becomes the next occurrence for the same repeat key and replaces the
-regular successor for that finalization turn. For flow parents in the
-in-memory/local runtime, a duplicate flow submitted while the parent owner is
-active stores the latest replacement parent and children, then materializes that
-flow when the active parent finalizes. Redis Lua now covers active parent
-completion, terminal failure, and stalled terminal-failure paths for flow
-keep-last.
-Ordinary flow child deduplication follows BullMQ's child add path for both
-static `add_flow()` and dynamic `add_flow_children()`: if a child candidate
-matches an existing deduplication owner, Lane returns and emits events for the
-owner, skips storing the candidate child, leaves the owner detached from the new
-parent, and records only the non-skipped children as the new parent's pending
-dependencies. When that child deduplication uses `keep_last_if_active` and the
-owner is active, Lane stores the latest candidate as the next child instead. The
-active owner still owns the deduplication id, and owner finalization materializes
-the latest child and registers it as a dependency of the candidate parent.
-Retrying a failed deduplicated job reclaims the deduplication id while the job is
-waiting or active again; retry is rejected if another live deduplication owner,
-including a retained terminal TTL owner, already owns that id.
-`remove_deduplication_key()` clears the queue's current owner for a
-deduplication id before finalization, or during a retained terminal TTL window,
-matching BullMQ's queue-level `removeDeduplicationKey()` behavior of deleting
-the Redis deduplication key. The original job remains in its current state, but
-later submissions with the same deduplication id can become the new owner.
-`get_deduplication_job_id()` returns the current usable owner job id for that
-deduplication id; the Redis backend validates the owner job snapshot instead of
-blindly exposing an orphaned raw key.
+当前的重复数据删除模式有意覆盖BullMQ的简单模式。一个
+没有 TTL 的重复数据删除 ID 会阻止重复添加，直到所属作业为止
+完成、最终失败、被删除或被清理。 TTL支持的
+重复数据删除 id 遵循 BullMQ 的 Redis 终结规则：完成和
+终端故障保留所有者密钥，同时其 Redis TTL 仍为正，因此
+重复项继续返回保留的终端所有者，直到 TTL 过期
+当保留该终端作业记录时。当`remove_on_complete(true)`时，
+`remove_on_fail(true)`，或完成作业保留删除作业记录
+同样的移动到完成回合，Redis 重复数据删除密钥仍然会过期
+类似于 BullMQ 的 Lua 路径，但 Lane 的高级添加/获取 API 需要可用的作业
+快照，并可能在接受以后的替换之前删除丢失的所有者。
+移除式路径，例如显式移除、清理、排水和手动
+`remove_deduplication_key()`立即清除所有者。
+`extend_ttl(true)` 涵盖 BullMQ 的去抖扩展路径：重复添加
+返回当前所有者并刷新重复数据删除 TTL，而不是允许
+所有者密钥将在原定截止日期到期。
+`replace_delayed(true)` 还涵盖了 BullMQ 的延迟所有者替换路径：一个新的
+重复数据删除添加可能会删除延迟的独立所有者并将新作业插入
+当旧所有者仍然存在于延迟索引中时进行相同的操作。
+对于 TTL 支持的延迟更换，更换保留了现有所有者
+默认key的剩余TTL；当`extend_ttl(true)`也被设置时，替换而是刷新 TTL。
+`keep_last_if_active(true)` 涵盖 BullMQ 的活动所有者保留最后路径
+独立和重复系列作业：当前所有者在时添加的重复项
+主动返回该所有者，覆盖队列本地下一个作业记录，以及
+当所有者完成时，仅实现最新的副本，最终失败，
+或耗尽停滞的作业恢复。如果最新的副本有延迟，则延迟
+从所有者最终确定时间戳开始。对于重复系列，最新
+重复成为相同重复键的下一个出现并替换
+该最终轮次的常规继任者。对于流动父母来说
+内存中/本地运行时，当父所有者处于运行状态时提交的重复流
+active 存储最新的替换父项和子项，然后实现
+当活动父进程完成时流动。 Redis Lua 现在覆盖活动父级
+流程的完成、终端故障和停滞的终端故障路径
+保持最后。
+普通流程子级去重遵循 BullMQ 的子级添加路径
+静态 `add_flow()` 和动态 `add_flow_children()`：如果是子候选
+匹配现有的重复数据删除所有者，Lane 返回并发出事件
+所有者，跳过存储候选子项，使所有者与新的子项分离
+父级，并且仅将未跳过的子级记录为新父级的待处理
+依赖关系。当该子重复数据删除使用`keep_last_if_active`并且
+所有者处于活动状态，Lane 将最新的候选者存储为下一个孩子。这活动所有者仍然拥有重复数据删除 ID，并且所有者最终确定得以实现
+最新的孩子并将其注册为候选父母的依赖者。
+重试失败的重复数据删除作业会在作业执行期间回收重复数据删除 ID。
+等待或再次活动；如果有另一个实时重复数据删除所有者，则重试会被拒绝，
+包括保留的终端 TTL 所有者，已经拥有该 ID。
+`remove_deduplication_key()` 清除队列的当前所有者
+最终确定之前或保留的终端 TTL 窗口期间的重复数据删除 ID，
+匹配 BullMQ 的队列级别 `removeDeduplicationKey()` 删除行为
+Redis 重复数据删除键。原来的工作仍保持当前状态，但是
+具有相同重复数据删除 ID 的后续提交可以成为新的所有者。
+`get_deduplication_job_id()` 返回当前可用的所有者作业 ID
+重复数据删除 ID； Redis 后端验证所有者作业快照而不是
+盲目地暴露孤立的原始密钥。
 
-Use `LocalJobQueue` when a process-local runtime needs durable restart
-recovery. Its JSON snapshot stores jobs, events, deduplication follow-up jobs,
-released deduplication owners, and parent-scoped flow dependency side indexes
-so terminal child return values and ignored/fail-parent failure markers survive
-ordinary child cleanup and process restart:
+当进程本地运行时需要持久重启时使用`LocalJobQueue`
+恢复。它的JSON快照存储作业、事件、重复数据删除后续作业、
+已发布的重复数据删除所有者和父级范围的流依赖项索引
+因此终端子返回值和忽略/失败父失败标记仍然存在
+普通子进程清理和进程重启：
 
 ```rust
 use a3s_lane::{JobOptions, JobQueueBackend, LocalJobQueue};
@@ -978,24 +978,24 @@ if let Some(claimed) = claimed {
 # }
 ```
 
-Use `RedisJobQueue` when multiple workers or processes need to claim from the
-same durable priority queue. It stores jobs as JSON in a Redis hash, indexes
-states with sorted sets, stores retained job logs in per-job Redis lists, and
-uses Lua scripts to atomically add jobs, promote due delayed jobs, claim work,
-and transition leased jobs. The Redis backend follows the core BullMQ locking
-mechanism: a claim creates an independent TTL lock key for the job, and
-complete, fail, release, delay, and renew operations must prove ownership by
-matching the lock token before the script mutates the
-active/completed/failed/delayed indexes. Active `get_job()` snapshots read that
-lock key back so management callers can inspect the current lease token.
-`renew_leases()` mirrors BullMQ's
-`extendLocks` shape: Redis checks every token in one Lua turn, renews valid lock
-keys, updates active lease scores and retained job snapshots, removes successful
-jobs from the `stalled` candidate set, and returns only the failed job ids.
-Stalled recovery uses BullMQ's two-phase candidate set shape: a recovery pass
-records active jobs in a `stalled` set for the next pass, successful
-renew/finalize scripts remove the job from that set, and only a later pass whose
-candidate has no TTL lock can requeue or fail the job:
+当多个工人或进程需要向
+相同的持久优先级队列。它将作业以 JSON 形式存储在 Redis 哈希、索引中
+具有排序集的状态，将保留的作业日志存储在每个作业的 Redis 列表中，以及
+使用 Lua 脚本自动添加工作、提升因延迟而产生的工作、领取工作、
+和过渡租赁工作。 Redis 后端遵循核心 BullMQ 锁定
+机制：声明为作业创建一个独立的 TTL 锁定密钥，并且
+完成、失败、发布、延迟和更新操作必须证明所有权
+在脚本改变之前匹配锁定令牌
+活动/已完成/失败/延迟索引。活动 `get_job()` 快照读取到
+将密钥锁定回来，以便管理调用者可以检查当前的租赁令牌。
+`renew_leases()` 镜像 BullMQ
+`extendLocks` 形状：Redis 在 Lua 一轮中检查每个令牌，更新有效锁
+键，更新活动租赁分数和保留的作业快照，删除成功的
+`stalled` 候选集中的作业，并仅返回失败的作业 ID。
+停滞恢复使用 BullMQ 的两阶段候选集形状：恢复通道
+将活动作业记录在`stalled`集中，用于下一次传递，成功
+更新/最终化脚本从该集合中删除该作业，并且仅删除其稍后通过的作业
+候选人没有 TTL 锁可以重新排队或失败作业：
 
 ```rust
 use a3s_lane::{JobOptions, JobQueueBackend, JobRateLimit, RedisJobQueue, RetryPolicy};
@@ -1056,723 +1056,703 @@ assert_eq!(queue.get_job(&job.id).await?.map(|job| job.name), Some("send".to_str
 # }
 ```
 
-`with_claim_rate_limit()` configures a worker-local claim rate limit while
-sharing the counter key through Redis for workers that use the same namespace
-and queue. `set_claim_rate_limit()` stores the shared configuration in the queue
-meta hash as `max` and `duration`, matching BullMQ's global rate-limit
-mechanism. `get_claim_rate_limit()` reads those fields with `HMGET`, and
-`get_claim_rate_limit_ttl()` follows BullMQ's `getRateLimitTtl` script shape:
-with an explicit max it returns a TTL only after the limiter counter reaches
-that threshold, otherwise it uses Redis-shared `meta.max` when present and falls
-back to raw `PTTL` for the limiter key. `rate_limit_claims_for()` mirrors
-BullMQ's manual `rateLimit()` path by setting the limiter key to a very large
-counter with a millisecond TTL; `clear_claim_rate_limit_key()` mirrors
-`removeRateLimitKey()` by deleting that limiter key without changing shared
-configuration. `clear_claim_rate_limit()` removes the shared config fields. The
-Lua claim script prefers an explicit worker-local limit and otherwise reads the
-Redis meta values before checking the rate-limit counter. When the window is
-exhausted, `claim_next()` returns `None` and the job remains waiting for a later
-poll. `claim_next_blocking()` mirrors BullMQ's worker-side limiter delay by
-checking the active limiter TTL after an empty claim and sleeping until the
-limiter window can admit another job, capped by the worker's blocking deadline.
+`with_claim_rate_limit()` 配置工人本地索赔率限制，同时
+通过 Redis 为使用相同命名空间的工作人员共享计数器密钥
+和队列。 `set_claim_rate_limit()` 将共享配置存储在队列中
+元哈希为 `max` 和 `duration`，匹配 BullMQ 的全局速率限制
+机制。 `get_claim_rate_limit()` 使用 `HMGET` 读取这些字段，并且
+`get_claim_rate_limit_ttl()` 遵循 BullMQ 的 `getRateLimitTtl` 脚本形状：
+具有明确的最大值，仅在限制器计数器达到后才返回 TTL
+该阈值，否则它会使用 Redis 共享 `meta.max` 存在并下降
+回到原始的`PTTL`作为限制器键。 `rate_limit_claims_for()`镜子
+BullMQ的手动`rateLimit()`路径通过将限制器键设置为非常大
+具有毫秒 TTL 的计数器； `clear_claim_rate_limit_key()`镜子
+`removeRateLimitKey()` 通过删除该限制器密钥而不更改共享
+配置。 `clear_claim_rate_limit()` 删除共享配置字段。的
+Lua 声明脚本更喜欢明确的本地工人限制，否则读取
+检查速率限制计数器之前的 Redis 元值。当窗户是
+耗尽，`claim_next()`返回`None`并且作业仍在等待稍后
+民意调查。 `claim_next_blocking()` 反映 BullMQ 的工作端限制器延迟
+在空声明后检查活动限制器 TTL，并休眠直到
+限制器窗口可以接纳另一项工作，但以工作人员的阻塞期限为上限。
 
-`set_max_active_jobs()` configures a Redis-shared active job ceiling for the
-queue. It stores the value in the queue meta hash as `concurrency`, matching
-BullMQ's queue-maxed mechanism. `get_max_active_jobs()` reads that same meta
-field, mirroring BullMQ's global concurrency getter. `is_maxed()` mirrors
-BullMQ's `isMaxed()` queue getter by reading `meta.concurrency` and the active
-sorted-set count in one Lua turn. The Lua claim script reads the meta value,
-checks the active sorted set count in the same Redis turn, and returns `None`
-without moving a job or consuming rate-limit capacity when the queue is already
-maxed. `clear_max_active_jobs()` removes the shared ceiling.
+`set_max_active_jobs()` 配置 Redis 共享的活动作业上限
+队列。它将队列元哈希中的值存储为`concurrency`，匹配
+BullMQ 的队列最大机制。 `get_max_active_jobs()` 读取相同的元数据
+字段，镜像 BullMQ 的全局并发 getter。 `is_maxed()`镜子
+BullMQ 的 `isMaxed()` 队列 getter 通过读取 `meta.concurrency` 和活动的
+Lua 一轮中的有序集计数。 Lua声明脚本读取元值，
+检查同一个 Redis 轮中的活动排序集计数，并返回 `None`
+当队列已经存在时，无需移动作业或消耗速率限制容量
+最大化。 `clear_max_active_jobs()` 移除共享天花板。
 
-Like BullMQ's `moveToActive` script, Redis claims also promote due delayed jobs
-inside the same Lua script before checking pause, rate-limit, max-active, and
-the next claim. A paused or maxed queue can still move due delayed jobs back to
-`waiting`; it simply returns `None` instead of leasing work. In that paused or
-maxed branch, Lane suppresses the base worker marker just like BullMQ's
-`addBaseMarkerIfNeeded(markerKey, isPausedOrMaxed)` helper, so delayed promotion
-does not wake another worker until the queue resumes or an active slot opens.
-Claiming also validates the stored job state before moving a waiting-index entry
-to `active`, pruning stale waiting sorted-set entries instead of reactivating
-jobs that have already moved elsewhere.
+与 BullMQ 的 `moveToActive` 脚本一样，Redis 声称也会促进由于延迟的作业
+在检查暂停、速率限制、最大活动和之前，在同一个 Lua 脚本中
+下一个索赔。暂停或已满的队列仍可以由于延迟的作业而移回
+`waiting`；它只是返回 `None` 而不是租赁工作。在那暂停或
+maxed 分支，Lane 会像 BullMQ 一样抑制基础工作标记
+`addBaseMarkerIfNeeded(markerKey, isPausedOrMaxed)`帮手，所以延迟推广
+在队列恢复或活动槽打开之前不会唤醒其他工作人员。
+在移动等待索引条目之前，声明还会验证存储的作业状态
+到`active`，修剪陈旧的等待排序集条目而不是重新激活
+已经转移到其他地方的工作岗位。
 
-Redis also maintains a BullMQ-style queue `marker` zset inside the same Lua
-state transitions that move jobs into `waiting` or `delayed`. Waiting writes add
-member `0` at score `0`; delayed writes and delayed removals refresh member `1`
-to the earliest delayed score, mirroring BullMQ's `addBaseMarkerIfNeeded` and
-`addDelayMarkerIfNeeded` wake-up mechanism. `claim_next_blocking()` uses a
-dedicated Redis connection to `BZPOPMIN` that marker set, treats the popped
-marker only as a wake-up signal, and then reruns the normal Lua claim path so
-pause, rate-limit, max-active, delayed promotion, and lock ownership checks stay
-atomic. A successful claim rewrites the base marker to fan out multiple blocked
-workers over bulk-added jobs, and pause/resume updates the marker set so resumed
-queues wake sleeping Redis workers. Active-job finalization paths also refresh
-the base marker whenever waiting work remains, so completing, terminally
-failing, retry-delaying, or manually delaying a leased job wakes blocked Redis
-workers after a `set_max_active_jobs()` slot becomes available.
-`JobQueueBackend::claim_next_blocking()` exposes that wait path to the
-backend-agnostic `JobWorker`; non-blocking backends use the default immediate
-`claim_next()` fallback, while Redis workers use the marker-backed `BZPOPMIN`
-path when the queue is not currently rate-limited.
+Redis还在同一个Lua中维护了一个BullMQ风格的队列`marker`zset
+将作业移动到 `waiting` 或 `delayed` 的状态转换。等待写入添加
+成员`0`，得分为`0`；延迟写入和延迟删除刷新成员`1`
+到最早的延迟分数，反映 BullMQ 的 `addBaseMarkerIfNeeded` 和
+`addDelayMarkerIfNeeded`唤醒机制。 `claim_next_blocking()` 使用
+专用 Redis 连接到标记集的`BZPOPMIN`，处理弹出的内容
+标记仅作为唤醒信号，然后重新运行正常的 Lua 声明路径，以便
+暂停、速率限制、最大活跃、延迟升级和锁定所有权检查保留
+原子的。成功的声明会重写基本标记以扇出多个被阻止的
+工作人员处理批量添加的作业，并暂停/恢复更新标记集，以便恢复
+队列唤醒沉睡的 Redis 工作人员。活动工作完成路径也刷新
+每当等待工作剩余时，基本标记，因此完成，最终
+失败、重试延迟或手动延迟租用作业会唤醒阻塞的 Redis
+`set_max_active_jobs()` 插槽可用后的工作人员。
+`JobQueueBackend::claim_next_blocking()` 将该等待路径暴露给
+与后端无关`JobWorker`；非阻塞后端使用默认的立即数
+`claim_next()` 后备，而 Redis 工作线程使用标记支持的 `BZPOPMIN`
+当队列当前不受速率限制时的路径。
 
-Redis adds are Lua-backed as well. The add scripts write job JSON and the
-waiting, delayed, or waiting-children index in the same Redis turn. If a custom
-job id already exists, the script returns the existing job without advancing the
-waiting sequence or writing duplicate state indexes. Lane rejects custom job ids
-equal to `0`, prefixed with `0:`, or pure integers before script execution,
-matching BullMQ's reserved marker namespace and integer-id guard. Redis scripts
-special-case marker-like values while claiming, listing, and promoting jobs, so
-Lane keeps those ids out of the user job-id namespace. Bulk add follows the same
-mechanism in one script call while preserving the caller's input order, including
-the same deduplication stream events that BullMQ's pipelined `addBulk()` emits
-for each job.
-For simple deduplication, the same add scripts use an independent
-`deduplication:<id>` key, equivalent to BullMQ's `de:<id>` role, to return the
-current owner before writing a duplicate. If `DeduplicationOptions` has a TTL,
-the Lua scripts write that owner key with `PX` so Redis expires the
-deduplication window even if the original job later completes or fails before
-the TTL does. Completion, terminal failure, and stalled terminal-failure scripts
-mirror BullMQ's `removeDeduplicationKeyIfNeededOnFinalization`: they delete a
-matching owner key only when Redis reports no TTL (`PTTL == -1`) or an expiring
-zero TTL, and preserve keys with a positive TTL. The keep-last-if-active mode
-intentionally omits that TTL, matching BullMQ's active owner behavior so the key
-cannot expire while work is still leased. If
-`extend_ttl(true)` is set, duplicate adds refresh the owner key with `PX` before
-returning the current owner, matching BullMQ's debounce extension branch.
-If `replace_delayed(true)` is set and the current owner is a standalone delayed
-job, the add script first removes the old delayed zset member, then removes the
-old job hash and inserts the new owner only if that delayed removal succeeded,
-mirroring BullMQ's delayed replacement branch. With TTL-backed deduplication, the
-script updates the owner id with Redis `KEEPTTL` so replacement does not extend
-the remaining deduplication window unless `extend_ttl(true)` is also set. That
-same branch emits BullMQ-style `removed prev=delayed`, `debounced`, and
-`deduplicated` events before the replacement job's own add/state events. If
-`keep_last_if_active(true)` is set and the current owner is present in the
-active sorted set, duplicate adds overwrite a
-`deduplication_next:<id>` proto-job record and `PERSIST` the owner key. For
-standalone and repeat jobs, complete, terminal fail, and stalled terminal-fail
-scripts then atomically delete the old owner key, materialize that latest
-proto-job into waiting or delayed state, and set the deduplication owner to the
-new job. When the owner and latest duplicate
-share the same repeat key, the finalization script also increments
-`repeat_count`, sets the `repeat:<key>` owner to the materialized latest job, and
-suppresses the regular repeat successor for that turn. This preserves the
-single-owner repeat invariant while matching BullMQ's keep-last requeue
-mechanism, where the dedup-next record is consumed during job finalization rather
-than by a later client-side pass. Flow keep-last uses the same
-`deduplication_next:<id>` key with a flow envelope; Redis currently materializes
-that envelope on active parent completion, terminal failure, or stalled terminal
-failure. Active flow-child keep-last deduplication stores the next child with its
-parent relationship and registers the materialized child in the parent dependency
-set when the active owner finalizes. Flow parent deduplication follows BullMQ's
-`addParentJob` path too:
-duplicate parent submissions return the current owner flow and write
-`debounced` and `deduplicated` events on the owner parent id; active keep-last
-flow duplicates write the same events while replacing the pending
-`deduplication_next:<id>` flow envelope. Redis removal paths mirror BullMQ's
-removal helper too: when remove,
-clean, drain, repeat upsert, or flow unprocessed-child removal deletes the job
-that still owns `deduplication:<id>`, it also clears `deduplication_next:<id>` so
-a previously active owner cannot leave a stale shadow job behind.
+Redis 添加也由 Lua 支持。添加脚本写入作业 JSON 和
+在同一个 Redis 轮次中等待、延迟或等待子索引。如果定制
+作业 ID 已存在，脚本返回现有作业而不推进
+等待序列或写入重复的状态索引。 Lane 拒绝自定义作业 ID
+等于`0`，以`0:`为前缀，或脚本执行前的纯整数，
+匹配 BullMQ 的保留标记命名空间和整数 ID 保护。 Redis 脚本
+在申请、列出和晋升工作时使用特殊情况的类似标记的值，因此
+Lane 将这些 ID 保留在用户作业 ID 命名空间之外。批量添加同样如此
+一个脚本调用中的机制，同时保留调用者的输入顺序，包括
+与 BullMQ 的管道式 `addBulk()` 发出的重复数据删除流事件相同
+对于每项工作。
+对于简单的重复数据删除，相同的添加脚本使用独立的
+`deduplication:<id>` key，相当于BullMQ的`de:<id>`作用，返回
+当前所有者在写入副本之前。如果`DeduplicationOptions`有TTL，
+Lua 脚本使用 `PX` 写入所有者密钥，以便 Redis 过期
+重复数据删除窗口，即使原始作业稍后完成或之前失败
+TTL 确实如此。完成、终端失败和停滞的终端失败脚本
+镜像 BullMQ 的 `removeDeduplicationKeyIfNeededOnFinalization`：他们删除了一个
+仅当 Redis 报告没有 TTL (`PTTL == -1`) 或过期时才匹配所有者密钥
+TTL 为零，并保留具有正 TTL 的密钥。 keep-last-if-active 模式故意省略 TTL，匹配 BullMQ 的主动所有者行为，因此关键
+当工作仍在租赁期间时不能过期。如果
+`extend_ttl(true)`已设置，重复添加之前用`PX`刷新所有者密钥
+返回当前所有者，匹配 BullMQ 的 debounce 扩展分支。
+如果设置了`replace_delayed(true)`并且当前所有者是独立的延迟
+作业中，添加脚本首先删除旧的延迟 zset 成员，然后删除
+旧作业哈希并仅在延迟删除成功时插入新所有者，
+镜像 BullMQ 的延迟替换分支。通过 TTL 支持的重复数据删除，
+脚本使用 Redis `KEEPTTL` 更新所有者 ID，因此替换不会扩展
+剩余的重复数据删除窗口，除非还设置了 `extend_ttl(true)`。那
+同一分支发出 BullMQ 风格的 `removed prev=delayed`、`debounced` 和
+替换作业自己的添加/状态事件之前的`deduplicated` 事件。如果
+`keep_last_if_active(true)` 已设置且当前所有者存在于
+活动排序集，重复添加覆盖 a
+`deduplication_next:<id>` 原始作业记录和 `PERSIST` 所有者密钥。对于
+独立和重复作业、完成、终端失败和停滞的终端失败
+然后脚本自动删除旧的所有者密钥，实现最新的密钥
+proto-job 进入等待或延迟状态，并将重复数据删除所有者设置为
+新工作。当所有者和最新的重复时
+共享相同的重复密钥，终结脚本也会递增
+`repeat_count`，将 `repeat:<key>` 所有者设置为具体化的最新作业，并且
+抑制该回合的常规重复后继者。这保留了单所有者重复不变性，同时匹配 BullMQ 的 keep-last 重新排队
+机制，其中 dedup-next 记录在作业完成期间消耗，而不是
+而不是通过稍后的客户端传递。 Flow keep-last 使用相同的
+`deduplication_next:<id>` 带流量包络的密钥； Redis目前已实现
+活动父完成、终端故障或终端停滞的信封
+失败。活动流子级保留最后重复数据删除存储下一个子级及其
+父关系并将物化子项注册到父依赖项中
+当活动所有者完成时设置。流父级重复数据删除遵循 BullMQ 的
+`addParentJob` 路径：
+重复的父提交返回当前所有者流程并写入
+所有者父 ID 上的 `debounced` 和 `deduplicated` 事件；主动保持最后
+流程重复写入相同的事件，同时替换挂起的事件
+`deduplication_next:<id>` 流量包络线。 Redis 删除路径镜像 BullMQ 的
+删除助手：删除时，
+clean、drain、repeat upsert 或 flow 未处理子项删除会删除作业
+仍然拥有 `deduplication:<id>`，它也会清除 `deduplication_next:<id>` 所以
+以前活跃的所有者不能留下陈旧的影子工作。
 
-Waiting order is modeled after BullMQ's Redis-level mechanism rather than only
-matching its option names. In BullMQ 5.79.3, standard jobs use a Redis list:
-`opts.lifo` selects `RPUSH`, FIFO uses `LPUSH`, and workers consume from the
-tail with `RPOPLPUSH`; prioritized jobs use a sorted set whose score is
-`priority * 0x100000000 + counter`, and `changePriority(..., lifo: true)` puts
-the job at the front of its same-priority score range. Lane stores all waiting
-jobs in one sorted set, so each Lua script that moves a job into `waiting`
-increments the queue sequence, writes that value to `job.enqueued_seq`, and
-computes a priority-bucketed score. The lower half of each priority bucket is
-reserved for LIFO entries with reversed sequence order, and the upper half is
-reserved for FIFO entries with forward sequence order. This keeps `ZRANGE`
-claiming priority-first, newest LIFO before older LIFO, LIFO before FIFO at the
-same priority, and oldest FIFO before newer FIFO, while preserving
-`get_counts_per_priority()` as a `ZCOUNT` over the same priority bucket.
-`release_active_job()` writes the returned job at the start of its priority
-bucket, mirroring BullMQ's `pushBackJobWithPriority()` score for prioritized
-jobs and the `RPUSH` front-of-consumption behavior for standard wait-list jobs;
-if multiple released jobs share that exact score, Redis orders them by job id.
+等待顺序是模仿 BullMQ 的 Redis 级别机制而不仅仅是
+匹配其选项名称。在 BullMQ 5.79.3 中，标准作业使用 Redis 列表：
+`opts.lifo`选择`RPUSH`，FIFO使用`LPUSH`，worker从
+尾部有`RPOPLPUSH`；优先作业使用一个排序集，其分数为
+`priority * 0x100000000 + counter` 和 `changePriority(..., lifo: true)` 放置
+位于其相同优先级分数范围前面的作业。巷子里的商店都在等待
+作业在一个排序集中，因此每个将作业移动到 `waiting` 的 Lua 脚本
+增加队列序列，将该值写入 `job.enqueued_seq`，并且
+计算优先级分桶分数。每个优先级桶的下半部分是
+为具有相反顺序的 LIFO 条目保留，上半部分是
+为具有正向序列顺序的 FIFO 条目保留。这保持了`ZRANGE`
+要求优先级第一，最新的 LIFO 在较旧的 LIFO 之前，LIFO 在 FIFO 之前
+相同的优先级，最旧的 FIFO 在较新的 FIFO 之前，同时保留
+`get_counts_per_priority()` 作为同一优先级存储桶上的 `ZCOUNT`。
+`release_active_job()` 将返回的作业写入其优先级的开头
+存储桶，镜像 BullMQ 的 `pushBackJobWithPriority()` 优先级分数
+工作和标准等候名单工作的`RPUSH`前端消费行为；
+如果多个已发布的作业共享该确切分数，Redis 将按作业 ID 对它们进行排序。
 
-Finished-job retention follows BullMQ's underlying `moveToFinished` mechanism
-rather than only matching the `removeOnComplete` and `removeOnFail` option
-names. In BullMQ 5.79.3, those options are normalized to `keepJobs`; `true`
-becomes `{ count: 0 }`, `false` becomes unlimited retention, a number becomes
-`{ count: number }`, and an object may carry `age`, `count`, and `limit`. The
-`moveToFinished-14.lua` script writes the current job to the completed or failed
-zset with the finish timestamp as score, then calls
-`removeJobsByMaxAge(timestamp, maxAge, targetSet, prefix, maxLimit)` and
-`removeJobsByMaxCount(maxCount, targetSet, prefix)` in the same Lua turn.
-Lane mirrors that storage-level behavior: Redis completion, terminal failure,
-stalled terminal-failure, and flow-cleanup scripts that fail a parent first
-finalize the job, then apply age cleanup, then count cleanup against the
-terminal zset while deleting the job hash, log list, and dependency set for
-removed finished jobs. Like BullMQ's `moveToFinished` scripts, this finished-job
-record cleanup does not delete the deduplication owner key; a TTL-backed owner
-continues to live until Redis expires it, while a no-TTL owner is already
-released during finalization.
-In-memory and local durable queues use the same order against `finished_at`
-timestamps. Age cleanup is best-effort just like BullMQ: there is no background
-timer, so an over-age completed or failed job is removed only when a later job
-enters the same terminal state.
+完成的作业保留遵循 BullMQ 的底层 `moveToFinished` 机制
+而不是仅匹配 `removeOnComplete` 和 `removeOnFail` 选项
+名称。在 BullMQ 5.79.3 中，这些选项被标准化为`keepJobs`； `true`
+变成`{ count: 0 }`，`false`变成无限保留，一个数字变成
+`{ count: number }`，并且一个对象可以携带`age`、`count`和`limit`。的
+`moveToFinished-14.lua` 脚本将当前作业写入已完成或失败
+zset 以完成时间戳作为分数，然后调用
+`removeJobsByMaxAge(timestamp, maxAge, targetSet, prefix, maxLimit)` 和
+`removeJobsByMaxCount(maxCount, targetSet, prefix)` 在同一个 Lua 回合中。
+Lane 镜像存储级行为：Redis 完成、终端失败、
+停滞的终端故障和首先使父级失败的流清理脚本
+完成工作，然后应用年龄清理，然后根据年龄进行清理
+终端 zset，同时删除作业哈希、日志列表和依赖项集
+删除已完成的作业。就像 BullMQ 的 `moveToFinished` 脚本一样，这个完成的工作
+记录清理不会删除重复数据删除所有者密钥； TTL 支持的所有者
+继续存在，直到 Redis 过期，而无 TTL 所有者已经存在
+在定稿期间发布。
+内存中和本地持久队列对 `finished_at` 使用相同的顺序
+时间戳。年龄清理是尽力而为，就像 BullMQ 一样：没有背景
+计时器，因此只有当后续作业出现时，才会删除超龄完成或失败的作业
+进入相同的终止状态。
 
-Queue events follow BullMQ's Redis stream mechanism. BullMQ's Lua scripts write
-global queue events with `XADD <queue>:events`, commonly using
-`MAXLEN ~ maxEvents` with a default of 10,000 retained entries; `QueueEvents`
-then reads from that stream by event id. Lane mirrors that storage shape for the
-Redis backend with an `events` stream per queue. Lua state transitions write the
-event in the same Redis turn as the job mutation: add writes `added` followed by
-`waiting`, `delayed`, or `waiting-children`; claim writes `active prev=waiting`;
-completion writes `completed prev=active` with `returnvalue`; failure writes
-`failed` or retry `delayed` with `failedReason`, and terminal failures whose
-attempt count is exhausted also write BullMQ-style `retries-exhausted` with
-`attemptsMade`; completed and terminal failed move-to-finished paths write a
-queue-level `drained` event when no waiting or active jobs remain; flow child
-completion, terminal failure, and stalled terminal failure paths also emit parent
-`waiting`, `delayed`, or `failed` events with `prev=waiting-children` when that
-same Lua turn releases or fails the parent;
-explicit removal writes `removed prev=<state>` for the removed job; `clean_jobs()`
-writes a queue-level `cleaned count=<n>` event after removing aged jobs;
-deduplicated adds, including bulk adds, write BullMQ-style `debounced` and
-`deduplicated` events with the owner job id, deduplication id, and skipped
-candidate job id; flow parent deduplication writes the same event pair with the
-owner parent id and skipped candidate parent id; ordinary flow child
-deduplication writes the event pair on the existing child owner while omitting the
-skipped candidate from the new parent dependency set; flow child custom job-id
-duplicates write BullMQ-style `duplicated` on the retained child id when the
-existing child is attached to the new parent; delayed-owner replacement also
-writes `removed prev=delayed` for the old owner followed by `debounced` and
-`deduplicated` events on the replacement job id; progress writes
-`progress data=<json>`; pause/resume write queue-level events.
-`read_events()` uses `XRANGE` over stream ids, and
-`trim_events()` uses BullMQ-style `XTRIM MAXLEN ~`. The in-memory and local
-durable backends keep the same retained event entries in their snapshots so
-tests and embedded runtimes expose the same contract without Redis. Like
-BullMQ's `addLog` script, Lane job logs remain a retained log list and do not
-emit queue events; progress updates do.
+队列事件遵循 BullMQ 的 Redis 流机制。 BullMQ的Lua脚本编写
+`XADD <queue>:events`的全局队列事件，常用
+`MAXLEN ~ maxEvents`，默认保留 10,000 个条目； `QueueEvents`
+然后通过事件 ID 从该流中读取。车道镜那储物形状为
+Redis 后端每个队列有一个 `events` 流。 Lua状态转换写的是
+与作业突变相同的 Redis 回合中的事件：add 写入 `added` 后跟
+`waiting`、`delayed`、或`waiting-children`；索赔写`active prev=waiting`；
+补全将 `completed prev=active` 与 `returnvalue` 写入；失败写入
+`failed` 或使用 `failedReason` 重试 `delayed`，以及终端故障
+尝试计数已耗尽，还可以编写 BullMQ 风格的 `retries-exhausted` ，
+`attemptsMade`；已完成和终端失败的移动到完成的路径写入
+当没有等待或活动作业剩余时，队列级`drained`事件；流子
+完成、终端故障和停滞的终端故障路径也会发出父级
+`waiting`、`delayed` 或 `failed` 事件与 `prev=waiting-children` 时
+同一个 Lua 回合释放父级或使父级失败；
+显式删除为删除的作业写入`removed prev=<state>`； `clean_jobs()`
+删除老化作业后写入队列级`cleaned count=<n>`事件；
+去重添加，包括批量添加，编写 BullMQ 风格 `debounced` 和
+`deduplicated` 具有所有者作业 ID、重复数据删除 ID 并已跳过的事件
+候选人职位 ID；流父重复数据删除写入相同的事件对
+所有者父 ID 和跳过的候选父 ID；普通流子
+重复数据删除将事件对写入现有子所有者，同时忽略从新的父依赖集中跳过候选；流程子自定义作业 ID
+当重复项在保留的子 id 上写入 BullMQ 样式 `duplicated` 时
+现有的孩子依附于新的父母；延迟业主更换也
+为旧所有者写入 `removed prev=delayed`，然后是 `debounced` 和
+`deduplicated` 替换作业 ID 上的事件；进度写道
+`progress data=<json>`；暂停/恢复写入队列级事件。
+`read_events()` 在流 ID 上使用 `XRANGE`，并且
+`trim_events()` 使用 BullMQ 风格的 `XTRIM MAXLEN ~`。内存中和本地
+持久后端在其快照中保留相同的保留事件条目，因此
+测试和嵌入式运行时在没有 Redis 的情况下公开相同的合约。喜欢
+BullMQ的`addLog`脚本，Lane作业日志保留保留日志列表并且不
+发出队列事件；进度更新确实如此。
 
-Completion, terminal failure, and stalled terminal failure scripts use
-BullMQ-style finalization semantics for deduplication keys: a matching owner key
-with no TTL is released, while a matching key with a positive TTL remains until
-Redis expires it, even if `remove_on_complete(true)`, `remove_on_fail(true)`, or
-finished-job retention deletes the finished job record immediately. Remove,
-clean, drain, repeat upsert, and flow child-removal paths use removal semantics
-instead: they release the matching owner key and also clear the paired
-`deduplication_next:<id>` shadow record, matching BullMQ's removal cleanup for
-keep-last deduplication.
-Manual retry reclaims the key inside the retry script, reapplies the TTL, and
-refuses to move the failed job back to waiting if a newer non-terminal job
-already owns the same deduplication id.
-`remove_deduplication_key()` deletes `deduplication:<id>` directly, so a later
-add can claim the same id even while the old owner remains non-terminal. When a
-keep-last owner has a pending successor, the release also clears
-`deduplication_next:<id>` so the old active owner cannot materialize a stale
-duplicate after the id was manually released. The in-memory and local durable
-backends persist the same logical release by tracking the released owner id in
-their snapshots instead of relying on a client-side scan alone.
-`get_deduplication_job_id()` consults that same `deduplication:<id>` key. Unlike
-BullMQ's raw `GET de:<id>` getter, Lane validates that the owner can still be
-loaded as a job snapshot for the job-returning API surface; if the key points at
-a missing or mismatched job, or at a terminal job without a positive TTL owner
-key, it clears both the stale owner key and any orphaned
-`deduplication_next:<id>` record before reporting no owner. Terminal jobs with a
-positive TTL and a retained job record remain valid deduplication owners until
-Redis expires the key.
+完成、终端故障和停滞的终端故障脚本使用
+BullMQ 风格的重复数据删除键最终确定语义：匹配的所有者键
+没有 TTL 的密钥被释放，而具有正 TTL 的匹配密钥将保留，直到
+Redis 会使其过期，即使 `remove_on_complete(true)`、`remove_on_fail(true)` 或
+完成作业保留立即删除完成的作业记录。删除，
+clean、drain、repeat upsert 和 flow 子项删除路径使用删除语义
+相反：他们释放匹配的所有者密钥并清除配对的密钥
+`deduplication_next:<id>` 影子记录，匹配 BullMQ 的删除清理
+保留最后的重复数据删除。
+手动重试回收重试脚本内的密钥，重新应用 TTL，并且
+如果有更新的非终端作业，则拒绝将失败的作业移回等待状态
+已拥有相同的重复数据删除 ID。
+`remove_deduplication_key()`直接删除`deduplication:<id>`，所以稍后
+即使旧所有者仍然是非终端，add 也可以声明相同的 id。当一个
+keep-last 所有者有一个待定的继任者，释放也清除
+`deduplication_next:<id>` 所以旧的活跃所有者无法实现陈旧的
+手动释放id后重复。内存中和本地持久
+后端通过跟踪发布的所有者 ID 来保持相同的逻辑发布
+他们的快照，而不是仅仅依赖客户端扫描。
+`get_deduplication_job_id()` 查阅相同的 `deduplication:<id>` 密钥。不像
+BullMQ 的原始 `GET de:<id>` getter，Lane 验证所有者仍然可以
+作为作业返回 API 表面的作业快照加载；如果关键点在作业缺失或不匹配，或者终端作业没有明确的 TTL 所有者
+密钥，它会清除过时的所有者密钥和任何孤立的密钥
+`deduplication_next:<id>` 举报无主前记录。终端作业
+正的 TTL 和保留的作业记录仍然是有效的重复数据删除所有者，直到
+Redis 使密钥过期。
 
-Redis flow submission is all-or-nothing: the flow add script writes the parent,
-new children, existing-parent and existing-child attachments, state indexes,
-queue events, and the parent's pending dependency set in one Redis turn.
-Duplicate ids inside the same submitted flow are rejected. An existing parent
-custom job id follows BullMQ's `addParentJob` duplicate path: Lane keeps the
-stored parent snapshot, emits `duplicated`, preserves the current dependency set,
-and adds only the submitted children that are new, duplicated for that parent, or
-deduplication keep-last placeholders. An existing child custom job id follows
-BullMQ's `handleDuplicatedJob` path when it has no conflicting retained parent:
-Lane keeps the original child data, updates its `parent_id`, emits `duplicated`,
-adds non-completed children to the new parent dependency set, and lets an
-already completed child satisfy the dependency immediately so the parent can
-leave `waiting_children` in the same turn. If the existing child still belongs
-to a different retained parent, the flow add returns a parent-conflict error
-without creating partial records. If a child candidate
-deduplicates against an existing owner, the add script handles that before
-dependency insertion: ordinary candidates are skipped, the existing owner is not
-attached to the new parent, and the returned flow contains only the children that
-were actually stored. Active keep-last child candidates are stored in
-`deduplication_next:<id>` with their parent id; when the owner finalizes, the
-materialized child is added to the parent dependency set in the same Redis turn.
-`get_flow_dependencies()` uses a Redis-side read script to load the parent and
-every retained child snapshot from the jobs hash in one turn, and returns the
-child ids that are still pending or missing from retention.
-`get_flow_dependency_counts()` follows BullMQ's `getDependencyCounts` Redis/Lua
-mechanism instead of only copying the API names. BullMQ 5.79.3 counts
-parent-scoped `:processed`, `:dependencies`, `:failed`, and `:unsuccessful`
-structures with `HLEN`, `SCARD`, `HLEN`, and `ZCARD`, with ignored, removed, and
-continued failures handled by the failure-policy path. Lane now writes the same
-parent-scoped Redis side indexes under `dependencies:<parent_id>:processed`,
-`dependencies:<parent_id>:failed`, and
-`dependencies:<parent_id>:unsuccessful`, while in-memory and local-durable
-queues keep equivalent `JobQueueSnapshot.flow_dependency_indexes` entries.
-Child snapshots remain available for audit and compatibility fallback. The
-Redis count script reads those side indexes in one turn and returns processed,
-unprocessed, failed, ignored, and missing totals without returning every child
-snapshot to the client; the in-memory/local readers use the same authoritative
-side-index-first view and fall back to retained child snapshots only for child
-ids not covered by a side index.
-Removed failed dependencies are intentionally omitted from the failed and ignored
-totals, matching BullMQ's `removeDependencyOnFailure` behavior.
-`get_flow_dependency_selected_counts(parent_id, options)` mirrors BullMQ's
-`Job.getDependenciesCount(opts)` selector semantics. Empty options default to
-the four BullMQ buckets, while explicit options return `Some(count)` only for
-requested processed, unprocessed, ignored, and failed buckets. Redis reads the
-same parent-scoped side indexes with `HLEN`, `SCARD`, `HLEN`, and `ZCARD`,
-matching BullMQ's `getDependencyCounts-4.lua` mechanism and avoiding snapshot
-fan-out when callers only need counts. Lane keeps `get_flow_dependency_counts()`
-as the extended queue-level count snapshot with `missing` and compatibility
-fallback support.
-`get_flow_dependency_values(parent_id)` mirrors BullMQ's no-options
-`Job.getDependencies()` path: Redis reads the same parent-scoped `:processed`,
-`:dependencies`, `:failed`, and `:unsuccessful` structures with `HGETALL`,
-`SMEMBERS`, `HGETALL`, and `ZRANGE 0 -1`, parsing processed values as JSON and
-ignored values as failure-reason strings. It then merges retained child
-snapshots for any parent child id not covered by those side indexes, preserving
-full-bucket compatibility for flows created before the side-index fields were
-available.
-`get_flow_dependency_page(parent_id, options)` and
-`get_flow_dependency_pages(parent_id, options)` mirror BullMQ's paginated
-`Job.getDependencies(opts)` path for large fan-out inspection. Redis reads
-`processed` with `HSCAN dependencies:<parent_id>:processed`, `unprocessed` with
-`SSCAN dependencies:<parent_id>`, `ignored` with
-`HSCAN dependencies:<parent_id>:failed`, and `failed` with
-`ZRANGE dependencies:<parent_id>:unsuccessful`. The multi-bucket getter keeps
-the BullMQ result order and reads all requested buckets in one Lua turn instead
-of stitching together multiple client round trips. The `count` option is a Redis
-scan hint for hash and set buckets, just like BullMQ; callers should keep reading
-with the returned cursor until it becomes `0`. For mixed upgrade data, the
-initial `cursor = 0` page also appends retained child snapshot fallback entries
-that are not covered by side indexes; later cursor pages remain pure Redis
-cursor scans.
-When a child completes, fails with `ignore_dependency_on_failure` or
-`continue_parent_on_failure`, fails with `fail_parent_on_failure`, or when a
-static flow or active parent fan-out reuses an existing completed child by custom
-id, Lane mirrors BullMQ's parent-scoped side-index path instead of only relying
-on the child snapshot fallback. Mixed flows with reused completed children,
-newly completed children, ignored failures, and fail-parent failures therefore
-read one authoritative dependency view across Redis, in-memory, and local
-durable backends.
-Completing a flow parent checks both the Redis dependency set and
-`dependencies:<parent_id>:unsuccessful` before leaving the active state, matching
-BullMQ's `moveToFinished` guard that rejects jobs with pending dependencies or
-unsuccessful child dependencies. When `continueParentOnFailure` releases a
-parent early, later child completion still removes that child from the dependency
-set so the parent can only finish after the remaining required fan-in has
-resolved.
-`get_flow_children_values()` and `get_flow_ignored_children_failures()` follow
-BullMQ's `getChildrenValues()` and `getIgnoredChildrenFailures()` fan-in
-semantics. BullMQ reads parent-scoped `:processed` and `:failed` hashes; Lane's
-Redis read scripts now prefer those hashes as well, then merge retained child
-snapshots for any child id not covered by the side index. This preserves
-compatibility for mixed upgrade data where some children completed before the
-side indexes existed and later children wrote the new parent-scoped hashes.
-Completed children whose return value is JSON `null` remain visible through both
-side-index reads and retained-snapshot fallback reads.
-`remove_unprocessed_children()` follows BullMQ's `removeUnprocessedChildren`
-script shape at the dependency-set level: it removes children that are still in
-the parent's pending dependency set, skips completed, failed, active, or locked
-children, deletes the removed child records and per-child metadata, emits a
-BullMQ-style `removed` event for each removed child in the same Redis turn, then
-checks whether the parent can leave `waiting_children`. Lane returns the removed
-child snapshots for auditability while preserving the parent `child_ids`, so
-later dependency inspection reports removed children as missing.
-`remove_child_dependency()` follows BullMQ's `removeChildDependency` path: it
-removes one child from the parent's pending dependency set when present, clears
-the child's parent reference, keeps the child job itself, and releases the
-parent when no pending dependencies remain. Redis treats the pending dependency
-set, parent `child_ids`, and parent-scoped `:processed`, `:failed`, and
-`:unsuccessful` buckets as relationship evidence, so terminal children that have
-already left the pending set can still be detached without leaving ghost
-dependency values behind. In-memory and local-durable queues expose the same
-visible detach semantics by allowing retained completed or failed child
-snapshots to be removed from the parent's `child_ids` without deleting the child
-job. A stale dependency entry for an already terminal child is still removed
-just like BullMQ's `SREM` path. Ordinary job removal, clean, and drain paths
-remain separate from explicit dependency detach: they follow BullMQ's
-`removeJob`, `cleanJobsInSet`, and `drain` scripts by releasing pending parent
-dependencies and deleting the removed job's own metadata, while retained
-parent-scoped terminal dependency result indexes are not treated as cleanup
-targets outside explicit dependency detach. Local durable snapshots persist the
-same distinction, so reopening a queue after a completed or ignored child job was
-removed still preserves the parent's processed or ignored dependency bucket,
-while `remove_child_dependency()` clears the bucket intentionally.
+Redis流提交是全有或全无：流添加脚本写入父级，
+新子项、现有父项和现有子项附件、状态索引、
+队列事件，以及父级的挂起依赖项在一个 Redis 回合中设置。
+同一提交流程中的重复 ID 将被拒绝。现有家长
+自定义作业 ID 遵循 BullMQ 的 `addParentJob` 重复路径：Lane 保留
+存储的父快照，发出 `duplicated`，保留当前依赖集，
+并仅添加提交的新子项、与该父项重复的子项，或者
+重复数据删除保留最后的占位符。现有的子自定义作业 ID 如下
+当 BullMQ 没有冲突的保留父级时的 `handleDuplicatedJob` 路径：
+Lane 保留原始子数据，更新其 `parent_id`，发出 `duplicated`，
+将未完成的子项添加到新的父项依赖项集中，并让
+已经完成的孩子立即满足依赖性，以便父母可以
+在同一回合留下`waiting_children`。如果现有的孩子仍然属于
+对于不同的保留父级，流添加返回父级冲突错误
+无需创建部分记录。如果儿童候选人
+针对现有所有者进行重复数据删除，添加脚本会处理之前的情况
+依赖项插入：跳过普通候选者，不跳过现有所有者
+附加到新的父级，并且返回的流仅包含以下子级：
+实际上被存储了。活跃的保留最后子候选者存储在
+`deduplication_next:<id>` 及其父 ID；当所有者最终确定时，在同一 Redis 回合中，物化子级将添加到父级依赖项集中。
+`get_flow_dependencies()` 使用 Redis 端读取脚本来加载父级和
+一轮中作业哈希中每个保留的子快照，并返回
+仍待保留或未保留的子 ID。
+`get_flow_dependency_counts()` 遵循 BullMQ 的 `getDependencyCounts` Redis/Lua
+机制而不是仅仅复制 API 名称。 BullMQ 5.79.3 计数
+父级范围 `:processed`、`:dependencies`、`:failed` 和 `:unsuccessful`
+具有 `HLEN`、`SCARD`、`HLEN` 和 `ZCARD` 的结构，忽略、删除和
+由故障策略路径处理的持续故障。莱恩现在写同样的
+`dependencies:<parent_id>:processed` 下的父范围 Redis 侧索引，
+`dependencies:<parent_id>:failed`，以及
+`dependencies:<parent_id>:unsuccessful`，同时在内存中且本地持久
+队列保留等效的`JobQueueSnapshot.flow_dependency_indexes`条目。
+子快照仍然可用于审核和兼容性回退。的
+Redis count脚本一轮读取这些边索引并返回处理后，
+未处理、失败、忽略和缺失的总数，而不返回每个子项
+快照到客户端；内存/本地读者使用相同的权威
+side-index-first 查看并回退到仅针对子级保留的子级快照
+id 未被侧面索引覆盖。
+删除的失败依赖项被故意从失败中省略并忽略
+总计，匹配 BullMQ 的 `removeDependencyOnFailure` 行为。
+`get_flow_dependency_selected_counts(parent_id, options)` 镜像 BullMQ
+`Job.getDependenciesCount(opts)` 选择器语义。空选项默认为
+四个 BullMQ 存储桶，而显式选项仅返回 `Some(count)`请求已处理、未处理、忽略和失败的存储桶。 Redis 读取
+与 `HLEN`、`SCARD`、`HLEN` 和 `ZCARD` 相同的父范围侧索引，
+匹配BullMQ的`getDependencyCounts-4.lua`机制并避免快照
+当调用者只需要计数时扇出。巷子保持`get_flow_dependency_counts()`
+作为具有 `missing` 和兼容性的扩展队列级计数快照
+后备支持。
+`get_flow_dependency_values(parent_id)` 镜像 BullMQ 的无选项
+`Job.getDependencies()`路径：Redis读取相同的父级范围`:processed`，
+`:dependencies`、`:failed` 和 `:unsuccessful` 结构以及 `HGETALL`，
+`SMEMBERS`、`HGETALL` 和 `ZRANGE 0 -1`，将处理后的值解析为 JSON 和
+忽略作为失败原因字符串的值。然后它合并保留的子项
+那些未包含在这些辅助索引中的任何父子 ID 的快照，保留
+在侧索引字段之前创建的流的全桶兼容性
+可用。
+`get_flow_dependency_page(parent_id, options)` 和
+`get_flow_dependency_pages(parent_id, options)` 镜像 BullMQ 的分页
+用于大扇出检查的`Job.getDependencies(opts)`路径。 Redis读取
+`processed` 与 `HSCAN dependencies:<parent_id>:processed`, `unprocessed` 与
+`SSCAN dependencies:<parent_id>`、`ignored` 与
+`HSCAN dependencies:<parent_id>:failed` 和 `failed` 与
+`ZRANGE dependencies:<parent_id>:unsuccessful`。多桶吸气剂保持
+BullMQ 结果顺序并在一个 Lua 回合中读取所有请求的存储桶
+将多个客户端往返缝合在一起。 `count`选项是Redis
+扫描 hash 提示并设置桶，就像 BullMQ 一样；来电者应继续阅读
+与返回的光标一起直到它变成`0`。对于混合升级数据，
+初始`cursor = 0`页面还附加保留的子快照后备条目未包含在辅助索引中的；后面的游标页面仍然是纯Redis
+光标扫描。
+当孩子完成时，失败并显示 `ignore_dependency_on_failure` 或
+`continue_parent_on_failure`，失败并显示`fail_parent_on_failure`，或者当
+静态流或主动父扇出按自定义重用现有的已完成子项
+id, Lane 镜像 BullMQ 的父级范围的侧索引路径，而不是仅依赖
+关于子快照回退。与重复使用的已完成子项的混合流，
+因此，新完成的子项、忽略的失败以及父项失败
+读取跨 Redis、内存中和本地的权威依赖关系视图
+耐用的后端。
+完成流程父级会检查 Redis 依赖项集和
+`dependencies:<parent_id>:unsuccessful` 离开活动状态前，匹配
+BullMQ 的 `moveToFinished` 防护会拒绝具有挂起依赖项的作业或
+不成功的子依赖项。当`continueParentOnFailure`释放
+父母早，晚子完成仍然会将该孩子从依赖关系中删除
+设置为父级只能在剩余所需的扇入完成后才能完成
+解决了。
+`get_flow_children_values()` 和 `get_flow_ignored_children_failures()` 关注
+BullMQ 的 `getChildrenValues()` 和 `getIgnoredChildrenFailures()` 扇入
+语义。 BullMQ 读取父级范围的 `:processed` 和 `:failed` 哈希值；莱恩的
+Redis 读取脚本现在也更喜欢这些哈希值，然后合并保留的子项
+侧面索引未涵盖的任何子 ID 的快照。这保留了
+混合升级数据的兼容性，其中一些孩子在
+存在辅助索引，后来的子级写入了新的父级范围的哈希值。返回值为 JSON `null` 的已完成子项在两者中均保持可见
+侧面索引读取和保留快照回退读取。
+`remove_unprocessed_children()` 遵循 BullMQ 的 `removeUnprocessedChildren`
+依赖集级别的脚本形状：它删除仍在的子项
+父级的挂起依赖项集，跳过已完成、失败、活动或锁定
+子项，删除已删除的子项记录和每个子项元数据，发出
+BullMQ 风格的 `removed` 事件针对同一个 Redis 回合中每个被移除的子节点，然后
+检查家长是否可以离开`waiting_children`。巷返回删除的
+子快照用于可审核性，同时保留父快照`child_ids`，因此
+后来的依赖性检查报告将儿童列为失踪。
+`remove_child_dependency()` 遵循 BullMQ 的 `removeChildDependency` 路径：
+当存在时，从父级的挂起依赖集中删除一个子级，清除
+孩子的父母参考，保留孩子的工作本身，并释放
+当没有悬而未决的依赖关系时，父级。 Redis 处理挂起的依赖关系
+设置、父级 `child_ids` 和父级范围 `:processed`、`:failed` 和
+`:unsuccessful` 桶作为关系证据，因此具有
+已经离开挂起的集合仍然可以分离而不会留下幽灵
+后面的依赖值。内存中队列和本地持久队列暴露相同的
+通过允许保留已完成或失败的子级来实现可见的分离语义
+要从父级的 `child_ids` 中删除快照而不删除子级
+工作。已终端子项的过时依赖项仍会被删除就像 BullMQ 的 `SREM` 路径一样。普通作业拆除、清洁、排水路径
+与显式依赖分离保持分离：它们遵循 BullMQ 的
+通过释放挂起的父级来实现`removeJob`、`cleanJobsInSet`和`drain`脚本
+依赖项并删除已删除作业自己的元数据，同时保留
+父级范围的终端依赖结果索引不被视为清理
+显式依赖分离之外的目标。本地持久快照持久化
+同样的区别，因此在完成或忽略的子作业后重新打开队列是
+删除仍然保留父级已处理或忽略的依赖项存储桶，
+而`remove_child_dependency()`则故意清理桶。
 
-Flow fan-in is also protected in Redis transitions. Redis flow submission writes
-a pending dependency set for the parent, and child completion, removal, and
-cleanup scripts remove the child id from that set before checking whether the
-parent can be released to `waiting`, parked in `delayed` until its own schedule
-is due, or failed because a child reached terminal failure. This follows
-BullMQ's dependency-removal mechanism: cleanup that removes a child also updates
-the parent dependency state instead of relying on a later client-side cleanup
-pass.
-Dynamic flow fan-out is Redis-atomic as well: `add_flow_children()` checks the
-parent lock and rejects parents whose `dependencies:<parent_id>:unsuccessful`
-zset is non-empty before inserting new dependencies, matching BullMQ's
-`moveToWaitingChildren` failed-child guard. It also falls back to retained child
-snapshots for mixed upgrade data where the side index is missing but a failed
-dependency is still recorded. When the guard passes it inserts new children or
-attaches existing custom-id children, skips ordinary deduplicated child
-candidates, stores active keep-last child candidates in `deduplication_next:<id>`,
-updates `dependencies:<parent_id>`, removes the parent from `active`, deletes
-its lock, writes the parent into
-`waiting_children`, and releases it immediately when all attached children were
-already completed in one Lua script. Keep-last placeholders keep the parent
-blocked until the owner finalization script materializes the latest child.
-`ignore_dependency_on_failure`, `remove_dependency_on_failure`,
-`continue_parent_on_failure`, and `fail_parent_on_failure` use Redis-side
-failure-policy paths for terminal `fail_job()` and stalled terminal failure.
-Ignored and removed failures remove the failed child from
-`dependencies:<parent_id>` and release or delay the parent only when the
-remaining dependency set is empty. Continued failures remove the failed child and
-move the parent to `waiting` or `delayed` immediately, leaving other pending
-dependencies inspectable. Fail-parent failures remove the failed child, write the
-child id into `dependencies:<parent_id>:unsuccessful`, keep the remaining
-dependencies inspectable, store a deferred failure on the parent, and let the
-worker fail the parent before processor execution, matching BullMQ's `fpof` plus
-`defa` path. Retrying that child removes the unsuccessful entry and restores the
-parent dependency set. If a failure policy has already released the parent,
-later terminal child failures still remove their pending dependency and update
-the parent-scoped failure indexes instead of remaining visible as unprocessed.
-The failed child remains retained for inspection. Ignored and continued failures
-are reported through the ignored dependency count; removed failures are retained
-but omitted from failed and ignored dependency counts, while fail-parent failures
-remain in the failed dependency count.
+流扇入在 Redis 转换中也受到保护。 Redis流提交写入
+为父级和子级完成、删除和设置挂起的依赖项
+清理脚本在检查是否存在之前从该集合中删除子 ID
+家长可以被释放到`waiting`，停在`delayed`直到它自己的时间表
+是由于孩子达到了极限失败而失败。这如下
+BullMQ 的依赖删除机制：删除子项的清理也会更新
+父依赖状态而不是依赖于稍后的客户端清理
+通过。
+动态流扇出也是 Redis 原子的：`add_flow_children()` 检查
+父级锁定并拒绝 `dependencies:<parent_id>:unsuccessful` 的父级
+在插入新的依赖项之前 zset 是非空的，与 BullMQ 的匹配
+`moveToWaitingChildren` 失败的儿童防护罩。它还会回退到保留的孩子
+混合升级数据的快照，其中侧面索引丢失但失败
+依赖性仍然被记录。当守卫通过时，它会插入新的孩子或
+附加现有的自定义 id 子项，跳过普通的重复数据删除子项
+候选者，将活跃的保留最后子候选者存储在`deduplication_next:<id>`中，
+更新 `dependencies:<parent_id>`，从 `active` 中删除父级，删除
+它的锁，将父级写入
+`waiting_children`，当所有附加的孩子都被释放后立即释放它
+已经在一个Lua脚本中完成了。 Keep-last 占位符保留父级
+被阻止，直到所有者最终确定脚本实现最新的子项。
+`ignore_dependency_on_failure`、`remove_dependency_on_failure`、
+`continue_parent_on_failure`和`fail_parent_on_failure`使用Redis端终端`fail_job()`和停滞的终端故障的故障策略路径。
+忽略并删除的失败将失败的子项从
+`dependencies:<parent_id>` 并仅在以下情况下释放或延迟父进程：
+剩余的依赖集为空。持续失败会删除失败的子项并
+立即将父级移动到`waiting`或`delayed`，留下其他待处理的
+依赖项可检查。 Fail-parent 失败删除失败的孩子，写入
+child id 放入`dependencies:<parent_id>:unsuccessful`，保留剩余的
+依赖项可检查，在父级上存储延迟故障，并让
+工作线程在处理器执行之前使父进程失败，匹配 BullMQ 的 `fpof` plus
+`defa` 路径。重试该子项会删除不成功的条目并恢复
+父依赖集。如果失败策略已经释放了父策略，
+后来的终端子故障仍然会删除其挂起的依赖关系并更新
+父级范围的故障索引，而不是保持未处理状态可见。
+不合格的孩子仍被保留以供检查。被忽视和持续的失败
+通过忽略的依赖项计数来报告；删除的故障被保留
+但从失败和忽略的依赖项计数中省略，而失败父失败
+保留在失败的依赖项计数中。
 
-Repeat successors are created during the Redis completion script too. The
-worker computes the next occurrence from `RepeatOptions`, then the Lua script
-finishes the current job and writes the next delayed or waiting occurrence in
-the same Redis turn. Redis keeps both a lightweight `repeat:<key>` owner key for
-fast collision checks and a scheduler index made of the queue-level `repeat`
-zset plus `repeat_meta:<key>` hashes. The add scripts check the owner key and
-fall back to scheduler metadata before inserting a new repeat job, the
-completion script transfers ownership and scheduler metadata to the successor
-before releasing the completed occurrence, and terminal failure, remove, clean,
-drain, and stalled terminal failure release both records only if they still
-point at the job being finalized or removed. Those release helpers also check
-`repeat_meta:<key>.jid`, so a terminal script clears scheduler metadata even when
-the fast `repeat:<key>` owner key has already disappeared.
-Manual retry reclaims the repeat key and scheduler metadata inside the retry
-script and rejects retry if another non-terminal occurrence already owns the
-series. `list_repeats()` reads the scheduler zset first, loads each owner job
-snapshot from the jobs hash, returns only non-terminal matching owners, restores
-the fast `repeat:<key>` owner key from `repeat_meta:<key>.jid` when that
-scheduler owner is still valid, clears stale scheduler/owner records that point
-at missing, terminal, or mismatched jobs, and scans legacy `repeat:<key>` owner
-keys as a migration fallback.
-`remove_repeat()` resolves the current `repeat:<key>` owner, falls back to the
-`repeat_meta:<key>` scheduler owner id when the fast owner key is missing, and
-then runs the same Redis-side removal path as `remove_job()`, so it rejects
-active leased owners, removes the job hash and state indexes, releases repeat
-and deduplication ownership, and can unblock flow parents. Repeat readers use
-the same scheduler metadata fallback: if the fast owner key is missing but
-`repeat_meta:<key>.jid` still points at a valid non-terminal repeat owner, Redis
-returns that owner and restores `repeat:<key>` with `SET NX`. If the owner key
-or scheduler metadata points at a missing job, Redis clears the stale owner key,
-zset entry, and metadata hash only when they still describe that missing owner.
-`upsert_repeat()` follows BullMQ's
-`upsertJobScheduler(..., override: true)` mechanism at Lane's current
-repeat-owner layer: the Redis script resolves the current `repeat:<key>` owner,
-falls back to `repeat_meta:<key>.jid` when the fast owner key is missing,
-repairs that owner key when the scheduler owner is still valid, rejects active
-leased owners, rejects flow-owned occurrences to avoid corrupting parent
-dependencies, checks job-id and deduplication-owner collisions, removes the old
-non-active owner from the jobs hash and state indexes, clears its lock, logs,
-dependency key, deduplication owner, and repeat owner only when they still point
-at that job, then writes the replacement job, its waiting/delayed index, events,
-deduplication key, `repeat:<key>` owner, and scheduler metadata in the same
-Redis turn. Lane validates repeat `end_at` before the Redis script is invoked;
-if the end timestamp is already earlier than the add/upsert timestamp, the
-operation returns a configuration error and leaves job hashes, state indexes,
-repeat owners, and scheduler metadata untouched.
+重复后继者也会在 Redis 完成脚本期间创建。的
+worker计算`RepeatOptions`的下一个出现，然后是Lua脚本
+完成当前作业并将下一个延迟或等待发生的事件写入
+同样的Redis转。 Redis 保留轻量级 `repeat:<key>` 所有者密钥
+快速冲突检查和由队列级`repeat`组成的调度程序索引
+zset 加上 `repeat_meta:<key>` 哈希值。添加脚本检查所有者密钥并
+在插入新的重复作业之前回退到调度程序元数据，
+完成脚本将所有权和调度程序元数据转移给后继者
+在释放已完成的事件和终端故障之前，删除、清理、
+耗尽和停滞的终端故障仅在它们仍然存在时才释放两条记录
+指向正在完成或删除的作业。那些发布助手还会检查
+`repeat_meta:<key>.jid`，因此终端脚本会清除调度程序元数据，即使
+快速`repeat:<key>`所有者密钥已经消失。
+手动重试回收重试中的重复键和调度程序元数据
+脚本并拒绝重试，如果另一个非终端事件已经拥有该
+系列。 `list_repeats()` 首先读取调度器zset，加载每个所有者作业
+来自作业哈希的快照，仅返回非终端匹配所有者，恢复
+来自 `repeat_meta:<key>.jid` 的快速 `repeat:<key>` 所有者密钥
+调度程序所有者仍然有效，清除该点的陈旧调度程序/所有者记录
+丢失、终止或不匹配的作业，并扫描旧版 `repeat:<key>` 所有者
+键作为迁移后备。`remove_repeat()` 解析当前 `repeat:<key>` 所有者，回退到
+`repeat_meta:<key>` 当快速所有者密钥丢失时的调度程序所有者 ID，以及
+然后运行与`remove_job()`相同的Redis端删除路径，因此它拒绝
+活跃的租用所有者，删除作业哈希和状态索引，释放重复
+和重复数据删除所有权，并且可以解锁流父级。读者重复使用
+相同的调度程序元数据回退：如果快速所有者密钥丢失但是
+`repeat_meta:<key>.jid` 仍然指向有效的非终端重复所有者 Redis
+返回该所有者并使用 `SET NX` 恢复 `repeat:<key>`。如果车主钥匙
+或调度程序元数据指向丢失的作业，Redis 清除过时的所有者密钥，
+仅当 zset 条目和元数据散列仍然描述丢失的所有者时。
+`upsert_repeat()` 遵循 BullMQ 的
+Lane当前的`upsertJobScheduler(..., override: true)`机制
+重复所有者层：Redis 脚本解析当前 `repeat:<key>` 所有者，
+当快速所有者密钥丢失时，回退到`repeat_meta:<key>.jid`，
+当调度程序所有者仍然有效时修复该所有者密钥，拒绝活动
+租用业主，拒绝流程拥有的事件，以避免腐败父母
+依赖关系，检查作业 ID 和重复数据删除所有者冲突，删除旧的
+作业哈希和状态索引中的非活动所有者，清除其锁、日志，
+仅当依赖键、重复数据删除所有者和重复所有者仍然指向时
+在该作业中，然后写入替换作业、其等待/延迟索引、事件、
+重复数据删除密钥、`repeat:<key>` 所有者和调度程序元数据位于同一目录中Redis转。 Lane 在调用 Redis 脚本之前验证重复`end_at`；
+如果结束时间戳已经早于添加/更新插入时间戳，则
+操作返回配置错误并留下作业哈希、状态索引、
+重复所有者和调度程序元数据未受影响。
 
-This is intentionally a script-level mechanism, not just API-field parity. It is
-inspired by BullMQ's use of Lua scripts to maintain repeat scheduler records,
-deduplication keys, locks, and state indexes atomically. In BullMQ 5.79.3,
-`addJobScheduler-11.lua` stores scheduler metadata in the repeat zset/hash and,
-when overriding, removes the previous delayed, prioritized, waiting, or paused
-next job before creating the new scheduled job; active/completed/failed
-collisions are not blindly overwritten. Lane now keeps the existing
-`repeat:<key>` owner key for fast collision checks and also writes a
-BullMQ-style scheduler zset at the queue's `repeat` key plus
-`repeat_meta:<key>` hashes containing the current owner id, name, next
-timestamp, state, count, repeat options, and the schedule-facing fields `key`,
-`every`, `pattern`, `limit`, and `endDate` when the Rust repeat options provide
-them. Scheduler writes delete and rebuild the metadata hash before `HSET`, so
-an overwrite from an interval schedule to a cron schedule cannot leave stale
-`every` or `endDate` fields behind. Add, bulk add, flow add, repeat upsert,
-repeat successor enqueue, claim-time due promotion, `promote_due_jobs()`,
-manual promote, reschedule, active delay/release, retry, remove, clean, drain,
-and stalled terminal cleanup update those records inside the same Redis script
-that mutates the job state. Non-terminal movement scripts rebuild the
-`repeat_meta:<key>` hash from the moved job snapshot, including schedule-facing
-fields such as `opts`, `every`, `pattern`, `limit`, and `endDate`; they also
-update the scheduler zset score and restore a missing fast `repeat:<key>` owner
-key with `SET NX` when the moved job still owns the series. If the fast owner is
-missing but scheduler metadata already names a different owner, the movement
-script leaves that scheduler record untouched instead of stealing the series.
-`get_repeat()`, `count_repeats()`, and `list_repeats_page()` read through the
-scheduler zset, validate the owner job snapshot, repair missing fast owner keys
-from scheduler metadata, prune stale metadata, and mirror BullMQ's
-`getJobScheduler`, `getJobSchedulersCount`, and `getJobSchedulers(start, end,
-asc)` read side: entries are ordered by next scheduled time, defaulting to
-descending order. Lane still models repeat work as
-a Rust-native repeat-series owner and successor enqueue flow rather than a full
-BullMQ JS template engine, so exact BullMQ scheduler field-for-field parity
-remains a later runtime feature-parity item.
+这是特意设置的脚本级机制，而不仅仅是 API 字段奇偶校验。它是
+受到 BullMQ 使用 Lua 脚本来维护重复调度程序记录的启发，
+以原子方式删除重复键、锁和状态索引。在 BullMQ 5.79.3 中，
+`addJobScheduler-11.lua` 将调度程序元数据存储在重复 zset/hash 中，并且，
+覆盖时，删除先前的延迟、优先、等待或暂停
+创建新的计划作业之前的下一个作业；活动/已完成/失败
+碰撞不会被盲目覆盖。莱恩现在保留了现有的
+`repeat:<key>` 用于快速碰撞检查的所有者密钥，还写入
+BullMQ 风格的调度程序 zset 在队列的 `repeat` 键加上
+`repeat_meta:<key>` 包含当前所有者 ID、名称、下一个的哈希值
+时间戳、状态、计数、重复选项和面向计划的字段`key`，
+当 Rust 重复选项提供时，`every`、`pattern`、`limit` 和 `endDate`
+他们。调度程序在`HSET`之前写入删除并重建元数据哈希，因此
+从间隔计划到 cron 计划的覆盖不能保持陈旧
+后面的 `every` 或 `endDate` 字段。添加、批量添加、流添加、重复插入、
+重复后继队列，索赔时间到期促销，`promote_due_jobs()`，
+手动提升、重新安排、主动延迟/释放、重试、删除、清理、排空、
+并停止终端清理更新同一 Redis 脚本内的这些记录
+这会改变工作状态。非终端移动脚本重建
+`repeat_meta:<key>` 已移动作业快照的哈希值，包括面向计划的`opts`、`every`、`pattern`、`limit` 和 `endDate` 等字段；他们还
+更新调度程序 zset 分数并恢复丢失的快速 `repeat:<key>` 所有者
+当移动的作业仍然拥有该系列时，请使用 `SET NX` 键。如果快速所有者是
+缺少但调度程序元数据已经指定了不同的所有者，即运动
+脚本保持调度程序记录不变，而不是窃取系列。
+`get_repeat()`、`count_repeats()` 和 `list_repeats_page()` 通读
+调度程序 zset，验证所有者作业快照，修复丢失的快速所有者密钥
+来自调度程序元数据、修剪陈旧元数据和镜像 BullMQ
+`getJobScheduler`、`getJobSchedulersCount` 和 `getJobSchedulers(start, end,
+asc)` 读取端：条目按下一个计划时间排序，默认为
+降序排列。莱恩仍然模型重复工作
+Rust 原生的重复系列所有者和后继队列流，而不是完整的
+BullMQ JS 模板引擎，因此精确的 BullMQ 调度程序字段对字段奇偶校验
+仍然是稍后运行时功能奇偶校验项。
 
-Manual lifecycle management follows the same Redis-side state movement rule:
-`promote_job()` removes a delayed job from the delayed zset and inserts it into
-waiting inside one script, treats the delayed zset as the Redis movement gate,
-rejects retained jobs whose stored state is no longer delayed, and prunes
-orphaned or stale delayed members while preserving that state-conflict result.
-`reschedule_job()` follows BullMQ's `changeDelay` mechanism: the
-script removes the job from the delayed zset, rejects the change if that zset
-membership is missing, updates the stored delay and scheduled timestamp, and
-adds the job back to the delayed zset with the new score in the same Redis turn.
-It also emits BullMQ's `delayed` event with the new delayed timestamp.
-`delay_active_job()` follows BullMQ's `moveToDelayed` mechanism for leased
-jobs: the script verifies the lock token, treats the active zset as the movement
-gate, rejects the move if that active index membership is missing, clears the
-lock, updates the stored delay and scheduled timestamp, and writes the delayed
-zset member in the same Redis turn. It emits the same delayed timestamp field as
-BullMQ's `moveToDelayed` script. `release_active_job()` follows BullMQ's
-`moveJobFromActiveToWait` state movement: the script verifies the lock token,
-treats the active zset as the movement gate, clears the lock and active lease
-fields, resets `processed_at`, and writes the job back into the waiting zset
-with its priority score in the same Redis turn. Unlike ordinary adds and retry
-requeues, active release writes the job at the start of its priority bucket so
-it is claimed before older FIFO or LIFO entries with the same priority, matching
-BullMQ's active-to-wait script. When the moved job is the current
-repeat-series owner, claim, claim-time delayed promotion, `promote_due_jobs()`,
-manual promote, reschedule, active delay, and active release also rebuild the
-scheduler hash/zset in the same script and repair a missing fast owner key
-instead of leaving the repeat series split across stale Redis keys. They do not
-overwrite a scheduler record that already points at another owner.
-`retry_job()` follows BullMQ's `reprocessJob` shape for retained failed and
-completed jobs: it treats the matching terminal zset as the Redis movement gate,
-rejects inconsistent completed/failed index drift after pruning the stale side,
-clears terminal metadata (`failed_reason` for failed jobs, `return_value` for
-completed jobs, plus processed/finished timestamps), emits `waiting` with
-`prev=failed` or `prev=completed`, and moves the job back to waiting inside one
-script. For deduplicated failed jobs, that same script reclaims the owner key and
-reapplies the deduplication TTL before returning the job to waiting. For
-repeat-keyed failed jobs, retry first checks both the fast `repeat:<key>` owner
-key and the scheduler `repeat_meta:<key>.jid` owner; if either points at another
-non-terminal occurrence, Redis restores the fast owner key when needed and
-rejects the retry. Only an uncontested failed owner reclaims the repeat key and
-scheduler metadata. When the retried job is a retained flow child, retry restores
-the child into the parent's pending dependency set, clears stale deferred parent
-failure metadata, and moves a non-terminal parent back to `waiting_children`,
-matching BullMQ's dependency restoration path for both failed and completed
-children.
-When a processing failure reaches terminal failed state because its configured
-retry attempts are exhausted, Lane emits `retries-exhausted` after `failed`,
-matching BullMQ's `moveToFinished` event order. Manual retry-discard paths only
-emit that event if the job had actually reached the configured retry limit.
-BullMQ's deprecated `job.discard()` is intentionally modeled as a current
-failure-path decision rather than stored job metadata: BullMQ sets an in-memory
-`discarded` flag, `shouldRetryJob()` checks that flag before `moveToFailed()`,
-and the Redis transition then uses the terminal failed path instead of delayed
-or immediate retry. Lane exposes that mechanism as
-`fail_job_discarding_retry()` and `JobContext::discard_retry()`. Lane also
-mirrors BullMQ's preferred `UnrecoverableError` path with
-`LaneError::unrecoverable_job()`: when a processor returns that error, the worker
-uses the same retry-bypass finalization path as `discard_retry()`. The Redis
-backend reuses the same active-to-failed Lua script as `fail_job()`, but passes
-the retry flag as disabled so the script writes the failed zset, releases
-deduplication/repeat ownership, and updates flow parents atomically.
+手动生命周期管理遵循相同的Redis端状态移动规则：
+`promote_job()` 从延迟 zset 中删除延迟作业并将其插入到
+在一个脚本中等待，将延迟的 zset 视为 Redis 移动门，
+拒绝其存储状态不再延迟的保留作业，并修剪
+孤儿或陈旧的延迟成员同时保留了状态冲突的结果。
+`reschedule_job()` 遵循 BullMQ 的 `changeDelay` 机制：
+脚本从延迟的 zset 中删除作业，如果该 zset 则拒绝更改
+缺少成员资格，更新存储的延迟和计划的时间戳，以及
+将作业添加回延迟的 zset，并在同一 Redis 回合中使用新分数。
+它还会发出带有新延迟时间戳的 BullMQ 的 `delayed` 事件。
+`delay_active_job()` 遵循 BullMQ 的 `moveToDelayed` 租用机制
+jobs：脚本验证锁定令牌，将活动 zset 视为移动
+门，如果缺少活动索引成员资格，则拒绝移动，清除
+锁，更新存储的延迟和计划时间戳，并写入延迟
+zset成员在同一个Redis轮中。它发出与以下相同的延迟时间戳字段
+BullMQ 的 `moveToDelayed` 脚本。 `release_active_job()` 遵循 BullMQ 的
+`moveJobFromActiveToWait`状态移动：脚本验证锁定令牌，
+将活动的 zset 视为移动门，清除锁和活动租约
+字段，重置`processed_at`，并将作业写回等待的 zset
+其在同一 Redis 回合中的优先级分数。与普通的添加和重试不同重新排队，主动释放将作业写入其优先级存储桶的开头，因此
+它在具有相同优先级的旧 FIFO 或 LIFO 条目之前声明，匹配
+BullMQ 的主动等待脚本。当移动的作业是当前作业时
+重复系列所有者，索赔，索赔时间延迟促销，`promote_due_jobs()`，
+手动升级、重新安排、主动延迟和主动发布也会重建
+同一脚本中的调度程序 hash/zset 并修复丢失的快速所有者密钥
+而不是让重复序列分布在过时的 Redis 键上。他们不
+覆盖已经指向另一个所有者的调度程序记录。
+`retry_job()` 遵循 BullMQ 的 `reprocessJob` 形状，用于保留失败和
+已完成的作业：它将匹配的终端 zset 视为 Redis 移动门，
+在修剪过时的一侧后拒绝不一致的已完成/失败索引漂移，
+清除终端元数据（`failed_reason`对于失败的作业，`return_value`对于
+已完成的作业，加上已处理/已完成的时间戳），发出 `waiting`
+`prev=failed` 或 `prev=completed`，并将作业移回其中等待
+脚本。对于重复数据删除失败的作业，同一脚本会回收所有者密钥并
+在将作业返回等待状态之前重新应用重复数据删除 TTL。对于
+重复键入失败的作业，重试首先检查快速 `repeat:<key>` 所有者
+密钥和调度程序`repeat_meta:<key>.jid`所有者；如果其中一个指向另一个
+非终止发生时，Redis 在需要时恢复快速所有者密钥，并且
+拒绝重试。只有无争议的失败所有者才能收回重复密钥并调度程序元数据。当重试的作业是保留的流程子级时，重试会恢复
+将子级放入父级的挂起依赖集中，清除陈旧的延迟父级
+失败元数据，并将非终端父级移回`waiting_children`，
+匹配 BullMQ 失败和完成的依赖关系恢复路径
+孩子们。
+当处理失败由于其配置而达到终端失败状态时
+重试次数耗尽，Lane 在 `failed` 之后发出 `retries-exhausted`，
+匹配 BullMQ 的 `moveToFinished` 事件顺序。仅手动重试-丢弃路径
+如果作业实际上已达到配置的重试限制，则发出该事件。
+BullMQ 已弃用的 `job.discard()` 有意建模为当前的
+失败路径决策而不是存储的作业元数据：BullMQ 设置内存中
+`discarded` 标志，`shouldRetryJob()` 在 `moveToFailed()` 之前检查该标志，
+然后 Redis 转换使用终端失败路径而不是延迟路径
+或立即重试。莱恩将该机制公开为
+`fail_job_discarding_retry()` 和 `JobContext::discard_retry()`。巷也
+镜像 BullMQ 的首选 `UnrecoverableError` 路径
+`LaneError::unrecoverable_job()`：当处理器返回该错误时，工作线程
+使用与 `discard_retry()` 相同的重试绕过最终路径。雷迪斯
+后端重用与`fail_job()`相同的活动到失败的Lua脚本，但通过
+重试标志被禁用，因此脚本写入失败的 zset，释放
+重复数据删除/重复所有权，并自动更新流父级。
 `update_priority()`
-rewrites the job hash and, for waiting jobs, replaces the waiting zset score in
-the same script; for jobs that are no longer waiting, it prunes stale waiting
-members while preserving the stored state. Retained terminal jobs can update
-their stored priority without being requeued, matching BullMQ's
-`changePriority-7.lua` existence-only guard. For waiting jobs, the script also
-refreshes `enqueued_seq` and recomputes the FIFO/LIFO score.
-`update_priority_with_lifo()` exposes BullMQ's
-`changePriority({ priority, lifo })` shape directly: the optional LIFO flag is
-stored on `job.options.lifo` before the waiting score is recomputed, so the
-Redis index changes together with the serialized job snapshot. This is
-intentionally aligned with BullMQ's mechanism of moving job state through Redis
-scripts instead of coordinating several client-side Redis commands. Lane also
-applies BullMQ's `2^21` priority ceiling before entering that script, so an
-invalid update cannot partially rewrite the job hash or waiting index.
+重写作业哈希，对于等待作业，替换等待 zset 分数相同的脚本；对于不再等待的作业，它会修剪陈旧的等待
+成员，同时保留存储的状态。保留的终端作业可以更新
+它们存储的优先级无需重新排队，与 BullMQ 匹配
+`changePriority-7.lua` 只存在的守卫。对于等待作业，脚本还
+刷新 `enqueued_seq` 并重新计算 FIFO/LIFO 分数。
+`update_priority_with_lifo()` 暴露 BullMQ
+`changePriority({ priority, lifo })` 直接形状：可选的 LIFO 标志是
+在重新计算等待分数之前存储在 `job.options.lifo` 上，因此
+Redis 索引随序列化作业快照一起更改。这是
+有意与 BullMQ 通过 Redis 移动作业状态的机制保持一致
+脚本而不是协调多个客户端 Redis 命令。巷也
+在进入该脚本之前应用 BullMQ 的 `2^21` 优先级上限，因此
+无效更新无法部分重写作业哈希或等待索引。
 
-Redis job management mutations are script-backed too. `update_data()` follows
-BullMQ's `updateData` existence check and write shape, adapted to Lane's Redis
-hash layout by decoding the stored job JSON, replacing `payload`, and writing the
-job snapshot back in one Lua turn. `update_progress()` mirrors BullMQ's
-`updateProgress-3.lua` existence-only guard: any retained job, including a
-terminal job, can receive a new progress value, and the script writes that value
-plus an `XADD event=progress` entry in one Redis turn. `save_stacktrace()`
-mirrors BullMQ's `saveStacktrace` storage behavior:
-the Lua script verifies that the retained job exists, decodes Lane's stored job
-JSON, replaces the stacktrace array and failure reason together, and writes the
-updated snapshot back in one Redis turn. `add_log()` follows BullMQ's `addLog` shape at the key level: the script
-verifies that the job exists, `RPUSH`es a structured JSON entry into
-`logs:<jobId>`, applies `LTRIM` when a retention count is provided, and mirrors
-the retained entries into the job JSON snapshot for Lane compatibility without
-emitting a queue event. `clean_jobs()` filters retained records by the parsed
-millisecond reference time, and `clean_jobs(JobState::Active, ...)` now mirrors
-BullMQ's `clean(..., "active")` guard by cleaning only active jobs whose worker
-lock is already gone. Locked active jobs must still finish, fail, be released,
-or pass through stalled recovery. Redis clean removes lock keys, hash entries,
-state indexes, stalled candidate entries, dependency sets, and log lists
-atomically, updates flow parents for removed child jobs, and returns the removed
-snapshots. For non-terminal repeat owners, the clean script mirrors BullMQ's
-scheduler-job guard: it checks both
-`repeat:<key>` and `repeat_meta:<key>.jid`, restores the fast owner key from
-valid scheduler metadata, and skips the current series owner instead of deleting
-it through broad cleanup.
-`RedisJobQueue::remove_orphaned_jobs(count, limit)` is a Redis-only maintenance
-helper equivalent to BullMQ's `removeOrphanedJobs()` for Lane's storage layout:
-it scans the central jobs hash with `HSCAN`, checks the waiting, delayed, active,
-waiting-children, completed, failed, and stalled Redis indexes in Lua, and only
-removes a job hash field when none of those keys reference the job id. Removed
-orphans also lose their retained `logs:<jobId>` list, `dependencies:<jobId>` set,
-and `locks:<jobId>` key in the same Redis turn. Pass `count = 0` to use the
-default scan count of 1000, and `limit = 0` to remove all orphans found by the
-scan.
+Redis 作业管理突变也是由脚本支持的。 `update_data()` 关注
+BullMQ的`updateData`存在检查和写入形状，适配Lane的Redis
+哈希布局，通过解码存储的作业 JSON，替换 `payload`，并写入
+Lua 回合中返回作业快照。 `update_progress()` 镜像 BullMQ
+`updateProgress-3.lua` 仅存守卫：任何保留的工作，包括
+终端作业，可以接收新的进度值，并且脚本写入该值
+加上一个 Redis 回合中的 `XADD event=progress` 条目。 `save_stacktrace()`
+镜像 BullMQ 的 `saveStacktrace` 存储行为：
+Lua脚本验证保留的作业是否存在，解码Lane存储的作业
+JSON，将 stacktrace 数组和失败原因一起替换，并写入
+在一个 Redis 回合中更新快照。 `add_log()` 在关键级别遵循 BullMQ 的 `addLog` 形状：脚本
+验证作业是否存在，`RPUSH`es 结构化 JSON 条目
+`logs:<jobId>`，在提供保留计数时应用 `LTRIM`，并且镜像
+作业 JSON 快照中保留的条目以实现车道兼容性，无需
+发出队列事件。 `clean_jobs()` 通过解析的过滤保留记录
+毫秒参考时间，`clean_jobs(JobState::Active, ...)` 现在镜像
+BullMQ 的 `clean(..., "active")` 通过仅清理其工人的活动作业来进行保护
+锁已经消失了。锁定的活动作业仍必须完成、失败、释放，
+或经历停滞的复苏。 Redis clean 删除锁键、哈希条目、
+状态索引、停滞候选条目、依赖集和日志列表以原子方式更新已删除的子作业的流程父级，并返回已删除的
+快照。对于非终端重复所有者，干净的脚本反映了 BullMQ 的
+调度程序作业防护：它检查两者
+`repeat:<key>` 和 `repeat_meta:<key>.jid`，从 恢复快速所有者密钥
+有效的调度程序元数据，并跳过当前系列所有者而不是删除
+通过广泛的清理。
+`RedisJobQueue::remove_orphaned_jobs(count, limit)` 是仅 Redis 维护
+相当于 Lane 存储布局的 BullMQ 的 `removeOrphanedJobs()` 助手：
+它使用 `HSCAN` 扫描中央作业哈希，检查等待、延迟、活动、
+Lua 中的等待子级、已完成、失败和停滞的 Redis 索引，并且仅
+当这些键都没有引用作业 ID 时，删除作业哈希字段。已删除
+孤儿也会失去保留的 `logs:<jobId>` 列表、`dependencies:<jobId>` 集，
+和 `locks:<jobId>` key 在同一个 Redis 回合中。通过 `count = 0` 使用
+默认扫描计数为 1000，并且 `limit = 0` 删除发现的所有孤儿
+扫描。
 
-Queue draining follows the same rule. `drain_jobs(false)` removes waiting jobs
-and `drain_jobs(true)` also removes ordinary delayed jobs in one Redis turn,
-while deleting each removed job's retained log list and leaving active,
-completed, failed, and waiting-children jobs in place. Like BullMQ's `drain`
-script, Lane protects the current delayed repeat
-occurrence: BullMQ derives that set from job scheduler records, while Lane
-checks the `repeat:<key>` owner key, falls back to `repeat_meta:<key>.jid`, and
-restores the fast owner key when scheduler metadata still names the delayed
-owner. Removed children update their parent dependency set in the same script,
-so a parent can move from `waiting_children` to `waiting`, `delayed`, or `failed`
-without a follow-up client pass.
+队列排出遵循相同的规则。 `drain_jobs(false)` 删除等待作业
+并且 `drain_jobs(true)` 还可以在一个 Redis 回合中删除普通的延迟作业，
+同时删除每个已删除作业的保留日志列表并保持活动状态，
+已完成、失败和正在等待的儿童作业已就位。就像 BullMQ 的 `drain`
+脚本，Lane保护当前延迟重复
+发生：BullMQ 从作业调度程序记录中派生该集合，而 Lane
+检查`repeat:<key>`所有者密钥，回退到`repeat_meta:<key>.jid`，并且
+当调度程序元数据仍然命名延迟时恢复快速所有者密钥
+业主。删除的子项会在同一脚本中更新其父项依赖项集，
+因此家长可以从 `waiting_children` 移动到 `waiting`、`delayed` 或 `failed`
+没有后续客户通行证。
 
-Queue obliteration follows BullMQ's underlying pause-first mechanism rather
-than only matching the public method name. BullMQ's public `obliterate()` calls
-`pause()` before invoking its Lua command; that command checks `meta.paused`,
-rejects active jobs unless `force` is set, and then removes the queue's state,
-job, lock, repeat, metrics, and metadata keys. Lane folds the same lifecycle into
-one Redis script: it writes `meta.paused`, checks the active sorted-set index,
-returns a job-state conflict when active jobs exist and `force` is false, counts
-the current job hash, and scans the queue prefix in batches until every matching
-key is deleted, including job hashes, lifecycle indexes, locks, retained logs,
-deduplication owners, keep-last-if-active shadow jobs, repeat owners, dependency
-sets, rate-limit counters, sequence keys, and the pause metadata itself. A failed
-non-forced obliteration intentionally leaves `meta.paused` in place, so no worker
-can claim additional jobs until the queue is resumed or forcibly obliterated. A
-successful forced obliteration removes the pause marker too, leaving an empty,
-unpaused queue that can accept fresh jobs with clean deduplication and repeat
-ownership.
+队列删除遵循 BullMQ 的底层暂停优先机制，而不是
+而不是仅匹配公共方法名称。 BullMQ 的公共 `obliterate()` 调用
+`pause()` 在调用其 Lua 命令之前；该命令检查`meta.paused`，
+拒绝活动作业，除非设置了`force`，然后删除队列的状态，
+作业、锁定、重复、指标和元数据键。 Lane 将相同的生命周期折叠成
+一个 Redis 脚本：它写入 `meta.paused`，检查活动排序集索引，
+当存在活动作业且 `force` 为 false 时，返回作业状态冲突，计数
+当前作业哈希，并批量扫描队列前缀，直到每个匹配
+key被删除，包括作业哈希，生命周期索引，锁，保留日志，
+重复数据删除所有者、保留最后活动影子作业、重复所有者、依赖性
+集、速率限制计数器、序列键和暂停元数据本身。失败了
+非强制擦除故意将 `meta.paused` 留在原地，因此没有工人
+可以要求额外的工作，直到队列恢复或强制删除。一个
+成功的强制删除也会删除暂停标记，留下一个空的，
+未暂停的队列，可以通过干净的重复数据删除和重复接受新作业
+所有权。
 
-Queue reads use the same Redis-side snapshot approach. `get_job_state()` follows
-BullMQ's `getState` mechanism by checking the Redis state indexes in one script,
-rather than trusting the serialized job JSON state field. Lane checks completed,
-failed, delayed, active, waiting, and waiting-children sorted sets and returns
-`None` when the job id is not present in any state index.
-`get_job_finished_result()` follows BullMQ's `isFinished(..., returnValue=true)`
-shape: Redis checks the completed and failed indexes plus the retained job hash
-in one Lua script, treats those indexes as authoritative even if a retained
-snapshot still carries an older state, and returns `NotFinished`, a completed
-`return_value`, a failed `failed_reason`, or `None` for missing retained records.
+队列读取使用相同的 Redis 端快照方法。 `get_job_state()` 关注
+BullMQ的`getState`机制通过在一个脚本中检查Redis状态索引，
+而不是信任序列化作业 JSON 状态字段。车道检查完成，
+失败、延迟、活动、等待和等待子级排序集和返回
+`None` 当作业 ID 不存在于任何状态索引中时。
+`get_job_finished_result()` 遵循 BullMQ 的 `isFinished(..., returnValue=true)`
+shape：Redis 检查已完成和失败的索引以及保留的作业哈希
+在一个 Lua 脚本中，即使保留了一个索引，也会将这些索引视为权威索引
+快照仍然带有较旧的状态，并返回`NotFinished`，一个已完成的状态
+`return_value`、失败的 `failed_reason` 或 `None`（缺少保留记录）。
 `RedisJobQueue::get_metrics(JobState::Completed | JobState::Failed, start, end)`
-follows BullMQ's `getMetrics` storage shape. Complete, fail, and stalled
-terminal scripts increment `metrics:<state>` and close one-minute windows into
-`metrics:<state>:data` with `LPUSH`/`LTRIM`; reads use the same `HMGET count,
-prevTS, prevCount`, `LRANGE`, and `LLEN` script shape. Lane records terminal
-metrics by default with `DEFAULT_JOB_METRICS_RETENTION` retained data points.
-`get_job_counts()` follows BullMQ's `getCounts` script shape: empty state input
-defaults to all lifecycle states, duplicate states are ignored after their first
-occurrence, and Redis counts the requested state indexes in one Lua script. Lane
-stores every lifecycle state as a sorted set, so the script uses `ZCARD` for
-waiting, delayed, active, waiting-children, completed, and failed instead of
-loading job snapshots client-side.
-`get_job_count()` mirrors BullMQ's `getJobCountByTypes()` getter layer by
-summing those per-state counts, so it inherits the same default-all and
-duplicate-state semantics. `count_pending_jobs()` mirrors BullMQ's `count()`
-meaning: waiting, delayed, and waiting-children jobs are counted as pending
-work, while active, completed, and failed jobs are excluded.
-`get_counts_per_priority()` follows BullMQ's `getCountsPerPriority` shape for
-priority queues: duplicate requested priorities are ignored after their first
-occurrence, and Redis counts waiting jobs with `ZCOUNT` over the priority-encoded
-waiting zset score range instead of loading job snapshots client-side.
-`get_job_logs()` reads the `logs:<jobId>` list with `LRANGE` and `LLEN`,
-including BullMQ's descending window convention of using negative indexes and
-reversing the result. Missing or already-removed log lists return an empty page.
-`clear_job_logs()` follows BullMQ's `Job.clearLogs()` storage behavior: positive
-retention uses `LTRIM logs:<jobId> -keep -1`, and zero retention deletes the log
-list. Lane also trims the embedded `logs` array in the job snapshot in the same
-Redis Lua turn so retained job records and Redis log lists do not drift.
-`list_jobs()` follows BullMQ's `getRanges`/`getJobs` mechanism at the Redis
-index layer: callers can request one or more lifecycle states and choose
-ascending or descending range order. Lane adapts that mechanism to its sorted
-state indexes by collecting the selected state members, pruning stale index
-entries whose retained job state no longer matches, sorting snapshots by Lane's
-stable state/priority/time/id order, and returning the requested page in one Lua
-turn.
-`stats()` evaluates one Lua script that reads the pause flag and all waiting,
-delayed, active, waiting-children, completed, and failed sorted-set counts in a
-single Redis turn, mirroring BullMQ's `getCounts` style instead of stitching
-together several client-side reads. Redis pause state follows BullMQ's
-`meta.paused` mechanism: `pause()` writes the field, `resume()` deletes it, and
-`is_paused()` reads that same field. A legacy `paused = 0` value is treated as
-resumed and cleaned up.
+遵循 BullMQ 的 `getMetrics` 存储形状。完成、失败和停滞
+终端脚本递增 `metrics:<state>` 并关闭一分钟窗口
+`metrics:<state>:data` 与 `LPUSH`/`LTRIM`；读取使用相同的`HMGET计数，
+prevTS，prevCount`, `LRANGE`, and `LLEN`脚本形状。车道记录终端
+默认情况下，指标带有 `DEFAULT_JOB_METRICS_RETENTION` 保留的数据点。
+`get_job_counts()` 遵循 BullMQ 的 `getCounts` 脚本形状：空状态输入
+默认为所有生命周期状态，在第一个状态之后重复的状态将被忽略
+发生次数，Redis 统计一个 Lua 脚本中请求的状态索引。巷
+将每个生命周期状态存储为排序集，因此脚本使用 `ZCARD`
+等待、延迟、活动、等待子级、完成和失败而不是
+客户端加载作业快照。`get_job_count()` 镜像 BullMQ 的 `getJobCountByTypes()` getter 层
+将每个状态的计数相加，因此它继承了相同的默认所有和
+重复状态语义。 `count_pending_jobs()` 镜像 BullMQ 的 `count()`
+含义：等待、延迟和等待子作业被视为待处理
+工作，而活动的、已完成的和失败的作业被排除在外。
+`get_counts_per_priority()` 遵循 BullMQ 的 `getCountsPerPriority` 形状
+优先级队列：重复请求的优先级在第一个优先级之后将被忽略
+发生，并且 Redis 将使用 `ZCOUNT` 计算优先级编码的等待作业
+等待 zset 分数范围而不是在客户端加载作业快照。
+`get_job_logs()` 读取带有 `LRANGE` 和 `LLEN` 的 `logs:<jobId>` 列表，
+包括 BullMQ 使用负索引的降序窗口约定以及
+扭转结果。丢失或已删除的日志列表将返回空页。
+`clear_job_logs()` 遵循 BullMQ 的 `Job.clearLogs()` 存储行为：积极
+保留使用`LTRIM logs:<jobId> -keep -1`，零保留删除日志
+列表。 Lane 还修剪了作业快照中嵌入的 `logs` 数组
+Redis Lua 开启，因此保留的作业记录和 Redis 日志列表不会发生漂移。
+`list_jobs()`在Redis上遵循BullMQ的`getRanges`/`getJobs`机制
+索引层：调用者可以请求一个或多个生命周期状态并选择
+升序或降序范围顺序。 Lane 使该机制适应其排序
+通过收集选定的状态成员、修剪陈旧索引来建立状态索引
+保留作业状态不再匹配的条目，按 Lane 排序快照稳定状态/优先级/时间/id顺序，并在一个Lua中返回请求的页面
+转。
+`stats()` 评估一个读取暂停标志和所有等待的 Lua 脚本，
+延迟、活动、等待子项、已完成和失败的排序集计数
+单转Redis，镜像BullMQ的`getCounts`风格而不是拼接
+一起进行几个客户端读取。 Redis 暂停状态遵循 BullMQ 的
+`meta.paused`机制：`pause()`写入字段，`resume()`删除字段，以及
+`is_paused()` 读取相同的字段。旧的 `paused = 0` 值被视为
+恢复并清理干净。
 
-Stalled recovery is Lua-backed as well. The recovery script follows BullMQ's
-`moveStalledJobsToWait` shape: it consumes the previous `stalled` candidate
-set, verifies that each candidate's independent lock key is missing, increments
-the stalled count, and either requeues the job or fails it in the same Redis
-turn. At the end of the script it marks the current active index members in the
-`stalled` set for the next recovery pass. Successful `renew_lease()`,
-`complete_job()`, `fail_job()`, `delay_active_job()`, and
-`release_active_job()` scripts remove the job from the candidate set, mirroring
-BullMQ's `extendLock` and `removeLock` helpers. If an active sorted-set member
-points at a job that has already moved to a different state, a later recovery
-pass prunes that stale active index instead of treating it as recoverable work.
-When a candidate is actually recovered, Redis writes a `stalled` event with the
-failure reason and then writes the resulting `waiting prev=active` or
-`failed prev=active` transition in the same Lua turn, matching the in-memory and
-local event contract while preserving BullMQ's explicit `stalled` notification.
-BullMQ 5.79.3 also special-cases repeatable scheduler jobs in
-`moveStalledJobsToWait-9.lua`: if the scheduler record still exists, the stalled
-occurrence is requeued even after the ordinary stalled limit is exceeded. Lane
-mirrors that branch for active repeat owners: non-repeat jobs still fail after
-`max_stalled_count`, but a stalled repeat owner whose owner key or scheduler
-metadata still points at the job is moved back to `waiting` and keeps its
-repeat ownership. If the fast `repeat:<key>` owner key is missing but
-`repeat_meta:<key>.jid` still names the stalled occurrence, the recovery script
-restores the fast owner key before requeueing it.
+停滞的恢复也是 Lua 支持的。恢复脚本遵循 BullMQ 的
+`moveStalledJobsToWait` 形状：它消耗之前的 `stalled` 候选者
+设置，验证每个候选者的独立锁定密钥是否丢失，递增
+停滞的计数，并且要么重新排队作业，要么在同一个 Redis 中失败
+转。在脚本的末尾，它标记了当前活跃的索引成员
+`stalled` 设置为下一个恢复通道。成功`renew_lease()`，
+`complete_job()`、`fail_job()`、`delay_active_job()`，以及
+`release_active_job()` 脚本从候选集中删除作业，镜像
+BullMQ 的 `extendLock` 和 `removeLock` 助手。如果一个活跃的排序集成员
+指向已经转移到不同状态的作业，稍后恢复
+传递陈旧的活动索引的修剪，而不是将其视为可恢复的工作。
+当候选对象实际恢复时，Redis 会写入一个 `stalled` 事件，其中包含
+失败原因，然后写入结果`waiting prev=active`或
+`failed prev=active` 在同一个 Lua 回合中转换，匹配内存中和
+本地事件合约，同时保留 BullMQ 的显式 `stalled` 通知。
+BullMQ 5.79.3 还提供了特殊情况下的可重复调度程序作业
+`moveStalledJobsToWait-9.lua`：如果调度程序记录仍然存在，则停止
+即使超出普通停顿限制后，事件也会重新排队。巷
+镜像活跃重复所有者的分支：非重复作业在之后仍然失败
+`max_stalled_count`，但是一个停滞的重复所有者，其所有者密钥或调度程序
+元数据仍然指向作业移回`waiting`并保留其重复所有权。如果快速 `repeat:<key>` 所有者密钥丢失，但
+`repeat_meta:<key>.jid` 仍将停滞的事件命名为恢复脚本
+在重新排队之前恢复快速所有者密钥。
 
-`remove_job()` uses a Redis script to reject active jobs only while their worker
-lock key still exists, matching BullMQ's `removeJob` `isLocked` guard. An active
-job whose lock has already disappeared can be removed as stale work; the script
-removes the job hash, lock key, all state indexes, stalled candidate entry,
-retained log list, and any child dependency set in one Redis turn. A remove
-request for a missing job still prunes orphaned indexes, locks, dependency sets,
-and log lists for that id. If the removed job is a flow child, the same script
-updates the parent's dependency set and atomically moves the parent from
-`waiting_children` to `waiting`, `delayed`, or `failed` as appropriate.
+`remove_job()` 使用 Redis 脚本仅在其工作线程时拒绝活动作业
+锁定密钥仍然存在，与 BullMQ 的 `removeJob` `isLocked` 防护相匹配。一个活跃的
+锁已经消失的作业可以作为过时的工作被删除；脚本
+删除作业哈希、锁定密钥、所有状态索引、停滞的候选条目，
+保留的日志列表，以及在一个 Redis 回合中设置的任何子依赖项。一个删除
+请求丢失的作业仍然会修剪孤立的索引、锁、依赖集，
+以及该 ID 的日志列表。如果删除的作业是流程子项，则相同的脚本
+更新父级的依赖集并自动将父级从
+`waiting_children` 至 `waiting`、`delayed` 或 `failed`（视情况而定）。
 
-Run the Redis integration test against any reachable Redis server:
+针对任何可访问的 Redis 服务器运行 Redis 集成测试：
 
 ```bash
 A3S_LANE_REDIS_URL=redis://127.0.0.1:6379/ \
   cargo test --features redis-backend --test redis_job_queue
 ```
 
-The integration harness performs a short TCP reachability preflight before the
-test body runs. Missing or unreachable Redis endpoints are reported and skipped
-quickly instead of letting every async test wait for its longer per-test timeout.
-Namespace cleanup also has bounded Redis command timeouts so a stale test
-connection fails clearly instead of hiding the actual failure behind the suite's
-outer timeout.
+集成工具在执行之前执行短暂的 TCP 可达性预检
+测试机构运行。报告并跳过丢失或无法访问的 Redis 端点
+快速，而不是让每个异步测试等待更长的每次测试超时。
+命名空间清理还具有有限的 Redis 命令超时，因此测试过时
+连接明显失败，而不是隐藏套件背后的实际失败
+外部超时。
 
-Use `JobWorker` to run async processors against any backend:
+使用 `JobWorker` 针对任何后端运行异步处理器：
 
 ```rust
 use a3s_lane::{
@@ -1813,37 +1793,37 @@ worker.run_until_idle(100).await?;
 # }
 ```
 
-Background `JobWorker` loops call `JobQueueBackend::claim_next_blocking()`.
-Redis backends use the queue marker zset to sleep until ready or delayed work
-wakes them, while in-memory and local durable backends keep the immediate claim
-fallback. `run_once()` remains non-blocking for deterministic manual work; use
-`run_once_blocking()` when a single worker iteration should wait for new work.
-Workers started with `start()` share one lease-renewal loop across concurrent
-processors and call `renew_leases()` in batches; direct `run_once()` calls keep
-the per-job renewal path so deterministic manual runs do not need a background
-worker handle.
+后台`JobWorker`循环调用`JobQueueBackend::claim_next_blocking()`。
+Redis 后端使用队列标记 zset 休眠，直到准备好或延迟工作
+唤醒他们，而内存中和本地持久后端保持立即声明
+后备。 `run_once()` 对于确定性手动工作保持非阻塞；使用
+`run_once_blocking()` 当单个工作迭代应该等待新工作时。
+从`start()`开始的工作人员在并发中共享一个租约续订循环
+处理器并批量调用`renew_leases()`；直接`run_once()`通话保持
+每个作业的更新路径，因此确定性手动运行不需要背景
+工人手柄。
 
-`JobContext::has_lost_lease()` and `JobContext::ensure_lease()` let long-running
-processors stop before doing more external work after the worker observes a
-failed lease renewal. Context progress and log helpers also refuse to write once
-that lease-loss flag is set. `JobContext::discard_retry()` lets a processor mark
-the current failed finalization as terminal even when the job's retry policy still
-has attempts remaining; the marker lives only on the worker context and is not
-stored on the job. Returning `LaneError::unrecoverable_job(message)` from a
-processor is the preferred typed-error equivalent for failures that should never
-be automatically retried.
+`JobContext::has_lost_lease()`和`JobContext::ensure_lease()`让长时间运行
+在工作人员观察到某个情况后，处理器会在执行更多外部工作之前停止
+续租失败。上下文进度和日志助手也拒绝写入一次
+设置了租赁损失标志。 `JobContext::discard_retry()`让处理器标记
+当前失败的最终确定为终端，即使作业的重试策略仍然存在
+尚有剩余尝试；标记仅存在于工人上下文中，而不是
+存储在作业中。从 a 返回 `LaneError::unrecoverable_job(message)`
+处理器是首选的类型错误等效项，用于处理永远不应该发生的故障
+会自动重试。
 
 ## 基准测试
 
-Apple Silicon（M 系列），release build，pre-warmed manager 稳态吞吐：
+Apple Silicon（M 系列），发布版本，带预热管理器的稳态吞吐量：
 
-| 工作负载 | 吞吐量 |
+|工作量|吞吐量|
 |----------|------------|
-| 100 命令，10 lane | ~33,000–50,000 ops/sec |
-| 100 命令，1 lane | ~6,600–10,000 ops/sec |
-| 指标开销 | ~3–5% |
+| 100 个命令，10 个通道 | ~33,000–50,000 次操作/秒 |
+| 100 个命令，1 个通道 | ~6,600–10,000 次操作/秒 |
+|指标开销| ~3–5% |
 
-完整 lifecycle 基准（含 manager create/start/shutdown）约 ~85–93 ops/sec—— dominated by 启动成本，非调度本身。
+完整生命周期基准（包括管理器创建/启动/关闭）以约 85-93 操作/秒的速度运行 — 主要由启动成本而非调度决定。
 
 ```bash
 cargo bench
@@ -1852,8 +1832,8 @@ open target/criterion/report/index.html
 
 ## 社区
 
-在 [Discord](https://discord.gg/XVg6Hu6H) 加入我们，提问、讨论与获取更新。
+加入我们的 [Discord](https://discord.gg/XVg6Hu6H)，了解问题、讨论和更新。
 
 ## 许可证
 
-MIT
+麻省理工学院
