@@ -1,17 +1,16 @@
 # a3s-lane
 
-Lane-based priority queues for concurrent async tasks. Commands can be organized into named lanes with configurable concurrency and priority, or retained as typed host-owned values until the host is ready to execute them.
-
-Priority controls which pending item is admitted next. It does not interrupt an already-running future; active work still needs an explicit cancellation and settlement contract.
-
-[![crates.io](https://img.shields.io/crates/v/a3s-lane.svg)](https://crates.io/crates/a3s-lane)
-
-<p align="center">
+<p>
   <strong>Language / 语言:</strong>
   <a href="README.md">English</a> ·
   <a href="README.zh-CN.md">中文</a>
 </p>
 
+Lane-based priority queues for concurrent async tasks. Commands can be organized into named lanes with configurable concurrency and priority, or retained as typed host-owned values until the host is ready to execute them.
+
+Priority controls which pending item is admitted next. It does not interrupt an already-running future; active work still needs an explicit cancellation and settlement contract.
+
+[![crates.io](https://img.shields.io/crates/v/a3s-lane.svg)](https://crates.io/crates/a3s-lane)
 
 ## Install
 
