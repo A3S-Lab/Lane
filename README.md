@@ -6,6 +6,13 @@ Priority controls which pending item is admitted next. It does not interrupt an 
 
 [![crates.io](https://img.shields.io/crates/v/a3s-lane.svg)](https://crates.io/crates/a3s-lane)
 
+<p align="center">
+  <strong>Language / 语言:</strong>
+  <a href="README.md">English</a> ·
+  <a href="README.zh-CN.md">中文</a>
+</p>
+
+
 ## Install
 
 ```toml
